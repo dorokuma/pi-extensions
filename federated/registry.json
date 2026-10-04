@@ -69,6 +69,20 @@
       }
     },
     {
+      "name": "ctx-orchestrate",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "ctx-orchestrate.ts",
+      "targetPath": "/root/.pi/agent/extensions/ctx-orchestrate.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
       "name": "codegraph-go",
       "category": "federated",
       "managed": "upstream-repo",

@@ -2,7 +2,7 @@
 
 本仓是全机 Pi 扩展的**唯一权威源 / 分发中枢**，架构为**联邦式**：
 
-- **hosted（内生，4 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
+- **hosted（内生，5 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
 - **federated（外生，3 个）**：源**留在各自宿主仓**，本仓仅以子进程级联调用它们各自的
   `install.sh`；改动回宿主仓走既有流程。
 - **external（外部，1 个）**：`herdr-agent-state.ts` 由 **herdr 二进制托管**，本仓只读
@@ -10,13 +10,14 @@
 
 数据源唯一：`federated/registry.json`。请先读 `AGENTS.md` 的 6 条铁律。
 
-## 全机 8 扩展矩阵
+## 全机 9 扩展矩阵
 
 | 名称 | 类别 | 权威源（绝对路径） | 目标安装路径 |
 |---|---|---|---|
 | auto-continue | hosted | `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts` | `/root/.pi/agent/extensions/auto-continue.ts` |
 | no-tables | hosted | `/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts` | `/root/.pi/agent/extensions/no-tables.ts` |
 | prism | hosted | `/root/workspace/pi-extensions/extensions/prism/src/prism.ts` | `/root/.pi/agent/extensions/prism.ts` |
+| ctx-orchestrate | hosted | `/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts` | `/root/.pi/agent/extensions/ctx-orchestrate.ts` |
 | herdsman-bridge | hosted | `/root/workspace/pi-extensions/extensions/herdsman-bridge/src/herdsman-bridge.ts`（运行时再导出 `/root/workspace/herdsman/packages/herdsman-pi/src/index.ts`） | `/root/.pi/agent/extensions/herdsman-pi.ts` |
 | codegraph-go | federated | `/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/codegraph-go.ts` |
 | ctxmode | federated | `/root/workspace/ctxmode/integrations/pi/ctxmode.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/ctxmode.ts` |
@@ -33,8 +34,8 @@
 pnpm setup                 # = pnpm install --ignore-workspace
 pnpm check                 # = tsc --noEmit
 
-bash install.sh --list     # 列出 8 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit    # 只读巡检 8 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --list     # 列出 9 扩展：名称/类别/权威源/目标/当前状态
+bash install.sh --audit    # 只读巡检 9 扩展：md5/权限/外生脚本是否存在/herdr 只读态
 bash install.sh --dry-run <name...>   # 只演练，不写任何文件
 bash install.sh <name...>  # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all      # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -78,9 +79,9 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 ## 目录布局
 
 ```
-extensions/<name>/src/<file>.ts     # 4 个内生扩展源码（唯一权威副本）
+extensions/<name>/src/<file>.ts     # 5 个内生扩展源码（唯一权威副本）
 extensions/<name>/README.md          # 各扩展：权威源/目标/来源/出处/一致性记录
-federated/registry.json              # 8 扩展的类别与绝对权威路径（install.sh 数据源）
+federated/registry.json              # 9 扩展的类别与绝对权威路径（install.sh 数据源）
 install.sh                           # 统一安装/巡检入口
 .agents/notes/                       # 重大变更与踩坑笔记
 .agents/history/no-tables/           # no-tables 两份历史备份的只读副本（三段式还原输入源）
