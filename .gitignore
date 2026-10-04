@@ -1,0 +1,36 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# AGENTS.md 是本仓必需交付物；本机全局 ignore（~/.config/git/ignore）会忽略所有 AGENTS.md，
+# 这里用仓库 .gitignore 反选覆盖（仓库 .gitignore 优先级高于全局 excludesFile），
+# 确保后续提交不会漏掉它。
+!AGENTS.md
+
+# 类型检查 / 工具产物（本仓产物只经 install.sh 逐字节同步到部署目录，不入库）
+*.tsbuildinfo
+
+# 日志 / 临时
+*.log
+*.tmp
+nohup.out
+
+# 常规范
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 说明：部署目录 /root/.pi/agent/extensions/ 下的 *.bak-* 由 herdr/线上流程托管，
+# 其归档/清理属后续阶段（AGENTS.md 铁律⑥：no-tables 三段式还原完成前动不得），
+# 本仓绝不写那些文件。
+# 唯一例外：.agents/history/no-tables/ 下两份 no-tables 历史备份的只读副本是本仓资产
+# （三段式还原的输入源，install -m 444 收置），正常跟踪，勿忽略。
+
+# ---- .agents/notes/：仅忽略笔记；.agents/history/ 仍须跟踪 ----
+# 过程笔记（.agents/notes/）磁盘保留、不入库，用 .gitignore 排除。
+# 切勿忽略 .agents/history/（no-tables 三段式还原的输入源），其下两份只读快照正常跟踪。
+.agents/notes/

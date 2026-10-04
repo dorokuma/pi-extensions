@@ -1,0 +1,20 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "联邦式 Pi 扩展分发中枢：4 个内生扩展的唯一权威源 + 3 个外生宿主仓的级联同步 + herdr 外部托管项的只读巡检",
+  "type": "module",
+  "scripts": {
+    "setup": "pnpm install --ignore-workspace",
+    "check": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0"
+  }
+}

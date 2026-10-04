@@ -1,0 +1,130 @@
+{
+  "_comment": "联邦式 Pi 扩展注册表：全机 8 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
+  "schemaVersion": 1,
+  "defaultDestDir": "/root/.pi/agent/extensions",
+  "settingsJson": "/root/.pi/agent/settings.json",
+  "neverWrite": [
+    "herdr-agent-state.ts"
+  ],
+  "extensions": [
+    {
+      "name": "auto-continue",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "auto-continue.ts",
+      "targetPath": "/root/.pi/agent/extensions/auto-continue.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "no-tables",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "no-tables.ts",
+      "targetPath": "/root/.pi/agent/extensions/no-tables.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "prism",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "prism.ts",
+      "targetPath": "/root/.pi/agent/extensions/prism.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/prism/src/prism.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "herdsman-bridge",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "herdsman-pi.ts",
+      "targetPath": "/root/.pi/agent/extensions/herdsman-pi.ts",
+      "doubleLoadGuard": {
+        "settingsFile": "/root/.pi/agent/settings.json",
+        "packageGlobs": ["@dorokuma/herdsman-pi", "herdsman-pi"],
+        "reason": "该桥再导出 /root/workspace/herdsman/packages/herdsman-pi 源码；若 settings.json 的 packages 同时装了同名 npm 包，将造成同扩展双实例（双 daemon client / 重复注册），故写前必读 packages 并显式报错退出"
+      },
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/herdsman-bridge/src/herdsman-bridge.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "codegraph-go",
+      "category": "federated",
+      "managed": "upstream-repo",
+      "destFile": "codegraph-go.ts",
+      "targetPath": "/root/.pi/agent/extensions/codegraph-go.ts",
+      "authority": {
+        "kind": "host-repo-cascade",
+        "sourcePath": "/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts",
+        "hostRepo": "/root/workspace/codegraph-go",
+        "installScript": "/root/workspace/codegraph-go/integrations/pi/install.sh",
+        "installDestEnv": "PI_EXT_DEST"
+      }
+    },
+    {
+      "name": "ctxmode",
+      "category": "federated",
+      "managed": "upstream-repo",
+      "destFile": "ctxmode.ts",
+      "targetPath": "/root/.pi/agent/extensions/ctxmode.ts",
+      "authority": {
+        "kind": "host-repo-cascade",
+        "sourcePath": "/root/workspace/ctxmode/integrations/pi/ctxmode.ts",
+        "hostRepo": "/root/workspace/ctxmode",
+        "installScript": "/root/workspace/ctxmode/integrations/pi/install.sh",
+        "installDestEnv": "PI_CTXMODE_EXT"
+      }
+    },
+    {
+      "name": "pi-cache-guardian",
+      "category": "federated",
+      "managed": "upstream-repo",
+      "destFile": "cache-guardian.ts",
+      "targetPath": "/root/.pi/agent/extensions/cache-guardian.ts",
+      "authority": {
+        "kind": "host-repo-cascade",
+        "sourcePath": "/root/workspace/pi-cache-guardian/extensions/cache-guardian.ts",
+        "hostRepo": "/root/workspace/pi-cache-guardian",
+        "installScript": "/root/workspace/pi-cache-guardian/integrations/pi/install.sh",
+        "installDestEnv": "PI_EXT_DEST"
+      }
+    },
+    {
+      "name": "herdr-agent-state",
+      "category": "external",
+      "managed": "herdr-binary",
+      "destFile": "herdr-agent-state.ts",
+      "targetPath": "/root/.pi/agent/extensions/herdr-agent-state.ts",
+      "authority": {
+        "kind": "out-of-band-herdr",
+        "sourcePath": null,
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "readOnly": true,
+      "note": "由 herdr 二进制托管/重装；本仓任何路径都绝不写它，仅在 --audit 只读巡检（md5/权限/头注）"
+    }
+  ]
+}
