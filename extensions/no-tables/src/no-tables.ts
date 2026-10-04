@@ -1,5 +1,6 @@
 // No-Tables Extension for Pi
-// Automatically converts any markdown table in assistant output to bullet lists.
+// 1. Automatically converts any markdown table in assistant output to bullet lists.
+// 2. Converts markdown formats unsupported by pi terminal (h3-h6 headings, images, footnotes).
 // Silent, zero-config, no user interaction needed.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
@@ -14,7 +15,7 @@ export default function (pi: ExtensionAPI) {
     let changed = false
     const newParts = parts.map((part: any) => {
       if (part.type !== "text") return part
-      const converted = convertTables(part.text)
+      const converted = convertUnsupportedMarkdown(convertTables(part.text))
       if (converted !== part.text) {
         changed = true
         return { ...part, text: converted }
@@ -25,6 +26,34 @@ export default function (pi: ExtensionAPI) {
     if (!changed) return
     return { message: { ...event.message, content: newParts } }
   })
+}
+
+function convertUnsupportedMarkdown(md: string): string {
+  // Split by fenced code blocks (``` or ~~~) so rules A-D only apply outside code blocks
+  const segments = md.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g)
+  for (let i = 0; i < segments.length; i += 2) {
+    segments[i] = applyMarkdownRules(segments[i])
+  }
+  return segments.join("")
+}
+
+function applyMarkdownRules(text: string): string {
+  // Rule A: h3-h6 headers to bold line
+  text = text.replace(/^(#{3,6})\s+(.+?)\s*#*\s*$/gm, "**$2**")
+
+  // Rule D: Footnote definition lines
+  text = text.replace(/^\[\^([^\]]+)\]:\s*(.+)$/gm, "**[$1]** $2")
+
+  // Rule C: Footnote references (not at definition line start)
+  text = text.replace(/\[\^([^\]]+)\]/g, "[$1]")
+
+  // Rule B: Images to links (empty alt -> [image](url))
+  text = text.replace(/!+\[(.*?)\]\((.*?)\)/g, (_match, alt: string, url: string) => {
+    const label = alt.trim() ? alt : "image"
+    return `[${label}](${url})`
+  })
+
+  return text
 }
 
 function convertTables(md: string): string {
