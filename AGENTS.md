@@ -10,7 +10,7 @@
    历史备份，其归档/清理属后续阶段）。部署副本只能由本仓 `install.sh` 依 md5 幂等同步。
 
 2. **内生（hosted）扩展改动只在本仓做**：`auto-continue` / `no-tables` / `prism` /
-   `herdsman-bridge` 的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
+   `herdsman-bridge` / `ctx-orchestrate` 的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
    `bash install.sh <name>` 同步到部署目录（`/reload` 或新会话生效）。不要在部署目录就地改。
 
 3. **外生（federated）扩展改动回宿主仓**：`codegraph-go` / `ctxmode` / `pi-cache-guardian`
@@ -20,7 +20,10 @@
 
 4. **重大变更与踩坑必须落笔记**：结构/契约/口径变更、双审事项、踩坑复盘，写入
    `.agents/notes/YYYYMMDD-<slug>.md`（带 front-matter：`status` 等）。见本仓初始笔记
-   `20261004-pi-extensions-repo-init.md`。
+   `20261004-pi-extensions-repo-init.md`。注意：`.agents/notes/` 属**本地过程记录、
+   gitignore 不入库**（远端读者看不到，这是有意的——过程资产不是交付物），因此铁律④
+   不产生悬空引用：需要入库的结论必须同步落到 `README.md` / 各扩展 `README.md`
+   的对应小节，而不是依赖 notes 的远端可见性。
 
 5. **任何脚本/流程都绝不写 `herdr-agent-state.ts`**：该文件由 **herdr 二进制托管**，本仓
    只在其旁挂自定义钩子。`install.sh` 对它是硬编码禁写白名单（`NEVERWRITE`）+
@@ -37,12 +40,12 @@
 
 | 类别 | 扩展 | 权威源 | 本仓职责 |
 |---|---|---|---|
-| hosted（内生） | auto-continue / no-tables / prism / herdsman-bridge | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
+| hosted（内生） | auto-continue / no-tables / prism / herdsman-bridge / ctx-orchestrate | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
 | federated（外生） | codegraph-go / ctxmode / pi-cache-guardian | 各自宿主仓 | 仅级联调用其 `install.sh` |
 | external（外部） | herdr-agent-state | herdr 二进制（带外） | 只读巡检，绝不写 |
 
 `herdr` 二进制还托管着 `herdr-agent-state.ts`；本仓与其只读共存。详见 `README.md` 的全机
-8 扩展矩阵与 `federated/registry.json`。
+9 扩展矩阵与 `federated/registry.json`。
 
 ## 命令入口
 
@@ -51,8 +54,8 @@
 pnpm setup                       # = pnpm install --ignore-workspace
 pnpm check                       # = tsc --noEmit（见 README『类型检查』的范围与局限）
 
-bash install.sh --list           # 列出 8 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit          # 只读巡检 8 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --list           # 列出 9 扩展：名称/类别/权威源/目标/当前状态
+bash install.sh --audit          # 只读巡检 9 扩展：md5/权限/外生脚本是否存在/herdr 只读态
 bash install.sh --dry-run <name> # 只演练，不写任何文件
 bash install.sh <name...>        # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all            # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）

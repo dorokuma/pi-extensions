@@ -1,5 +1,5 @@
 {
-  "_comment": "联邦式 Pi 扩展注册表：全机 8 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
+  "_comment": "联邦式 Pi 扩展注册表：全机 9 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
   "schemaVersion": 1,
   "defaultDestDir": "/root/.pi/agent/extensions",
   "settingsJson": "/root/.pi/agent/settings.json",
