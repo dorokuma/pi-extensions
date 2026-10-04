@@ -18,11 +18,14 @@
  *   `isPrematureStop()` 与它并列：`stopReason === "stop"`、本条 assistant 消息无
  *   toolCall、且结构上没把话说完 → 命中后**复用同一条续跑链路**
  *   （agent_settled → delayMs → sendUserMessage("继续")）与 streak/maxAttempts
- *   上限，不另起炉灶。为防误伤正常完成，另加两道闸（见 TOOL_USE_WINDOW_MS /
- *   USER_PROGRESS_STALL_MS）：本 turn 此前 5 分钟内有过 toolUse 活动（任务确实
- *   在进行中），且距上一条真人 user 消息已超过 90 秒（用户等久了还没看到收尾）。
+ *   上限，不另起炉灶。为防误伤正常完成，另加两道闸：A 闸（见 TOOL_USE_WINDOW_MS /
+ *   RUN_ACTIVE_MIN_MS）要求**活动证据**——本 turn 此前 5 分钟内有过 toolUse 活动，
+ *   **或**本 run 从 agent_start 起已持续超过 90 秒（覆盖纯思考、无工具动作的早衰）；
+ *   B 闸（见 USER_PROGRESS_STALL_MS）要求距上一条真人 user 消息已超过 90 秒（用户等
+ *   久了还没看到收尾）。
  *   命中/未命中的分支码（`stop:premature-thinking-only` /
- *   `stop:premature-truncated-text` / `premature:*`）随既有 notify 一起打出来。
+ *   `stop:premature-truncated-text` / `stop:premature-empty-content` /
+ *   `premature:no-activity-evidence` 等）随既有 notify 一起打出来。
  *
  *   与 esc 锁的边界：疑似早衰的 stop **不算**「上一轮正常结束」，所以不会按 R4
  *   自动解除 `userCancelled`——esc 之后照样要用户手发消息（或 `/auto-continue on`）
@@ -116,9 +119,10 @@ const BARE_ESC = "\u001b";
 const COMPACTION_BUSY_MAX_MS = 300_000;
 
 /**
- * 早衰 stop 闸 A 窗口：本 turn 此前 5 分钟内有过 toolUse 活动，才算「任务进行中」。
- * 一次提问 + 一次回答、全程没有任何工具动作的 turn 即使 stop 得早也不算早衰——
- * 那更可能是一次简短的正常收尾。
+ * 早衰 stop 闸 A 的活动证据之一：本 turn 此前 5 分钟内有过 toolUse 活动，才算
+ * 「任务进行中」。与 RUN_ACTIVE_MIN_MS 的 run 时长证据**并列**（满足其一过闸）。
+ * 一次提问 + 一次回答、半分钟内就 stop 且全程没有任何工具动作的 turn 也不算早衰——
+ * 那更可能是一次简短的正常收尾（run 时长证据会挡住它）。
  */
 const TOOL_USE_WINDOW_MS = 300_000;
 
@@ -127,6 +131,16 @@ const TOOL_USE_WINDOW_MS = 300_000;
  * 90 秒内的收尾（包括以冒号 / 列表项收尾的简短回答）一律不碰。
  */
 const USER_PROGRESS_STALL_MS = 90_000;
+
+/**
+ * 早衰 stop 闸 A 的并列活动证据：本 run 从 `agent_start` 起时长超过 90 秒，即使用户
+ * 全程没有工具动作（纯思考 / thinking-only 早衰），也算任务在进行中——覆盖闸 A 对
+ * 「无工具活动长任务」的永久假阴性（双审 oracle 设计保留项，本次销账）。
+ * 与 USER_PROGRESS_STALL_MS 初始同值（同为「用户等待下限」口径），但语义独立：闸 B
+ * 管「距上一条真人消息无进展多久」，本常量管「本 run 已持续多久」，两者可能各自
+ * 微调，故独立常量、不合并。边界与闸 B 对齐：**严格大于** 90 秒才算。
+ */
+const RUN_ACTIVE_MIN_MS = 90_000;
 
 /** HTTP statuses that are usually safe to retry / continue. */
 export const CONTINUE_HTTP_STATUSES = new Set([
@@ -307,19 +321,28 @@ export interface PrematureStopFacts {
   lastToolUseTs?: number;
   /** 最近一条真人 user 消息的时间戳（扩展自己发的「继续」不算）。 */
   lastUserMessageTs?: number;
+  /** 本 run 起点时间戳（`agent_start`，扩展自己跟踪；闸 A 的 run 时长并列证据）。 */
+  runStartTs?: number;
   /** 注入的当前时间；默认 Date.now()。 */
   now?: number;
 }
 
 type Verdict = { ok: true; reason: string } | { ok: false; reason: string };
 
-/** content 归一成块数组：不是数组（旧数据 / 字符串 content）就当空。 */
+/** content 归一成块数组：不是数组（旧数据）就当空。 */
 function asBlocks(content: unknown): ContentBlockLike[] {
   return Array.isArray(content) ? (content as ContentBlockLike[]) : [];
 }
 
-/** content 里全部 text 块按序拼接（早衰判定只看文本尾部，不需要块边界）。 */
+/**
+ * content 取纯文本：字符串 content（历史数据 / custom 消息形态）直接返回该字符串；
+ * 块数组则拼接全部 text 块（早衰判定只看文本尾部，不需要块边界）。
+ * 字符串分支是纵深防御（reviewer consider）：当前 assistant 消息 content 恒为块数组，
+ * 但外部/回放消息若带字符串 content，不能被误判成「无 text」而错入
+ * `stop:premature-empty-content`。与 userMessageText 的处理对齐。
+ */
 function blockText(content: unknown): string {
+  if (typeof content === "string") return content;
   return asBlocks(content)
     .filter((b): b is { type: "text"; text: string } => b?.type === "text" && typeof b.text === "string")
     .map((b) => b.text)
@@ -411,11 +434,14 @@ function positiveTs(ts: number | undefined): number | undefined {
  * 带 toolCall 的 stop 一概不碰（模型还想干活，交给下一轮即可）。
  *
  * 两道闸（防误伤正常完成，必须同时满足）：
- *   A) 该 turn 此前 5 分钟内有过 toolUse 活动（TOOL_USE_WINDOW_MS）；
+ *   A) 活动证据（**满足其一即可**）：本 turn 此前 5 分钟内有过 toolUse 活动
+ *      （TOOL_USE_WINDOW_MS），**或**本 run 从 agent_start 起已持续超过 90 秒
+ *      （RUN_ACTIVE_MIN_MS，覆盖无工具动作的纯思考长任务）；
  *   B) 距上一条真人 user 消息超过 90 秒仍无进展（USER_PROGRESS_STALL_MS）。
- * 时间戳优先用扩展自己跟踪的 lastToolUseTs / lastUserMessageTs（agent_settled 时
- * lastMessages 已就绪、turn_end 时还是上一轮残留，两种时点都不能只信 messages），
- * 取不到才回落到 messages 扫描；两边都没有证据时按「不续」处理（保守）。
+ * 时间戳优先用扩展自己跟踪的 lastToolUseTs / lastUserMessageTs / runStartTs
+ * （agent_settled 时 lastMessages 已就绪、turn_end 时还是上一轮残留，两种时点都
+ * 不能只信 messages），取不到才回落到 messages 扫描；两证据都无（无任何活动证据）
+ * 时按「不续」处理。
  */
 export function isPrematureStop(
   message: PrematureStopLike | undefined,
@@ -449,10 +475,14 @@ export function isPrematureStop(
 
   const now = positiveTs(facts.now) ?? Date.now();
 
-  // 闸 A：本 turn 此前 5 分钟内有过 toolUse 活动。
+  // 闸 A：活动证据二选一——5 分钟窗口内的 toolUse 活动，或本 run 时长 > 90 秒。
+  // 放行集扩大：无工具活动的长 run 也过闸；但仍要求至少一条活动证据，两证据都无才拦。
   const toolUseTs = positiveTs(facts.lastToolUseTs) ?? lastToolUseTsFromMessages(facts.messages);
-  if (toolUseTs === undefined || now - toolUseTs > TOOL_USE_WINDOW_MS) {
-    return { ok: false, reason: "premature:no-recent-tool-use" };
+  const runStartTs = positiveTs(facts.runStartTs);
+  const hasRecentToolUse = toolUseTs !== undefined && now - toolUseTs <= TOOL_USE_WINDOW_MS;
+  const hasLongRun = runStartTs !== undefined && now - runStartTs > RUN_ACTIVE_MIN_MS;
+  if (!hasRecentToolUse && !hasLongRun) {
+    return { ok: false, reason: "premature:no-activity-evidence" };
   }
 
   // 闸 B：距上一条真人 user 消息 > 90 秒无进展。
@@ -642,6 +672,12 @@ export default function (pi: ExtensionAPI) {
    */
   let lastHumanUserTs = 0;
   /**
+   * 早衰 stop 闸 A 的 run 时长证据：本 run 起点（`agent_start` 刷新）。与
+   * lastToolUseTs 不同，它必须随 agent_start **重置**——run 时长是「本 run 已跑
+   * 多久」的口径，跨 run 延续会把上一轮的长度算进来、把短 run 也放行。
+   */
+  let runStartTs = 0;
+  /**
    * 下一次 `before_agent_start` / `agent_start` 对应的是本扩展自己
    * `sendUserMessage(CONTINUE_PROMPT)` 发出的那次「继续」。发送前置位，在
    * `before_agent_start`（或 `agent_start`）里按该标志区分自发性 turn 与用户手发 turn。
@@ -671,13 +707,14 @@ export default function (pi: ExtensionAPI) {
    *
    * `messages` 只在 `lastMessages` 已就绪的时点（agent_settled）传入；turn_end 触发时
    * `lastMessages` 还是上一轮的残留（agent_end 尚未派发），那种时点只信扩展自己跟踪的
-   * `lastToolUseTs` / `lastHumanUserTs`，不传 messages。
+   * `lastToolUseTs` / `lastHumanUserTs` / `runStartTs`，不传 messages。
    */
   const judgePrematureStop = (message: AssistantLike | undefined, messages?: readonly AssistantLike[]) =>
     isPrematureStop(message, {
       messages,
       lastToolUseTs,
       lastUserMessageTs: lastHumanUserTs,
+      runStartTs,
     });
 
   /**
@@ -843,6 +880,7 @@ export default function (pi: ExtensionAPI) {
     // reload）一律清零，不把上一个会话的工具活动/用户输入带到下一个会话。
     lastToolUseTs = 0;
     lastHumanUserTs = 0;
+    runStartTs = 0;
     markCompactionEnd();
     registerTerminalInput(ctx);
     clearStatus(ctx);
@@ -853,6 +891,7 @@ export default function (pi: ExtensionAPI) {
     userCancelled = false;
     selfSending = false;
     promptFromExtension = false;
+    runStartTs = 0;
     markCompactionEnd();
     unregisterTerminalInput();
     clearStatus(ctx);
@@ -871,6 +910,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", () => {
     cancelPending();
     lastHttpStatus = undefined;
+    // 本 run 起点：闸 A 的 run 时长并列证据从此刻起算（agent_start 即新 run 开始）。
+    runStartTs = Date.now();
     // 只看「本次 run」产出的 assistant 消息。被 esc 中止的 run 可能一条新
     // assistant 消息都没产出，不清的话 lastMessages 会一直留着上一轮那条旧错误，
     // 下一次 agent_settled 会把它再判成 continue-worthy 又发一次「继续」。

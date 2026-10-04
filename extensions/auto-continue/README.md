@@ -22,16 +22,21 @@
 | `stop:premature-empty-content` | 命中：正文与 thinking 都是空的 |
 | `stop:complete-text` | 不续：正文正常收尾 |
 | `stop:has-tool-call` | 不续：这条 stop 还带着 toolCall |
-| `premature:no-recent-tool-use` | 不续：闸 A——本 turn 5 分钟内没有 toolUse 活动 |
+| `premature:no-activity-evidence` | 不续：闸 A——既无 5 分钟内 toolUse 活动、本 run 时长也未超 90 秒（v3.1 起由 `premature:no-recent-tool-use` 更名，口径从「无近期 toolUse」扩展为「无任何活动证据」） |
 | `premature:user-message-too-recent` | 不续：闸 B——距上一条真人 user 消息 ≤ 90 秒 |
 
-**两道防误伤闸（必须同时满足）**：A) 该 turn 此前 5 分钟（`TOOL_USE_WINDOW_MS`）内有
-toolUse 活动，说明任务确实在进行中；B) 距上一条**真人** user 消息已超过 90 秒
-（`USER_PROGRESS_STALL_MS`）仍无进展。时间戳优先用扩展自己跟踪的
-`lastToolUseTs` / `lastHumanUserTs`（`tool_execution_start`/`_end` 与非 extension 来源的
-`input` 事件更新），取不到才回落到 `agent_end.messages` 扫描；两边都没有证据时按
+**两道防误伤闸（必须同时满足）**：A) 活动证据（**满足其一即可**）——该 turn 此前
+5 分钟（`TOOL_USE_WINDOW_MS`）内有 toolUse 活动，**或**本 run 从 `agent_start` 起已超过
+90 秒（`RUN_ACTIVE_MIN_MS`，覆盖纯思考、无工具动作的长任务早衰）。相对 v3 是**放行集
+扩大**：无工具活动的长 run 也过闸；**但仍要求至少一条活动证据**，两条皆无一律按
+「不续」处理。B) 距上一条**真人**
+user 消息已超过 90 秒（`USER_PROGRESS_STALL_MS`）仍无进展。时间戳优先用扩展自己跟踪的
+`lastToolUseTs` / `lastHumanUserTs` / `runStartTs`（`tool_execution_start`/`_end`、非
+extension 来源的 `input` 事件、`agent_start` 分别更新），取不到才回落到
+`agent_end.messages` 扫描；两证据都无时按
 「不续」处理。扩展自发的「继续」不算新的 user 输入——否则续跑链的第二发永远过不了
-90s 闸。
+90s 闸。`runStartTs` 随 `agent_start` 重置（run 时长是「本 run 已跑多久」的口径，不能
+跨 run 累计），只随 session 切换清零。
 
 **与既有机制的边界**：疑似早衰的 stop **不算**「上一轮正常结束」，因此不会按 R4 自动
 解除 esc 取消锁——esc 之后照样要用户手发消息（或 `/auto-continue on`）才恢复；压缩
@@ -58,6 +63,7 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
 |---|---|---|---|---|
 | 2026-10-04 | 收纳纳管（逐字副本） | `4341280ec027415bf7b9276d965a49e7` | `29714` | 与部署副本 `cmp` 一致 |
 | 2026-10-04 | v3：新增早衰 stop 自动续跑分支（`isPrematureStop` + 两道闸） | `cb50578c13d98e3875e239b1fcc4b364` | `44035` | `install.sh auto-continue` 部署 + `--audit` MATCH（`cmp` 与部署副本逐字节一致） |
+| 2026-10-04 | v3.1：闸 A 新增 run 时长并列条件（`RUN_ACTIVE_MIN_MS`，无工具活动的长任务早衰不再永久假阴性，理由码更名 `premature:no-activity-evidence`）+ `blockText` 字符串 content 防御兼容；措辞按双审口径改为「放行集扩大、仍要求至少一条活动证据」 | `8d5c33da9ffce60f400ed73f90df32e1` | `46766` | `install.sh auto-continue` 部署 + `--audit` MATCH（`cmp` 与部署副本逐字节一致） |
 
 （改动后的 md5 / 字节数同时由 `bash install.sh --audit` 复核：auto-continue 行
 `MATCH — unchanged`，即仓内副本与部署副本一致。）
@@ -72,14 +78,17 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
    `/root/.pi/agent/extensions/auto-continue.ts`。
 2. `pnpm setup && bash install.sh auto-continue` 后，`/reload` 或新会话生效。
 
-## 自检（v3 早衰 stop 分支）
+## 自检（v3.1 早衰 stop 分支）
 冒烟脚本（假消息对象 / 假 ExtensionAPI + 假时钟，均在 `/tmp`，未入仓）：
-- `node /tmp/auto-continue-smoke.mjs`：27 组断言——thinking-only 命中、冒号/逗号/顿号/
+- `node /tmp/auto-continue-smoke.mjs`：32 组断言——thinking-only 命中、冒号/逗号/顿号/
   分号/未闭合代码块/markdown 标题/裸列表项/省略号命中、完整段落收尾不误伤、带 toolCall
   的 stop 不误伤、无近期 toolUse 活动不续、90s 闸（含边界与「继续」不算新 user 输入）、
+  闸 A run 时长并列条件（>90s 续 / 恰好 90s 不续 / toolUse 过期但 run 够长兜底）、
+  blockText 字符串 content 防御兼容（断句命中 truncated-text、完整收尾判 complete-text）、
   `looksTruncatedText` 单测。
-- `node /tmp/auto-continue-smoke-ext.mjs`：7 组扩展级场景——早衰 stop 走完
+- `node /tmp/auto-continue-smoke-ext.mjs`：9 组扩展级场景——早衰 stop 走完
   `delayMs` → `sendUserMessage("继续")` 且日志带原因码、正常完成不续、esc 锁不被绕过
   （且不误解锁）、压缩 busy 优先、草稿优先、连续早衰 stop 的 streak 累加到
-  `maxAttempts` 上限停手、`PI_AUTO_CONTINUE=0` 关闭时不续。
+  `maxAttempts` 上限停手、`PI_AUTO_CONTINUE=0` 关闭时不续；S9 无工具活动但 run > 90s
+  的 thinking-only 早衰也续、S10 无工具活动且 run ≤ 90s（闸 B 已过）不续。
 - `node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json`：exit 0。
