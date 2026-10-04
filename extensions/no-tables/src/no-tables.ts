@@ -1,6 +1,7 @@
 // No-Tables Extension for Pi
 // 1. Automatically converts any markdown table in assistant output to bullet lists.
 // 2. Converts markdown formats unsupported by pi terminal (h3-h6 headings, images, footnotes).
+// 3. Converts markdown links to plain text and bare URLs.
 // Silent, zero-config, no user interaction needed.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
@@ -51,6 +52,19 @@ function applyMarkdownRules(text: string): string {
   text = text.replace(/!+\[(.*?)\]\((.*?)\)/g, (_match, alt: string, url: string) => {
     const label = alt.trim() ? alt : "image"
     return `[${label}](${url})`
+  })
+
+  // Rule E: Links to text + url
+  text = text.replace(/\[(.*?)\]\((.*?)\)/g, (_match, label: string, url: string) => {
+    const trimmedLabel = label.trim()
+    const trimmedUrl = url.trim()
+    if (trimmedLabel === trimmedUrl) {
+      return trimmedUrl
+    }
+    if (!trimmedLabel) {
+      return trimmedUrl
+    }
+    return `${label} ${url}`
   })
 
   return text
