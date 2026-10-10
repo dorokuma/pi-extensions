@@ -29,13 +29,109 @@ export default function (pi: ExtensionAPI) {
   })
 }
 
-function convertUnsupportedMarkdown(md: string): string {
+export function convertUnsupportedMarkdown(md: string): string {
+  // Rule F runs BEFORE the split below.
+  //
+  // The split keys purely on where fence runs sit in the string, and the
+  // even/odd alternation it produces ("even = prose, odd = code") is fixed at
+  // that moment; rules A-E then rewrite only the prose half. F's whole job is to
+  // normalize those fence positions first, so the text the split hands to A-E is
+  // already the final one. Run it afterwards instead and the heading case breaks:
+  // rule A rewrites "### T" to "**T**" and its trailing \s*$ swallows the newline
+  // F inserted, so the fence lands glued to the bold text again ("**T**```") --
+  // i.e. it re-creates the very defect F exists to remove.
+  const normalized = normalizeMisplacedFences(md)
+
   // Split by fenced code blocks (``` or ~~~) so rules A-D only apply outside code blocks
-  const segments = md.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g)
+  const segments = normalized.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g)
   for (let i = 0; i < segments.length; i += 2) {
     segments[i] = applyMarkdownRules(segments[i])
   }
-  return segments.join("")
+
+  // Second F pass over the joined result. It exists for exactly one reason:
+  // rule A's "**$2**" replacement can consume the newline that the first pass
+  // inserted (a heading that is the last line of its prose segment ends up as
+  // "**T**" immediately followed by the fence). Re-running F restores the
+  // separation, and F is idempotent on already-clean text, so this is a no-op
+  // for every input that does not hit that interaction.
+  return normalizeMisplacedFences(segments.join(""))
+}
+
+// Rule F: repair fence runs (3+ backticks or 3+ tildes) that CommonMark does not
+// recognize as fences because of where they sit.
+//
+// Models regularly glue the opening fence to the end of a prose line:
+//
+//   **三、为什么 `none` 没加成**```
+//   $ magpie ...
+//   ```
+//
+// CommonMark only opens a code block when the fence run stands on its own line,
+// so here the glued run is not an opener and the *closing* fence becomes one
+// instead, swallowing every following line into a single code block. Breaking
+// the line in front of the fence restores the intended semantics without
+// editing one byte of the code block's content.
+//
+// The pass walks the lines with fence state, so a fence-looking line that is
+// really code content -- an indented ``` inside a ````-fenced block, or a glued
+// fence quoted inside a code block -- is never touched.
+export function normalizeMisplacedFences(md: string): string {
+  const out: string[] = []
+  let openFence: string | null = null
+
+  for (const line of md.split("\n")) {
+    if (openFence !== null) {
+      // Inside a block: only a genuine closing fence may be dedented; everything
+      // else is code content and is preserved byte-for-byte.
+      const dedented = dedentFenceLine(line)
+      const close = /^( {0,3})(`{3,}|~{3,})[ \t]*$/.exec(dedented)
+      if (close && close[2][0] === openFence[0] && close[2].length >= openFence.length) {
+        openFence = null
+        out.push(dedented)
+      } else {
+        out.push(line)
+      }
+      continue
+    }
+
+    // F1: a fence run glued to the end of a prose line is moved onto its own
+    // line. Two conditions keep this from firing on prose that merely *mentions*
+    // a fence ("模型把 ``` 贴在文字后面。"):
+    //   - the lookahead requires the run to be the last thing on the line apart
+    //     from an optional language tag ("```bash"), and
+    //   - the guard skips a run that has another fence run earlier on the same
+    //     line, so only the first run of a line can be promoted.
+    // Without both, promoting a mid-sentence mention to column 0 would turn that
+    // mention into a real opener and create the very bug this rule removes.
+    // A preceding ">" is excluded because a fence inside a blockquote is already
+    // valid where it stands, and runs of 3+ are required so inline `code` and
+    // ``code`` are never touched.
+    let fenceLine = line
+    const glued = /([^\n`~ \t>])[ \t]*(`{3,}|~{3,})(?=[ \t]*[A-Za-z0-9_+.\-]*[ \t]*(?:\r?\n|$))/.exec(line)
+    if (glued && !/`{3,}|~{3,}/.test(line.slice(0, glued.index + glued[1].length))) {
+      out.push(line.slice(0, glued.index + glued[1].length))
+      fenceLine = line.slice(glued.index + glued[0].length - glued[2].length).replace(/^[ \t]+/, "")
+    } else {
+      // F2: an indented fence run is moved to column 0. CommonMark accepts at
+      // most 3 spaces of indent (more is not a fence at all), while the split
+      // above ignores indentation entirely, so normalizing to column 0 is what
+      // makes the two agree.
+      fenceLine = dedentFenceLine(line)
+    }
+    out.push(fenceLine)
+
+    // Track whether this line opened a block, using the same 3+ run shape.
+    const open = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(fenceLine)
+    if (open && !(open[2][0] === "`" && open[3].includes("`"))) {
+      openFence = open[2]
+    }
+  }
+
+  return out.join("\n")
+}
+
+function dedentFenceLine(line: string): string {
+  return /^[ \t]+(?=`{3,}|~{3,})/.test(line) ? line.replace(/^[ \t]+/, "") : line
 }
 
 function applyMarkdownRules(text: string): string {
