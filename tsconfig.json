@@ -16,6 +16,10 @@
   },
   "include": [
     "extensions/auto-continue/src/**/*.ts",
+    "extensions/ctx-orchestrate/src/**/*.ts",
+    "extensions/exclude-tools-guard/src/**/*.ts",
+    "extensions/jev-gate/src/**/*.ts",
+    "extensions/magpie-image/src/**/*.ts",
     "extensions/no-tables/src/**/*.ts",
     "extensions/prism/src/**/*.ts"
   ],

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — 联邦式 Pi 扩展分发中枢的统一安装/巡检入口。
 #
-# 数据源：federated/registry.json（9 个扩展的类别与绝对权威路径）。本仓是 5 个
+# 数据源：federated/registry.json（12 个扩展的类别与绝对权威路径）。本仓是 8 个
 # 「hosted」内生扩展的唯一权威源，逐字节同步到部署目录；对 3 个「federated」外生
 # 扩展只以子进程级联调用其宿主仓的 install.sh（源留在宿主仓，改动回宿主仓走既有
 # 流程）；对 1 个「external」项 herdr-agent-state.ts 只读巡检、本仓绝不写它。
@@ -14,8 +14,8 @@
 #   - 实质改动后提示 Pi 需 /reload 或新会话才生效。
 #
 # 用法：
-#   install.sh --list                 # 列出 9 个扩展：名称/类别/权威源/目标/当前状态
-#   install.sh --audit                # 只读巡检全机 9 个：md5/权限/外生脚本/ herdr 只读态
+#   install.sh --list                 # 列出 12 个扩展：名称/类别/权威源/目标/当前状态
+#   install.sh --audit                # 只读巡检全机 12 个：md5/权限/外生脚本/ herdr 只读态
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -49,8 +49,8 @@ usage() {
 install.sh — 联邦式 Pi 扩展统一安装/巡检入口
 
 Usage:
-  install.sh --list                list 9 extensions (name/category/authority/target/status)
-  install.sh --audit               read-only inspect all 9 (md5/perms/upstream scripts/herdr)
+  install.sh --list                list 12 extensions (name/category/authority/target/status)
+  install.sh --audit               read-only inspect all 12 (md5/perms/upstream scripts/herdr)
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)

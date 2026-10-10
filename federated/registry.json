@@ -1,5 +1,5 @@
 {
-  "_comment": "联邦式 Pi 扩展注册表：全机 9 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
+  "_comment": "联邦式 Pi 扩展注册表：全机 12 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
   "schemaVersion": 1,
   "defaultDestDir": "/root/.pi/agent/extensions",
   "settingsJson": "/root/.pi/agent/settings.json",
@@ -57,7 +57,10 @@
       "targetPath": "/root/.pi/agent/extensions/herdsman-pi.ts",
       "doubleLoadGuard": {
         "settingsFile": "/root/.pi/agent/settings.json",
-        "packageGlobs": ["@dorokuma/herdsman-pi", "herdsman-pi"],
+        "packageGlobs": [
+          "@dorokuma/herdsman-pi",
+          "herdsman-pi"
+        ],
         "reason": "该桥再导出 /root/workspace/herdsman/packages/herdsman-pi 源码；若 settings.json 的 packages 同时装了同名 npm 包，将造成同扩展双实例（双 daemon client / 重复注册），故写前必读 packages 并显式报错退出"
       },
       "authority": {
@@ -77,6 +80,48 @@
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "jev-gate",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "jev-gate.ts",
+      "targetPath": "/root/.pi/agent/extensions/jev-gate.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "exclude-tools-guard",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "exclude-tools-guard.ts",
+      "targetPath": "/root/.pi/agent/extensions/exclude-tools-guard.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      }
+    },
+    {
+      "name": "magpie-image",
+      "category": "hosted",
+      "managed": "this-repo",
+      "destFile": "magpie-image.ts",
+      "targetPath": "/root/.pi/agent/extensions/magpie-image.ts",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts",
         "hostRepo": null,
         "installScript": null,
         "installDestEnv": null

@@ -6,11 +6,12 @@
 ## 铁律（不可违背）
 
 1. **严禁直接编辑部署目录下的 `.ts`**：`/root/.pi/agent/extensions/*.ts` 一律只读。
-   不要在那里改代码、不要手动 `cp` 覆盖、不要删/改/命名其下任何文件（含 6 个 `.bak-*`
+   不要在那里改代码、不要手动 `cp` 覆盖、不要删/改/命名其下任何文件（含 8 个 `.bak-*`
    历史备份，其归档/清理属后续阶段）。部署副本只能由本仓 `install.sh` 依 md5 幂等同步。
 
 2. **内生（hosted）扩展改动只在本仓做**：`auto-continue` / `no-tables` / `prism` /
-   `herdsman-bridge` / `ctx-orchestrate` 的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
+   `herdsman-bridge` / `ctx-orchestrate` / `jev-gate` / `exclude-tools-guard` / `magpie-image`
+   的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
    `bash install.sh <name>` 同步到部署目录（`/reload` 或新会话生效）。不要在部署目录就地改。
 
 3. **外生（federated）扩展改动回宿主仓**：`codegraph-go` / `ctxmode` / `pi-cache-guardian`
@@ -30,22 +31,24 @@
    `external` 类别剔除，双重防护；`--audit` 只对它只读巡检。**禁止**通过本仓任何脚本
    写入、覆盖、删除它。
 
-6. **`.bak-*` 归档/清理的前置条件（顺序钉死）**：**no-tables 三段式历史还原完成之前，部署
-   目录 `/root/.pi/agent/extensions/` 下的 6 个 `.bak-*` 一律不得归档/清理/移动/改名**——它们是
-   还原的原始凭据（本仓 `.agents/history/no-tables/` 只存了两份 no-tables 历史备份的只读副本）。
-   同理，**首次入库顺序钉死为「先 scaffold 提交（骨架 + 4 个 hosted 副本 + install.sh +
-   registry + 历史副本），后 no-tables 三段式还原」**，不得出现「无骨架却有内容」的历史。
+6. **`.bak-*` 归档/清理的前置条件**：**no-tables 三段式历史还原已在 `main`
+   执行完毕**（`241a969` restore v1 → `33ba8e7` restore v2 → `c44b86d` current managed copy）；
+   部署目录 `/root/.pi/agent/extensions/` 下的 **8 个** `.bak-*` **在未获主代理另行书面解冻之前**，
+   一律不得归档/清理/移动/改名——它们是还原的原始凭据（本仓 `.agents/history/no-tables/`
+   只存了两份 no-tables 历史备份的只读副本）。同理，**首次入库顺序钉死为「先 scaffold 提交
+   （骨架 + 4 个 hosted 副本 + install.sh + registry + 历史副本），后 no-tables 三段式还原」**，
+   不得出现「无骨架却有内容」的历史。
 
 ## 架构：联邦三层
 
 | 类别 | 扩展 | 权威源 | 本仓职责 |
 |---|---|---|---|
-| hosted（内生） | auto-continue / no-tables / prism / herdsman-bridge / ctx-orchestrate | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
+| hosted（内生） | auto-continue / no-tables / prism / herdsman-bridge / ctx-orchestrate / jev-gate / exclude-tools-guard / magpie-image | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
 | federated（外生） | codegraph-go / ctxmode / pi-cache-guardian | 各自宿主仓 | 仅级联调用其 `install.sh` |
 | external（外部） | herdr-agent-state | herdr 二进制（带外） | 只读巡检，绝不写 |
 
 `herdr` 二进制还托管着 `herdr-agent-state.ts`；本仓与其只读共存。详见 `README.md` 的全机
-9 扩展矩阵与 `federated/registry.json`。
+12 扩展矩阵与 `federated/registry.json`。
 
 ## 命令入口
 
@@ -54,8 +57,8 @@
 pnpm setup                       # = pnpm install --ignore-workspace
 pnpm check                       # = tsc --noEmit（见 README『类型检查』的范围与局限）
 
-bash install.sh --list           # 列出 9 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit          # 只读巡检 9 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --list           # 列出 12 扩展：名称/类别/权威源/目标/当前状态
+bash install.sh --audit          # 只读巡检 12 扩展：md5/权限/外生脚本是否存在/herdr 只读态
 bash install.sh --dry-run <name> # 只演练，不写任何文件
 bash install.sh <name...>        # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all            # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）

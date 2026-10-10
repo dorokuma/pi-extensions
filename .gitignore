@@ -25,10 +25,16 @@ Thumbs.db
 *.swp
 
 # 说明：部署目录 /root/.pi/agent/extensions/ 下的 *.bak-* 由 herdr/线上流程托管，
-# 其归档/清理属后续阶段（AGENTS.md 铁律⑥：no-tables 三段式还原完成前动不得），
+# 其归档/清理属后续阶段（AGENTS.md 铁律⑥：未获主代理另行书面解冻之前不得动），
 # 本仓绝不写那些文件。
 # 唯一例外：.agents/history/no-tables/ 下两份 no-tables 历史备份的只读副本是本仓资产
 # （三段式还原的输入源，install -m 444 收置），正常跟踪，勿忽略。
+
+# 全仓 *.bak-* 一律不入库（各扩展 src/ 与 calibrate/ 下的开发期备份同样不例外）。
+# 下面的反选只为显式标注 .agents/history/no-tables/ 的既有例外——
+# gitignore 不影响已跟踪文件，两份历史副本仍正常跟踪。
+*.bak-*
+!.agents/history/no-tables/*.bak-*
 
 # ---- .agents/notes/：仅忽略笔记；.agents/history/ 仍须跟踪 ----
 # 过程笔记（.agents/notes/）磁盘保留、不入库，用 .gitignore 排除。

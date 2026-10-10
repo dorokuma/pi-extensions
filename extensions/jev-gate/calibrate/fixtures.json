@@ -1,0 +1,321 @@
+{
+  "_doc": "jev-gate 校准样本 v2（阶段 A）。真值按 questions.json v2 的问句集合；ambiguous=true 不入准确率，只用于看置信度。",
+  "samples": [
+    {
+      "id": "verifier-full",
+      "task": "contract_lint",
+      "role": "verifier",
+      "payload": "环境：隔离副本 /tmp/wt-1，基线 commit abc123，worktree 隔离，副本干净。\n判据：\n1) `npm test`\n证据：退出码 1；原始输出 `FAIL src/a.test.ts`；产物哈希 deadbeef；耗时 3s。\n结果分类：失败。\n（本回传只陈述事实，不给结论、不建议、不评级。）",
+      "expect": {
+        "has_environment": true,
+        "has_commands": true,
+        "has_evidence_quadruple": true,
+        "no_conclusion": true
+      }
+    },
+    {
+      "id": "verifier-no-env",
+      "task": "contract_lint",
+      "role": "verifier",
+      "payload": "判据：`npm test`。证据：退出码 1；原始输出 `FAIL`；哈希 deadbeef；耗时 3s。结果分类：失败。（只陈述事实，无结论。）",
+      "expect": {
+        "has_environment": false,
+        "has_commands": true,
+        "has_evidence_quadruple": true,
+        "no_conclusion": true
+      }
+    },
+    {
+      "id": "verifier-no-commands",
+      "task": "contract_lint",
+      "role": "verifier",
+      "payload": "环境：副本 /tmp/wt-1，基线 abc123。证据：退出码 1；原始输出 `FAIL`；哈希 deadbeef；耗时 3s。结果分类：失败。（只陈述事实，无结论。）",
+      "expect": {
+        "has_environment": true,
+        "has_commands": false,
+        "has_evidence_quadruple": true,
+        "no_conclusion": true
+      }
+    },
+    {
+      "id": "verifier-thin-evidence",
+      "task": "contract_lint",
+      "role": "verifier",
+      "payload": "环境：副本 /tmp/wt-1，基线 abc123。判据一：`npm test`。退出码 1。结果分类：失败。",
+      "expect": {
+        "has_environment": true,
+        "has_commands": true,
+        "has_evidence_quadruple": false,
+        "no_conclusion": true
+      }
+    },
+    {
+      "id": "verifier-with-conclusion",
+      "task": "contract_lint",
+      "role": "verifier",
+      "payload": "环境：隔离副本 /tmp/wt-1，基线 commit abc123，worktree 隔离，副本干净。\n判据：\n1) `npm test`\n证据：退出码 1；原始输出 `FAIL src/a.test.ts`；产物哈希 deadbeef；耗时 3s。\n结果分类：失败。\n（本回传只陈述事实，不给结论、不建议、不评级。）\n结论：本次改动不可放行，建议先修复并发问题再重跑。",
+      "expect": {
+        "has_environment": true,
+        "has_commands": true,
+        "has_evidence_quadruple": true,
+        "no_conclusion": false
+      }
+    },
+    {
+      "id": "gates-clean",
+      "task": "gate_scan",
+      "payload": "证据齐全：环境、执行的命令、退出码、原始输出、产物哈希、耗时均有。所有判据通过。无未闭环 must fix。无致命质疑。没有 should fix 或观察项需要处理。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "gates-missing-fields",
+      "task": "gate_scan",
+      "payload": "证据里没有产物哈希，也没有耗时。其余字段齐全，判据全部通过，无 must fix，无致命质疑，无遗留项。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": true,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "gates-not-executed",
+      "task": "gate_scan",
+      "payload": "有一条判据标注为 未执行-拒答，其余判据通过。证据字段齐全，无 must fix，无致命质疑，无遗留项。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": true,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "gates-must-fix",
+      "task": "gate_scan",
+      "payload": "存在一条 must fix 尚未修复，也未复审。证据字段齐全，其余判据通过，无致命质疑，无遗留项。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": true,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "gates-fatal-doubt",
+      "task": "gate_scan",
+      "payload": "oracle 提出致命质疑：并发下可能丢失唤醒，尚未回应。证据字段齐全，判据通过，无 must fix，无遗留项。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": true,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "gates-leftovers",
+      "task": "gate_scan",
+      "payload": "有两条 should fix 既未获用户豁免，也没有记入遗留清单。证据字段齐全，判据通过，无 must fix，无致命质疑。\n\n【当前遗留清单（主代理记录）】\n- 无未闭环应修项",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": true
+      }
+    },
+    {
+      "id": "gates-leftovers-recorded",
+      "task": "gate_scan",
+      "payload": "有两条 should fix，均已记入遗留清单并经用户过目。证据字段齐全，判据通过，无 must fix，无致命质疑。",
+      "expect": {
+        "g1_evidence_missing_fields": false,
+        "g1_criterion_not_executed": false,
+        "g2_unresolved_must_fix": false,
+        "g3_unresolved_fatal_doubt": false,
+        "g4_leftovers_unrecorded": false
+      }
+    },
+    {
+      "id": "triage-normal",
+      "task": "return_triage",
+      "payload": "已完成：把限流计数改为 Redis 原子递增，build 与 test 全绿（命令与输出见上）。Files changed: src/rate_limiter.py。",
+      "expect": {
+        "kind": "normal_delivery",
+        "states_conclusion": true
+      }
+    },
+    {
+      "id": "triage-provider-error",
+      "task": "return_triage",
+      "payload": "provider error：finish_reason=error，上游返回 503，本回合未产生任何产出。",
+      "expect": {
+        "kind": "provider_error",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-empty",
+      "task": "return_triage",
+      "payload": "（空回传：未携带 last assistant 正文。）",
+      "expect": {
+        "kind": "empty_return",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-idle",
+      "task": "return_triage",
+      "payload": "我把这段代码看了一遍，暂时没有别的想法。",
+      "expect": {
+        "kind": "no_artifact_idle",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-truncated",
+      "task": "return_triage",
+      "payload": "审查发现：文件 src/a.ts:12 存在竞态；文件 src/b.ts:88 缺少边界检查；文件 src/c.ts",
+      "expect": {
+        "kind": "truncated",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-timeout",
+      "task": "return_triage",
+      "payload": "未执行-超时：`npm test` 超过 30 秒未返回，重试两次仍超时，无退出码。",
+      "expect": {
+        "kind": "exec_timeout",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-refusal",
+      "task": "return_triage",
+      "payload": "拒绝：该请求涉及对真实目标实施攻击，我不能协助。",
+      "expect": {
+        "kind": "refusal",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-evidence-incomplete",
+      "task": "return_triage",
+      "payload": "证据不完整：无法确认隔离副本是否干净，基线 commit 读取失败。",
+      "expect": {
+        "kind": "evidence_incomplete",
+        "states_conclusion": false
+      }
+    },
+    {
+      "id": "triage-ambiguous-1",
+      "task": "return_triage",
+      "payload": "改了配置，应该没问题。",
+      "expect": {
+        "kind": "no_artifact_idle",
+        "states_conclusion": false
+      },
+      "ambiguous": true
+    },
+    {
+      "id": "triage-ambiguous-2",
+      "task": "return_triage",
+      "payload": "搞定。",
+      "expect": {
+        "kind": "empty_return",
+        "states_conclusion": false
+      },
+      "ambiguous": true
+    },
+    {
+      "id": "source-good",
+      "task": "source_audit",
+      "payload": "结论一：官方文档规定 1M 上下文（来源 https://docs.example.com/ctx）。结论二：第三方评测给出 62.5（来源 https://bench.example.com/qwen，单源未交叉验证）。",
+      "expect": {
+        "all_claims_sourced": true,
+        "has_verifiable_urls": true,
+        "marks_unverified": true
+      }
+    },
+    {
+      "id": "source-no-url",
+      "task": "source_audit",
+      "payload": "结论一：据官方文档，上下文为 1M。结论二：第三方评测给出 62.5（来源 https://bench.example.com/qwen，单源未交叉验证）。",
+      "expect": {
+        "all_claims_sourced": false,
+        "has_verifiable_urls": true,
+        "marks_unverified": true
+      }
+    },
+    {
+      "id": "source-no-unverified-mark",
+      "task": "source_audit",
+      "payload": "结论一：来源 https://docs.example.com/ctx。结论二：来源 https://bench.example.com/qwen。",
+      "expect": {
+        "all_claims_sourced": true,
+        "has_verifiable_urls": true,
+        "marks_unverified": false
+      }
+    },
+    {
+      "id": "source-vague",
+      "task": "source_audit",
+      "payload": "据社区讨论，该模型表现不错；有人提到它在长上下文上更强。",
+      "expect": {
+        "all_claims_sourced": false,
+        "has_verifiable_urls": false,
+        "marks_unverified": true
+      }
+    },
+    {
+      "id": "disagree-b-new",
+      "task": "disagreement",
+      "payload": "审查 A：发现一处并发竞态，判为致命。\n---\n复核 B：同意该竞态成立；另发现一处未处理的错误分支，A 未提及。",
+      "expect": {
+        "relation": "b_raises_new",
+        "has_material_disagreement": true,
+        "same_finding_set": true
+      }
+    },
+    {
+      "id": "disagree-b-refutes",
+      "task": "disagreement",
+      "payload": "审查 A：认定存在致命竞态，必须修复。\n---\n复核 B：该竞态不成立——计数操作已是原子的，依据见源码 src/rl.py:20。",
+      "expect": {
+        "relation": "b_refutes_a",
+        "has_material_disagreement": true,
+        "same_finding_set": true
+      }
+    },
+    {
+      "id": "disagree-agree",
+      "task": "disagreement",
+      "payload": "审查 A：无致命项，可放行。\n---\n复核 B：同意，无致命项。",
+      "expect": {
+        "relation": "agrees",
+        "has_material_disagreement": false,
+        "same_finding_set": true
+      }
+    },
+    {
+      "id": "disagree-different-scope",
+      "task": "disagreement",
+      "payload": "审查 A：检查了并发语义与时序。\n---\n复核 B：检查了错误处理与资源释放，提出两处新问题。",
+      "expect": {
+        "relation": "both_raise_different",
+        "has_material_disagreement": true,
+        "same_finding_set": false
+      }
+    }
+  ]
+}
