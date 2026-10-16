@@ -58,11 +58,13 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 目标父目录 `mkdir -p` + `install -m 644`、DEST 非绝对/为目录显式 `FAILED` 非零退出、实质改动
 后提示 `/reload` 或新会话生效、外生脚本缺失/失败容忍并在最后一行重打 `WARN` 汇总。
 `--audit` 保持严格只读，在巡检完 11 项已登记扩展后，额外对目标目录（`DEST_DIR`）执行顶层差集比对与子目录递归扫描（`find -P -mindepth 2` 无限深度，不跟随符号链接、不进入符号链接目录）：
-顶层条目与 `federated/registry.json` 的 `.extensions[].destFile` 做差集，子目录递归收集 `.ts` 文件（非 `.ts` 嵌套文件不逐条列，仅在汇总行计入 `nested non-.ts not listed`），
-在明细表中按 8 类 `KIND` 标注（`other *.ts` 顶层独立或残留扩展、`nested *.ts` 子目录未登记 `.ts`、`__tests__ file` `__tests__/` 内合法冻结测试文件、`historical backup` 冻结历史备份［含 `*.bak-*` 与 `*.bak`］、`__tests__ dir` / `dir` 目录、`other-file` / `other`），
-打印分类计数（汇总行 `dir [incl. __tests__/]: N` 含 `__tests__ dir`）与未登记 `*.ts`（含顶层 `other *.ts` 与子目录 `nested *.ts`，不含 `__tests__ file`）专项 `WARN` 告警；
+顶层条目与 `federated/registry.json` 的 `.extensions[].destFile` 做差集，子目录**大小写不敏感**递归收集 `.ts` 文件（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`；非 `.ts` 嵌套文件不逐条列，仅在汇总行计入 `nested non-.ts not listed`），
+在明细表中按 8 类 `KIND` 标注（`other *.ts` 顶层独立或残留 `.ts`［大小写不敏感］、`nested *.ts` 非 `__tests__/` 子目录内未登记 `.ts`［大小写不敏感］、`__tests__ file` 任意层级 `__tests__/` 目录内［匹配 `__tests__/*` 或 `*/__tests__/*`］的合法冻结测试文件、`historical backup` 冻结历史备份［含 `*.bak-*` 与 `*.bak`，大小写敏感］、`__tests__ dir` / `dir` 目录、`other-file` / `other`），
+对非普通文件（fifo / socket / device / 目录 / 符号链接）一律**跳过 `md5sum` 内容校验**（`DEST_MD5` 显示 `----` 并在 `AUDIT` 列注明 `content check skipped`）以防 fifo 阻塞挂死，
+表头与汇总的递归 `.ts` 扫描计数统一标注为 `nested .ts scanned`（与 `KIND` 名 `nested *.ts` 区分），汇总行将合并桶显式分解为 `dir [merged: dir=A + __tests__ dir=B]: C` 与 `other [merged: other-file=D + other=E]: F`（使明细行数与汇总数字可双向推导），并输出未登记 `*.ts`（含顶层 `other *.ts` 与子目录 `nested *.ts`，不含 `__tests__ file`）专项 `WARN` 告警；
+同时显式检查 `find` / `sort` 可用性并捕获退出码与 `stderr`，若递归扫描失败/受阻绝不静默，而是在表头/范围行标注 `INCOMPLETE` 并输出 `install.sh WARN: recursive subdirectory scan INCOMPLETE ... — nested entries may be under-reported`；
 差集 `WARN` 直接输出到 **stdout**（非 `warn()` 的 `stderr` 通道），**不改变既有退出码语义（保持 `exit 0`）**。
-细节与实测见 `.agents/notes/20261004-pi-extensions-repo-init.md`。
+细节与实测见 `.agents/notes/20261004-pi-extensions-repo-init.md` 与 `.agents/notes/20261016-audit-dest-diff-warning.md`。
 
 ## 已知事项（如实披露）
 
@@ -70,12 +72,11 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
   已登记的 11 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容 `herdsman-bridge` →
   `herdsman-pi.ts`、`pi-cache-guardian` → `cache-guardian.ts` 的异名映射）列出全部未登记顶层条目，同时以
   `find -P -mindepth 2`（无限深度，不跟随符号链接、不进入符号链接目录）递归收集子目录内的 `.ts` 文件：
-  - 明细表 `KIND` 共 8 类：`other *.ts`（顶层未登记 `.ts`）、`nested *.ts`（非 `__tests__/` 子目录内的未登记 `.ts`）、
-    `__tests__ file`（`__tests__/` 目录内的 `.ts` 测试文件，合法冻结）、`historical backup`（匹配 `*.bak-*` 与 `*.bak` 的历史备份）、
-    `__tests__ dir`、`dir`、`other-file`、`other`；非 `.ts` 的嵌套文件不逐条列出，仅在汇总行给计数（`nested non-.ts not listed: N`）；
-    汇总行 `dir [incl. __tests__/]: N` 显式包含 `dir` 与 `__tests__ dir`。
-  - 专项点名告警 `install.sh WARN: unregistered *.ts in dest-dir: ...` 覆盖顶层 `other *.ts` 与子目录 `nested *.ts`，
-    **不点名**合法冻结的 `__tests__ file`。
+  - **`.ts` 后缀大小写不敏感**：顶层 `other *.ts` 与子目录递归收集均先取小写副本再匹配 `*.ts`（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`），明细表与专项点名保留原始文件名大小写；`historical backup`（`*.bak-*` / `*.bak`）与 `__tests__` 目录名保持大小写敏感，不改变其它类别语义。
+  - **任意层级 `__tests__/` 归类契约**：子目录 `.ts` 只要位于任意层级的 `__tests__/` 目录内（相对路径匹配 `__tests__/*` 或 `*/__tests__/*`，如 `__tests__/no-tables.test.ts`、`__tests__/nested/z.ts`、`x/__tests__/y.ts`），均归为 `__tests__ file`（进明细表披露，**不进**专项 `WARN` 点名）；其余子目录 `.ts` 归为 `nested *.ts`（进明细表且与顶层 `other *.ts` 一并进 `install.sh WARN: unregistered *.ts in dest-dir: ...` 专项点名）。
+  - **表头与汇总标签区分及可分解计数**：明细表 `KIND` 共 8 类（`other *.ts`、`nested *.ts`、`__tests__ file`、`historical backup`、`__tests__ dir`、`dir`、`other-file`、`other`）；非 `.ts` 嵌套文件不逐条列出，仅计入 `nested non-.ts (count-only)` / `nested non-.ts not listed`。表头与汇总中的递归 `.ts` 命中总数统一用 `nested .ts scanned`（等于 `nested *.ts` + `__tests__ file`），与 `KIND` 标签 `nested *.ts` 严格区分；汇总行合并桶显式写出可分解细项 `dir [merged: dir=A + __tests__ dir=B]: C` 与 `other [merged: other-file=D + other=E]: F`，保证「明细表行数 ↔ 汇总数字」可双向推导。
+  - **特殊文件防挂死（跳过内容校验）**：`md5_of`、`status_of` 与 `audit_unregistered_dest` 对所有非普通文件（fifo / socket / device / 目录 / 符号链接，即不满足 `[ ! -L ] && [ -f ]` 者）一律跳过 `md5sum` 内容校验，`DEST_MD5` 输出 `----` 并在 `AUDIT` 列说明 `content check skipped`，确保含 `mkfifo` 管道等特殊文件时 `--audit` 永不阻塞挂死。
+  - **`find` / `sort` 失败不静默**：递归扫描前显式预检 `command -v find` 与 `command -v sort`，执行时通过 `set -o pipefail` 与 FD 3 捕获 `find ... | sort -z` 的退出码与 `stderr`。一旦 `find` / `sort` 缺失或子树遍历报错（非零退出），绝不输出「全部已登记 / 完整 recursive scan」的虚假结论，而是在表头标注 `[INCOMPLETE: exit <rc>]`、在 `scan scope:` 与末尾显式打印 `install.sh WARN: recursive subdirectory scan INCOMPLETE in <ddir> (exit <rc>: <reason>) — nested entries may be under-reported (read-only audit; exit code unchanged).`（之所以选打印明确 `WARN` 而非 `fail` 非零退出，是为了在部分子树权限受限或受限环境缺 `find` 时仍完整输出 11 项已登记扩展与顶层差集的只读巡检结果，并維持 `--audit` 默认 `exit 0` 的只读契约一致）。
   - **输出通道说明**：`--audit` 差集段的 `install.sh WARN:` 行直接通过 `echo` 输出到 **stdout**（与巡检表同流，便于单流检索），
     **不走**安装模式 `warn()` 的 `stderr` 通道与脚本末尾 `WARNS` 汇总。
   - **退出码语义与后续可选 `--strict`（未实现）**：即使存在未登记 `.ts` 扩展（如真实部署目录中独立存在的 `gemini-safety.ts`，
