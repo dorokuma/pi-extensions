@@ -37,7 +37,7 @@ pnpm setup                 # = pnpm install --ignore-workspace
 pnpm check                 # = tsc --noEmit
 
 bash install.sh --list     # 列出 11 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit    # 只读巡检 11 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --audit    # 只读巡检 11 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警
 bash install.sh --dry-run <name...>   # 只演练，不写任何文件
 bash install.sh <name...>  # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all      # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -57,10 +57,22 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 `set -euo pipefail`、`md5sum` 预检、md5 幂等（同则 `unchanged`、不动 mtime）、源缺失即失败、
 目标父目录 `mkdir -p` + `install -m 644`、DEST 非绝对/为目录显式 `FAILED` 非零退出、实质改动
 后提示 `/reload` 或新会话生效、外生脚本缺失/失败容忍并在最后一行重打 `WARN` 汇总。
+`--audit` 保持严格只读，在巡检完 11 项已登记扩展后，额外对目标目录（`DEST_DIR`）顶层条目与
+`federated/registry.json` 的 `.extensions[].destFile` 做差集比对：默认**全部列出**未登记条目并标注类别
+（`other *.ts` 独立或残留扩展、`historical *.bak-*` 冻结历史备份、`__tests__ dir` / `dir` 目录、`other-file`），
+打印分类计数与未登记 `*.ts` 专项 `WARN` 告警，**不改变既有退出码语义（保持 `exit 0`）**。
 细节与实测见 `.agents/notes/20261004-pi-extensions-repo-init.md`。
 
 ## 已知事项（如实披露）
 
+- **`install.sh --audit` 的 dest 目录差集告警与退出码语义**：`--audit` 除巡检 `federated/registry.json`
+  已登记的 11 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容 `herdsman-bridge` →
+  `herdsman-pi.ts`、`pi-cache-guardian` → `cache-guardian.ts` 的异名映射）列出全部未登记条目，按
+  `other *.ts` / `historical *.bak-*` / `__tests__ dir` / `dir` / `other-file` 分类标注并打印 `WARN` 汇总。
+  即使存在未登记 `.ts` 扩展（如真实部署目录中独立存在的 `gemini-safety.ts`，或扩展从 registry 移除后尚未清理的残留副本），
+  `--audit` 仍保持 `exit 0`（仅输出 `WARN`）：原因是真实部署目录长期合法共存未入 registry 的独立脚本、
+  受铁律⑥ 冻结保护的 8 份 `.bak-*` 以及 `__tests__` 目录，若升级为非零退出码会导致日常只读巡检恒常失败、
+  破坏既有调用方语义。
 - **`pnpm setup` 返回 exit 1 属已知告警**：pnpm 的 approve-builds 机制会以
   `ERR_PNPM_IGNORED_BUILDS`（`Ignored build scripts: @google/genai / esbuild / protobufjs`）
   令 `pnpm install --ignore-workspace` 整体 exit 1。此时依赖**已装全**（`Already up to date`），

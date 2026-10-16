@@ -15,7 +15,7 @@
 #
 # 用法：
 #   install.sh --list                 # 列出 11 个扩展：名称/类别/权威源/目标/当前状态
-#   install.sh --audit                # 只读巡检全机 11 个：md5/权限/外生脚本/ herdr 只读态
+#   install.sh --audit                # 只读巡检全机 11 个：md5/权限/外生脚本/herdr 只读态 + dest 差集告警
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -50,7 +50,7 @@ install.sh — 联邦式 Pi 扩展统一安装/巡检入口
 
 Usage:
   install.sh --list                list 11 extensions (name/category/authority/target/status)
-  install.sh --audit               read-only inspect all 11 (md5/perms/upstream scripts/herdr)
+  install.sh --audit               read-only inspect all 11 (md5/perms/upstream scripts/herdr) + warn on unregistered dest-dir entries
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)
@@ -84,6 +84,15 @@ md5_of() {
 extension_exists() { jq -e --arg n "$1" '.extensions[] | select(.name==$n)' "$REGISTRY" >/dev/null 2>&1; }
 regq() { jq -r --arg n "$1" ".extensions[] | select(.name==\$n) | ${2} // \"\"" "$REGISTRY"; }
 all_names() { jq -r '.extensions[].name' "$REGISTRY"; }
+all_dest_files() { jq -r '.extensions[].destFile // empty' "$REGISTRY"; }
+is_registered_dest_file() { # $1=basename  $2=newline-joined registered destFiles
+  local target="$1" list="$2" item
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    [ "$item" = "$target" ] && return 0
+  done <<< "$list"
+  return 1
+}
 # --all 目标 = 非 external（类别剔除 herdr）。NEVERWRITE 记的是 destFile（如
 # herdr-agent-state.ts），故这里必须按 destFile 口径与 .destFile 比对（早期版本比对的是
 # .name，口径不一致 → 永不匹配、这一层形同虚设的死代码，已修）。
@@ -238,6 +247,90 @@ status_of() { # $1=name  $2=dest_dir
   printf '%s\t%s\t%s\t%s\n' "$status" "${smd5:---}" "${dmd5}" "$perms"
 }
 
+# ---- dest 目录差集巡检（audit 专用，严格只读）----
+# 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
+# 的 destFile 为 herdsman-pi.ts、pi-cache-guardian 为 cache-guardian.ts，必须比对 .destFile
+# 而非 .name）。默认全部列出并标注类别（other *.ts / historical *.bak-* / __tests__ dir /
+# dir / other），仅输出 WARN 告警、不改变 --audit 退出码（exit 0）。
+audit_unregistered_dest() { # $1=dest_dir
+  local ddir="$1" reg_files entry base kind dmd5 perms detail
+  local total=0 ts_count=0 bak_count=0 dir_count=0 other_count=0
+  local ts_list=()
+  if [ ! -d "$ddir" ]; then
+    echo "unregistered entries in dest-dir ($ddir): none (dest-dir does not exist)"
+    return 0
+  fi
+  reg_files="$(all_dest_files)"
+  local entries=()
+  local nullglob_was=0 dotglob_was=0
+  shopt -q nullglob && nullglob_was=1
+  shopt -q dotglob && dotglob_was=1
+  shopt -s nullglob dotglob
+  for entry in "$ddir"/*; do
+    base="${entry##*/}"
+    if [ "$base" = "." ] || [ "$base" = ".." ]; then continue; fi
+    if ! is_registered_dest_file "$base" "$reg_files"; then
+      entries+=("$entry")
+    fi
+  done
+  [ "$nullglob_was" -eq 0 ] && shopt -u nullglob
+  [ "$dotglob_was" -eq 0 ] && shopt -u dotglob
+
+  if [ "${#entries[@]}" -eq 0 ]; then
+    echo "unregistered entries in dest-dir ($ddir): 0 (all dest-dir entries are registered in registry)"
+    return 0
+  fi
+
+  echo "unregistered entries in dest-dir (present in $ddir, absent from registry): ${#entries[@]}"
+  printf '%-42s %-22s %-34s %-5s %s\n' "UNREGISTERED_ENTRY" "KIND" "DEST_MD5" "PERM" "AUDIT"
+  for entry in "${entries[@]}"; do
+    base="${entry##*/}"
+    total=$((total + 1))
+    dmd5="----"
+    perms="$(stat -c '%a' "$entry" 2>/dev/null || echo '(err)')"
+    if [ -d "$entry" ]; then
+      dir_count=$((dir_count + 1))
+      if [ "$base" = "__tests__" ]; then
+        kind="__tests__ dir"
+        detail="WARN: UNREGISTERED — test directory in dest-dir (not in registry)"
+      else
+        kind="dir"
+        detail="WARN: UNREGISTERED — directory in dest-dir (not in registry)"
+      fi
+      base="${base}/"
+    elif [ -f "$entry" ]; then
+      if md5_of "$entry" >/dev/null 2>&1; then dmd5="$(md5_of "$entry")" || dmd5="(err)"; else dmd5="(err)"; fi
+      case "$base" in
+        *.bak-*|*.bak)
+          bak_count=$((bak_count + 1))
+          kind="historical *.bak-*"
+          detail="WARN: UNREGISTERED — historical backup (frozen per AGENTS.md #6; not in registry)"
+          ;;
+        *.ts)
+          ts_count=$((ts_count + 1))
+          ts_list+=("$base")
+          kind="other *.ts"
+          detail="WARN: UNREGISTERED — active .ts extension not in registry"
+          ;;
+        *)
+          other_count=$((other_count + 1))
+          kind="other-file"
+          detail="WARN: UNREGISTERED — non-registry file in dest-dir"
+          ;;
+      esac
+    else
+      other_count=$((other_count + 1))
+      kind="other"
+      detail="WARN: UNREGISTERED — special/symlink entry in dest-dir"
+    fi
+    printf '%-42s %-22s %-34s %-5s %s\n' "$base" "$kind" "$dmd5" "$perms" "$detail"
+  done
+  echo "$PROG WARN: dest-dir ($ddir) has $total unregistered entry/entries not in registry (other *.ts: $ts_count, historical *.bak-*: $bak_count, dir: $dir_count, other: $other_count)."
+  if [ "$ts_count" -gt 0 ]; then
+    echo "$PROG WARN: unregistered *.ts in dest-dir: ${ts_list[*]} — verify whether standalone/external or stale leftover (read-only audit; exit code unchanged)."
+  fi
+}
+
 # ---- hosted 安装（逐字节、md5 幂等）----
 install_hosted() { # $1=name
   local name="$1" src dest smd5
@@ -342,6 +435,8 @@ case "$MODE" in
         echo "    └─ external/herdr-managed: READ-ONLY — this repo will never modify it; governed by the herdr binary"
       fi
     done < <(all_names)
+    echo "-------------------------------------------------------------------------------------------------------------------------------"
+    audit_unregistered_dest "$DEST_DIR"
     echo "-------------------------------------------------------------------------------------------------------------------------------"
     echo "audit complete: no files written (this mode is strictly read-only)."
     exit 0
