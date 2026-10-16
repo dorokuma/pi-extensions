@@ -1,11 +1,12 @@
 # jev-gate
 
 ## 概况
-把 Jev（TypeSafe **System One 分类器**，非 LLM）接进 pi，用于既有派发体系里
+把 Jev / Clef（**System One 分类器**，非 LLM）接进 pi，用于既有派发体系里
 「答案空间可提前写死、高频、判断不能拖到几秒」的判定环节。本扩展做两件事：
 
-1. **注册分类器 provider**：`windhub`（baseUrl `https://windhub.cc/v1`，模型 `jev-latest`），
+1. **注册分类器 provider**：`magpie-jev`（默认 baseUrl `http://127.0.0.1:3425/v1`，模型 `group/classifier`），
    使 codemode 的 `models.classify()` 可直接调用（pi 文档定义的分类器正规通道）。
+   provider 标识固定为 `magpie-jev` 而非 `magpie`，避免 `registerProvider` 传入 `models` 时整体覆盖 `models.json` 中 `magpie` 的聊天模型。
 2. **注册直连工具 `jev_check`**：5 个固定任务，问句表与判定阈值全部写死在本文件内，
    调用方只传待判文本，不自行拼问句、不自行设阈值。
 
@@ -68,27 +69,27 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `WINDHUB_API_KEY` | 必填 | 凭据解析顺序见下 |
-| `WINDHUB_BASE_URL` | `https://windhub.cc/v1` | |
-| `JEV_MODEL_ID` | `jev-latest` | |
+| `MAGPIE_BASE_URL` / `WINDHUB_BASE_URL` | `http://127.0.0.1:3425/v1` | `MAGPIE_BASE_URL` 优先，末尾斜杠自动归一 |
+| `MAGPIE_API_KEY` / `WINDHUB_API_KEY` | 本地网关默认 `"magpie"` | 凭据解析顺序见下（`MAGPIE_API_KEY` 优先） |
+| `JEV_MODEL_ID` | `group/classifier` | Magpie 分类器路由组（按序回退 `cloudflare-jev/@cf/cloudflare/clef` → `clef-flash` → `typesafe/jev`） |
 | `JEV_MAX_STATE_CHARS` | `24000` | payload 字符上限，超出显式截断并在结果内标注 |
 | `JEV_TIMEOUT_MS` | `60000` | 单次调用超时 |
 
-**上游限流（实测）**：windhub 为**每分钟最多 20 次请求**（含失败尝试），超出返回 429。
-`jev_check` 不做重试，429 原样上报；批量使用请自行节流（校准脚本默认 15 rpm）。
+**历史限流备查**：旧 windhub 上游为每分钟最多 20 次请求（超出返回 429）；`jev_check` 不做重试，429 原样上报；批量使用请自行节流（校准脚本默认 15 rpm）。
 
-### 凭据解析（两源，按序）
-1. **进程环境** `process.env.WINDHUB_API_KEY` —— pi 文档所指的 provider 密钥正规来源
+### 凭据解析（三步，按序）
+1. **进程环境** `process.env.MAGPIE_API_KEY` / `process.env.WINDHUB_API_KEY` —— pi 文档所指的 provider 密钥正规来源
    （providers.md：「Set the variable before starting Pi」）。
-2. **回落** `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json` 的 `env` 块 ——
+2. **回落** `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json` 的 `env` 块（`MAGPIE_API_KEY` / `WINDHUB_API_KEY`）——
    已实测：pi 的 `settings.env` **不注入 pi 进程环境**（environment-variables.md 只定义它
    服务于 shell 工具会话），故本扩展显式回落读取，使凭据仍只存于 `0600` 非版本控制文件里。
-   当前生产即走此路径。
+3. **本地回环网关令牌** `"magpie"` —— 当 `BASE_URL` 指向本机回环网关（`127.0.0.0/8`、`localhost`、`localhost.`、`::1`、`[::1]` 及 IPv4-mapped / IPv4-translated IPv6 回环 `::ffff:127.0.0.0/104`、`::ffff:0:127.0.0.0/104` 含展开形态，且 URL 不含 `username`/`password`）时，
+   回落到本地网关字面量令牌 `"magpie"`（非密钥，与 `models.json` 及 `magpie-image.ts` 一致，开箱即用）。
 
-两源皆无 → **fail-closed** 报错并说明原因，绝不静默降级。
+指向远端网关（或含认证信息的 URL）且未配置任何凭据 → **fail-closed** 抛出 `missing MAGPIE_API_KEY/WINDHUB_API_KEY: ...` 并说明原因，绝不静默降级。当配置为远端网关且进程环境未设 `$MAGPIE_API_KEY`（仅存于 `settings.json` `env`）时，`jev_check` 工具自身通过 `resolveApiKey()` 正常读取 `settings.json`，而 `pi.registerProvider` 在注册时已优先传入 `resolveApiKey()` 的解析值（仅在 `resolveApiKey()` 也返回 `undefined` 即两边都无凭据时才回退为 `$MAGPIE_API_KEY` 占位，且此时 `jev_check` 本身也 fail-closed）。
 
 ## 数据外发（必读）
-`jev_check` 会把 `payload` 文本发送至 `windhub.cc`。payload 只应是回传正文或报告本体，
+`jev_check` 会把 `payload` 文本发送至本地 Magpie 网关并转发至上游分类器（Cloudflare Workers AI Clef）。payload 只应是回传正文或报告本体，
 **不得包含凭据、密钥或未脱敏的环境信息**。
 
 ## 官方能力边界（勿越界使用）
@@ -115,30 +116,30 @@ extensions/jev-gate/README.md                # 本文件
 - 来源：**2026-10-06 本机新建**（非纳管迁移，无外部出处）。
 
 ## 纳管时的一致性记录
-- 部署值（v3，2026-10-08 子代理身份加固后）：md5 `16f435fb61b67916364e51ee3573af55` / `41707` 字节 / `854` 行
-- 与部署副本 `cmp` 逐字节一致（2026-10-09 回仓时校验）；
+- 部署值（v4.2，2026-10-16 迁移至 Magpie 分类器路由组 `group/classifier` 并完成两轮双审 fail-closed 加固后）：md5 `f4ff427bb51b6fa378fcfd356b81fa99` / `48840` 字节 / `1005` 行
+- 与部署副本 `cmp` 逐字节一致（2026-10-16 `bash install.sh jev-gate` 同步后校验）；
   `bash install.sh --audit` 该项 `MATCH — unchanged`。
 - 历史沿革：v1 `47fd8643…`/28139 字节/575 行 → v2 `93bd62ef…`/30378 字节/613 行
-  （阶段 A 校准：三档判据、移除 `has_five_classification`、g4 拆两问）→ v3 现值
-  （2026-10-08 子代理身份加固：`SUBAGENT-IDENTITY` 块 S1–S4 fail-closed 判据，
-  子代理会话不注册任何 Jev 能力）。
+  （阶段 A 校准：三档判据、移除 `has_five_classification`、g4 拆两问）→ v3 `16f435fb…`（入库微调后 `8ff31157…`/41714 字节/854 行，2026-10-08 子代理身份加固：`SUBAGENT-IDENTITY` 块 S1–S4 fail-closed 判据，
+  子代理会话不注册任何 Jev 能力）→ v4 `9e0364b3…`/45064 字节/919 行（2026-10-16 迁移至本地 Magpie 网关 `magpie-jev` / `group/classifier`）→ v4.1 `8abf24d8…`/48724 字节/1004 行（2026-10-16 一轮双审加固：完备化 `isLocalGatewayUrl` 回环判定、顶层非对象 JSON 拦截、`validateAnswers` 请求键集与单题结构/概率 `[0, 1]` 边界 fail-closed 校验、`verdictFor` 预定义字段表遍历）→ v4.2 现值（2026-10-16 二轮复审收口：`isLocalGatewayUrl` 兼容 `::ffff:0:w.x.y.z` / `[::ffff:0:7f00:1]`–`[::ffff:0:7fff:ffff]` 及展开形态、收紧 `validateAnswers` 的 `score` 档位边界与 `choiceOf` 的 `probabilities[choice]` 必填校验）。
 - 注：v1 版曾把问句表拆成 `src/questions.json`，但 `install.sh` 是**单文件拷贝**，
   部署目录拿不到该 JSON，扩展加载直接失败（`Cannot find module './questions.json'`）。
   已回 inline 为单文件；校准脚本改从本文件抽取。**新增 hosted 扩展不得引入运行时附带文件。**
 - `SUBAGENT-IDENTITY` 块与 `exclude-tools-guard.ts` 中的同名块**逐字节一致**，校验命令：
   `diff <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/jev-gate/src/jev-gate.ts) \
        <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/exclude-tools-guard/src/exclude-tools-guard.ts)`
-  （2026-10-09 实测 exit 0，块内 220 行 / md5 `0c4590313a515752986fbad0a903699e`）。
+  （2026-10-09 与 2026-10-16 实测均 exit 0，块内 220 行 / md5 `0c4590313a515752986fbad0a903699e`）。
 
-## 验证记录（2026-10-06）
+## 验证记录（2026-10-06 初版 / 2026-10-16 Magpie Clef 迁移）
 - `npx tsc --noEmit`：**exit 0**（本仓 tsconfig `include` 已含本扩展）。
-- **加载烟雾**：`pi --print` 启动无扩展错误、无凭据告警（v1、v2 各测一次）。
-- **功能烟雾**：真实调用 `jev_check` → `POST https://windhub.cc/v1/systemone` → 返回
+- **2026-10-16 Magpie Clef 实测与 fail-closed 校验**：本地 Magpie `POST http://127.0.0.1:3425/v1/systemone`（路由组 `group/classifier` → `cloudflare-jev/@cf/cloudflare/clef`）返回顶层 `{ model: "clef", answers, usage: { input_tokens, output_tokens } }`（`unwrapSystemOneBody` 同时兼容 `{ result: { answers, usage, model } }` 包裹形态）；`noul` / `choice` / `score` 均 `200`，`type:"bool"` 返回 `400 AiError (code 5006)`；正样本 ≥ 0.91、负样本 ≤ 0.06，兼容三档阈值。`callJev` 对顶层 `null`/非对象 JSON、缺失请求 question key、单题结构不符或概率越出 `[0, 1]` 闭区间/非有限 number 一律 fail-closed 抛错；`verdictFor` 按预定义字段表遍历，5 类门禁任务端到端调用与全部异常分支实测通过。
+- **加载烟雾（2026-10-06 初版）**：`pi --print` 启动无扩展错误、无凭据告警（v1、v2 各测一次）。
+- **功能烟雾（2026-10-06 初版）**：真实调用 `jev_check` → `POST https://windhub.cc/v1/systemone` → 返回
   `model=jev-1.13.0`。v2 实测输出形如
   `contract: present 2/4 (has_environment, has_evidence_quadruple) | UNCERTAIN(0.35-0.8, ...): has_commands, no_conclusion`
   —— 即中间带只报不确定，符合设计。
 - **线上题型实测**：`noul` / `choice` / `score` 均 `200`；**字面量 `type:"bool"` 返回
-  `400 upstream_error`**（下游不接受），故本扩展只发 `noul`/`choice`/`score`。
+  `400`**（下游不接受），故本扩展只发 `noul`/`choice`/`score`。
 
 ## 已知边界与未解项
 - **阶段 B（中文真实样本）未做**：中文准确率未自评，阈值一律按从严口径使用。
