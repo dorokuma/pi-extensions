@@ -248,20 +248,29 @@ status_of() { # $1=name  $2=dest_dir
 }
 
 # ---- dest 目录差集巡检（audit 专用，严格只读）----
-# 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
-# 的 destFile 为 herdsman-pi.ts、pi-cache-guardian 为 cache-guardian.ts，必须比对 .destFile
-# 而非 .name）。默认全部列出并标注类别（other *.ts / historical *.bak-* / __tests__ dir /
-# dir / other），仅输出 WARN 告警、不改变 --audit 退出码（exit 0）。
+# 1) 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
+#    的 destFile 为 herdsman-pi.ts、pi-cache-guardian 为 cache-guardian.ts，必须比对 .destFile
+#    而非 .name）。
+# 2) 递归扫描 dest_dir 子目录（find -P -mindepth 2，无限深度，不跟随符号链接、不进入符号链接目录）：
+#    收集子目录内未登记 .ts 文件；非 .ts 的嵌套文件不逐条列，仅在汇总行给计数。
+# 3) 明细表实现 KIND 枚举（共 8 类，与代码分支严格一致）：
+#    other *.ts / other-file / historical backup（含 *.bak-* 与 *.bak，原标签 historical *.bak-*） /
+#    __tests__ dir / __tests__ file / nested *.ts / dir / other。
+#    其中 __tests__/ 目录内 .ts 归 __tests__ file（合法冻结，进明细表但不进专项 WARN 点名）；
+#    其余子目录内未登记 .ts 归 nested *.ts（进明细表且与顶层 other *.ts 一并进专项 WARN 点名）。
+# 4) 汇总行 dir [incl. __tests__/]: N 显式注明含 __tests__ dir；差集 WARN 直接 echo 到 stdout
+#    （与巡检表同流，非 warn() 的 stderr 通道），不改变 --audit 退出码（保持 exit 0）。
 audit_unregistered_dest() { # $1=dest_dir
-  local ddir="$1" reg_files entry base kind dmd5 perms detail
-  local total=0 ts_count=0 bak_count=0 dir_count=0 other_count=0
+  local ddir="$1" reg_files entry sub_entry base rel kind dmd5 perms detail
+  local total=0 top_total=0 nested_ts_total=0
+  local top_ts_count=0 nested_ts_count=0 tests_file_count=0 bak_count=0 dir_count=0 other_count=0 nested_non_ts_count=0
   local ts_list=()
   if [ ! -d "$ddir" ]; then
     echo "unregistered entries in dest-dir ($ddir): none (dest-dir does not exist)"
     return 0
   fi
   reg_files="$(all_dest_files)"
-  local entries=()
+  local top_entries=()
   local nullglob_was=0 dotglob_was=0
   shopt -q nullglob && nullglob_was=1
   shopt -q dotglob && dotglob_was=1
@@ -270,25 +279,50 @@ audit_unregistered_dest() { # $1=dest_dir
     base="${entry##*/}"
     if [ "$base" = "." ] || [ "$base" = ".." ]; then continue; fi
     if ! is_registered_dest_file "$base" "$reg_files"; then
-      entries+=("$entry")
+      top_entries+=("$entry")
     fi
   done
   [ "$nullglob_was" -eq 0 ] && shopt -u nullglob
   [ "$dotglob_was" -eq 0 ] && shopt -u dotglob
 
-  if [ "${#entries[@]}" -eq 0 ]; then
-    echo "unregistered entries in dest-dir ($ddir): 0 (all dest-dir entries are registered in registry)"
+  # 递归扫描子目录（depth >= 2，find -P 不跟随符号链接、不进入符号链接目录）
+  local nested_ts_entries=()
+  while IFS= read -r -d '' sub_entry; do
+    rel="${sub_entry#"$ddir"/}"
+    case "$rel" in
+      *.ts)
+        if [ -L "$sub_entry" ]; then
+          nested_non_ts_count=$((nested_non_ts_count + 1))
+        else
+          nested_ts_entries+=("$sub_entry")
+        fi
+        ;;
+      *)
+        nested_non_ts_count=$((nested_non_ts_count + 1))
+        ;;
+    esac
+  done < <(find -P "$ddir" -mindepth 2 -not -type d -print0 2>/dev/null | LC_ALL=C sort -z)
+
+  if [ "${#top_entries[@]}" -eq 0 ] && [ "${#nested_ts_entries[@]}" -eq 0 ] && [ "$nested_non_ts_count" -eq 0 ]; then
+    echo "unregistered entries in dest-dir ($ddir): 0 (all dest-dir entries are registered in registry; recursive scan: unlimited depth, symlinks not followed [-P])"
     return 0
   fi
 
-  echo "unregistered entries in dest-dir (present in $ddir, absent from registry): ${#entries[@]}"
+  local listed_total=$(( ${#top_entries[@]} + ${#nested_ts_entries[@]} ))
+  echo "unregistered entries in dest-dir (present in $ddir, absent from registry): top-level=${#top_entries[@]}, nested *.ts=${#nested_ts_entries[@]}, nested non-.ts (count-only)=$nested_non_ts_count (listed in table: $listed_total)"
+  echo "scan scope: top-level all entries + recursive subdirectories (depth >= 2, unlimited depth) for *.ts; symlinks not followed (find -P / lstat)"
   printf '%-42s %-22s %-34s %-5s %s\n' "UNREGISTERED_ENTRY" "KIND" "DEST_MD5" "PERM" "AUDIT"
-  for entry in "${entries[@]}"; do
+  for entry in "${top_entries[@]}"; do
     base="${entry##*/}"
+    top_total=$((top_total + 1))
     total=$((total + 1))
     dmd5="----"
     perms="$(stat -c '%a' "$entry" 2>/dev/null || echo '(err)')"
-    if [ -d "$entry" ]; then
+    if [ -L "$entry" ]; then
+      other_count=$((other_count + 1))
+      kind="other"
+      detail="WARN: UNREGISTERED — special/symlink entry in dest-dir (symlink not followed)"
+    elif [ -d "$entry" ]; then
       dir_count=$((dir_count + 1))
       if [ "$base" = "__tests__" ]; then
         kind="__tests__ dir"
@@ -301,13 +335,14 @@ audit_unregistered_dest() { # $1=dest_dir
     elif [ -f "$entry" ]; then
       if md5_of "$entry" >/dev/null 2>&1; then dmd5="$(md5_of "$entry")" || dmd5="(err)"; else dmd5="(err)"; fi
       case "$base" in
+        # 含 *.bak-* 与 *.bak 两类历史备份后缀；标签统一为 historical backup 避免遗漏 *.bak 的误导
         *.bak-*|*.bak)
           bak_count=$((bak_count + 1))
-          kind="historical *.bak-*"
+          kind="historical backup"
           detail="WARN: UNREGISTERED — historical backup (frozen per AGENTS.md #6; not in registry)"
           ;;
         *.ts)
-          ts_count=$((ts_count + 1))
+          top_ts_count=$((top_ts_count + 1))
           ts_list+=("$base")
           kind="other *.ts"
           detail="WARN: UNREGISTERED — active .ts extension not in registry"
@@ -325,8 +360,32 @@ audit_unregistered_dest() { # $1=dest_dir
     fi
     printf '%-42s %-22s %-34s %-5s %s\n' "$base" "$kind" "$dmd5" "$perms" "$detail"
   done
-  echo "$PROG WARN: dest-dir ($ddir) has $total unregistered entry/entries not in registry (other *.ts: $ts_count, historical *.bak-*: $bak_count, dir: $dir_count, other: $other_count)."
-  if [ "$ts_count" -gt 0 ]; then
+
+  for sub_entry in "${nested_ts_entries[@]}"; do
+    rel="${sub_entry#"$ddir"/}"
+    nested_ts_total=$((nested_ts_total + 1))
+    total=$((total + 1))
+    dmd5="----"
+    perms="$(stat -c '%a' "$sub_entry" 2>/dev/null || echo '(err)')"
+    if md5_of "$sub_entry" >/dev/null 2>&1; then dmd5="$(md5_of "$sub_entry")" || dmd5="(err)"; else dmd5="(err)"; fi
+    case "$rel" in
+      __tests__/*)
+        tests_file_count=$((tests_file_count + 1))
+        kind="__tests__ file"
+        detail="WARN: UNREGISTERED — test file under __tests__/ (frozen/legitimate; not in registry)"
+        ;;
+      *)
+        nested_ts_count=$((nested_ts_count + 1))
+        ts_list+=("$rel")
+        kind="nested *.ts"
+        detail="WARN: UNREGISTERED — nested .ts file in subdirectory (not in registry)"
+        ;;
+    esac
+    printf '%-42s %-22s %-34s %-5s %s\n' "$rel" "$kind" "$dmd5" "$perms" "$detail"
+  done
+
+  echo "$PROG WARN: dest-dir ($ddir) has $total unregistered listed entry/entries not in registry (top-level: $top_total, nested *.ts: $nested_ts_total; other *.ts: $top_ts_count, nested *.ts: $nested_ts_count, __tests__ file: $tests_file_count, historical backup: $bak_count, dir [incl. __tests__/]: $dir_count, other [other-file/other]: $other_count; nested non-.ts not listed: $nested_non_ts_count)."
+  if [ "${#ts_list[@]}" -gt 0 ]; then
     echo "$PROG WARN: unregistered *.ts in dest-dir: ${ts_list[*]} — verify whether standalone/external or stale leftover (read-only audit; exit code unchanged)."
   fi
 }

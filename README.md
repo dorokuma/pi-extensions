@@ -57,22 +57,32 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 `set -euo pipefail`、`md5sum` 预检、md5 幂等（同则 `unchanged`、不动 mtime）、源缺失即失败、
 目标父目录 `mkdir -p` + `install -m 644`、DEST 非绝对/为目录显式 `FAILED` 非零退出、实质改动
 后提示 `/reload` 或新会话生效、外生脚本缺失/失败容忍并在最后一行重打 `WARN` 汇总。
-`--audit` 保持严格只读，在巡检完 11 项已登记扩展后，额外对目标目录（`DEST_DIR`）顶层条目与
-`federated/registry.json` 的 `.extensions[].destFile` 做差集比对：默认**全部列出**未登记条目并标注类别
-（`other *.ts` 独立或残留扩展、`historical *.bak-*` 冻结历史备份、`__tests__ dir` / `dir` 目录、`other-file`），
-打印分类计数与未登记 `*.ts` 专项 `WARN` 告警，**不改变既有退出码语义（保持 `exit 0`）**。
+`--audit` 保持严格只读，在巡检完 11 项已登记扩展后，额外对目标目录（`DEST_DIR`）执行顶层差集比对与子目录递归扫描（`find -P -mindepth 2` 无限深度，不跟随符号链接、不进入符号链接目录）：
+顶层条目与 `federated/registry.json` 的 `.extensions[].destFile` 做差集，子目录递归收集 `.ts` 文件（非 `.ts` 嵌套文件不逐条列，仅在汇总行计入 `nested non-.ts not listed`），
+在明细表中按 8 类 `KIND` 标注（`other *.ts` 顶层独立或残留扩展、`nested *.ts` 子目录未登记 `.ts`、`__tests__ file` `__tests__/` 内合法冻结测试文件、`historical backup` 冻结历史备份［含 `*.bak-*` 与 `*.bak`］、`__tests__ dir` / `dir` 目录、`other-file` / `other`），
+打印分类计数（汇总行 `dir [incl. __tests__/]: N` 含 `__tests__ dir`）与未登记 `*.ts`（含顶层 `other *.ts` 与子目录 `nested *.ts`，不含 `__tests__ file`）专项 `WARN` 告警；
+差集 `WARN` 直接输出到 **stdout**（非 `warn()` 的 `stderr` 通道），**不改变既有退出码语义（保持 `exit 0`）**。
 细节与实测见 `.agents/notes/20261004-pi-extensions-repo-init.md`。
 
 ## 已知事项（如实披露）
 
-- **`install.sh --audit` 的 dest 目录差集告警与退出码语义**：`--audit` 除巡检 `federated/registry.json`
+- **`install.sh --audit` 的 dest 目录差集告警、子目录扫描与退出码语义**：`--audit` 除巡检 `federated/registry.json`
   已登记的 11 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容 `herdsman-bridge` →
-  `herdsman-pi.ts`、`pi-cache-guardian` → `cache-guardian.ts` 的异名映射）列出全部未登记条目，按
-  `other *.ts` / `historical *.bak-*` / `__tests__ dir` / `dir` / `other-file` 分类标注并打印 `WARN` 汇总。
-  即使存在未登记 `.ts` 扩展（如真实部署目录中独立存在的 `gemini-safety.ts`，或扩展从 registry 移除后尚未清理的残留副本），
-  `--audit` 仍保持 `exit 0`（仅输出 `WARN`）：原因是真实部署目录长期合法共存未入 registry 的独立脚本、
-  受铁律⑥ 冻结保护的 8 份 `.bak-*` 以及 `__tests__` 目录，若升级为非零退出码会导致日常只读巡检恒常失败、
-  破坏既有调用方语义。
+  `herdsman-pi.ts`、`pi-cache-guardian` → `cache-guardian.ts` 的异名映射）列出全部未登记顶层条目，同时以
+  `find -P -mindepth 2`（无限深度，不跟随符号链接、不进入符号链接目录）递归收集子目录内的 `.ts` 文件：
+  - 明细表 `KIND` 共 8 类：`other *.ts`（顶层未登记 `.ts`）、`nested *.ts`（非 `__tests__/` 子目录内的未登记 `.ts`）、
+    `__tests__ file`（`__tests__/` 目录内的 `.ts` 测试文件，合法冻结）、`historical backup`（匹配 `*.bak-*` 与 `*.bak` 的历史备份）、
+    `__tests__ dir`、`dir`、`other-file`、`other`；非 `.ts` 的嵌套文件不逐条列出，仅在汇总行给计数（`nested non-.ts not listed: N`）；
+    汇总行 `dir [incl. __tests__/]: N` 显式包含 `dir` 与 `__tests__ dir`。
+  - 专项点名告警 `install.sh WARN: unregistered *.ts in dest-dir: ...` 覆盖顶层 `other *.ts` 与子目录 `nested *.ts`，
+    **不点名**合法冻结的 `__tests__ file`。
+  - **输出通道说明**：`--audit` 差集段的 `install.sh WARN:` 行直接通过 `echo` 输出到 **stdout**（与巡检表同流，便于单流检索），
+    **不走**安装模式 `warn()` 的 `stderr` 通道与脚本末尾 `WARNS` 汇总。
+  - **退出码语义与后续可选 `--strict`（未实现）**：即使存在未登记 `.ts` 扩展（如真实部署目录中独立存在的 `gemini-safety.ts`，
+    或扩展从 registry 移除后尚未清理的残留副本），`--audit` 默认仍保持 `exit 0`（仅输出 `WARN`）——原因是真实部署目录长期合法共存
+    未入 registry 的独立脚本、受铁律⑥ 冻结保护的 8 份 `.bak-*` 以及 `__tests__/` 目录与测试文件，若默认升级为非零退出码会导致日常只读巡检恒常失败、
+    破坏既有调用方语义。可选严格模式 `--strict`（在检测到未登记 `other *.ts` / `nested *.ts` 或 `DRIFT` 时返回非零退出码，供强门禁 CI 按需显式开启）
+    **当前未实现**，作为后续可选演进项登记于此。
 - **`pnpm setup` 返回 exit 1 属已知告警**：pnpm 的 approve-builds 机制会以
   `ERR_PNPM_IGNORED_BUILDS`（`Ignored build scripts: @google/genai / esbuild / protobufjs`）
   令 `pnpm install --ignore-workspace` 整体 exit 1。此时依赖**已装全**（`Already up to date`），
