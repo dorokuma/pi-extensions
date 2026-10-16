@@ -115,16 +115,16 @@ install.sh                           # 统一安装/巡检入口
 
 ## 状态
 
-- **已入库**：`main` 上已有 **8 个 commit**（`fc1176a` scaffold → `b9d5331` 第 5 个 hosted 入库 →
-  `50ee528`），`origin/main` 与 `main` 同指 `50ee528`；本轮工作分支 `chore/catchup-magpie-image`
-  自 `50ee528` 开出、**改动未提交**。阶段 0（工程底座）+ 阶段 1（hosted 逐字纳管）+ 阶段 2
+- **已入库（历史快照：截至 `50ee528`；后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`）**：截至 `50ee528` 时 `main` 上有 **8 个 commit**（`fc1176a` scaffold → `b9d5331` 第 5 个 hosted 入库 →
+  `50ee528`），当时 `origin/main` 与 `main` 同指 `50ee528`、工作分支 `chore/catchup-magpie-image`
+  自 `50ee528` 开出且改动尚未提交；**后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`**（当前 `main` 与 `origin/main` 同指 `77885dd`，共 **10 个 commit**）。阶段 0（工程底座）+ 阶段 1（hosted 逐字纳管）+ 阶段 2
   （`install.sh` + `registry.json`）均已完成并通过双审（reviewer / oracle），3 条 should-fix 已在
   首次入库前的修复轮落地（install.sh herdsman 防护 fail-closed + settings 解析优先级、
   installable_names 死代码修正、no-tables 三段式还原输入源与部署目录解耦），详见初始笔记。
 - **计数现状**：hosted **8 个**（auto-continue / no-tables / prism / ctx-orchestrate /
   herdsman-bridge / jev-gate / exclude-tools-guard / magpie-image），全机 **12 个**
   （8 hosted + 3 federated + 1 external）。
-- **本轮收尾内容**（分支 `chore/catchup-magpie-image`，未提交）：三处「部署比仓内新」的漂移整文件
+- **本轮收尾内容**（历史快照：截至 `50ee528` 时为分支 `chore/catchup-magpie-image` 未提交改动；后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`）：三处「部署比仓内新」的漂移整文件
   回仓（jev-gate / exclude-tools-guard / no-tables 的 rule F 修复）；第 8 个 hosted 扩展
   `magpie-image` 纳管；no-tables rule F 回归测试收入本仓；计数同步（`registry.json` /
   `install.sh` / `AGENTS.md` / `tsconfig.json`）；`.gitignore` 补 `*.bak-*`（保留
@@ -138,9 +138,9 @@ install.sh                           # 统一安装/巡检入口
   2026-10-04 的过程记录、**已被后续 3 个还原提交覆盖**（该笔记是
   历史过程记录，不改写）。该序列
   commit-3 的历史期望值 `bc0c2e5da0348102f38dc6a475c6ea34` / 3430 字节是**历史快照、本身正确，
-  不需校正**；工作区现值 `921c34be3d4f8a004a3066f3c1267b90` / 8159 字节是 2026-10-08 rule F 修复
-  回仓后的**未提交改动**，只描述工作区，**不回写**该历史序列。
-- **注记 ②（`.bak-*` 冻结线）**：AGENTS.md 铁律⑥ 关于部署目录 `.bak-*` 的冻结线**仍然有效**——
+  不需校正**；现值 `921c34be3d4f8a004a3066f3c1267b90` / 8159 字节是 2026-10-08 rule F 修复
+  回仓后的版本（历史快照：截至 `50ee528` 时为工作区未提交改动；后续已由 `ab50f9d` 入库同步），**不回写**该历史序列。
+- **强制约束 ②（原注记 ②：`.bak-*` 冻结线，现行有效）**：AGENTS.md 铁律⑥ 关于部署目录 `.bak-*` 的冻结线**仍然有效**——
   三段式还原虽已在 `main` 执行完毕，但部署目录的 8 个 `.bak-*`（它们是还原的原始凭据）
   **在未获主代理另行书面解冻之前**，一律不得归档/清理/移动/改名；解冻与否只取决于主代理的书面指令，
   **不以「还原是否完成并复核」为停止条件**。计数口径已统一为 **8 个**（cache-guardian 4 份 + no-tables 2 份
