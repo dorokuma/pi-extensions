@@ -15,7 +15,7 @@
 #
 # 用法：
 #   install.sh --list                 # 列出 11 个扩展：名称/类别/权威源/目标/当前状态
-#   install.sh --audit                # 只读巡检全机 11 个：md5/权限/外生脚本/ herdr 只读态
+#   install.sh --audit                # 只读巡检全机 11 个：md5/权限/外生脚本/herdr 只读态 + dest 差集告警
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -50,7 +50,7 @@ install.sh — 联邦式 Pi 扩展统一安装/巡检入口
 
 Usage:
   install.sh --list                list 11 extensions (name/category/authority/target/status)
-  install.sh --audit               read-only inspect all 11 (md5/perms/upstream scripts/herdr)
+  install.sh --audit               read-only inspect all 11 (md5/perms/upstream scripts/herdr) + warn on unregistered dest-dir entries
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)
@@ -73,6 +73,8 @@ command -v jq    >/dev/null 2>&1 || fail "jq not found in PATH (PATH=$PATH) — 
 jq -e . "$REGISTRY" >/dev/null 2>&1 || fail "registry is not valid JSON: $REGISTRY"
 
 md5_of() {
+  # 防御纵深：非普通文件（符号链接/目录/fifo/socket/device）绝不调用 md5sum，防止阻塞挂死。
+  [ ! -L "$1" ] && [ -f "$1" ] || return 1
   local out rc=0
   out="$(md5sum -- "$1")" || rc=$?
   [ "$rc" -eq 0 ] || return 1
@@ -84,6 +86,15 @@ md5_of() {
 extension_exists() { jq -e --arg n "$1" '.extensions[] | select(.name==$n)' "$REGISTRY" >/dev/null 2>&1; }
 regq() { jq -r --arg n "$1" ".extensions[] | select(.name==\$n) | ${2} // \"\"" "$REGISTRY"; }
 all_names() { jq -r '.extensions[].name' "$REGISTRY"; }
+all_dest_files() { jq -r '.extensions[].destFile // empty' "$REGISTRY"; }
+is_registered_dest_file() { # $1=basename  $2=newline-joined registered destFiles
+  local target="$1" list="$2" item
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    [ "$item" = "$target" ] && return 0
+  done <<< "$list"
+  return 1
+}
 # --all 目标 = 非 external（类别剔除 herdr）。NEVERWRITE 记的是 destFile（如
 # herdr-agent-state.ts），故这里必须按 destFile 口径与 .destFile 比对（早期版本比对的是
 # .name，口径不一致 → 永不匹配、这一层形同虚设的死代码，已修）。
@@ -216,17 +227,30 @@ status_of() { # $1=name  $2=dest_dir
     local script; script="$(regq "$name" '.authority.installScript // ""')"
     if [ -z "$script" ] || [ ! -e "$script" ]; then ext_exist="missing"; fi
   fi
-  if [ -n "$src" ] && md5_of "$src" >/dev/null 2>&1; then smd5="$(md5_of "$src")" || smd5=""; fi
-  if [ -f "$dest" ]; then
+  if [ -n "$src" ] && [ ! -L "$src" ] && [ -f "$src" ] && md5_of "$src" >/dev/null 2>&1; then
+    smd5="$(md5_of "$src")" || smd5=""
+  fi
+  if [ ! -L "$dest" ] && [ -f "$dest" ]; then
     if md5_of "$dest" >/dev/null 2>&1; then dmd5="$(md5_of "$dest")" || dmd5="(err)"; fi
+    perms="$(stat -c '%a' "$dest" 2>/dev/null || echo '(err)')"
+  elif [ -L "$dest" ] || [ -e "$dest" ]; then
+    dmd5="----"
     perms="$(stat -c '%a' "$dest" 2>/dev/null || echo '(err)')"
   fi
   if [ "$cat" = "external" ] || [ -z "$src" ]; then
-    if [ -f "$dest" ]; then status="read-only (herdr-managed)"; else status="absent (herdr-managed)"; fi
+    if [ ! -L "$dest" ] && [ -f "$dest" ]; then
+      status="read-only (herdr-managed)"
+    elif [ -L "$dest" ] || [ -e "$dest" ]; then
+      status="read-only (herdr-managed; non-regular entry, content check skipped)"
+    else
+      status="absent (herdr-managed)"
+    fi
   elif [ -z "$smd5" ]; then
     status="source missing: $src"
-  elif [ ! -f "$dest" ]; then
+  elif [ ! -L "$dest" ] && [ ! -e "$dest" ]; then
     status="not installed"
+  elif [ -L "$dest" ] || [ ! -f "$dest" ]; then
+    status="DRIFT (non-regular entry; content check skipped)"
   elif [ "$smd5" = "$dmd5" ]; then
     status="unchanged"
   else
@@ -236,6 +260,232 @@ status_of() { # $1=name  $2=dest_dir
     status="missing (upstream script not found)"
   fi
   printf '%s\t%s\t%s\t%s\n' "$status" "${smd5:---}" "${dmd5}" "$perms"
+}
+
+# ---- dest 目录差集巡检（audit 专用，严格只读）----
+# 1) 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
+#    的 destFile 为 herdsman-pi.ts、pi-cache-guardian 为 cache-guardian.ts，必须比对 .destFile
+#    而非 .name）。
+# 2) 递归扫描 dest_dir 子目录（find -P -mindepth 2，无限深度，不跟随符号链接、不进入符号链接目录）：
+#    大小写不敏感收集子目录内未登记 .ts 文件（覆盖 .ts / .TS / .Ts / .tS）；非 .ts 的嵌套文件不逐条列，
+#    仅在汇总行给计数。显式捕获 find/sort 退出码与 stderr，失败时绝不静默（打印 INCOMPLETE WARN 说明可能少报）。
+# 3) 明细表实现 KIND 枚举（共 8 类，与代码分支严格一致）：
+#    other *.ts / other-file / historical backup（含 *.bak-* 与 *.bak，大小写敏感） /
+#    __tests__ dir / __tests__ file / nested *.ts / dir / other。
+#    其中任意层级的 __tests__/ 目录内（匹配 __tests__/* 或 */__tests__/*）的 .ts 归 __tests__ file
+#    （合法冻结，进明细表但不进专项 WARN 点名）；其余子目录内未登记 .ts 归 nested *.ts（进明细表且与
+#    顶层 other *.ts 一并进专项 WARN 点名）。
+# 4) 非普通文件（fifo/socket/device/目录/符号链接）一律跳过 md5 内容校验（DEST_MD5=----），防止 fifo 等
+#    特殊文件阻塞 md5sum 导致 --audit 挂死。
+# 5) 表头以 nested .ts scanned=N 标注递归命中的 .ts 总数（与 KIND 名 nested *.ts 区分）；汇总行同时给出
+#    扫描层级计数与全部 8 类 KIND 可分解计数（dir [merged: dir=A + __tests__ dir=B]: C、
+#    other [merged: other-file=D + other=E]: F），使明细行数与汇总数字可双向推导；差集 WARN 直接 echo
+#    到 stdout（与巡检表同流，非 warn() 的 stderr 通道），不改变 --audit 退出码（保持 exit 0）。
+audit_unregistered_dest() { # $1=dest_dir
+  local ddir="$1" reg_files entry sub_entry base base_lc rel rel_lc kind dmd5 perms detail
+  local total=0 top_total=0 nested_ts_total=0
+  local top_ts_count=0 nested_ts_count=0 tests_file_count=0 bak_count=0
+  local dir_count=0 plain_dir_count=0 tests_dir_count=0
+  local other_count=0 other_file_count=0 other_special_count=0
+  local nested_non_ts_count=0
+  local ts_list=()
+  if [ ! -d "$ddir" ]; then
+    echo "unregistered entries in dest-dir ($ddir): none (dest-dir does not exist)"
+    return 0
+  fi
+  reg_files="$(all_dest_files)"
+  local top_entries=()
+  local nullglob_was=0 dotglob_was=0
+  shopt -q nullglob && nullglob_was=1
+  shopt -q dotglob && dotglob_was=1
+  shopt -s nullglob dotglob
+  for entry in "$ddir"/*; do
+    base="${entry##*/}"
+    if [ "$base" = "." ] || [ "$base" = ".." ]; then continue; fi
+    if ! is_registered_dest_file "$base" "$reg_files"; then
+      top_entries+=("$entry")
+    fi
+  done
+  [ "$nullglob_was" -eq 0 ] && shopt -u nullglob
+  [ "$dotglob_was" -eq 0 ] && shopt -u dotglob
+
+  # 递归扫描子目录（depth >= 2，find -P 不跟随符号链接、不进入符号链接目录）。
+  # 显式检查 find/sort 可用性并通过 FD 3 + pipefail 捕获退出码与 stderr，杜绝进程替换静默吞错。
+  local nested_ts_entries=()
+  local scan_rc=0 scan_err=""
+  if ! command -v find >/dev/null 2>&1; then
+    scan_rc=127
+    scan_err="find not found in PATH (PATH=$PATH)"
+  elif ! command -v sort >/dev/null 2>&1; then
+    scan_rc=127
+    scan_err="sort not found in PATH (PATH=$PATH)"
+  else
+    local find_fd find_pid sub_rc=0
+    exec {find_fd}< <(
+      set -o pipefail
+      exec 3>&1
+      rc=0
+      err="$({ find -P "$ddir" -mindepth 2 -not -type d -print0 | LC_ALL=C sort -z; } 2>&1 1>&3)" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        printf '__SCAN_ERR__:%s:%s\0' "$rc" "$err" >&3
+      fi
+      exit "$rc"
+    )
+    find_pid=$!
+    while IFS= read -r -d '' sub_entry <&"$find_fd"; do
+      if [[ "$sub_entry" == __SCAN_ERR__:* ]]; then
+        local payload="${sub_entry#__SCAN_ERR__:}"
+        scan_rc="${payload%%:*}"
+        scan_err="${payload#*:}"
+        continue
+      fi
+      rel="${sub_entry#"$ddir"/}"
+      rel_lc="${rel,,}"
+      case "$rel_lc" in
+        *.ts)
+          nested_ts_entries+=("$sub_entry")
+          ;;
+        *)
+          nested_non_ts_count=$((nested_non_ts_count + 1))
+          ;;
+      esac
+    done
+    exec {find_fd}<&-
+    wait "$find_pid" || sub_rc=$?
+    if [ "$scan_rc" -eq 0 ] && [ "$sub_rc" -ne 0 ]; then
+      scan_rc="$sub_rc"
+      [ -n "$scan_err" ] || scan_err="find/sort pipeline exited with status $sub_rc"
+    fi
+  fi
+
+  local scan_err_clean="" scan_status_tag=""
+  if [ "$scan_rc" -ne 0 ]; then
+    scan_err_clean="${scan_err//$'\n'/; }"
+    scan_err_clean="${scan_err_clean%; }"
+    [ -n "$scan_err_clean" ] || scan_err_clean="unknown find/sort error"
+    scan_status_tag=" [INCOMPLETE: exit $scan_rc]"
+  fi
+
+  if [ "$scan_rc" -eq 0 ] && [ "${#top_entries[@]}" -eq 0 ] && [ "${#nested_ts_entries[@]}" -eq 0 ] && [ "$nested_non_ts_count" -eq 0 ]; then
+    echo "unregistered entries in dest-dir ($ddir): 0 (all dest-dir entries are registered in registry; recursive scan: unlimited depth, symlinks not followed [-P])"
+    return 0
+  fi
+
+  local listed_total=$(( ${#top_entries[@]} + ${#nested_ts_entries[@]} ))
+  echo "unregistered entries in dest-dir (present in $ddir, absent from registry): top-level=${#top_entries[@]}, nested .ts scanned=${#nested_ts_entries[@]}${scan_status_tag}, nested non-.ts (count-only)=$nested_non_ts_count (listed in table: $listed_total)"
+  if [ "$scan_rc" -eq 0 ]; then
+    echo "scan scope: top-level all entries + recursive subdirectories (depth >= 2, unlimited depth) for *.ts (case-insensitive); symlinks not followed (find -P / lstat)"
+  else
+    echo "scan scope: top-level all entries + recursive subdirectories (INCOMPLETE: exit $scan_rc — ${scan_err_clean}; nested entries may be under-reported)"
+  fi
+  if [ "$listed_total" -eq 0 ] && [ "$nested_non_ts_count" -eq 0 ]; then
+    echo "$PROG WARN: recursive subdirectory scan INCOMPLETE in $ddir (exit $scan_rc: ${scan_err_clean}) — nested entries may be under-reported (read-only audit; exit code unchanged)."
+    return 0
+  fi
+
+  printf '%-42s %-22s %-34s %-5s %s\n' "UNREGISTERED_ENTRY" "KIND" "DEST_MD5" "PERM" "AUDIT"
+  for entry in "${top_entries[@]}"; do
+    base="${entry##*/}"
+    top_total=$((top_total + 1))
+    total=$((total + 1))
+    dmd5="----"
+    perms="$(stat -c '%a' "$entry" 2>/dev/null || echo '(err)')"
+    if [ -L "$entry" ]; then
+      other_special_count=$((other_special_count + 1))
+      other_count=$((other_count + 1))
+      kind="other"
+      detail="WARN: UNREGISTERED — symlink entry in dest-dir (symlink not followed; content check skipped)"
+    elif [ -d "$entry" ]; then
+      dir_count=$((dir_count + 1))
+      if [ "$base" = "__tests__" ]; then
+        tests_dir_count=$((tests_dir_count + 1))
+        kind="__tests__ dir"
+        detail="WARN: UNREGISTERED — test directory in dest-dir (not in registry; content check skipped)"
+      else
+        plain_dir_count=$((plain_dir_count + 1))
+        kind="dir"
+        detail="WARN: UNREGISTERED — directory in dest-dir (not in registry; content check skipped)"
+      fi
+      base="${base}/"
+    elif [ -f "$entry" ]; then
+      if md5_of "$entry" >/dev/null 2>&1; then dmd5="$(md5_of "$entry")" || dmd5="(err)"; else dmd5="(err)"; fi
+      base_lc="${base,,}"
+      case "$base" in
+        # 含 *.bak-* 与 *.bak 两类历史备份后缀（大小写敏感）；标签统一为 historical backup 避免遗漏 *.bak 的误导
+        *.bak-*|*.bak)
+          bak_count=$((bak_count + 1))
+          kind="historical backup"
+          detail="WARN: UNREGISTERED — historical backup (frozen per AGENTS.md #6; not in registry)"
+          ;;
+        *)
+          # .ts 后缀大小写不敏感（覆盖 .ts / .TS / .Ts / .tS），不改变其它类别大小写语义
+          case "$base_lc" in
+            *.ts)
+              top_ts_count=$((top_ts_count + 1))
+              ts_list+=("$base")
+              kind="other *.ts"
+              detail="WARN: UNREGISTERED — active .ts extension not in registry"
+              ;;
+            *)
+              other_file_count=$((other_file_count + 1))
+              other_count=$((other_count + 1))
+              kind="other-file"
+              detail="WARN: UNREGISTERED — non-registry file in dest-dir"
+              ;;
+          esac
+          ;;
+      esac
+    else
+      other_special_count=$((other_special_count + 1))
+      other_count=$((other_count + 1))
+      kind="other"
+      detail="WARN: UNREGISTERED — special non-regular entry in dest-dir (fifo/socket/device; content check skipped)"
+    fi
+    printf '%-42s %-22s %-34s %-5s %s\n' "$base" "$kind" "$dmd5" "$perms" "$detail"
+  done
+
+  for sub_entry in "${nested_ts_entries[@]}"; do
+    rel="${sub_entry#"$ddir"/}"
+    nested_ts_total=$((nested_ts_total + 1))
+    total=$((total + 1))
+    dmd5="----"
+    perms="$(stat -c '%a' "$sub_entry" 2>/dev/null || echo '(err)')"
+    local is_regular_sub=0
+    if [ ! -L "$sub_entry" ] && [ -f "$sub_entry" ]; then
+      is_regular_sub=1
+      if md5_of "$sub_entry" >/dev/null 2>&1; then dmd5="$(md5_of "$sub_entry")" || dmd5="(err)"; else dmd5="(err)"; fi
+    fi
+    case "$rel" in
+      __tests__/*|*/__tests__/*)
+        tests_file_count=$((tests_file_count + 1))
+        kind="__tests__ file"
+        if [ "$is_regular_sub" -eq 1 ]; then
+          detail="WARN: UNREGISTERED — test file under __tests__/ (frozen/legitimate; not in registry)"
+        else
+          detail="WARN: UNREGISTERED — non-regular test entry under __tests__/ (fifo/socket/device/symlink; content check skipped)"
+        fi
+        ;;
+      *)
+        nested_ts_count=$((nested_ts_count + 1))
+        ts_list+=("$rel")
+        kind="nested *.ts"
+        if [ "$is_regular_sub" -eq 1 ]; then
+          detail="WARN: UNREGISTERED — nested .ts file in subdirectory (not in registry)"
+        else
+          detail="WARN: UNREGISTERED — nested .ts non-regular entry in subdirectory (fifo/socket/device/symlink; content check skipped)"
+        fi
+        ;;
+    esac
+    printf '%-42s %-22s %-34s %-5s %s\n' "$rel" "$kind" "$dmd5" "$perms" "$detail"
+  done
+
+  echo "$PROG WARN: dest-dir ($ddir) has $total unregistered listed entry/entries not in registry (top-level: $top_total, nested .ts scanned: $nested_ts_total; other *.ts: $top_ts_count, nested *.ts: $nested_ts_count, __tests__ file: $tests_file_count, historical backup: $bak_count, dir [merged: dir=$plain_dir_count + __tests__ dir=$tests_dir_count]: $dir_count, other [merged: other-file=$other_file_count + other=$other_special_count]: $other_count; nested non-.ts not listed: $nested_non_ts_count)."
+  if [ "${#ts_list[@]}" -gt 0 ]; then
+    echo "$PROG WARN: unregistered *.ts in dest-dir: ${ts_list[*]} — verify whether standalone/external or stale leftover (read-only audit; exit code unchanged)."
+  fi
+  if [ "$scan_rc" -ne 0 ]; then
+    echo "$PROG WARN: recursive subdirectory scan INCOMPLETE in $ddir (exit $scan_rc: ${scan_err_clean}) — nested entries may be under-reported (read-only audit; exit code unchanged)."
+  fi
 }
 
 # ---- hosted 安装（逐字节、md5 幂等）----
@@ -342,6 +592,8 @@ case "$MODE" in
         echo "    └─ external/herdr-managed: READ-ONLY — this repo will never modify it; governed by the herdr binary"
       fi
     done < <(all_names)
+    echo "-------------------------------------------------------------------------------------------------------------------------------"
+    audit_unregistered_dest "$DEST_DIR"
     echo "-------------------------------------------------------------------------------------------------------------------------------"
     echo "audit complete: no files written (this mode is strictly read-only)."
     exit 0

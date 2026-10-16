@@ -58,7 +58,7 @@ pnpm setup                       # = pnpm install --ignore-workspace
 pnpm check                       # = tsc --noEmit（见 README『类型检查』的范围与局限）
 
 bash install.sh --list           # 列出 11 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit          # 只读巡检 11 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --audit          # 只读巡检 11 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警
 bash install.sh --dry-run <name> # 只演练，不写任何文件
 bash install.sh <name...>        # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all            # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -68,7 +68,8 @@ bash install.sh --dest-dir <DIR> # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 
 数据源唯一：`federated/registry.json`。`install.sh` 契约与
 `/root/workspace/codegraph-go/integrations/pi/install.sh` 对齐（`set -euo pipefail`、
 `md5sum` 预检、md5 幂等、源缺失即失败、目标父目录 `mkdir -p`、`install -m 644`、DEST
-非绝对/为目录显式 FAILED 非零退出、改动后提示 `/reload`、外生失败在最后一行重打 WARN 汇总）。
+非绝对/为目录显式 FAILED 非零退出、改动后提示 `/reload`、外生失败在最后一行重打 WARN 汇总；
+`--audit` 额外对 dest 目录与 registry `.extensions[].destFile` 做只读差集巡检［含顶层全量条目与 `find -P` 不跟随软链的子目录 `.ts` 大小写不敏感递归扫描，按 `other *.ts` / `nested *.ts` / `__tests__ file`（任意层级 `__tests__/` 目录内文件） / `historical backup` / `__tests__ dir` / `dir` / `other-file` / `other` 分类标注，非普通文件（fifo/socket/device/目录/软链）一律跳过 `md5sum` 内容校验防挂死，表头/汇总以 `nested .ts scanned` 区分递归命中总数与 `KIND` 名 `nested *.ts` 且合并桶显式写出 `dir`/`other` 可分解子项，非 `.ts` 嵌套文件仅计入汇总，`other *.ts` 与 `nested *.ts` 进专项 `WARN` 点名而 `__tests__ file` 不点名，`find`/`sort` 缺失或遍历报错时显式打印 `INCOMPLETE` `WARN` 说明可能少报，差集 `WARN` 输出到 stdout］，退出码保持 `0`）。
 
 ## 部署副本一致性
 hosted 扩展仓内副本与部署副本在收纳时已 `cmp` 逐字节一致；md5/字节数记录在各自
