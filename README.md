@@ -2,7 +2,7 @@
 
 本仓是全机 Pi 扩展的**唯一权威源 / 分发中枢**，架构为**联邦式**：
 
-- **hosted（内生，8 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
+- **hosted（内生，7 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
 - **federated（外生，3 个）**：源**留在各自宿主仓**，本仓仅以子进程级联调用它们各自的
   `install.sh`；改动回宿主仓走既有流程。
 - **external（外部，1 个）**：`herdr-agent-state.ts` 由 **herdr 二进制托管**，本仓只读
@@ -10,13 +10,12 @@
 
 数据源唯一：`federated/registry.json`。请先读 `AGENTS.md` 的 6 条铁律。
 
-## 全机 12 扩展矩阵
+## 全机 11 扩展矩阵
 
 | 名称 | 类别 | 权威源（绝对路径） | 目标安装路径 |
 |---|---|---|---|
 | auto-continue | hosted | `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts` | `/root/.pi/agent/extensions/auto-continue.ts` |
 | no-tables | hosted | `/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts` | `/root/.pi/agent/extensions/no-tables.ts` |
-| prism | hosted | `/root/workspace/pi-extensions/extensions/prism/src/prism.ts` | `/root/.pi/agent/extensions/prism.ts` |
 | ctx-orchestrate | hosted | `/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts` | `/root/.pi/agent/extensions/ctx-orchestrate.ts` |
 | herdsman-bridge | hosted | `/root/workspace/pi-extensions/extensions/herdsman-bridge/src/herdsman-bridge.ts`（运行时再导出 `/root/workspace/herdsman/packages/herdsman-pi/src/index.ts`） | `/root/.pi/agent/extensions/herdsman-pi.ts` |
 | jev-gate | hosted | `/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts` | `/root/.pi/agent/extensions/jev-gate.ts` |
@@ -37,8 +36,8 @@
 pnpm setup                 # = pnpm install --ignore-workspace
 pnpm check                 # = tsc --noEmit
 
-bash install.sh --list     # 列出 12 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit    # 只读巡检 12 扩展：md5/权限/外生脚本是否存在/herdr 只读态
+bash install.sh --list     # 列出 11 扩展：名称/类别/权威源/目标/当前状态
+bash install.sh --audit    # 只读巡检 11 扩展：md5/权限/外生脚本是否存在/herdr 只读态
 bash install.sh --dry-run <name...>   # 只演练，不写任何文件
 bash install.sh <name...>  # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all      # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -82,9 +81,9 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 ## 目录布局
 
 ```
-extensions/<name>/src/<file>.ts     # 8 个内生扩展源码（唯一权威副本）
+extensions/<name>/src/<file>.ts     # 7 个内生扩展源码（唯一权威副本）
 extensions/<name>/README.md          # 各扩展：权威源/目标/来源/出处/一致性记录
-federated/registry.json              # 12 扩展的类别与绝对权威路径（install.sh 数据源）
+federated/registry.json              # 11 扩展的类别与绝对权威路径（install.sh 数据源）
 install.sh                           # 统一安装/巡检入口
 .agents/notes/                       # 重大变更与踩坑笔记
 .agents/history/no-tables/           # no-tables 两份历史备份的只读副本（三段式还原输入源）
@@ -92,12 +91,12 @@ install.sh                           # 统一安装/巡检入口
 
 ## 类型检查
 
-- 主路径：`pnpm setup`（= `pnpm install --ignore-workspace`）+ `tsc --noEmit`，覆盖 7 个
+- 主路径：`pnpm setup`（= `pnpm install --ignore-workspace`）+ `tsc --noEmit`，覆盖 6 个
   自包含内生扩展 `auto-continue` / `ctx-orchestrate` / `exclude-tools-guard` / `jev-gate` /
-  `magpie-image` / `no-tables` / `prism`（实测通过，exit 0）。
+  `magpie-image` / `no-tables`（实测通过，exit 0）。
 - **2026-10-09 补 `exclude-tools-guard`**：此前 `extensions/exclude-tools-guard/src/**` 不在
   tsconfig `include`（AGENTS.md 铁律②与矩阵都列了该扩展、类型检查却不覆盖它）→ 已按字母序补入
-  `include`，本仓 tsc 图由 6 个增至 7 个，与 `include` 逐项一致。
+  `include`，当时本仓 tsc 图由 6 个增至 7 个（2026-10-16 移除已归档扩展后现为 6 个），与 `include` 逐项一致。
 - **2026-10-06 修正两处既有缺口**：① `extensions/ctx-orchestrate/src/**` 与新增的
   `extensions/jev-gate/src/**` 此前不在 tsconfig `include`（旧图只列 3 个扩展，导致
   「检查通过」为假绿）；② 源码 `import { Type } from "typebox"` 所需依赖此前仅存在于
@@ -121,12 +120,12 @@ install.sh                           # 统一安装/巡检入口
   （`install.sh` + `registry.json`）均已完成并通过双审（reviewer / oracle），3 条 should-fix 已在
   首次入库前的修复轮落地（install.sh herdsman 防护 fail-closed + settings 解析优先级、
   installable_names 死代码修正、no-tables 三段式还原输入源与部署目录解耦），详见初始笔记。
-- **计数现状**：hosted **8 个**（auto-continue / no-tables / prism / ctx-orchestrate /
-  herdsman-bridge / jev-gate / exclude-tools-guard / magpie-image），全机 **12 个**
-  （8 hosted + 3 federated + 1 external）。
+- **计数现状**：hosted **7 个**（auto-continue / no-tables / ctx-orchestrate /
+  herdsman-bridge / jev-gate / exclude-tools-guard / magpie-image），全机 **11 个**
+  （7 hosted + 3 federated + 1 external）。
 - **本轮收尾内容**（历史快照：截至 `50ee528` 时为分支 `chore/catchup-magpie-image` 未提交改动；后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`）：三处「部署比仓内新」的漂移整文件
-  回仓（jev-gate / exclude-tools-guard / no-tables 的 rule F 修复）；第 8 个 hosted 扩展
-  `magpie-image` 纳管；no-tables rule F 回归测试收入本仓；计数同步（`registry.json` /
+  回仓（jev-gate / exclude-tools-guard / no-tables 的 rule F 修复）；当时第 8 个 hosted 扩展
+  `magpie-image` 纳管（2026-10-16 移除已归档扩展后现为 7 个 hosted）；no-tables rule F 回归测试收入本仓；计数同步（`registry.json` /
   `install.sh` / `AGENTS.md` / `tsconfig.json`）；`.gitignore` 补 `*.bak-*`（保留
   `.agents/history/no-tables/` 两份只读副本的既有反选例外）。
 - **注记 ①（no-tables 三段式历史还原）**：该还原**已在 `main` 执行完毕**，落在 3 个提交上
