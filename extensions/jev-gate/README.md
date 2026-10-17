@@ -71,7 +71,7 @@
 |---|---|---|
 | `MAGPIE_BASE_URL` / `WINDHUB_BASE_URL` | `http://127.0.0.1:3425/v1` | `MAGPIE_BASE_URL` 优先，末尾斜杠自动归一 |
 | `MAGPIE_API_KEY` / `WINDHUB_API_KEY` | 本地网关默认 `"magpie"` | 凭据解析顺序见下（`MAGPIE_API_KEY` 优先） |
-| `JEV_MODEL_ID` | `group/classifier` | Magpie 分类器路由组（按序回退 `cloudflare-jev/@cf/cloudflare/clef` → `clef-flash` → `typesafe/jev`） |
+| `JEV_MODEL_ID` | `group/classifier` | Magpie 分类器路由组（`routing: order`，当前实际成员按序回退 `cloudflare-jev/@cf/cloudflare/clef` → `cloudflare-jev/@cf/cloudflare/clef-flash` 两项；第三跳 `typesafe/jev` 仅在 `pickedFrom` 候选目录、未进入当前路由组，为历史候选待配置） |
 | `JEV_MAX_STATE_CHARS` | `24000` | payload 字符上限，超出显式截断并在结果内标注 |
 | `JEV_TIMEOUT_MS` | `60000` | 单次调用超时 |
 
