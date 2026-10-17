@@ -19,7 +19,7 @@
    `/root/workspace/pi-cache-guardian`），本仓只以子进程级联调用它们各自的
    `integrations/pi/install.sh`。要改它们，去对应宿主仓走其既有流程，**不要**在本仓副本改。
 
-4. **重大变更与踩坑必须落笔记**：结构/契约/口径变更、双审事项、踩坑复盘，写入
+4. **重大变更与踩坑必须落笔记**：结构/契约/口径变更、所在档位的门禁事项、踩坑复盘，写入
    `.agents/notes/YYYYMMDD-<slug>.md`（带 front-matter：`status` 等）。见本仓初始笔记
    `20261004-pi-extensions-repo-init.md`。注意：`.agents/notes/` 属**本地过程记录、
    gitignore 不入库**（远端读者看不到，这是有意的——过程资产不是交付物），因此铁律④
