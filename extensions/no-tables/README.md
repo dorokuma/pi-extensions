@@ -5,6 +5,7 @@
 1. Markdown 表格 → 项目符号列表（首列作标签，其余列作 `明细: 值`）。
 2. h3–h6 标题 → 加粗行；脚注定义/引用归一；图片 → 链接。
 3. Markdown 链接 → 「标签 + URL」纯文本 / 裸 URL。
+4. 加粗闭合侧翼修复（Rule G）：闭合 `**` 前为标点且后紧跟非空白文字时，在闭合 `**` 后补一个空格，避免 CommonMark/marked 因右翼规则不成立将其渲染为裸星号（开定界符 `**` 与单星 `*` 不改动）。
 围栏代码块（``` / ~~~）内的内容不处理。通过 `message_end` 钩子改写 assistant 消息。
 
 ## 权威源 / 目标 / 来源
@@ -25,6 +26,7 @@
   改为 `"../src/no-tables.ts"`**（不改则 `ERR_MODULE_NOT_FOUND`）；用例与断言逐字相同，
   仓内副本 md5 `826f1f202c7d5d6e64615038c1642040` / 5646 字节 / 127 行。
   跑法 `node --test extensions/no-tables/test/no-tables.test.ts`（实测 12/12 pass）。
+- 2026-10-18 Rule G 新增（加粗闭合侧翼修复）：`extensions/no-tables/src/no-tables.ts` md5 `d209be514c8a51fa38d83432eb384f46` / `10337` 字节 / `238` 行；`extensions/no-tables/test/no-tables.test.ts` md5 `fa45426752c15ae17ae678ed4419bbe8` / `6940` 字节 / `160` 行（实测 17/17 pass）。
 
 ## 出处与许可
 - **作者声明为自研，未经第三方独立核实。** 本仓不做独立溯源，也不代其声明任何许可证

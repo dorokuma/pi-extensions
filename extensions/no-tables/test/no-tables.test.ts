@@ -125,3 +125,36 @@ test("rules A-E still apply to prose that a glued fence used to swallow", () => 
   assert.ok(out.includes("**四、结论**"), out)
   assert.ok(out.endsWith("正常正文。"), out)
 })
+
+test("rule G: inserts a space after closing ** when preceded by punctuation and followed by text", () => {
+  assert.equal(
+    convertUnsupportedMarkdown("**实际用法举个例子：**女儿连续跑了"),
+    "**实际用法举个例子：** 女儿连续跑了",
+  )
+})
+
+test("rule G: end-of-line closing ** and colon outside ** remain unchanged", () => {
+  for (const s of [
+    "**它的用途是……：**",
+    "**实际用法举个例子**：女儿连续跑了",
+    "- **returned（回传量）**：行尾结束",
+  ]) {
+    assert.equal(convertUnsupportedMarkdown(s), s)
+  }
+})
+
+test("rule G: opening ** followed by text and closing ** after non-punctuation remain unchanged", () => {
+  for (const s of ["**x**是合法", "这是**加粗**测试"]) {
+    assert.equal(convertUnsupportedMarkdown(s), s)
+  }
+})
+
+test("rule G: idempotent when run again on already-repaired text", () => {
+  const once = convertUnsupportedMarkdown("**实际用法举个例子：**女儿连续跑了")
+  assert.equal(once, "**实际用法举个例子：** 女儿连续跑了")
+  assert.equal(convertUnsupportedMarkdown(once), once)
+})
+
+test("rule G: single-asterisk emphasis is out of scope and left untouched", () => {
+  assert.equal(convertUnsupportedMarkdown("*text*：后文"), "*text*：后文")
+})

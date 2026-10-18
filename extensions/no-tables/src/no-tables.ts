@@ -163,6 +163,42 @@ function applyMarkdownRules(text: string): string {
     return `${label} ${url}`
   })
 
+  // Rule G: repair right-flanking bold closers (**...<punct>**<text>) that
+  // CommonMark rejects when the closing ** is preceded by punctuation and
+  // immediately followed by non-whitespace, non-punctuation text.
+  //
+  // Why only the closing (right-flanking) side:
+  //   CommonMark defines a delimiter run as right-flanking only if it is not
+  //   preceded by whitespace AND either (a) not preceded by punctuation, or
+  //   (b) preceded by punctuation and followed by whitespace or punctuation.
+  //   Models frequently put a colon or closing bracket inside the bold span and
+  //   continue the sentence without a space ("**实际用法举个例子：**女儿连续跑了"):
+  //   the closing ** sits between "：" (punctuation) and "女" (non-whitespace,
+  //   non-punctuation), fails (b), and renders as literal asterisks. The opening
+  //   ** has the mirror rule (left-flanking allows following non-whitespace text,
+  //   e.g. "**x**是合法" or "说明：**加粗**"), which is already valid and must
+  //   not be touched. Matching complete **...** pairs ensures an opening ** is
+  //   never mistaken for a closer, and leaving closers followed by whitespace,
+  //   end-of-line, or trailing punctuation (e.g. "- **returned（回传量）**：行尾结束")
+  //   untouched preserves spans that CommonMark already parses as strong.
+  //
+  // Why only ** (strong) and not * (emphasis):
+  //   Single-* runs appear routinely in prose as multiplication, globs, or
+  //   unpaired markers, and "*text*：后文" is out of scope for this fixup.
+  //   Restricting the rule to ** avoids false positives on single asterisks.
+  const boldClosingPunct = /[：:，,。．.、；;！!？?…—～~）)】\]》〉」』”’"']$/
+  const boldFollowingNonSpace = /^[^\s*：:，,。．.、；;！!？?…）)】\]》〉」』]/
+  text = text.replace(
+    /(?<!\*)\*\*(?=\S)([^\n*]*?[^\s*])\*\*(?!\*)/g,
+    (match, inner: string, offset: number, str: string) => {
+      const nextChar = str[offset + match.length] ?? ""
+      if (boldClosingPunct.test(inner) && boldFollowingNonSpace.test(nextChar)) {
+        return `${match} `
+      }
+      return match
+    },
+  )
+
   return text
 }
 
