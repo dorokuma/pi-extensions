@@ -142,16 +142,16 @@
       }
     },
     {
-      "name": "pi-cache-guardian",
+      "name": "pi-cache-stats",
       "category": "federated",
       "managed": "upstream-repo",
-      "destFile": "cache-guardian.ts",
-      "targetPath": "/root/.pi/agent/extensions/cache-guardian.ts",
+      "destFile": "cache-stats.ts",
+      "targetPath": "/root/.pi/agent/extensions/cache-stats.ts",
       "authority": {
         "kind": "host-repo-cascade",
-        "sourcePath": "/root/workspace/pi-cache-guardian/extensions/cache-guardian.ts",
-        "hostRepo": "/root/workspace/pi-cache-guardian",
-        "installScript": "/root/workspace/pi-cache-guardian/integrations/pi/install.sh",
+        "sourcePath": "/root/workspace/pi-cache-stats/extensions/cache-stats.ts",
+        "hostRepo": "/root/workspace/pi-cache-stats",
+        "installScript": "/root/workspace/pi-cache-stats/integrations/pi/install.sh",
         "installDestEnv": "PI_EXT_DEST"
       }
     },
