@@ -156,5 +156,33 @@ test("rule G: idempotent when run again on already-repaired text", () => {
 })
 
 test("rule G: single-asterisk emphasis is out of scope and left untouched", () => {
-  assert.equal(convertUnsupportedMarkdown("*text*：后文"), "*text*：后文")
+  for (const s of ["*text*：后文", "*text：*后文"]) {
+    assert.equal(convertUnsupportedMarkdown(s), s)
+  }
+})
+
+test("rule G: inline backtick code spans and aligned closing punctuation are left untouched", () => {
+  for (const s of ["`**实际用法：**例子`", "``**实际用法：**例子``", "**a：**～x", '**a：**"引用"']) {
+    assert.equal(convertUnsupportedMarkdown(s), s)
+  }
+  assert.equal(
+    convertUnsupportedMarkdown("行内 `**a：**b` 不变，但**实际用法：**例子要补空格"),
+    "行内 `**a：**b` 不变，但**实际用法：** 例子要补空格",
+  )
+})
+
+test("rule G: bold span containing inline code inserts space after closing ** and is idempotent", () => {
+  const input = "**`--flag`：**强制执行"
+  const once = convertUnsupportedMarkdown(input)
+  assert.equal(once, "**`--flag`：** 强制执行")
+  assert.ok(once.includes("`--flag`"))
+  assert.equal(convertUnsupportedMarkdown(once), once)
+})
+
+test("rule E: link label containing inline code is flattened without altering code span and is idempotent", () => {
+  const input = "see [`docs`](https://example.com) and [`**a：**b`](https://example.com)"
+  const once = convertUnsupportedMarkdown(input)
+  assert.equal(once, "see `docs` https://example.com and `**a：**b` https://example.com")
+  assert.ok(once.includes("`docs`") && once.includes("`**a：**b`"))
+  assert.equal(convertUnsupportedMarkdown(once), once)
 })

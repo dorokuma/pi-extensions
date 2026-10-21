@@ -23,7 +23,7 @@
 | magpie-image | hosted | `/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts` | `/root/.pi/agent/extensions/magpie-image.ts` |
 | codegraph-go | federated | `/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/codegraph-go.ts` |
 | ctxmode | federated | `/root/workspace/ctxmode/integrations/pi/ctxmode.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/ctxmode.ts` |
-| pi-cache-guardian | federated | `/root/workspace/pi-cache-guardian/extensions/cache-guardian.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/cache-guardian.ts` |
+| pi-cache-stats | federated | `/root/workspace/pi-cache-stats/extensions/cache-stats.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/cache-stats.ts` |
 | herdr-agent-state | external | herdr 二进制托管（带外，无本仓/宿主仓权威源） | `/root/.pi/agent/extensions/herdr-agent-state.ts`（只读，绝不写） |
 
 > herdsman-bridge 仓内文件名是 `herdsman-bridge.ts`，安装后部署文件名是 `herdsman-pi.ts`，
@@ -70,7 +70,7 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 
 - **`install.sh --audit` 的 dest 目录差集告警、子目录扫描与退出码语义**：`--audit` 除巡检 `federated/registry.json`
   已登记的 11 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容 `herdsman-bridge` →
-  `herdsman-pi.ts`、`pi-cache-guardian` → `cache-guardian.ts` 的异名映射）列出全部未登记顶层条目，同时以
+  `herdsman-pi.ts`、`pi-cache-stats` → `cache-stats.ts` 的异名映射）列出全部未登记顶层条目，同时以
   `find -P -mindepth 2`（无限深度，不跟随符号链接、不进入符号链接目录）递归收集子目录内的 `.ts` 文件：
   - **`.ts` 后缀大小写不敏感**：顶层 `other *.ts` 与子目录递归收集均先取小写副本再匹配 `*.ts`（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`），明细表与专项点名保留原始文件名大小写；`historical backup`（`*.bak-*` / `*.bak`）与 `__tests__` 目录名保持大小写敏感，不改变其它类别语义。
   - **任意层级 `__tests__/` 归类契约**：子目录 `.ts` 只要位于任意层级的 `__tests__/` 目录内（相对路径匹配 `__tests__/*` 或 `*/__tests__/*`，如 `__tests__/no-tables.test.ts`、`__tests__/nested/z.ts`、`x/__tests__/y.ts`），均归为 `__tests__ file`（进明细表披露，**不进**专项 `WARN` 点名）；其余子目录 `.ts` 归为 `nested *.ts`（进明细表且与顶层 `other *.ts` 一并进 `install.sh WARN: unregistered *.ts in dest-dir: ...` 专项点名）。

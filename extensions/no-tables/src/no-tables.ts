@@ -42,7 +42,7 @@ export function convertUnsupportedMarkdown(md: string): string {
   // i.e. it re-creates the very defect F exists to remove.
   const normalized = normalizeMisplacedFences(md)
 
-  // Split by fenced code blocks (``` or ~~~) so rules A-D only apply outside code blocks
+  // Split by fenced code blocks (``` or ~~~) so rules A-G only apply outside code blocks
   const segments = normalized.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g)
   for (let i = 0; i < segments.length; i += 2) {
     segments[i] = applyMarkdownRules(segments[i])
@@ -134,6 +134,34 @@ function dedentFenceLine(line: string): string {
   return /^[ \t]+(?=`{3,}|~{3,})/.test(line) ? line.replace(/^[ \t]+/, "") : line
 }
 
+type CodeSpanRange = { start: number; end: number }
+
+function splitByInlineCode(text: string): string[] {
+  const re = /(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g
+  const segments: string[] = []
+  let lastIndex = 0
+  for (const match of text.matchAll(re)) {
+    const index = match.index!
+    segments.push(text.slice(lastIndex, index), match[0])
+    lastIndex = index + match[0].length
+  }
+  segments.push(text.slice(lastIndex))
+  return segments
+}
+
+function joinWithCodeRanges(segments: string[]): { text: string; codeRanges: CodeSpanRange[] } {
+  const codeRanges: CodeSpanRange[] = []
+  let offset = 0
+  for (let i = 0; i < segments.length; i++) {
+    const len = segments[i].length
+    if (i % 2 === 1) {
+      codeRanges.push({ start: offset, end: offset + len })
+    }
+    offset += len
+  }
+  return { text: segments.join(""), codeRanges }
+}
+
 function applyMarkdownRules(text: string): string {
   // Rule A: h3-h6 headers to bold line
   text = text.replace(/^(#{3,6})\s+(.+?)\s*#*\s*$/gm, "**$2**")
@@ -141,6 +169,28 @@ function applyMarkdownRules(text: string): string {
   // Rule D: Footnote definition lines
   text = text.replace(/^\[\^([^\]]+)\]:\s*(.+)$/gm, "**[$1]** $2")
 
+  // Split by inline backtick code spans (`...`) after line-anchored rules (A, D)
+  // so inline code inside headings/footnotes does not break ^/$ line anchors,
+  // while inline rules (C, B, E, G) skip inline code literals (e.g. `**...：**x`).
+  const segments = splitByInlineCode(text)
+  for (let i = 0; i < segments.length; i += 2) {
+    segments[i] = applyInlineMarkdownRules(segments[i])
+  }
+
+  // Re-run Rule E and Rule G on the joined text so cross-segment patterns
+  // (e.g. `[`docs`](url)` or `**`--flag`：**text`) are repaired while matches
+  // whose delimiters fall inside inline code span ranges remain untouched.
+  const { text: joined, codeRanges } = joinWithCodeRanges(segments)
+  if (codeRanges.length === 0) {
+    return joined
+  }
+  const afterLinks = applyLinkRule(joined, codeRanges)
+  const finalCodeRanges =
+    afterLinks === joined ? codeRanges : joinWithCodeRanges(splitByInlineCode(afterLinks)).codeRanges
+  return applyBoldClosingRule(afterLinks, finalCodeRanges)
+}
+
+function applyInlineMarkdownRules(text: string): string {
   // Rule C: Footnote references (not at definition line start)
   text = text.replace(/\[\^([^\]]+)\]/g, "[$1]")
 
@@ -151,7 +201,28 @@ function applyMarkdownRules(text: string): string {
   })
 
   // Rule E: Links to text + url
-  text = text.replace(/\[(.*?)\]\((.*?)\)/g, (_match, label: string, url: string) => {
+  text = applyLinkRule(text)
+
+  // Rule G: repair right-flanking bold closers (**...<punct>**<text>)
+  text = applyBoldClosingRule(text)
+
+  return text
+}
+
+function applyLinkRule(text: string, codeRanges: CodeSpanRange[] = []): string {
+  return text.replace(/\[(.*?)\]\((.*?)\)/g, (match, label: string, url: string, offset: number) => {
+    const matchEnd = offset + match.length
+    const labelEnd = offset + 1 + label.length
+    const inOrTouchesCodeDelimiter = codeRanges.some(
+      (r) =>
+        r.start < matchEnd &&
+        r.end > offset &&
+        !(r.start >= offset + 1 && r.end <= labelEnd) &&
+        !(r.start >= labelEnd + 2 && r.end <= matchEnd - 1),
+    )
+    if (inOrTouchesCodeDelimiter) {
+      return match
+    }
     const trimmedLabel = label.trim()
     const trimmedUrl = url.trim()
     if (trimmedLabel === trimmedUrl) {
@@ -162,44 +233,52 @@ function applyMarkdownRules(text: string): string {
     }
     return `${label} ${url}`
   })
+}
 
-  // Rule G: repair right-flanking bold closers (**...<punct>**<text>) that
-  // CommonMark rejects when the closing ** is preceded by punctuation and
-  // immediately followed by non-whitespace, non-punctuation text.
-  //
-  // Why only the closing (right-flanking) side:
-  //   CommonMark defines a delimiter run as right-flanking only if it is not
-  //   preceded by whitespace AND either (a) not preceded by punctuation, or
-  //   (b) preceded by punctuation and followed by whitespace or punctuation.
-  //   Models frequently put a colon or closing bracket inside the bold span and
-  //   continue the sentence without a space ("**实际用法举个例子：**女儿连续跑了"):
-  //   the closing ** sits between "：" (punctuation) and "女" (non-whitespace,
-  //   non-punctuation), fails (b), and renders as literal asterisks. The opening
-  //   ** has the mirror rule (left-flanking allows following non-whitespace text,
-  //   e.g. "**x**是合法" or "说明：**加粗**"), which is already valid and must
-  //   not be touched. Matching complete **...** pairs ensures an opening ** is
-  //   never mistaken for a closer, and leaving closers followed by whitespace,
-  //   end-of-line, or trailing punctuation (e.g. "- **returned（回传量）**：行尾结束")
-  //   untouched preserves spans that CommonMark already parses as strong.
-  //
-  // Why only ** (strong) and not * (emphasis):
-  //   Single-* runs appear routinely in prose as multiplication, globs, or
-  //   unpaired markers, and "*text*：后文" is out of scope for this fixup.
-  //   Restricting the rule to ** avoids false positives on single asterisks.
-  const boldClosingPunct = /[：:，,。．.、；;！!？?…—～~）)】\]》〉」』”’"']$/
-  const boldFollowingNonSpace = /^[^\s*：:，,。．.、；;！!？?…）)】\]》〉」』]/
-  text = text.replace(
+// Rule G: repair right-flanking bold closers (**...<punct>**<text>) that
+// CommonMark rejects when the closing ** is preceded by punctuation and
+// immediately followed by non-whitespace, non-punctuation text.
+//
+// Why only the closing (right-flanking) side:
+//   CommonMark defines a delimiter run as right-flanking only if it is not
+//   preceded by whitespace AND either (a) not preceded by punctuation, or
+//   (b) preceded by punctuation and followed by whitespace or punctuation.
+//   Models frequently put a colon or closing bracket inside the bold span and
+//   continue the sentence without a space ("**实际用法举个例子：**女儿连续跑了"):
+//   the closing ** sits between "：" (punctuation) and "女" (non-whitespace,
+//   non-punctuation), fails (b), and renders as literal asterisks. The opening
+//   ** has the mirror rule (left-flanking allows following non-whitespace text,
+//   e.g. "**x**是合法" or "说明：**加粗**"), which is already valid and must
+//   not be touched. Matching complete **...** pairs ensures an opening ** is
+//   never mistaken for a closer, and leaving closers followed by whitespace,
+//   end-of-line, or trailing punctuation (e.g. "- **returned（回传量）**：行尾结束")
+//   untouched preserves spans that CommonMark already parses as strong.
+//
+// Why only ** (strong) and not * (emphasis):
+//   Single-* runs appear routinely in prose as multiplication, globs, or
+//   unpaired markers, and "*text*：后文" is out of scope for this fixup.
+//   Restricting the rule to ** avoids false positives on single asterisks.
+const boldClosingPunct = /[：:，,。．.、；;！!？?…—～~）)】\]》〉」』”’"']$/
+const boldFollowingNonSpace = /^[^\s*：:，,。．.、；;！!？?…—～~）)】\]》〉」』”’"']/
+
+function applyBoldClosingRule(text: string, codeRanges: CodeSpanRange[] = []): string {
+  return text.replace(
     /(?<!\*)\*\*(?=\S)([^\n*]*?[^\s*])\*\*(?!\*)/g,
     (match, inner: string, offset: number, str: string) => {
-      const nextChar = str[offset + match.length] ?? ""
+      const matchEnd = offset + match.length
+      const inOrTouchesCodeDelimiter = codeRanges.some(
+        (r) => r.start < matchEnd && r.end > offset && !(r.start >= offset + 2 && r.end <= matchEnd - 2),
+      )
+      if (inOrTouchesCodeDelimiter) {
+        return match
+      }
+      const nextChar = str[matchEnd] ?? ""
       if (boldClosingPunct.test(inner) && boldFollowingNonSpace.test(nextChar)) {
         return `${match} `
       }
       return match
     },
   )
-
-  return text
 }
 
 function convertTables(md: string): string {

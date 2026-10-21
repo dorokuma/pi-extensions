@@ -14,9 +14,9 @@
    的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
    `bash install.sh <name>` 同步到部署目录（`/reload` 或新会话生效）。不要在部署目录就地改。
 
-3. **外生（federated）扩展改动回宿主仓**：`codegraph-go` / `ctxmode` / `pi-cache-guardian`
+3. **外生（federated）扩展改动回宿主仓**：`codegraph-go` / `ctxmode` / `pi-cache-stats`
    的源**留在各自宿主仓**（`/root/workspace/codegraph-go`、`/root/workspace/ctxmode`、
-   `/root/workspace/pi-cache-guardian`），本仓只以子进程级联调用它们各自的
+   `/root/workspace/pi-cache-stats`），本仓只以子进程级联调用它们各自的
    `integrations/pi/install.sh`。要改它们，去对应宿主仓走其既有流程，**不要**在本仓副本改。
 
 4. **重大变更与踩坑必须落笔记**：结构/契约/口径变更、所在档位的门禁事项、踩坑复盘，写入
@@ -44,7 +44,7 @@
 | 类别 | 扩展 | 权威源 | 本仓职责 |
 |---|---|---|---|
 | hosted（内生） | auto-continue / no-tables / herdsman-bridge / ctx-orchestrate / jev-gate / exclude-tools-guard / magpie-image | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
-| federated（外生） | codegraph-go / ctxmode / pi-cache-guardian | 各自宿主仓 | 仅级联调用其 `install.sh` |
+| federated（外生） | codegraph-go / ctxmode / pi-cache-stats | 各自宿主仓 | 仅级联调用其 `install.sh` |
 | external（外部） | herdr-agent-state | herdr 二进制（带外） | 只读巡检，绝不写 |
 
 `herdr` 二进制还托管着 `herdr-agent-state.ts`；本仓与其只读共存。详见 `README.md` 的全机
