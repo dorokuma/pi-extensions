@@ -264,7 +264,7 @@ status_of() { # $1=name  $2=dest_dir
 
 # ---- dest 目录差集巡检（audit 专用，严格只读）----
 # 1) 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
-#    的 destFile 为 herdsman-pi.ts、pi-cache-guardian 为 cache-guardian.ts，必须比对 .destFile
+#    的 destFile 为 herdsman-pi.ts、pi-cache-stats 为 cache-stats.ts，必须比对 .destFile
 #    而非 .name）。
 # 2) 递归扫描 dest_dir 子目录（find -P -mindepth 2，无限深度，不跟随符号链接、不进入符号链接目录）：
 #    大小写不敏感收集子目录内未登记 .ts 文件（覆盖 .ts / .TS / .Ts / .tS）；非 .ts 的嵌套文件不逐条列，
