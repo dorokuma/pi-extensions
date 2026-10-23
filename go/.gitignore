@@ -1,0 +1,26 @@
+# Binaries and build output
+/bin/*
+!/bin/pig-test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+*.prof
+*.pprof
+
+# Editor and temporary files
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Local build and scratch directories
+/dist/
+/tmp/

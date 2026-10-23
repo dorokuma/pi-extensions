@@ -1,0 +1,10 @@
+你是在 eqi12 开发机上执行 pi 全面 Go 化迁移的工程师。先完整阅读 /root/workspace/pi-go/PLAN.md，严格遵守第 0 节"硬规矩"。
+
+本次只做"第 0 批：并行环境"（PLAN.md 第 1 节），全部做完再停，不要开始第 1 批。
+
+要求：
+- 不改 /root/.pi/agent/ 下任何文件，不改 /root/.gemini/config/hooks.json，不重启 herdsman 守护进程。
+- PiG 的配置目录参数/环境变量要从 PiG 源码或文档里查实，不许猜。
+- 每一步跑完的真实命令输出要摘进报告。
+- 结束时写好 /root/workspace/pi-go/reports/batch-0.md，并在 /root/workspace/pi-go 里 git commit。
+- 最后一行输出：BATCH0_DONE 或 BATCH0_BLOCKED: <原因>。
