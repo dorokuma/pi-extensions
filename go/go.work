@@ -1,0 +1,9 @@
+go 1.26.0
+
+// PiG 编译时 GOWORK=off，本文件只服务本地开发与 CI 检查。
+// 作用是让本地 go build/vet/test 能把 github.com/MichaelKinsy/PiG/extensions/sdk 解析到 go/pigsdk。
+use (
+	.
+	./gemini-safety
+	./pigsdk
+)
