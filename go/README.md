@@ -55,7 +55,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
   ```
 - 编译与验证 examples 扩展（通过 PiG runner 编译）：
   ```sh
-  make examples-build
+  make examples-smoke
   # 等价于: ./bin/pig-test -e ./examples/hello --mode json -p "调用 hello_ping 工具并返回其结果"
   ```
 - 运行 examples 扩展并调用工具：
@@ -101,7 +101,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
    ```
    该扩展**只能由 PiG 在构建期动态替换为 staged SDK 才能编译成功**（PiG 会在 runtime cell 构建期将 SDK 映射至 `$PIG_HOME/state/pigsdk/go/`）。
 3. **构建与运行标准入口**：
-   必须使用 `make examples-build` 或 `make examples-run`（或通过 `./bin/pig-test -e ./examples/hello ...`）来进行编译与验证。
+   必须使用 `make examples-smoke` 或 `make examples-run`（或通过 `./bin/pig-test -e ./examples/hello ...`）来进行编译与验证。
 
 ## 隔离测试配置目录说明
 

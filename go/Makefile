@@ -1,7 +1,7 @@
 PIG := ./bin/pig-test
 PIG_ISOLATED_DIR ?= /root/.pig-test/agent
 
-.PHONY: all build test vet install-test examples-build examples-run help
+.PHONY: all build test vet install-test examples-smoke examples-run help
 
 all: help
 
@@ -11,8 +11,8 @@ help:
 	@echo "  test            - Run tests across all packages (go test ./...)"
 	@echo "  vet             - Run static analysis (go vet ./...)"
 	@echo "  install-test    - Validate and install into isolated directory (PIG_ISOLATED_DIR)"
-	@echo "  examples-build  - Build/validate examples/hello via PiG runner compiler"
-	@echo "  examples-run    - Execute examples/hello tool call via PiG"
+	@echo "  examples-smoke  - Load examples/hello in isolated PiG and call hello_ping (JSON output; makes one model call)"
+	@echo "  examples-run    - Same as examples-smoke, plain text output (makes one model call)"
 	@echo "  help            - Show this help message"
 
 build:
@@ -38,7 +38,7 @@ install-test:
 	go build ./...
 	@echo "install-test validation succeeded for isolated directory: $(PIG_ISOLATED_DIR)"
 
-examples-build:
+examples-smoke:
 	$(PIG) -e ./examples/hello --mode json -p "调用 hello_ping 工具并返回其结果"
 
 examples-run:
