@@ -73,6 +73,10 @@ pi-vcc(5529，两个本地补丁 `pi-vcc-0.10.0-recall-note`、`pi-vcc-0.9.0-ctx
 
 1. 隔离目录里 PiG + 全部 Go 扩展连续实用 3 天无回退。
 2. 启动器 `~/.pi/agent/bin/pi` 改为调 PiG（保留旧文件备份），herdsman 切到 Go。
+   - 配置方式定为 PiG 直接复用 pi 的配置目录：启动器设 `PIG_USE_PI_DIRS=1`（此时 PiG 认 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`），不另建 `~/.pig/agent`，也不写自己的喜鹊 Agent 插件。这样喜鹊内置的 Pi 适配继续管 models.json/settings.json：原生协议（magpie-anthropic 走 anthropic-messages）、价格、默认模型、思考档位都现成。
+   - 依据（2026-10-23 在复制目录 `/root/.pig-pidirs-test/agent` 实测，PiG 0.5.2+1.4.0）：默认模型 magpie/group/smartass、人设、思考档位生效；usage.cost 有值；magpie-anthropic 的 api 为 anthropic-messages；PiG 起 node 扩展宿主并真正运行 TS 扩展（ctxmode 子进程被拉起）；跑完 settings/models/auth/mcp/trust/models-store 均未被改写。
+   - 切换前还要补测：交互界面（TUI）、moshi-hooks 与 herdsman-pi 两个扩展（测试时移出未测）。
+   - 切换后删掉隔离测试用的社区 agent-pig 插件（先 `magpie pig default` 再移除）和 `/root/.pig-test`、`/root/.pig-pidirs-test`。
 3. 再观察 3 天，然后卸载 Node（nvm 下的 v22 和 v26），删 `node_modules`。
 4. 卸之前跑 `rg -l "node|npx|pnpm" /root/.local/bin /root/.pi /root/.gemini/config` 确认没有残留调用。
 
