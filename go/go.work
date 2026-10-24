@@ -8,6 +8,7 @@ use (
 	./ctx-orchestrate
 	./exclude-tools-guard
 	./herdr-agent-state
+	./jev-gate
 	./no-tables
 	./pi-context-pruning
 	./pi-env
