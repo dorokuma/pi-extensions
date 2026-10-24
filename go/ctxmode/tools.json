@@ -1,0 +1,368 @@
+[
+  {
+    "name": "ctx_run",
+    "label": "CTX Run",
+    "description": "执行/测编。action=execute|execute_file|batch|run_task。测编优先 run_task；不确定输出用 execute（argv 优先）。",
+    "promptSnippet": "Run commands, batch jobs, or structured test/build tasks",
+    "promptGuidelines": [
+      "Use ctx_run action=run_task for go/npm/cargo/make test and build.",
+      "Use ctx_run action=execute for shell/code; prefer argv over command; command runs via a fixed /bin/sh -c (SHELL ignored, no allowlist).",
+      "Use ctx_run action=batch for multiple commands with optional queries (same fixed /bin/sh -c semantics)."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "execute|execute_file|batch|run_task",
+          "enum": [
+            "execute",
+            "execute_file",
+            "batch",
+            "run_task"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command text run via a fixed, controlled /bin/sh -c (SHELL ignored; no command allowlist). Pipes/redirects/&&/heredoc/$() allowed. Ignored when argv is non-empty; prefer argv."
+        },
+        "language": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "number",
+          "description": "ms (execute/execute_file/batch default 30000, run_task default 300000, max 3600000)"
+        },
+        "background": {
+          "type": "boolean",
+          "description": "Only with action=execute. Starts and returns immediately; no proactive push. Then call ctx_bg action=wait once with id or pid (default 60000ms, max 3600000ms); timeout does not kill. Do not poll list/log."
+        },
+        "intent": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "patternProperties": {
+            "^.*$": {
+              "type": "string"
+            }
+          }
+        },
+        "stdin": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "command"
+            ]
+          }
+        },
+        "queries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "concurrency": {
+          "type": "number"
+        },
+        "query_scope": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "ctx_fs",
+    "label": "CTX FS",
+    "description": "工作区文件（沙箱）。action=ls|glob|stat|rg|resolve|related（rg 默认 limit=20，超限自动落库并返回摘要，支持 offset 线性翻页；resolve 按近似/@路径模糊检索候选文件，移植自 pi-fff；related 查找给定文件的测试/实现配对、同 stem 与同目录关联文件）。",
+    "promptSnippet": "List, glob, stat, search, resolve, or find related files under workdirs",
+    "promptGuidelines": [
+      "Prefer ctx_fs over shell find/ls/rg when listing or searching workspace files.",
+      "rg: grep for a concrete identifier (e.g. MyFunc), never '.*' — grep is not a file reader.",
+      "rg: after 1-2 greps, Read the top-hit file instead of grepping again.",
+      "rg: for huge result sets use ctx_kb action=search or ctx_fs rg offset paging."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "ls|glob|stat|rg|resolve|related",
+          "enum": [
+            "ls",
+            "glob",
+            "stat",
+            "rg",
+            "resolve",
+            "related"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "glob": {
+          "type": "string"
+        },
+        "depth": {
+          "type": "number"
+        },
+        "include_hidden": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "number"
+        },
+        "offset": {
+          "type": "number"
+        },
+        "ignore_case": {
+          "type": "boolean"
+        },
+        "context": {
+          "type": "number"
+        },
+        "literal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "ctx_git",
+    "label": "CTX Git",
+    "description": "只读 git。action=status|diff|log。",
+    "promptSnippet": "Read-only git status/diff/log",
+    "promptGuidelines": [
+      "Prefer ctx_git for status/diff/log instead of shell git."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "status|diff|log",
+          "enum": [
+            "status",
+            "diff",
+            "log"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "stat": {
+          "type": "boolean"
+        },
+        "unified": {
+          "type": "number"
+        },
+        "staged": {
+          "type": "boolean"
+        },
+        "n": {
+          "type": "number"
+        },
+        "oneline": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "ctx_kb",
+    "label": "CTX KB",
+    "description": "本地知识库。action=index|search|fetch|stats|purge|doctor。",
+    "promptSnippet": "Index/search knowledge base, fetch URLs, doctor, purge",
+    "promptGuidelines": [
+      "Use ctx_kb action=search after large ctx_run outputs were auto-indexed.",
+      "purge requires confirm:true plus confirm_phrase (the knowledge base name echoed in the error)."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "index|search|fetch|stats|purge|doctor",
+          "enum": [
+            "index",
+            "search",
+            "fetch",
+            "stats",
+            "purge",
+            "doctor"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "maxBytes": {
+          "type": "number"
+        },
+        "timeout_ms": {
+          "type": "number",
+          "description": "ms (default 150000, max 3600000)"
+        },
+        "ttl_ms": {
+          "type": "number",
+          "description": "ms (0=skip cache, omit=86400000)"
+        },
+        "confirm": {
+          "type": "boolean"
+        },
+        "confirm_phrase": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "dryRun": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "ctx_bg",
+    "label": "CTX Background",
+    "description": "后台进程。仅由 ctx_run action=execute background:true 启动；启动立即返回且不会主动推送。拿到 id 后默认调用一次 ctx_bg action=wait（阻塞本次调用，默认60000ms，最大3600000ms，超时不杀进程）。id 和 pid 二选一；禁止用 list/log 周期轮询。list 快照、log 查看尾部、kill 终止进程。",
+    "promptSnippet": "Manage background jobs from ctx_run execute background:true",
+    "promptGuidelines": [
+      "Use ctx_bg after starting background processes with ctx_run action=execute background:true."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "list|kill|log|wait",
+          "enum": [
+            "list",
+            "kill",
+            "log",
+            "wait"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "number"
+        },
+        "tail_lines": {
+          "type": "number"
+        },
+        "tail_bytes": {
+          "type": "number"
+        },
+        "timeout_ms": {
+          "type": "number",
+          "description": "ms (default 60000, max 3600000; does not kill)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "ctx_stats",
+    "label": "CTX Stats",
+    "description": "上下文消耗统计（本会话）：各工具调用次数、回给上下文窗口的字节、估算 token，以及被自动入库到 KB 而省下的 kept-out 字节（覆盖全部入库路径：ctx_run 超限输出、ctx_fs rg 自动入库、ctx_kb index、ctx_run action=batch、ctx_kb fetch、旧 JSON 迁移）。无 action 参数；json:true 返回机器可读输出。",
+    "promptSnippet": "Session context-consumption statistics (returned vs kept-out bytes)",
+    "promptGuidelines": [
+      "Use ctx_stats to see how many bytes this session returned to the context window versus kept out by auto-indexing.",
+      "ctx_stats takes no action argument; pass json:true for machine-readable output."
+    ],
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "json": {
+          "type": "boolean",
+          "description": "Return the report as JSON"
+        }
+      }
+    }
+  }
+]
