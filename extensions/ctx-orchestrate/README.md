@@ -1,42 +1,22 @@
 # ctx-orchestrate
 
 ## 概况
-codemode 灰度的**终态设施**：把 3 个高频多步流程固化为组合工具，并给 codemode 的
+codemode 灰度的**终态设施**：把高频多步的 `ctx_fs` 检索流程固化为组合工具，并给 codemode 的
 `text()` 回传加一道物理硬顶。本扩展**不 spawn 任何进程、不注册 command、不读
-settings.json**——只 `registerTool` ×3 + `pi.on("tool_result")` ×1。
+settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
 
-三个组合工具（`exposure: "codemode"`，不主动声明给模型，仅 codemode 脚本内
+唯一组合工具（`exposure: "codemode"`，不主动声明给模型，仅 codemode 脚本内
 `tools.*` / `searchTools()` 可达；`namespace: ctxmode`，`describeNamespace("ctxmode")`
 读 instructions）：
 
 | 工具 | 嵌套调用 | 输出（outputSchema → structuredContent） |
 |---|---|---|
-| `ctx_symbol_read(symbol, depth?, max_files?, path?, file?)` | `codegraph` node → 并发 callers/callees → （depth=2）再解析 ≤6 个被调用符号 | `{symbol, files:[{path,line,role}], summary, errors?}` |
-| `ctx_test_digest(kind, target, tail?, cwd?, args?, timeout_ms?)` | `ctx_run` action=run_task | `{kind,target,passed,failed,failures:[{name,excerpt}],summary,exit_code?,argv?,tail?,error?}` |
 | `ctx_search_digest(patterns[], path?, glob?, max_hits?, …)` | 并发多个 `ctx_fs` action=rg（有界并发 4） | `{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary, errors?}` |
 
-三者共用同一套纪律：`annotations.readOnlyHint=true`、`outputSchema` + `structuredContent`
+该工具沿用既有纪律：`annotations.readOnlyHint=true`、`outputSchema` + `structuredContent`
 与 text 双通道返回、`ctx.executeTool()` 嵌套调用的失败防御（`Promise.allSettled`
-+ 部分失败降级：失败落在 `structuredContent.errors/.failures` 或 `error` 字段，
++ 部分失败降级：失败落在 `structuredContent.errors` 字段，
 整体失败才 `isError:true`，绝不因单步失败抛异常）。
-
-## ctx_test_digest 计数解析覆盖
-pass/fail **自全文输出提取**（独立于 `tail` 窗口），优先识别各框架自带的用例汇总行：
-- **jest**：`Tests:  2 failed, 140 passed, 142 total`（冒号式，旧正则）。
-- **vitest**（默认 reporter，2026-10-04 增补）：`Tests  2 failed | 140 passed (142)` /
-  `Tests  142 passed (142)`。用 `\bTests\b` 定位**用例**汇总行后逐段取 `<count> <status>`
-  加总 passed/failed，免疫 failed/passed 先后顺序；**不**误伤 `Test Files  …`（文件数）或
-  pytest 的 `test session`（词形不匹配）。
-  补丁背景：vitest 无冒号且 `|` 分隔，旧 jest 正则（需冒号）与 pytest 正则（需 passed 与
-  failed 同时出现）都匹配不到，故全通过时 `passed/failed=0`（e2e 现场缺口）。
-- **pytest / go / tap**：沿用既有正则与逐行计数，本次改动对它们**零回归**（已差分验证
-  old==new）。
-
-已知限制（既有口径，本次未改，如实披露）：pytest 仅 "N passed" 而未见 failed 时旧逻辑不认
-（→0）、pytest "N failed, M passed" 语序会被旧正则反向、tap 的 `ok` 行被双计——属
-pytest/tap 自身口径，铁律要求零回归故不动；vitest 失败用例名取 `×`/`✕` 行并已剥离尾部
-` <n>ms` 时长，而详细错误在 vitest 单独的 "Failed Tests" 段（通常走 stderr），受块式提取所限
-excerpt 有限。
 
 ## 治理钩子：codemode text() 回传硬顶
 `pi.on("tool_result")` 拦截**模型直接发出的 `codemode` 调用**（无 `parentToolCallId`）：
@@ -63,12 +43,17 @@ excerpt 有限。
   本仓是其唯一权威源，此前不存在任何副本。
 
 ## 纳管时的一致性记录
-- md5：`280f7767637f0e06cfb6db4c58ec8420`
-- 字节数：`45076`（1115 行）
+- md5：`0e33386a7178868cbefe31969f08720b`
+- 字节数：`25394`（613 行）
 - 部署副本由 `bash install.sh ctx-orchestrate` 依 md5 幂等同步；`--audit` 报 `MATCH`。
 - 历史沿革：纳管初值为 `bc486f54…`/42681 字节，vitest 计数补丁后为
   `e9127d93…`/44253 字节，oracle 应修项 2（marker 携带 `details.fullOutputPath`，双审
-  应修收口）后为上值；三者均依 `install.sh` 同步且 `cmp` 逐字节一致。
+  应修收口）后为 `280f7767…`/45076 字节；各版均依 `install.sh` 同步且 `cmp` 逐字节一致。
+- **2026-10-24 摘除 `ctx_symbol_read` / `ctx_test_digest`**：两者连同实现函数、schema、
+  解析器（`parsePathLines` / `parseCalleeNames` / `parseTaskOutput`）、常量与 prompt 片段
+  一并删除，当前仅保留 `ctx_search_digest`；改前部署件备份为
+  `/root/.pi/agent/extensions/ctx-orchestrate.ts.bak-20261024-pre-drop2`
+  （md5 `280f7767637f0e06cfb6db4c58ec8420`）。后续 Go 版移植亦**不带**这两个工具。
 
 ## 出处与许可
 - **作者声明为自研，未经第三方独立核实。** 本仓不做独立溯源，也不代其声明任何许可证
@@ -76,12 +61,13 @@ excerpt 有限。
 
 ## 类型检查（已知限制，如实披露）
 本扩展运行时 `import { Type } from "typebox"`（与 `ctxmode.ts` / `codegraph-go.ts` 同：
-由 pi 宿主环境提供）。本仓 `node_modules` 下**没有** `typebox`（只有
-`@earendil-works/*`、`@types/node`、`typescript`），故它**不纳入**本仓 `tsc --noEmit`
-图（`tsconfig.json` 的 `include` 未列它）——与 `herdsman-bridge` 同一处置思路：
-纳入会让 `pnpm check` 因 TS2307 报错，掩盖其余内生扩展的真实检查结论。
-替代校验：jiti/node 直加载冒烟（`/tmp/ctx-orch-smoke.mjs`，含字段名与 types.d.ts
-逐一比对、三个工具的真输出回放、治理钩子截断断言），实测通过。
+由 pi 宿主环境提供）。本仓 `node_modules/typebox` 已存在，且 `tsconfig.json` 的 `include`
+已列 `extensions/ctx-orchestrate/src/**/*.ts`，故它**已在**本仓 `tsc --noEmit` 图内
+（`tsc --noEmit --listFiles` 可见该文件），`pnpm check` 实测 EXIT=0。
+补充校验：node 直加载冒烟（`/tmp/ctx-orch-smoke.mjs`，临时文件不入库），断言改后的注册面
+（唯一 `ctx_search_digest` + 一个 `tool_result` 钩子）、治理钩子 3000 字硬顶的三项行为
+（顶层截断 / 嵌套不治理 / 非 codemode 不动）与 `ctx_search_digest` 端到端
+（rg 输出解析 + 跨模式去重 + 按文件聚合），25 项断言全部通过。
 
 ## 改动流程（铁律）
 1. 只在本仓 `extensions/ctx-orchestrate/src/ctx-orchestrate.ts` 改；**严禁**直接编辑
