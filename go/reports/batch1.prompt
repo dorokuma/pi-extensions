@@ -1,0 +1,13 @@
+你是 pigo，执行 /root/workspace/pi-extensions/go/PLAN.md 的「第 1 批：小件」。先完整读 PLAN.md（硬规矩 1–6 全部适用）、go/README.md、go/reports/batch-0.md，以及仓库根目录 AGENTS.md。
+
+范围（7 个）：gemini-safety、herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish（@tiny-fish/sdk 改直接 HTTP）、pi-context-pruning。
+
+要求：
+1. 每个组件一个子目录 go/<名字>/，一个组件一次提交，提交只 add go/ 下文件；仓库里 extensions/exclude-tools-guard 的未提交改动绝不能进提交，也不要改它。
+2. 行为基准一律以 /root/.pi/agent/extensions/ 下正在用的版本（npm 包以实际安装的版本）为准；与 pi-extensions 仓库内版本有差异就写进报告。TS 原版有测试的逐条翻成 Go 测试；没有测试的，自己按 TS 行为写对照测试。
+3. herdr-agent-state：绝不写它的 TS 文件。先查 herdr 0.9.5 对 PiG 有没有官方集成（`herdr integration --help` 等），有就记下用法、不自己写；查不实就只写调研结论，留给爸爸定，不要硬写。
+4. node:net 用法改 Go net，socket 路径和协议保持一致。
+5. 每个组件：go build ./...、go vet ./...、go test ./... 全绿；用 go/bin/pig-test 在隔离环境（PIG_HOME=/root/.pig-test）实际加载并触发一次，贴真实输出。不改 /root/.pi/agent、启动器、hooks.json，不重启 herdsman 守护进程，不改 PiG 源码（ref/PiG 只读），PiG 缺口写进报告。
+6. 不许打印或提交任何密钥（隔离目录 models.json 里有真 key）。
+7. 报告写 go/reports/batch-1.md：每个组件做了什么、测试命令和结果原文、与 TS 版行为差异、没跑过的明说没跑、遗留问题。不要推送，推送由 Grok Bot 验收后做。
+8. 全部完成后，在报告末尾写一行「BATCH-1 DONE」并提交报告。你的交付会被逐条复核（diff、重跑 build/vet/test、核对报告每一句），不要写没验证过的结论。
