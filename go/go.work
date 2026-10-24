@@ -5,6 +5,7 @@ go 1.26.0
 use (
 	.
 	./auto-continue
+	./codegraph-go
 	./ctx-orchestrate
 	./exclude-tools-guard
 	./herdr-agent-state
