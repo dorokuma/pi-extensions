@@ -549,7 +549,8 @@ func TestJSWhitespace_HeadingsAndFootnotes(t *testing.T) {
 }
 
 func TestCRLF_VerbatimPreserved(t *testing.T) {
-	// F2 regression: CRLF inputs are not given extra leniency, matching TS behavior verbatim.
+	// CRLF inputs get no extra leniency: these cases stay byte-identical to the TS
+	// authority (a CRLF table never matches, and a CRLF glued fence is not promoted).
 	t.Run("crlf_table_preserved", func(t *testing.T) {
 		table := "| 名字 | 分数 |\r\n| --- | --- |\r\n| Alice | 100 |\r\n"
 		got := notables.ConvertTables(table)
@@ -586,73 +587,132 @@ func TestDocumentedDeviations_U2028(t *testing.T) {
 	}
 }
 
-func TestKnownDeviations_LineTerminators(t *testing.T) {
-	// 这些是与 TS 的已知分歧，冻结 Go 行为以便回归时显式可见。
-	// 已知行终止符分歧（CRLF/CR 待修 + U+2028/2029 仅文档化）
-	pipeline := func(s string) string {
-		return notables.ConvertUnsupportedMarkdown(notables.ConvertTables(s))
-	}
+// ============================================================================
+// CRLF / CR line-terminator parity with the TS authority
+// ============================================================================
+//
+// 所有期望值均由直接运行 TS 权威源（extensions/no-tables/src/no-tables.ts，node）
+// 产出，不是手写推导；对比方法见 README「CRLF / CR 行终止符对齐」。
 
+func pipeline(s string) string {
+	return notables.ConvertUnsupportedMarkdown(notables.ConvertTables(s))
+}
+
+func TestLineTerminatorParity_READMEItems(t *testing.T) {
+	// 原「下一批待修」清单条目 1–5、7（条目 6、8 见 U+2028/U+2029 文档化分歧）。
 	tests := []struct {
 		name  string
 		input string
-		want  string // 当前 Go 输出
+		want  string // TS 输出
 	}{
-		// NEXT-BATCH: CRLF line-terminator alignment (see README)
 		{
 			name:  "1_crlf_indented_empty_fence",
 			input: "```\r\n    ```\r\n",
-			want:  "```\r\n    ```\r\n",
+			want:  "```\r\n```\r\n",
 		},
 		{
 			name:  "2_crlf_indented_fence_with_info",
 			input: "```bash\r\n    ```\r\n",
-			want:  "```bash\r\n    ```\r\n",
+			want:  "```bash\r\n```\r\n",
 		},
 		{
 			name:  "3_crlf_code_indented_closer",
 			input: "```\r\ncode\r\n    ```\r\n",
-			want:  "```\r\ncode\r\n    ```\r\n",
+			want:  "```\r\ncode\r\n```\r\n",
 		},
 		{
 			name:  "4_crlf_nested_indented_fence",
 			input: "````markdown\r\n    ```\r\n    code\r\n    ```\r\n````\r\n",
-			want:  "````markdown\r\n    ```\r\n    code\r\n    ```\r\n````\r\n",
+			want:  "````markdown\r\n```\r\n    code\r\n```\r\n````\r\n",
 		},
 		{
 			name:  "5_heading_cr",
 			input: "### a\rb",
-			want:  "**a\rb**",
+			want:  "**a**\rb",
 		},
-		// 仅文档化（不计划修）：U+2028 / U+2029
-		{
-			name:  "6_heading_u2029",
-			input: "### a\u2029b",
-			want:  "**a\u2029b**",
-		},
-		// NEXT-BATCH: CRLF line-terminator alignment (see README)
 		{
 			name:  "7_table_with_cr",
 			input: "| a\rb | c |\n| - | - |\n| 1 | 2 |\n",
-			want:  "- **1** — c: 2\n",
-		},
-		// 仅文档化（不计划修）：U+2028 / U+2029
-		{
-			name:  "8a_link_with_u2028",
-			input: "[a\u2028b](https://x.com)",
-			want:  "a\u2028b https://x.com",
-		},
-		{
-			name:  "8b_image_with_u2028",
-			input: "![a\u2028b](https://x.com/a.png)",
-			want:  "a\u2028b https://x.com/a.png",
+			want:  "| a\rb | c |\n| - | - |\n| 1 | 2 |\n",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := pipeline(tt.input)
-			if got != tt.want {
+			if got := pipeline(tt.input); got != tt.want {
+				t.Fatalf("pipeline(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLineTerminatorParity_RuleCoverage(t *testing.T) {
+	// 逐规则覆盖 \n / \r\n / \r：Rule A（标题）、B（图片）、C/D（脚注）、E（链接）、
+	// F（围栏）、G（粗体闭合）与表格转换。
+	tests := []struct {
+		name  string
+		input string
+		want  string // TS 输出
+	}{
+		// Rule A: JS /m 的 ^/$ 在裸 CR 处也断行，且 . 不跨 CR。
+		{"heading_cr", "### a\rb", "**a**\rb"},
+		{"heading_crlf", "### a\r\nb", "**a**\nb"},
+		{"heading_cr_after_hash_run", "###\r标题", "**标题**"},
+		{"heading_double_cr_then_next_heading", "### a\r\r#### b", "**a**\r**b**"},
+		{"heading_after_bare_cr_line_start", "a\r\r### b", "a\r\r**b**"},
+		{"heading_mixed_terminators", "### a\n\r### b\r\n#### c\r", "**a**\r**b**\n**c**"},
+		{"heading_whitespace_crossing_terminators", "### a\u3000\r\n\r\n###\ta\r\r#### 四级", "**a**\n**a**\r**四级**"},
+		{"heading_crlf_prose", "### 标题\r\n正文", "**标题**\n正文"},
+		// Rule D: 脚注定义行（\s* 可自行吃掉 CRLF）。
+		{"footdef_crlf_trailing", "[^1]: x\r\n", "**[1]** x\r\n"},
+		{"footdef_ws_crossing_crlf", "[^1]:\r\nbody", "**[1]** body"},
+		{"footdef_bare_cr", "[^1]:x\rb", "**[1]** x\rb"},
+		// 表格：JS 的 . 不跨 CR，含裸 CR 的单元格保持原样（不转 bullet）。
+		{"table_cr_cell_untouched", "| a\rb | c |\n| - | - |\n| 1 | 2 |\n", "| a\rb | c |\n| - | - |\n| 1 | 2 |\n"},
+		{"table_crlf_untouched", "| a | b |\r\n| - | - |\r\n| 1 | 2 |\r\n", "| a | b |\r\n| - | - |\r\n| 1 | 2 |\r\n"},
+		{"table_row_greedy_partial", "| a | b |\n| - | - |\n| 1 | 2\r |\n", "- 1\n 2\r |\n"},
+		// Rule F：CRLF/CR 行尾使 TS 的围栏状态机不触发，只有 F2 去缩进生效。
+		{"fence_glued_crlf_untouched", "正文```\r\ncode\r\n```\r\n", "正文```\r\ncode\r\n```\r\n"},
+		{"fence_glued_cr_untouched", "正文```\rcode\r```\r", "正文```\rcode\r```\r"},
+		// Rule B / E / C：行内规则在 CRLF/CR 上下文中照常生效。
+		{"image_crlf_trailing", "![logo](https://x.com/a.png)\r\n", "logo https://x.com/a.png\r\n"},
+		{"link_crlf_trailing", "[label](https://x.com)\r\n", "label https://x.com\r\n"},
+		{"footref_crlf", "正文[^n1]引用\r\n", "正文[n1]引用\r\n"},
+		{"image_crlf_broken_span_untouched", "![alt](https://x.com\r\n)", "![alt](https://x.com\r\n)"},
+		// Rule G：闭合 ** 后的换行不能被当作需要补空格的后续文本。
+		{"bold_crlf_untouched", "**实际用法举个例子：**\r\n女儿", "**实际用法举个例子：**\r\n女儿"},
+		{"bold_cr_untouched", "**实际用法举个例子：**\r女儿", "**实际用法举个例子：**\r女儿"},
+		{"inline_code_and_bold_crlf", "行内 `**a：**b` 不变，但**实际用法：**例子要补空格\r\n", "行内 `**a：**b` 不变，但**实际用法：** 例子要补空格\r\n"},
+		// 混合行终止符 + 全流程。
+		{"inline_code_before_crlf_heading", "`code`\r\n### t\r\n", "`code`\r\n**t**"},
+		{"mixed_document", "### 标题\r\n| a | b |\n| - | - |\n| 1 | 2 |\n\r\n[^x]: 定义\r\n", "**标题**\n- **1** — b: 2\n\r\n**[x]** 定义\r\n"},
+		{"crlf_report_output_untouched", "**三、为什么 `none` 没加成**```\r\n$ magpie\r\n```\r\n", "**三、为什么 `none` 没加成**```\r\n$ magpie\r\n```\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pipeline(tt.input); got != tt.want {
+				t.Fatalf("pipeline(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDocumentedDeviations_U2028U2029(t *testing.T) {
+	// 仍需文档化、不计划修的 U+2028 / U+2029 分歧（README 条目 6、8）。
+	tests := []struct {
+		name  string
+		input string
+		want  string // 当前 Go 输出（与 TS 不一致）
+	}{
+		{"6_heading_u2029", "### a\u2029b", "**a\u2029b**"},
+		{"8a_link_with_u2028", "[a\u2028b](https://x.com)", "a\u2028b https://x.com"},
+		{"8b_image_with_u2028", "![a\u2028b](https://x.com/a.png)", "a\u2028b https://x.com/a.png"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pipeline(tt.input); got != tt.want {
 				t.Fatalf("pipeline(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})

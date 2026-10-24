@@ -46,20 +46,55 @@ const (
 	// jsWhitespaceClass defines the character class for regexes mirroring JavaScript \s:
 	// [\t\n\f\r\v \x{00a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]
 	jsWhitespaceClass = `[\t\n\f\r\v \x{00a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]`
+
+	// jsLineStart mirrors JavaScript's multiline ^ (pattern flag m) for LF and CR.
+	//
+	// JS ^ matches at the start of input and right after any line terminator
+	// (\n, \r, \u2028, \u2029); Go's (?m)^ only breaks on \n. The bare CR is
+	// covered here by consuming it in capture group 1; callers re-emit that group
+	// verbatim, so the net byte stream is unchanged (the anchor stays zero-width).
+	// A CR inside "\r\n" needs no alternative: the position between \r and \n is
+	// followed by \n, which no rule can start with. U+2028/U+2029 stay out of
+	// scope (documented deviation).
+	jsLineStart = `(?:^|(\r))`
+
+	// jsLineEnd mirrors JavaScript's multiline $ (pattern flag m) for LF and CR.
+	//
+	// JS $ matches before any line terminator and at the end of input; Go's (?m)$
+	// only breaks on \n. RE2 has no lookahead either, so the only way to express
+	// "$ before a line terminator" is to consume that terminator in capture group 4.
+	// replaceWithJSLines compensates for the consumption: it never rewrites that
+	// group and resumes scanning on the terminator itself, which is exactly where
+	// JS's zero-width $ leaves the cursor (see the helper's comment). Because the
+	// preceding \s* can itself swallow a terminator (JS \s contains \r and \n), the
+	// resulting bytes still match TS -- e.g. "### a\r\n" -> "**a**" (the CRLF is
+	// eaten by \s*), not "**a**\r\n". U+2028/U+2029 stay out of scope (documented
+	// deviation).
+	jsLineEnd = `(\r\n|\r|\n|\z)`
+
+	// jsDot mirrors JavaScript's unescaped . in the same scope: JS . never matches
+	// \n or \r, while Go's . matches every byte except \n.
+	jsDot = `[^\n\r]`
 )
 
 var (
-	// tableRe matches markdown tables: header row + separator + data rows
-	// Matches TS no-tables.ts:286 with LF (\n); CRLF inputs are left untouched.
-	reTable = regexp.MustCompile(`(?m)^(\|.+\|)\n(\|[-| :]+\|)\n((?:\|.+\|\n?)+)`)
+	// tableRe matches markdown tables: header row + separator + data rows.
+	// Mirrors TS no-tables.ts:286 `/^(\|.+\|)\n(\|[-| :]+\|)\n((?:\|.+\|\n?)+)/gm`:
+	// JS multiline ^ also breaks after a bare CR, and JS . never crosses \r, so a
+	// CRLF table never matches here (the row separator demands a bare \n).
+	reTable = regexp.MustCompile(`(?m)` + jsLineStart + `(\|` + jsDot + `+\|)\n(\|[-| :]+\|)\n((?:\|` + jsDot + `+\|\n?)+)`)
 
 	// Glued fence lookbehind/tail matcher:
 	// A line ending with a glued fence: non-delimiter character + optional spaces + fence (3+) + optional tag + optional spaces
 	// End pattern [ \t]*$ matches TS no-tables.ts:110 lookahead (?:\r?\n|$); CRLF lines ending with \r do not match.
 	reGluedTail = regexp.MustCompile(`([^\n` + "`" + `~ \t>])[ \t]*(` + "`" + `{3,}|~{3,})([ \t]*[A-Za-z0-9_+.\-]*[ \t]*)$`)
 
-	// Fenced code block opener
-	reOpenFence = regexp.MustCompile(`^( {0,3})(` + "`" + `{3,}|~{3,})(.*)$`)
+	// Fenced code block opener.
+	// Mirrors TS no-tables.ts:124 `/^( {0,3})(`{3,}|~{3,})(.*)$/` (no m flag, JS .
+	// never crosses \r, JS $ is end-of-input). A line still carrying a CRLF's \r
+	// therefore does NOT open a block in TS -- and must not in Go either, or the
+	// fence state machine dedents lines TS leaves alone.
+	reOpenFence = regexp.MustCompile(`^( {0,3})(` + "`" + `{3,}|~{3,})(` + jsDot + `*)$`)
 
 	// Fenced code block closer matching TS no-tables.ts:87 [ \t]*$
 	reCloseFence = regexp.MustCompile(`^( {0,3})(` + "`" + `{3,}|~{3,})[ \t]*$`)
@@ -67,11 +102,18 @@ var (
 	// Fenced code blocks for splitting prose and code (matching TS no-tables.ts:46)
 	reFencedBlock = regexp.MustCompile("(```[\\s\\S]*?```|~~~[\\s\\S]*?~~~)")
 
-	// Rule A: h3-h6 headers to bold line (using JS \s equivalent character class)
-	reHeading = regexp.MustCompile(`(?m)^(#{3,6})` + jsWhitespaceClass + `+(.+?)` + jsWhitespaceClass + `*#*` + jsWhitespaceClass + `*$`)
+	// Rule A: h3-h6 headers to bold line.
+	// Mirrors TS no-tables.ts:167 `/^(#{3,6})\s+(.+?)\s*#*\s*$/gm` -- JS multiline ^
+	// also breaks after a bare CR, JS . never crosses \r, and JS $ also breaks
+	// before a bare CR (Go's (?m)$ only breaks on \n). Only patching . to [^\n\r]
+	// is not enough: without the CR-aware $, "### a\rb" would still be read as one
+	// heading (Go) instead of a heading plus trailing text (TS).
+	reHeading = regexp.MustCompile(`(?m)` + jsLineStart + `(#{3,6})` + jsWhitespaceClass + `+(` + jsDot + `+?)` + jsWhitespaceClass + `*#*` + jsWhitespaceClass + `*` + jsLineEnd)
 
-	// Rule D: Footnote definition lines (using JS \s equivalent character class)
-	reFootDef = regexp.MustCompile(`(?m)^\[\^([^\]]+)\]:` + jsWhitespaceClass + `*(.+)$`)
+	// Rule D: Footnote definition lines.
+	// Mirrors TS no-tables.ts:170 `/^\[\^([^\]]+)\]:\s*(.+)$/gm` under the same
+	// CR-aware ^/$/. mapping as Rule A.
+	reFootDef = regexp.MustCompile(`(?m)` + jsLineStart + `\[\^([^\]]+)\]:` + jsWhitespaceClass + `*(` + jsDot + `+)` + jsLineEnd)
 
 	// Rule C: Footnote references
 	reFootRef = regexp.MustCompile(`\[\^([^\]]+)\]`)
@@ -118,45 +160,65 @@ func isBoldFollowingNonSpace(r rune) bool {
 
 // ConvertTables converts markdown tables into bullet lists.
 func ConvertTables(md string) string {
-	return reTable.ReplaceAllStringFunc(md, func(match string) string {
-		sub := reTable.FindStringSubmatch(match)
-		if len(sub) < 4 {
-			return match
+	matches := reTable.FindAllStringSubmatchIndex(md, -1)
+	if len(matches) == 0 {
+		return md
+	}
+
+	var sb strings.Builder
+	lastIndex := 0
+	for _, m := range matches {
+		sb.WriteString(md[lastIndex:m[0]])
+		sb.WriteString(jsCaptured(md, m, 1)) // consumed CR restored (see jsLineStart)
+		sb.WriteString(convertTableMatch(md[m[4]:m[5]], md[m[8]:m[9]]))
+		lastIndex = m[1]
+	}
+	sb.WriteString(md[lastIndex:])
+	return sb.String()
+}
+
+// jsCaptured returns the text captured by group n (1-based), or "" when the
+// group did not participate in the match.
+func jsCaptured(text string, m []int, n int) string {
+	start, end := m[2*n], m[2*n+1]
+	if start < 0 || end < 0 {
+		return ""
+	}
+	return text[start:end]
+}
+
+// convertTableMatch renders one matched table (header row + body block) as bullets.
+func convertTableMatch(headerLine, bodyBlock string) string {
+	headers := splitCells(headerLine)
+	trimmedBody := strings.TrimSpace(bodyBlock)
+	lines := strings.Split(trimmedBody, "\n")
+
+	var bullets []string
+	for _, line := range lines {
+		row := splitCells(line)
+		label := ""
+		if len(row) > 0 {
+			label = strings.TrimSpace(row[0])
 		}
-		headerLine := sub[1]
-		bodyBlock := sub[3]
-
-		headers := splitCells(headerLine)
-		trimmedBody := strings.TrimSpace(bodyBlock)
-		lines := strings.Split(trimmedBody, "\n")
-
-		var bullets []string
-		for _, line := range lines {
-			row := splitCells(line)
-			label := ""
-			if len(row) > 0 {
-				label = strings.TrimSpace(row[0])
-			}
-			var details []string
-			for i := 1; i < len(headers) && i < len(row); i++ {
-				h := strings.TrimSpace(headers[i])
-				v := strings.TrimSpace(row[i])
-				if v != "" {
-					if h != "" {
-						details = append(details, fmt.Sprintf("%s: %s", h, v))
-					} else {
-						details = append(details, v)
-					}
+		var details []string
+		for i := 1; i < len(headers) && i < len(row); i++ {
+			h := strings.TrimSpace(headers[i])
+			v := strings.TrimSpace(row[i])
+			if v != "" {
+				if h != "" {
+					details = append(details, fmt.Sprintf("%s: %s", h, v))
+				} else {
+					details = append(details, v)
 				}
 			}
-			if len(details) > 0 {
-				bullets = append(bullets, fmt.Sprintf("- **%s** — %s", label, strings.Join(details, ", ")))
-			} else if label != "" {
-				bullets = append(bullets, fmt.Sprintf("- %s", label))
-			}
 		}
-		return strings.Join(bullets, "\n") + "\n"
-	})
+		if len(details) > 0 {
+			bullets = append(bullets, fmt.Sprintf("- **%s** — %s", label, strings.Join(details, ", ")))
+		} else if label != "" {
+			bullets = append(bullets, fmt.Sprintf("- %s", label))
+		}
+	}
+	return strings.Join(bullets, "\n") + "\n"
 }
 
 func splitCells(line string) []string {
@@ -317,12 +379,87 @@ func joinWithCodeRanges(segments []string) (string, []CodeSpanRange) {
 	return sb.String(), codeRanges
 }
 
+// replaceWithJSLines applies a JavaScript /gm-style replacement to text.
+//
+// re must start with jsLineStart (group 1) and end with jsLineEnd (group
+// termGroup). JS anchors are zero-width, but RE2 has no lookbehind/lookahead, so
+// the only way to say "$ before a line terminator" is to consume that terminator.
+// This helper undoes that consumption on both sides of the match:
+//
+//   - the consumed terminator is not rewritten and stays in the output verbatim;
+//   - scanning resumes on the terminator itself, which is exactly where JS's
+//     zero-width $ leaves the cursor.
+//
+// Resuming matters: "###\ta\r\r#### b" makes the trailing \s* swallow one \r and
+// $ sit before the second one. If the scan skipped past the second \r, the
+// following heading (whose ^ is the position after that \r) would be missed and
+// Go would disagree with TS.
+func replaceWithJSLines(text string, re *regexp.Regexp, termGroup int, render func(group func(int) string) string) string {
+	var sb strings.Builder
+	written := 0
+	searchFrom := 0
+
+	for searchFrom <= len(text) {
+		offset := searchFrom
+		m := re.FindStringSubmatchIndex(text[offset:])
+		if m == nil {
+			break
+		}
+		for i := range m {
+			if m[i] >= 0 {
+				m[i] += offset
+			}
+		}
+
+		termStart := m[2*termGroup]
+		if termStart < 0 {
+			termStart = m[1]
+		}
+		if termStart <= m[0] {
+			break // no forward progress; cannot happen for the rules below
+		}
+
+		sb.WriteString(text[written:m[0]])
+		sb.WriteString(jsCaptured(text, m, 1)) // bare CR the ^ anchor consumed
+		sb.WriteString(render(func(n int) string { return jsCaptured(text, m, n) }))
+		written = termStart
+		searchFrom = termStart
+	}
+
+	sb.WriteString(text[written:])
+	return sb.String()
+}
+
+// replaceHeadingLines applies Rule A with JavaScript /gm anchor semantics.
+//
+// TS: text.replace(/^(#{3,6})\s+(.+?)\s*#*\s*$/gm, "**$2**")
+//
+// The Go regexp carries jsLineStart (group 1, a consumed bare CR), the heading
+// run (group 2), the heading text (group 3) and jsLineEnd (group 4, a consumed
+// line terminator).
+func replaceHeadingLines(text string) string {
+	return replaceWithJSLines(text, reHeading, 4, func(group func(int) string) string {
+		return "**" + group(3) + "**"
+	})
+}
+
+// replaceFootnoteDefinitions applies Rule D with JavaScript /gm anchor semantics.
+//
+// TS: text.replace(/^\[\^([^\]]+)\]:\s*(.+)$/gm, "**[$1]** $2")
+// Group layout matches replaceHeadingLines: 1 = consumed bare CR, 2 = footnote
+// id, 3 = definition body, 4 = consumed line terminator.
+func replaceFootnoteDefinitions(text string) string {
+	return replaceWithJSLines(text, reFootDef, 4, func(group func(int) string) string {
+		return "**[" + group(2) + "]** " + group(3)
+	})
+}
+
 func applyMarkdownRules(text string) string {
 	// Rule A: h3-h6 headers to bold line
-	text = reHeading.ReplaceAllString(text, "**$2**")
+	text = replaceHeadingLines(text)
 
 	// Rule D: Footnote definition lines
-	text = reFootDef.ReplaceAllString(text, "**[$1]** $2")
+	text = replaceFootnoteDefinitions(text)
 
 	// Split by inline backtick code spans (`...`) after line-anchored rules (A, D)
 	segments := splitByInlineCode(text)
