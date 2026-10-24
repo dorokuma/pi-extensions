@@ -12,7 +12,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 
 批次推进概要（详见 [go/PLAN.md](PLAN.md)）：
 - 第 0 批：并行环境搭建（PiG 部署、隔离配置目录、仓库骨架）
-- 第 1 批：小件扩展移植（gemini-safety、herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish、pi-context-pruning）
+- 第 1 批：小件扩展移植（herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish、pi-context-pruning；gemini-safety 已弃用并删除）
 - 第 2 批：中件扩展移植（moshi-hooks、ctxmode、jev-gate、ctx-orchestrate、auto-continue、codegraph-go）
 - 第 3 批：界面类扩展移植（cache-stats、pi-my-compact-ui）
 - 第 4 批：大件扩展移植（pi-vcc、rpiv-ask-user-question、herdsman-pi 扩展侧）
@@ -25,7 +25,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 
 1. **架构构成**：
    - **根 Module**（`go.mod`：`github.com/dorokuma/pi-extensions/go`）：负责管理工程根脚手架、Makefile 仓级门禁、构建验证工具及公共库（如 `internal/version`）。
-   - **组件嵌套 Module**（`go/<name>/go.mod`）：每个移植的扩展组件均拥有独立的根级子目录与独立的 `go.mod`（例如 `go/gemini-safety/go.mod` 声明 `module github.com/dorokuma/pi-extensions/go/gemini-safety`），每个组件子目录自身就是一个独立的 PiG 扩展。
+   - **组件嵌套 Module**（`go/<name>/go.mod`）：每个移植的扩展组件均拥有独立的根级子目录与独立的 `go.mod`（例如 `go/no-tables/go.mod` 声明 `module github.com/dorokuma/pi-extensions/go/no-tables`），每个组件子目录自身就是一个独立的 PiG 扩展。
 
 2. **为什么组件必须自带 `go.mod`**：
    - 依据 PiG 扩展加载规范（只读参考仓 `/root/workspace/ref/PiG` 中的 `docs/extension-authoring.md:346`，PiG 源码检出，不在本仓内），PiG 在扫描扩展目录时，依据目录中是否存在 `go.mod`（或 `Cargo.toml`、Python factory 等）判定其为一个独立的语言扩展单元，且仅加载扩展根目录自身。若没有独立的 `go.mod`，PiG 将无法将其作为 Go 扩展正确识别与加载。
@@ -44,7 +44,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 ## 目录约定与纪律
 
 - 复合 Module 架构：根 Module（Go 1.26.0）管理脚手架与通用包，各组件为独立嵌套 Module。
-- 组件独立目录：每个移植组件在 `go/` 根目录下拥有独立的子目录（如 `gemini-safety`）。
+- 组件独立目录：每个移植组件在 `go/` 根目录下拥有独立的子目录（如 `no-tables`）。
 - **受 `pi-extensions` 仓库的 `AGENTS.md` 铁律约束**：
   - 提交时**只 add `go/`**，绝不夹带仓内已有未提交改动（如 `extensions/exclude-tools-guard/` 下的未提交修改）。
   - **绝不写 `herdr-agent-state.ts`**（由 herdr 二进制托管）。

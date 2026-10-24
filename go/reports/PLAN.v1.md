@@ -41,6 +41,8 @@
 
 gemini-safety(49)、herdr-agent-state(261)、exclude-tools-guard(279)、no-tables(317)、pi-env(237)、pi-tinyfish(621，`@tiny-fish/sdk` 改成直接 HTTP 调用)、pi-context-pruning(218)。
 
+（2026-10-24 注：gemini-safety 已弃用并删除）
+
 注意：exclude-tools-guard 在 pi-extensions 仓库里有未提交改动，以 `/root/.pi/agent/extensions/` 里实际在用的版本为准，差异写进报告。
 
 ## 3. 第 2 批：中件（约 6300 行）

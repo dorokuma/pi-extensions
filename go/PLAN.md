@@ -41,7 +41,7 @@
 
 ## 2. 第 1 批：小件（约 2000 行 TS）
 
-gemini-safety(49)、herdr-agent-state(261)、exclude-tools-guard(279)、no-tables(317)、pi-env(237)、pi-tinyfish(621，`@tiny-fish/sdk` 改成直接 HTTP 调用)、pi-context-pruning(218)。
+herdr-agent-state(261)、exclude-tools-guard(279)、no-tables(317)、pi-env(237)、pi-tinyfish(621，`@tiny-fish/sdk` 改成直接 HTTP 调用)、pi-context-pruning(218)（共 6 件；gemini-safety 已弃用、已删除：pi 只走喜鹊 openai/anthropic 格式，Gemini 2.5+ 四类内容过滤默认即 Off，`safetySettings` 注入已无意义）。
 
 注意：exclude-tools-guard 在 pi-extensions 仓库里有未提交改动，以 `/root/.pi/agent/extensions/` 里实际在用的版本为准，差异写进报告。
 
