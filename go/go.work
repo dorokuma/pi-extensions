@@ -4,6 +4,7 @@ go 1.26.0
 // 作用是让本地 go build/vet/test 能把 github.com/MichaelKinsy/PiG/extensions/sdk 解析到 go/pigsdk。
 use (
 	.
+	./auto-continue
 	./exclude-tools-guard
 	./herdr-agent-state
 	./no-tables
