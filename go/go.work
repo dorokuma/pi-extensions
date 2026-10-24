@@ -5,6 +5,7 @@ go 1.26.0
 use (
 	.
 	./auto-continue
+	./ctx-orchestrate
 	./exclude-tools-guard
 	./herdr-agent-state
 	./no-tables
