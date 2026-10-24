@@ -2,7 +2,10 @@
 
 ## 概况
 全局工具排除守卫：在**所有**会话（交互 TUI、`--print`、`-p`、`--mode json`、RPC、恢复旧会话）
-中把 `grep` / `find` / `ls` / `bash` 从活动工具里反复过滤掉，强制走 CodeGraph、`ctx_fs`、`ctx_run`。
+中把 `grep` / `find` / `ls` / `bash` 从活动工具里反复过滤掉，强制走 CodeGraph、`ctx_fs`、`ctx_run`；
+对子代理会话（`isSubagentSession() === true`）额外剔除 `jev_check` / `ask_user_question`，并在
+`before_agent_start` 阶段清空主代理专用 `APPEND_SYSTEM.md`（清空 `appendSystemPrompt` 并从
+先序扩展可能已写入的 `forceSystemPrompt` 中精确剥离对应的 `<addendum>` 段落）。
 `session_start` 与 `before_agent_start` 两个时机各兜底一次——后者专门防「会话恢复中途被激活」
 与「其他扩展把内置工具重新激活」。
 
@@ -23,12 +26,13 @@ for read-only roles"）。
 - 来源：2026-10-06 16:05 手写于部署目录（迁移当日补位），同日纳管回本仓；内容一字未改。
 
 ## 纳管时的一致性记录
-- 部署值（2026-10-08 子代理身份加固后）：md5 `9f448d58bb6c056d2041441b61ba26ed`
-- 字节数：`11704`（263 行）
-- 与部署副本逐字节一致（2026-10-09 回仓时 `cmp` 校验）；`bash install.sh --audit` 该项 `MATCH`。
+- 部署值（2026-10-22 子代理 APPEND_SYSTEM.md 隔离加固后）：md5 `30722dbb05328b63a2cb87729072b7a0`
+- 字节数：`12450`（279 行）
+- 与部署副本逐字节一致；`bash install.sh --audit` 该项 `MATCH`。
 - 历史沿革：纳管初值 `5d4edb821255e3d4ad66e96ecac97633` / `968` 字节（迁移当日补位版）→
-  2026-10-08 加固后为上值（新增 `SUBAGENT-IDENTITY` 块 + 子代理会话额外剔除
-  `jev_check` / `ask_user_question`）。
+  2026-10-08 加固后为 `9f448d58bb6c056d2041441b61ba26ed` / `11704` 字节（新增 `SUBAGENT-IDENTITY` 块 + 子代理会话额外剔除
+  `jev_check` / `ask_user_question`）→
+  2026-10-22 加固后为上值（子代理 `before_agent_start` 阶段清空 `appendSystemPrompt` 并精确剥离 `forceSystemPrompt` 中的 `<addendum>` 块）。
 - `SUBAGENT-IDENTITY` 块与 `extensions/jev-gate/src/jev-gate.ts` 中的同名块**逐字节一致**，校验命令：
   `diff <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/jev-gate/src/jev-gate.ts) \
        <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/exclude-tools-guard/src/exclude-tools-guard.ts)`

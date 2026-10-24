@@ -9,9 +9,10 @@ import net from "node:net";
  * 保证在所有会话（交互式 TUI、--print、-p、--mode json、RPC、恢复旧会话等）中，
  * 彻底排除 grep, find, ls, bash 等工具，强制走 CodeGraph、ctx_fs、ctx_run。
  *
- * 子代理会话（C1）额外强制剔除主代理专用工具 jev_check 与 ask_user_question：
- * 派发层已用 --exclude-tools 传这两个名字，但 `herdr agent start --kind pi` 与直接跑
- * bin/pi 的旁路不带该旗标，故在此按会话身份运行期兜底。
+ * 子代理会话（C1）额外强制剔除主代理专用工具 jev_check 与 ask_user_question，
+ * 并清空主代理专用 APPEND_SYSTEM.md（addendum 段）：
+ * 派发层已用 --exclude-tools 与 --append-system-prompt '' 传参，但 `herdr agent start --kind pi`
+ * 与直接跑 bin/pi 的旁路不带这些旗标，故在此按会话身份运行期兜底。
  */
 
 // ===== SUBAGENT-IDENTITY-BEGIN =====
@@ -240,8 +241,9 @@ export default function (pi: ExtensionAPI) {
   /** 子代理会话额外剔除：jev_check 是喂给主代理的门禁信号，ask_user_question 是面向用户的问询通道。 */
   const SUBAGENT_EXCLUDED_TOOLS = new Set(["jev_check", "ask_user_question"]);
 
-  const enforceExclusions = async (): Promise<void> => {
-    const excluded = (await isSubagentSession())
+  const enforceExclusions = async (): Promise<boolean> => {
+    const isSubagent = await isSubagentSession();
+    const excluded = isSubagent
       ? new Set([...EXCLUDED_TOOLS, ...SUBAGENT_EXCLUDED_TOOLS])
       : EXCLUDED_TOOLS;
     const currentActive = pi.getActiveTools();
@@ -249,6 +251,7 @@ export default function (pi: ExtensionAPI) {
     if (filtered.length !== currentActive.length) {
       pi.setActiveTools(filtered);
     }
+    return isSubagent;
   };
 
   // 会话启动时生效（身份判定 fail-closed，见上面 SUBAGENT-IDENTITY 块）
@@ -256,8 +259,21 @@ export default function (pi: ExtensionAPI) {
     await enforceExclusions();
   });
 
-  // 每个 turn 开始时二次兜底（防止子代理或会话恢复中途被激活）
-  pi.on("before_agent_start", async () => {
-    await enforceExclusions();
+  // 每个 turn 开始时二次兜底（防止子代理或会话恢复中途被激活，并剥离主代理专用 APPEND_SYSTEM.md）
+  pi.on("before_agent_start", async (event) => {
+    const isSubagent = await enforceExclusions();
+    if (!isSubagent) return;
+    const leakedAppend = event.systemPromptOptions.appendSystemPrompt;
+    event.systemPromptOptions.appendSystemPrompt = "";
+    if (
+      leakedAppend &&
+      event.systemPromptOptions.forceSystemPrompt !== undefined
+    ) {
+      const addendumBlock = `<addendum>\n${leakedAppend}\n</addendum>`;
+      event.systemPromptOptions.forceSystemPrompt =
+        event.systemPromptOptions.forceSystemPrompt
+          .replaceAll(`\n\n${addendumBlock}`, "")
+          .replaceAll(addendumBlock, "");
+    }
   });
 }
