@@ -329,6 +329,22 @@ export interface PrematureStopFacts {
 
 type Verdict = { ok: true; reason: string } | { ok: false; reason: string };
 
+/**
+ * 一轮「继续」的调度相位，与 Go 版 `go/auto-continue/state.go` 的
+ * continueIdle / continueArmed / continueChecking / continueCommitted 一一对应。
+ * TS 是单线程，所以这不是锁，而是把「裸 ESC 的观察 + cancelPending」与
+ * 「timer 回调的发送」之间的先后关系写成可判定的状态：
+ *
+ *   idle      — 本代没有已排队的继续；
+ *   armed     — 代号已递增，timer 正在装入（必须在同一个同步段内先置位）；
+ *   checking  — 本代 timer 已触发，正在跑宿主前置检查，**仍可取消**；
+ *   committed — 回调已认领本次发送，之后的 ESC 不得声称取消了本轮。
+ *
+ * 代号已不符的旧回调一律不碰这些状态：否则它会把新一代的 timer 引用清掉
+ * （ESC 就再也取消不了新一代、只能眼看它发出去），或在取消之后照发。
+ */
+type ContinuePhase = "idle" | "armed" | "checking" | "committed";
+
 /** content 归一成块数组：不是数组（旧数据）就当空。 */
 function asBlocks(content: unknown): ContentBlockLike[] {
   return Array.isArray(content) ? (content as ContentBlockLike[]) : [];
@@ -645,6 +661,8 @@ export default function (pi: ExtensionAPI) {
   let lastMessages: AssistantLike[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   let generation = 0;
+  /** 本代「继续」的调度相位（见 ContinuePhase）；generation 定身份，相位定可取消性。 */
+  let continuePhase: ContinuePhase = "idle";
   /**
    * R3：压缩期标志。`ctx.isIdle()` 只看 `_isAgentRunActive`，压缩中被判成 idle，
    * 所以只能用扩展事件 session_before_compact / session_compact 自己维护。
@@ -688,6 +706,9 @@ export default function (pi: ExtensionAPI) {
 
   const cancelPending = () => {
     generation += 1;
+    // 代号与相位在同一个同步段里一起作废：此后任何依靠旧代号/旧相位的回调
+    // 都既不能发送，也不能动新一代的 timer。
+    continuePhase = "idle";
     if (timer) {
       clearTimeout(timer);
       timer = undefined;
@@ -809,7 +830,11 @@ export default function (pi: ExtensionAPI) {
     const ctx = terminalCtx;
     if (!ctx) return;
 
-    if (timer) {
+    // R2：本轮已有可取消的继续（armed / checking）→ 只取消本轮。相位是这里
+    // 唯一的判据：ESC 的观察与 cancelPending 在同一个同步段完成，所以回调在
+    // 宿主检查里重入 ESC 也照样取消；已经 committed 的发送不在此列——那时
+    // ESC 不得声称取消了本轮（真实的 abort 走下面的 isIdle 分支）。
+    if (continuePhase === "armed" || continuePhase === "checking") {
       cancelPending();
       clearStatus(ctx);
       try {
@@ -995,6 +1020,83 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ===========================================================================
+  // 计时器取消的线性化：四相位（idle / armed / checking / committed）
+  // ===========================================================================
+
+  /** 本代尝试的收尾：代号已被替换时不碰新一代的相位。 */
+  const finishContinue = (token: number) => {
+    if (token === generation) continuePhase = "idle";
+  };
+
+  /**
+   * 本代 timer 到期后的发送路径（就是原来内联的 setTimeout 回调），四相位在这里
+   * 收口，与 Go 版 `fireContinue` 同构：
+   *
+   * 1. 代号不符的旧回调**什么都不碰**。它可能是被取代那一代已经排出、甚至已经
+   *    触发但还没轮到执行的 callback（台架用假 scheduler 强制构造这种重放；Pi
+   *    1.4.0 在线 Node 事件调度下未观察到、也未证明可达），而此刻 `timer` 很可能
+   *    已经是新一代的 timer；在这种交错成立的前提下，这里把它清掉，ESC 就看不到
+   *    新一代，只能在 delayMs 后眼看它把「继续」发出去。
+   * 2. 通过代号检查后本代进入 checking：宿主前置检查（isIdle / hasPendingMessages /
+   *    getEditorText）期间保持可取消身份——ESC 的观察与 cancelPending 是同一个
+   *    同步段，取消先赢就不发（这段重入由台架的同步宿主 hook 模拟）。
+   * 3. 前置检查全部通过后**再查一次代号**（防御性复查：宿主方法里可能重入 ESC /
+   *    命令 / 会话切换；台架以同步 hook 模拟，在线是否发生未证），然后进入
+   *    committed 并落定 streak / selfSending，才真正发送；committed 之后的 ESC
+   *    不得声称取消了本轮。
+   *
+   * 单线程事实：这里没有锁，也不假装与 Go 版有同样的并发窗口——真实 TS 事件循环
+   * 里 ESC 与回调不会同时跑。相位 + 代号针对的是两种**假设性/防御性**交错（台架
+   * 强制重放已 clearTimeout 的旧回调、假宿主方法调用内部同步重入 ESC），只固化与
+   * Go 版一致的不变量：**不是** Pi 1.4.0 在线 Node 事件调度中已发生或已证明可达的
+   * 故障，也不声称所有潜在故障永久不可能（double-settled 路径尚未完整核清）。
+   */
+  const handleContinueTimer = (token: number, attempt: number, ctx: ExtensionContext) => {
+    if (token !== generation) return;
+    // 本代自己的 timer 已经触发；引用落地后，相位由本函数负责推进与收尾。
+    timer = undefined;
+    continuePhase = "checking";
+
+    if (!enabled) {
+      finishContinue(token);
+      return;
+    }
+    // 与 agent_settled 同一套判定：锁未解 / 压缩中 / 非 idle / 有排队消息 /
+    // 输入框有草稿，任何一种都不发。
+    if (userCancelled || compacting) {
+      finishContinue(token);
+      clearStatus(ctx);
+      return;
+    }
+    if (!ctx.isIdle() || ctx.hasPendingMessages() || editorHasDraft(ctx)) {
+      finishContinue(token);
+      clearStatus(ctx);
+      return;
+    }
+
+    // 宿主方法可能重入（ESC handler、/auto-continue off、会话切换都会走
+    // cancelPending → generation++）：发送前必须复查代号，不能在可重入调用之后
+    // 无复查地继续。
+    if (token !== generation) return;
+
+    // 发送认领：此后 ESC 读到的相位是 committed，不得声称取消成功。
+    continuePhase = "committed";
+    streak = attempt;
+    // 标记「下一次 agent_start / before_agent_start 是本扩展自己发的继续」，
+    // 免得它把 userCancelled 当成用户手动发消息给解除掉。
+    selfSending = true;
+    // ExtensionAPI.sendUserMessage 声明为返回 void（SendUserMessageHandler 同），
+    // 实际实现是 fire-and-forget：内部 `void session.prompt().catch(→ runner.emitError)`，
+    // 失败只会以扩展错误事件的形式冒出来，同步 try/catch 是死代码，这里直接调用。
+    pi.sendUserMessage(CONTINUE_PROMPT);
+    // 注意：这里不能立刻把 selfSending 置回 false —— input handler 可能在
+    // sendUserMessage 调用内部同步执行，before_agent_start 等后续步骤则经异步
+    // continuation 推进；标志要保留到既有入口消费到它，不能在发送后立即复位。
+    clearStatus(ctx);
+    finishContinue(token);
+  };
+
   pi.on("agent_settled", async (_event, ctx) => {
     if (!enabled) return;
 
@@ -1067,6 +1169,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     const token = ++generation;
+    // 与 Go 版对齐：在 timer 装入**之前**、同一个同步段里把本代标成 armed。
+    // 下面的 setStatus / notify 是宿主调用，可能重入（ESC handler、命令、会话切换
+    // 都会走 cancelPending → generation++）；没有这一步时那段时间里 ESC 看不到
+    // 任何 pending 身份、取消不了，之后 timer 照样装上。
+    continuePhase = "armed";
     const attempt = streak + 1;
     const wait = delayMs;
     const reason = verdict.reason;
@@ -1083,33 +1190,12 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
-    timer = setTimeout(() => {
-      timer = undefined;
-      if (token !== generation) return;
-      if (!enabled) return;
-      // 与 agent_settled 同一套判定：锁未解 / 压缩中 / 非 idle / 有排队消息 /
-      // 输入框有草稿，任何一种都不发。
-      if (userCancelled || compacting) {
-        clearStatus(ctx);
-        return;
-      }
-      if (!ctx.isIdle() || ctx.hasPendingMessages() || editorHasDraft(ctx)) {
-        clearStatus(ctx);
-        return;
-      }
-
-      streak = attempt;
-      // 标记「下一次 agent_start / before_agent_start 是本扩展自己发的继续」，
-      // 免得它把 userCancelled 当成用户手动发消息给解除掉。
-      selfSending = true;
-      // ExtensionAPI.sendUserMessage 声明为返回 void（SendUserMessageHandler 同），
-      // 实际实现是 fire-and-forget：内部 `void session.prompt().catch(→ runner.emitError)`，
-      // 失败只会以扩展错误事件的形式冒出来，同步 try/catch 是死代码，这里直接调用。
-      pi.sendUserMessage(CONTINUE_PROMPT);
-      // 注意：这里不能立刻把 selfSending 置回 false —— input / before_agent_start
-      // 事件在 sendUserMessage 返回之后的微任务里才派发，标志要留到那里被消费。
-      clearStatus(ctx);
-    }, wait);
+    // 宿主调用之后复查代号与相位：arm 窗口里已被取消的那一轮不得再装 timer。
+    if (token === generation && continuePhase === "armed") {
+      timer = setTimeout(() => {
+        handleContinueTimer(token, attempt, ctx);
+      }, wait);
+    }
   });
 
   pi.registerCommand("auto-continue", {

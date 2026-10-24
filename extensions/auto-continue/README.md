@@ -47,6 +47,31 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
 运行期内按 `esc` 中止的语义见源码顶部 v2 注释（`userCancelled` 锁的收敛范围与 pi 事件
 模型的限制）。
 
+**计时器取消的四相位（与 Go 版对齐）**：一轮「继续」的调度相位显式记为
+`idle` / `armed` / `checking` / `committed`（源码 `ContinuePhase`，对应
+`go/auto-continue/state.go` 的 `continueIdle` / `continueArmed` / `continueChecking` /
+`continueCommitted`）。该 Go 路径是当前同工作树开发中的实现，仅作设计对照：Go 移植
+独立提交，本 TS 扩展运行不依赖 Go 源码；这里只作纯文本路径引用，不建远端链接。
+
+- `armed`：`agent_settled` 里代号递增后**先于 timer 装入**、在同一个同步段置位；
+  `setStatus` / `notify` 这段宿主调用里重入的裸 ESC 因此仍能取消，之后才复查代号与
+  相位决定是否装 timer。
+- `checking`：本代 timer 已触发、正在跑宿主前置检查（`isIdle` /
+  `hasPendingMessages` / `getEditorText`）。这段时间里本代保持可取消身份——ESC 的
+  观察与 `cancelPending` 同一个同步段完成，取消先赢就不发；前置检查之后再查一次
+  代号，宿主方法重入（ESC / `/auto-continue off` / 会话切换）造成的取消不会被无
+  复查地越过。
+- `committed`：发送认领。此刻之后的 ESC 不得声称「已取消本轮自动继续」——真实
+  abort 仍走 `isIdle` 分支的 `markUserAbort`（「已按 esc 中止」）。
+- 代号已不符的旧回调**什么都不碰**：不再 `timer = undefined`，因此不会清掉新一代的
+  timer 引用（旧实现会，导致 ESC 看不到新一代、`delayMs` 后照发）。
+
+单线程事实：TS 没有并行线程，这些相位不是锁，也不声称与 Go 版共享并发窗口；它把
+两种**假设性/防御性**交错（已排出/已排队旧回调被台架强制重放、宿主方法调用内由同步
+hook 重入 ESC）写成可判定状态，只固化与 Go 版一致的不变量——**不是** Pi 1.4.0 在线
+Node 事件调度已发生或已证明可达的故障，也不声称所有潜在故障永久不可能（double-settled
+路径尚未完整核清）。Go 版额外覆盖的 goroutine 并行窗口在 TS 里不存在，不做类比。
+
 ## 权威源 / 目标 / 来源
 - 权威源（本仓，唯一）：`extensions/auto-continue/src/auto-continue.ts`
   （绝对路径 `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts`）
@@ -64,9 +89,16 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
 | 2026-10-04 | 收纳纳管（逐字副本） | `4341280ec027415bf7b9276d965a49e7` | `29714` | 与部署副本 `cmp` 一致 |
 | 2026-10-04 | v3：新增早衰 stop 自动续跑分支（`isPrematureStop` + 两道闸） | `cb50578c13d98e3875e239b1fcc4b364` | `44035` | `install.sh auto-continue` 部署 + `--audit` MATCH（`cmp` 与部署副本逐字节一致） |
 | 2026-10-04 | v3.1：闸 A 新增 run 时长并列条件（`RUN_ACTIVE_MIN_MS`，无工具活动的长任务早衰不再永久假阴性，理由码更名 `premature:no-activity-evidence`）+ `blockText` 字符串 content 防御兼容；措辞按双审口径改为「放行集扩大、仍要求至少一条活动证据」 | `8d5c33da9ffce60f400ed73f90df32e1` | `46766` | `install.sh auto-continue` 部署 + `--audit` MATCH（`cmp` 与部署副本逐字节一致） |
+| 2026-10-24 | 计时器取消线性化（四相位 `idle`/`armed`/`checking`/`committed`，与 Go 版 `go/auto-continue/state.go` 对齐）：旧代号回调不再触碰新一代 timer；宿主前置检查期间保持可取消；发送前复查代号；commit 之后 ESC 不谎称取消。新增 `test/auto-continue-timer-race.test.mjs`（7 用例）。同日按主代理审查只改注释措辞（「真实可达」→ 台架强制重放的假设性交错；另校正 `selfSending` 与 input 时序说明），执行逻辑与测试断言零改动（AST / 去注释 token 比较 IDENTICAL） | `55775e1fda107b4da9704c007d33b7b8` | `52326` | `tsc --noEmit` exit 0；`node --test extensions/auto-continue/test/auto-continue-timer-race.test.mjs` 7/7 PASS exit 0；2026-10-24 经 `install.sh auto-continue` 同步部署（源/部署 md5 一致 `55775e1fda107b4da9704c007d33b7b8`、`cmp` 0、`52326` 字节），`--audit` MATCH；**未** `/reload`、**未**重启，当前 pi 仍用原已加载逻辑，新代码等下次 pi 启动加载；本TS修复按独立提交归档，不与Go移植混入同一提交 |
 
-（改动后的 md5 / 字节数同时由 `bash install.sh --audit` 复核：auto-continue 行
-`MATCH — unchanged`，即仓内副本与部署副本一致。）
+（`MATCH — unchanged` 是 `install.sh` 的同步校验记录：2026-10-24 本阶段已执行
+`bash install.sh auto-continue`，源与部署副本 md5 同为 `55775e1fda107b4da9704c007d33b7b8`、
+`cmp` 0、各 `52326` 字节，只读 `bash install.sh --audit` 亦打印 `MATCH — unchanged`。
+**未** `/reload`、**未**重启任何 pi：当前运行中的 pi 仍使用它启动时加载的原逻辑，新代码
+要等下次 pi 启动才加载；本TS修复按独立提交归档，不与Go移植混入同一提交。历史基线 md5
+`8d5c33da9ffce60f400ed73f90df32e1` / `46766` 字节仍是备份
+`auto-continue.ts.bak-20261024-pre-timer-race` 的当前内容——该备份按 AGENTS.md #6 原样保留，
+**不等于**新版本，在 `--audit` 中属预期 `historical backup` WARN。）
 
 ## 出处与许可
 - **作者声明为自研，未经第三方独立核实。** 本仓不做独立溯源，也不代其声明任何许可证
@@ -79,6 +111,7 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
 2. `pnpm setup && bash install.sh auto-continue` 后，`/reload` 或新会话生效。
 
 ## 自检（v3.1 早衰 stop 分支）
+
 冒烟脚本（假消息对象 / 假 ExtensionAPI + 假时钟，均在 `/tmp`，未入仓）：
 - `node /tmp/auto-continue-smoke.mjs`：32 组断言——thinking-only 命中、冒号/逗号/顿号/
   分号/未闭合代码块/markdown 标题/裸列表项/省略号命中、完整段落收尾不误伤、带 toolCall
@@ -92,3 +125,23 @@ busy（R3 看门狗）、输入框草稿、非 idle / 有排队消息这几道�
   `maxAttempts` 上限停手、`PI_AUTO_CONTINUE=0` 关闭时不续；S9 无工具活动但 run > 90s
   的 thinking-only 早衰也续、S10 无工具活动且 run ≤ 90s（闸 B 已过）不续。
 - `node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json`：exit 0。
+
+## 自检（计时器取消：四相位回归）
+```bash
+node --test extensions/auto-continue/test/auto-continue-timer-race.test.mjs
+```
+7 个用例全 PASS、exit 0：T1（已排出但被取消的旧回调不得动新一代 timer，重放后 ESC
+仍能取消新代，最终 send 为 0）、T2（`isIdle` / `hasPendingMessages` / `getEditorText`
+三个宿主重入点各自重入裸 ESC：checking 仍可取消、send 0、`streak` 不增、取消通知准确）、
+T3a（armed 窗口内重入 ESC：取消先赢，timer 不被装上、重放也不发送）、T3b（commit 先赢：
+之后的 ESC 不得谎称取消，也不补发）。
+
+台架读**真实权威源** `src/auto-continue.ts`，用 `typescript.transpileModule` 编成 CJS
+后在当前 realm 执行，只注入 ExtensionAPI / ExtensionContext polyfill、假 fs（配置写不
+到真实 home）、假 env、假 scheduler，驱动 `session_start` / `agent_end` /
+`agent_settled` / `onTerminalInput` 这些真实入口；不跑 pi、不读用户配置、不 sleep。
+
+对照「修复前红」：`AUTO_CONTINUE_SRC=<修复前只读副本> node --test <同一条命令>`。
+基线（md5 `8d5c33da9ffce60f400ed73f90df32e1`）上 T1 / T2×3 / T3a FAIL（实质断言失败，
+非编译错误），T3b PASS——「发送已 commit 后 ESC 不谎称取消」在原实现本来就正确，
+本次只是把它固化成不变量。
