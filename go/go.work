@@ -9,6 +9,7 @@ use (
 	./exclude-tools-guard
 	./herdr-agent-state
 	./jev-gate
+	./moshi-hooks
 	./no-tables
 	./pi-context-pruning
 	./pi-env
