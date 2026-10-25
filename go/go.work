@@ -18,4 +18,5 @@ use (
 	./pi-env
 	./pi-tinyfish
 	./pigsdk
+	./rpiv-ask-user-question
 )
