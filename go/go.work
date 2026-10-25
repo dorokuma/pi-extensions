@@ -16,6 +16,7 @@ use (
 	./no-tables
 	./pi-context-pruning
 	./pi-env
+	./pi-my-compact-ui
 	./pi-tinyfish
 	./pigsdk
 )
