@@ -5,6 +5,7 @@ go 1.26.0
 use (
 	.
 	./auto-continue
+	./cache-stats
 	./codegraph-go
 	./ctx-orchestrate
 	./ctxmode
