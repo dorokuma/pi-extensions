@@ -20,4 +20,5 @@ use (
 	./pi-tinyfish
 	./pi-vcc
 	./pigsdk
+	./rpiv-ask-user-question
 )
