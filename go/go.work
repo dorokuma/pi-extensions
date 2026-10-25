@@ -17,5 +17,6 @@ use (
 	./pi-context-pruning
 	./pi-env
 	./pi-tinyfish
+	./pi-vcc
 	./pigsdk
 )
