@@ -18,5 +18,6 @@ use (
 	./pi-env
 	./pi-my-compact-ui
 	./pi-tinyfish
+	./pi-vcc
 	./pigsdk
 )
