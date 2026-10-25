@@ -9,9 +9,9 @@ settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
 `tools.*` / `searchTools()` 可达；`namespace: ctxmode`，`describeNamespace("ctxmode")`
 读 instructions）：
 
-| 工具 | 嵌套调用 | 输出（outputSchema → structuredContent） |
+| 工具（codemode 内调用形式，非顶层） | 嵌套调用 | 输出（outputSchema → structuredContent） |
 |---|---|---|
-| `ctx_search_digest(patterns[], path?, glob?, max_hits?, …)` | 并发多个 `ctx_fs` action=rg（有界并发 4） | `{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary, errors?}` |
+| `tools.ctx_search_digest({ patterns: ["foo", "bar"], max_hits: 50 })`（对象参数；**只在 codemode 脚本内调用**，它不是模型顶层工具，不能顶层调用，也不要输出裸 `<tool_call>` 文本） | 并发多个 `ctx_fs` action=rg（有界并发 4） | `{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary, errors?}` |
 
 该工具沿用既有纪律：`annotations.readOnlyHint=true`、`outputSchema` + `structuredContent`
 与 text 双通道返回、`ctx.executeTool()` 嵌套调用的失败防御（`Promise.allSettled`
@@ -43,9 +43,19 @@ settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
   本仓是其唯一权威源，此前不存在任何副本。
 
 ## 纳管时的一致性记录
-- md5：`0e33386a7178868cbefe31969f08720b`
-- 字节数：`25394`（613 行）
-- 部署副本由 `bash install.sh ctx-orchestrate` 依 md5 幂等同步；`--audit` 报 `MATCH`。
+
+> **纳管时历史快照（非当前内容）**：下面三项 md5 / 字节数 / 行数与「`--audit` 报 `MATCH`」
+> 只描述该记录书写时点的内容（已核实等于本仓基线提交里那份 25394 字节 / 613 行的文件，
+> 亦即改前备份 `/root/.pi/agent/extensions/ctx-orchestrate.ts.bak-20261025-digest-hint`）。
+> 其后源码只改过**提示文字**：2026-10-25 把 `ctx_search_digest` 的调用说明收口为「只在
+> codemode 脚本内以 `tools.ctx_search_digest({...})` 调用、不裸顶层调用、不输出裸
+> `<tool_call>` 文本」，本 README 的调用示例也改为可直接复制的具体对象；当前内容以文件
+> 本身为准。本轮按任务禁用 `install.sh` 与 `--audit`，未跑巡检，故**不得**据本节声称
+> 当前仍是 `MATCH`。
+
+- md5：`0e33386a7178868cbefe31969f08720b`（纳管时历史快照）
+- 字节数：`25394`（613 行，纳管时历史快照）
+- 部署副本由 `bash install.sh ctx-orchestrate` 依 md5 幂等同步；`--audit` 报 `MATCH`（同为该时点的记录）。
 - 历史沿革：纳管初值为 `bc486f54…`/42681 字节，vitest 计数补丁后为
   `e9127d93…`/44253 字节，oracle 应修项 2（marker 携带 `details.fullOutputPath`，双审
   应修收口）后为 `280f7767…`/45076 字节；各版均依 `install.sh` 同步且 `cmp` 逐字节一致。

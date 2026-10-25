@@ -42,6 +42,7 @@ func namespace() *sdk.ToolNamespace {
 		Description: "ctxmode 组合工具：把多路 ctx_fs 检索压成一次调用，自带跨模式去重、按文件聚合与部分失败降级。",
 		Instructions: strings.Join([]string{
 			"ctx_search_digest 是组合工具：内部并发多个 ctx_fs rg 并自行聚合，调用方只拿摘要与结构化结果（outputSchema → structuredContent）。",
+			"调用方式：只能在 codemode 脚本内以 tools.ctx_search_digest({...}) 调用（exposure=codemode，不在模型顶层声明），不要顶层调用，也不要输出裸 <tool_call> 文本。",
 			"中间过程克制：不要在脚本里 text()/console.log 大段原始输出；用返回值做判断即可。",
 			"最终报告完整：结束脚本前给出结构化结论（计数 + 关键路径 + 一句下一步）。",
 			"失败容忍：部分失败不进异常，而是落在 structuredContent.errors / .failures / isError；先看这些字段再决定重试或降级。",
@@ -147,7 +148,8 @@ func Extension() *sdk.Extension {
 			"{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary}. Read-only.",
 		PromptSnippet: "Multi-pattern search aggregated per file",
 		PromptGuidelines: []string{
-			"Use ctx_search_digest for several patterns at once instead of one rg call per pattern.",
+			"Use tools.ctx_search_digest({...}) inside codemode for several patterns at once instead of one rg call per pattern.",
+			"Call it only from inside codemode as tools.ctx_search_digest({...}): it is not declared as a top-level model tool, so never invoke it top-level and never emit a bare <tool_call> text block.",
 			"Keep patterns concrete (identifiers, not '.*'); it returns excerpts, not file reads.",
 		},
 		Parameters:   searchDigestSchema(),
