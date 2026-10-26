@@ -17,7 +17,7 @@ import (
 // fake uiContext standing in for the host.
 
 // startedRuntime builds a runtime whose session_start has run against a fake UI.
-func startedRuntime(t *testing.T) (*runtimeState, *fakeUI, *fakeTUI) {
+func startedRuntime(t testing.TB) (*runtimeState, *fakeUI, *fakeTUI) {
 	t.Helper()
 	r := testRuntime(t)
 	ui := newFakeUI()

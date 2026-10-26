@@ -207,7 +207,7 @@ func (f *fakeUI) lastInputHandler() func(string) terminalInputVerdict {
 // ── runtime fixtures ───────────────────────────────────────────────────────
 
 // testRuntime builds a runtime state with a deterministic clock and no host.
-func testRuntime(t *testing.T) *runtimeState {
+func testRuntime(t testing.TB) *runtimeState {
 	t.Helper()
 	r := createRuntimeState()
 	r.spinnerStartMs = 0

@@ -37,6 +37,12 @@ type toolGroupComponent struct {
 	mount *container
 	// rendered caches the last rendered lines (Container caches too).
 	rendered []string
+	// renderedWidth / renderedSpinIndex key the cache so an animation tick that
+	// only advances the spinner frame rebuilds when the glyph changes, and a
+	// host Working-tick re-render with the same frame is O(1).
+	renderedWidth     int
+	renderedSpinIndex int
+	renderedAnchored  bool
 }
 
 // newToolGroup builds a group. TS names it
@@ -114,6 +120,7 @@ func (g *toolGroupComponent) addToolAt(tool *toolComponent, now int64) {
 	}
 	tool.owner = g
 	g.entries = append(g.entries, groupEntry{kind: "tool", tool: tool})
+	g.invalidateLocked()
 }
 
 // addThinking is addThinking (L854-859): idempotent, a run belongs to exactly
@@ -131,6 +138,7 @@ func (g *toolGroupComponent) addThinkingLocked(entry *thinkingEntry) {
 	}
 	entry.owner = g
 	g.entries = append(g.entries, groupEntry{kind: "thinking", think: entry})
+	g.invalidateLocked()
 }
 
 // addNotice is addNotice (L860-865). It takes mu itself.
@@ -350,7 +358,11 @@ func (g *toolGroupComponent) invalidate() {
 }
 
 // invalidateLocked is invalidate for a caller that holds mu.
-func (g *toolGroupComponent) invalidateLocked() { g.rendered = nil }
+func (g *toolGroupComponent) invalidateLocked() {
+	g.rendered = nil
+	g.renderedWidth = 0
+	g.renderedSpinIndex = -1
+}
 
 // Render implements component.
 func (g *toolGroupComponent) Render(width int) []string { return g.renderWidth(width) }
@@ -687,35 +699,83 @@ func anyEntry(entries []groupEntry, pred func(groupEntry) bool) bool {
 // event handler may be appending an entry, so entries/children/anchored must be
 // read under the lock. scheduleAnimation is called after mu is released, because
 // it takes the lock itself and is a host-facing step.
+//
+// rendered caches the padded lines keyed by width and spinner frame index so a
+// host Working-tick that re-enters with the same frame is cheap; invalidate
+// drops the cache when content changes.
 func (g *toolGroupComponent) renderWidth(width int) []string {
 	g.tui.mu.Lock()
 	visible := g.visibleEntriesLocked()
 	if len(visible) == 0 {
+		g.rendered = nil
 		g.tui.mu.Unlock()
 		return nil
 	}
 	wantAnimation := g.needsAnimationLocked()
+	spinIndex := g.animationSpinIndexLocked(wantAnimation)
+	anchored := g.anchored
+	if g.rendered != nil && g.renderedWidth == width && g.renderedSpinIndex == spinIndex && g.renderedAnchored == anchored {
+		out := g.rendered
+		g.tui.mu.Unlock()
+		if wantAnimation {
+			g.tui.scheduleAnimation()
+		}
+		return out
+	}
 	paddingCount := minInt(groupPaddingX, maxInt(0, width-1))
 	padding := strings.Repeat(" ", paddingCount)
 	contentWidth := maxInt(1, width-paddingCount-groupPaddingRight)
 	lines := g.renderCollapsed(contentWidth, visible)
-	anchored := g.anchored
-	g.tui.mu.Unlock()
-
-	if wantAnimation {
-		g.tui.scheduleAnimation()
-	}
 	if len(lines) == 0 {
+		g.rendered = nil
+		g.tui.mu.Unlock()
+		if wantAnimation {
+			g.tui.scheduleAnimation()
+		}
 		return nil
 	}
 	rendered := make([]string, len(lines))
 	for i, line := range lines {
 		rendered[i] = padding + tui.TruncateToWidth(line, contentWidth, "...", false)
 	}
-	if anchored {
-		return rendered
+	if !anchored {
+		rendered = append([]string{""}, rendered...)
 	}
-	return append([]string{""}, rendered...)
+	g.rendered = rendered
+	g.renderedWidth = width
+	g.renderedSpinIndex = spinIndex
+	g.renderedAnchored = anchored
+	g.tui.mu.Unlock()
+
+	if wantAnimation {
+		g.tui.scheduleAnimation()
+	}
+	return rendered
+}
+
+// animationSpinIndexLocked is the spinner frame index that keyed the render
+// cache. Non-animating groups use -1 so a later animation start cannot reuse
+// a still frame by accident.
+func (g *toolGroupComponent) animationSpinIndexLocked(animating bool) int {
+	if !animating {
+		return -1
+	}
+	now := g.tui.nowMsLocked()
+	start := g.tui.spinnerStartMs
+	if g.hasPendingLocked() {
+		index := int((now - start) / spinnerMs)
+		index %= len(spinnerFrames)
+		if index < 0 {
+			index += len(spinnerFrames)
+		}
+		return index
+	}
+	index := int((now - start) / thinkingSpinnerIntervalMs)
+	index %= len(thinkingSpinnerFrames)
+	if index < 0 {
+		index += len(thinkingSpinnerFrames)
+	}
+	return index
 }
 
 // maxInt / minInt are the small integer helpers the porters share.

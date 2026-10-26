@@ -90,8 +90,11 @@ func (r *runtimeState) terminalRows() int {
 }
 
 // scheduleAnimation is scheduleAnimation (L769-785): one pending tick that
-// re-renders while any group still animates. The tick re-arms itself through
-// the next render, so a group that stops animating ends the chain.
+// keeps animating groups moving. The tick invalidates the host display tool
+// card (or falls back to requestRender when none is registered) and re-arms
+// itself through the next render, so a group that stops animating ends the
+// chain. It deliberately avoids a blanket requestRender when a card hook
+// exists: that full redraw races the host Working spinner (see the tick body).
 func (r *runtimeState) scheduleAnimation() {
 	r.mu.Lock()
 	if r.animTimer != nil {
@@ -138,19 +141,41 @@ func (r *runtimeState) scheduleAnimation() {
 		if r.animTimer == timer {
 			r.animTimer = nil
 		}
-		// Snapshot under the lock; needsAnimation reads the runtime state
-		// itself, so it runs after mu is released (never nested under it).
+		// Prefer host tool-card Invalidate over capturedTui.requestRender.
+		// A full requestRender races the host Working StatusIndicator's ~80ms
+		// tick (interactive_layout.go tickStatusIndicators -> tui.Render) and
+		// forces another walk of the conversation; that is what makes the
+		// editor-border "Working" spinner stutter when compact-ui is on.
+		// Invalidating only the display tool card marks it dirty so the host's
+		// next (already scheduled) frame rebuilds just that card. Fall back to
+		// requestRender only when no card Invalidate hook is registered (tests,
+		// or a thinking-only group with no host tool card yet).
 		groups := r.groupsListLocked()
 		tui := r.capturedTui
-		r.mu.Unlock()
+		var invalidates []func()
 		any := false
 		for _, group := range groups {
-			if group.needsAnimation() {
-				any = true
-				break
+			if !group.needsAnimationLocked() {
+				continue
+			}
+			any = true
+			group.invalidateLocked()
+			if len(group.children) == 0 {
+				continue
+			}
+			display := group.children[len(group.children)-1]
+			if display == nil || display.toolCallID == "" {
+				continue
+			}
+			if fn := r.toolCardInvalidate[display.toolCallID]; fn != nil {
+				invalidates = append(invalidates, fn)
 			}
 		}
-		if any {
+		r.mu.Unlock()
+		for _, fn := range invalidates {
+			fn()
+		}
+		if any && len(invalidates) == 0 {
 			requestRender(tui)
 		}
 	}()
