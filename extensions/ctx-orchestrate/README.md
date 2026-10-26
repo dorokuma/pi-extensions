@@ -11,7 +11,7 @@ settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
 
 | 工具（codemode 内调用形式，非顶层） | 嵌套调用 | 输出（outputSchema → structuredContent） |
 |---|---|---|
-| `tools.ctx_search_digest({ patterns: ["foo", "bar"], max_hits: 50 })`（对象参数；**只在 codemode 脚本内调用**，它不是模型顶层工具，不能顶层调用，也不要输出裸 `<tool_call>` 文本） | 并发多个 `ctx_fs` action=rg（有界并发 4） | `{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary, errors?}` |
+| `tools.ctx_search_digest({ patterns: ["foo", "bar"], max_hits: 50 })`（对象参数；**在 codemode 脚本内调用**） | 并发多个 `ctx_fs` action=rg（有界并发 4） | `{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary, errors?}` |
 
 该工具沿用既有纪律：`annotations.readOnlyHint=true`、`outputSchema` + `structuredContent`
 与 text 双通道返回、`ctx.executeTool()` 嵌套调用的失败防御（`Promise.allSettled`
@@ -48,8 +48,7 @@ settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
 > 只描述该记录书写时点的内容（已核实等于本仓基线提交里那份 25394 字节 / 613 行的文件，
 > 亦即改前备份 `/root/.pi/agent/extensions/ctx-orchestrate.ts.bak-20261025-digest-hint`）。
 > 其后源码只改过**提示文字**：2026-10-25 把 `ctx_search_digest` 的调用说明收口为「只在
-> codemode 脚本内以 `tools.ctx_search_digest({...})` 调用、不裸顶层调用、不输出裸
-> `<tool_call>` 文本」，本 README 的调用示例也改为可直接复制的具体对象；当前内容以文件
+> codemode 脚本内以 `tools.ctx_search_digest({...})` 调用」，本 README 的调用示例也改为可直接复制的具体对象；当前内容以文件
 > 本身为准。本轮按任务禁用 `install.sh` 与 `--audit`，未跑巡检，故**不得**据本节声称
 > 当前仍是 `MATCH`。
 
