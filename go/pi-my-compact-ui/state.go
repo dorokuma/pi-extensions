@@ -101,6 +101,10 @@ type runtimeState struct {
 	assistantContentCont   map[*container]bool
 	assistantContentStates map[*container]*assistantContentState
 	groupAnchors           map[*toolGroupComponent]*groupAnchor
+	// toolCardInvalidate holds the host Invalidate callback for each tool card
+	// the ToolRenderer has drawn. When a tool joins a group, sibling cards are
+	// invalidated so only the group's display tool keeps painting.
+	toolCardInvalidate map[string]func()
 }
 
 // createRuntimeState is createRuntimeState (L9-46).
@@ -118,6 +122,7 @@ func createRuntimeState() *runtimeState {
 		groupOrder:             []*toolGroupComponent{},
 		assistantContentCont:   map[*container]bool{},
 		assistantContentStates: map[*container]*assistantContentState{},
+		toolCardInvalidate:     map[string]func(){},
 		groupAnchors:           map[*toolGroupComponent]*groupAnchor{},
 	}
 }

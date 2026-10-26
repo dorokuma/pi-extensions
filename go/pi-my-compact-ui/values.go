@@ -207,13 +207,82 @@ func toolSummary(name string, args map[string]any) toolSummaryValue {
 	case "codemode":
 		return toolSummaryValue{name: "codemode", content: oneLine(argsString(args, "code", "..."), -1)}
 	default:
-		for _, key := range []string{"path", "query", "name", "description", "url"} {
+		// TS prefers path/query/name/description/url. PiG sessions often use
+		// ctx_run (command/argv/commands/action/code) instead of bash, so the
+		// fallback also surfaces those fields for a one-line card summary.
+		for _, key := range []string{"path", "query", "name", "description", "url", "command", "code"} {
 			if value, ok := args[key]; ok && value != nil {
-				return toolSummaryValue{name: name, content: oneLine(jsString(value), -1)}
+				if text := strings.TrimSpace(jsString(value)); text != "" {
+					return toolSummaryValue{name: name, content: oneLine(text, -1)}
+				}
 			}
+		}
+		if joined := argvJoined(args["argv"]); joined != "" {
+			return toolSummaryValue{name: name, content: oneLine(joined, -1)}
+		}
+		if cmd := firstCommandsSummary(args["commands"]); cmd != "" {
+			return toolSummaryValue{name: name, content: oneLine(cmd, -1)}
+		}
+		if action := strings.TrimSpace(argsString(args, "action", "")); action != "" {
+			return toolSummaryValue{name: name, content: oneLine(action, -1)}
 		}
 		return toolSummaryValue{name: name, content: oneLine("...", -1)}
 	}
+}
+
+// argvJoined joins a ctx_run-style argv list into one summary line.
+func argvJoined(value any) string {
+	switch items := value.(type) {
+	case []any:
+		parts := make([]string, 0, len(items))
+		for _, item := range items {
+			s, ok := item.(string)
+			if !ok || s == "" {
+				continue
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(parts, " ")
+	case []string:
+		parts := make([]string, 0, len(items))
+		for _, s := range items {
+			if s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
+}
+
+// firstCommandsSummary picks a readable preview from a ctx_run commands list.
+func firstCommandsSummary(value any) string {
+	switch items := value.(type) {
+	case []any:
+		for _, item := range items {
+			switch entry := item.(type) {
+			case string:
+				if text := strings.TrimSpace(entry); text != "" {
+					return text
+				}
+			case map[string]any:
+				if text := strings.TrimSpace(argsString(entry, "command", "")); text != "" {
+					return text
+				}
+				if text := strings.TrimSpace(argsString(entry, "label", "")); text != "" {
+					return text
+				}
+			}
+		}
+	case []string:
+		for _, entry := range items {
+			if text := strings.TrimSpace(entry); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 // toolSummaryValue is the `{ name, content }` pair toolSummary returns.

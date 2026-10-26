@@ -106,11 +106,41 @@ func isVisibleTextMarkdown(value component) bool {
 
 // hideGroupedToolRender is hideGroupedToolRender (L1084-1094): the TS patches
 // ToolExecutionComponent.prototype.render so a grouped tool renders nothing.
-// The port folds that into toolComponent.Render (component.go), so this
-// function only records the patch state for the README mapping.
+// The port folds that into toolComponent.Render (component.go) for the
+// in-process tree, and into toolRenderLines (extension.go) for the PiG host
+// ToolRenderer path: non-display grouped cards return no lines so the host
+// hides them (renderShell "self" + empty content).
 func hideGroupedToolRender(tool *toolComponent) {
 	if tool == nil {
 		return
 	}
-	// Nothing to install: Render already returns no lines while owner != nil.
+	// Nothing to install on the prototype: host cards are hidden by
+	// toolRenderLines when the tool has an owner and is not the group's
+	// display tool. toolComponent.Render already returns nil while owner != nil.
+}
+
+// isGroupHostDisplayToolLocked reports whether this tool is the one host card
+// that should paint the whole group. The caller holds mu. The last child is
+// the display tool so newly added calls take over the tree as they stream in.
+func isGroupHostDisplayToolLocked(group *toolGroupComponent, tool *toolComponent) bool {
+	if group == nil || tool == nil || len(group.children) == 0 {
+		return false
+	}
+	return group.children[len(group.children)-1] == tool
+}
+
+// groupHasTreeLocked reports whether the group needs the multi-entry tree
+// (header + rail). A lone tool entry keeps the single-row card shape.
+func groupHasTreeLocked(group *toolGroupComponent) bool {
+	if group == nil {
+		return false
+	}
+	visible := group.visibleEntriesLocked()
+	if len(visible) > 1 {
+		return true
+	}
+	if len(visible) == 1 && visible[0].kind != "tool" {
+		return true
+	}
+	return false
 }

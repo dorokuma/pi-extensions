@@ -286,6 +286,10 @@ func TestToolSummary(t *testing.T) {
 		{"generic name", "mystery", map[string]any{"name": "n"}, toolSummaryValue{"mystery", "n"}},
 		{"generic description", "mystery", map[string]any{"description": "d"}, toolSummaryValue{"mystery", "d"}},
 		{"generic url", "mystery", map[string]any{"url": "u"}, toolSummaryValue{"mystery", "u"}},
+		{"generic command", "ctx_run", map[string]any{"action": "execute", "command": "git status"}, toolSummaryValue{"ctx_run", "git status"}},
+		{"generic argv", "ctx_run", map[string]any{"action": "execute", "argv": []any{"herdr", "pane", "read"}}, toolSummaryValue{"ctx_run", "herdr pane read"}},
+		{"generic commands", "ctx_run", map[string]any{"action": "batch", "commands": []any{map[string]any{"command": "gh run list"}}}, toolSummaryValue{"ctx_run", "gh run list"}},
+		{"generic action only", "ctx_run", map[string]any{"action": "execute"}, toolSummaryValue{"ctx_run", "execute"}},
 		{"generic nothing", "mystery", map[string]any{"other": 1}, toolSummaryValue{"mystery", "..."}},
 	}
 	for _, tc := range cases {

@@ -389,32 +389,55 @@ func (r *runtimeState) installToolRenderer(e *sdk.Extension) {
 		return &sdk.ToolRenderers{
 			Shell: sdk.ToolRenderShellSelf,
 			Call: func(_ sdk.Context, args map[string]any, render sdk.ToolRenderContext, width int) ([]string, error) {
-				return r.toolRenderLines(toolName, args, render, nil, width), nil
+				return r.toolRenderLines(toolName, args, render, nil, false, width), nil
 			},
-			Result: func(_ sdk.Context, result sdk.ToolRenderResult, _ sdk.ToolRenderResultOptions, render sdk.ToolRenderContext, width int) ([]string, error) {
-				text := toolRenderResultText(result)
-				return r.toolRenderLines(toolName, render.Args, render, &text, width), nil
+			Result: func(_ sdk.Context, result sdk.ToolRenderResult, options sdk.ToolRenderResultOptions, render sdk.ToolRenderContext, width int) ([]string, error) {
+				expanded := options.Expanded || render.Expanded
+				var output *string
+				if expanded {
+					text := toolRenderResultText(result)
+					output = &text
+				}
+				return r.toolRenderLines(toolName, render.Args, render, output, expanded, width), nil
 			},
 		}
 	})
 }
 
-// toolRenderLines renders one tool card: the compact row, then the output text
-// when there is any. Every state read happens under mu, so a render on the
-// host's thread cannot race an event handler.
-func (r *runtimeState) toolRenderLines(name string, args map[string]any, render sdk.ToolRenderContext, output *string, width int) []string {
+// toolRenderLines renders one host tool card. Grouped tools follow the TS
+// hideGroupedToolRender contract on the PiG ToolRenderer path: only the group's
+// display tool paints (the full tree when there are multiple entries); the
+// others return no lines so the host hides the card. Result text stays folded
+// unless the host reports Expanded (Ctrl+O).
+func (r *runtimeState) toolRenderLines(name string, args map[string]any, render sdk.ToolRenderContext, output *string, expanded bool, width int) []string {
 	if width < 1 {
 		width = 1
 	}
 	r.mu.Lock()
+	r.rememberToolCardInvalidateLocked(render)
+	existing := r.findGroupedToolByIDLocked(render.ToolCallID)
+	if existing != nil && existing.owner != nil {
+		owner := existing.owner
+		if !isGroupHostDisplayToolLocked(owner, existing) {
+			r.mu.Unlock()
+			return nil
+		}
+		if groupHasTreeLocked(owner) {
+			r.mu.Unlock()
+			return owner.Render(width)
+		}
+	}
 	group := r.lastActiveGroup
+	if existing != nil && existing.owner != nil {
+		group = existing.owner
+	}
 	if group == nil {
 		group = &toolGroupComponent{tui: r}
 	}
 	tool := r.toolRenderToolLocked(name, args, render)
 	frame := toolSpinnerFrame(r.nowMsLocked(), r.spinnerStartMs)
 	lines := []string{group.toolRowLocked("", tool, frame, width, false)}
-	if output != nil && strings.TrimSpace(*output) != "" {
+	if expanded && output != nil && strings.TrimSpace(*output) != "" {
 		inner := maxInt(1, width)
 		for _, raw := range strings.Split(strings.TrimRight(*output, "\n"), "\n") {
 			wrapped := tui.WrapTextWithAnsi(raw, inner)
@@ -427,6 +450,18 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 	}
 	r.mu.Unlock()
 	return lines
+}
+
+// rememberToolCardInvalidateLocked stores the host Invalidate hook for a card.
+// The caller holds mu.
+func (r *runtimeState) rememberToolCardInvalidateLocked(render sdk.ToolRenderContext) {
+	if render.ToolCallID == "" || render.Invalidate == nil {
+		return
+	}
+	if r.toolCardInvalidate == nil {
+		r.toolCardInvalidate = map[string]func(){}
+	}
+	r.toolCardInvalidate[render.ToolCallID] = render.Invalidate
 }
 
 // toolRenderToolLocked builds the tool component a ToolRenderContext

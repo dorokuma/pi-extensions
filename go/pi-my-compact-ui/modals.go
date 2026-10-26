@@ -365,9 +365,13 @@ func (m *detailModalComponent) renderWidth(width int) []string {
 		elapsed := "(" + tool.elapsed + ")"
 		title = fgOf(th, color, icon) + " " + fgOf(th, "toolTitle", bold(tool.name)) + " " + fgOf(th, "muted", elapsed)
 		switch {
-		case tool.name == "bash" || tool.name == "powershell":
+		case tool.name == "bash" || tool.name == "powershell" || argsString(tool.args, "command", "") != "":
 			command := argsString(tool.args, "command", "...")
 			for _, line := range tui.WrapTextWithAnsi("$ "+command, innerWidth) {
+				contentLines = append(contentLines, fgOf(th, "accent", line))
+			}
+		case tool.args != nil && argvJoined(tool.args["argv"]) != "":
+			for _, line := range tui.WrapTextWithAnsi("$ "+argvJoined(tool.args["argv"]), innerWidth) {
 				contentLines = append(contentLines, fgOf(th, "accent", line))
 			}
 		case tool.args != nil && argsString(tool.args, "path", "") != "":

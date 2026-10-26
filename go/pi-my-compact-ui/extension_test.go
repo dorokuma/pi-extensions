@@ -62,7 +62,7 @@ func TestExtensionRegistration(t *testing.T) {
 }
 
 // Test the tool renderer the factory registers draws the same compact row the
-// group draws, and appends the output text for a result (task 必修 1.2).
+// group draws. Result text stays folded unless Expanded is set.
 func TestToolRendererCompactRow(t *testing.T) {
 	r, _ := modalRuntime(t)
 	group := r.newToolGroup(0)
@@ -81,7 +81,7 @@ func TestToolRendererCompactRow(t *testing.T) {
 		ExecutionStarted: true,
 		IsPartial:        true,
 		DurationMs:       &duration,
-	}, nil, width)
+	}, nil, false, width)
 	if len(call) != 1 {
 		t.Fatalf("call lines = %d, want the single compact row", len(call))
 	}
@@ -97,23 +97,103 @@ func TestToolRendererCompactRow(t *testing.T) {
 	}
 
 	output := "127.0.0.1 localhost\n"
-	result := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
+	folded := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
 		ToolCallID:   "call-1",
 		ArgsComplete: true,
-	}, &output, width)
-	if len(result) != 2 {
-		t.Fatalf("result lines = %d, want the compact row plus the output", len(result))
+	}, &output, false, width)
+	if len(folded) != 1 {
+		t.Fatalf("folded result lines = %d, want the compact row only", len(folded))
 	}
-	if !strings.Contains(result[0], "read") {
-		t.Errorf("result row = %q, want the compact row first", result[0])
+	if strings.Contains(joinLines(folded), "127.0.0.1") {
+		t.Errorf("folded result = %q, want no output body", folded)
 	}
-	if !strings.Contains(result[1], "127.0.0.1 localhost") {
-		t.Errorf("result body = %q, want the tool output", result[1])
+
+	expanded := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
+		ToolCallID:   "call-1",
+		ArgsComplete: true,
+		Expanded:     true,
+	}, &output, true, width)
+	if len(expanded) != 2 {
+		t.Fatalf("expanded result lines = %d, want the compact row plus the output", len(expanded))
+	}
+	if !strings.Contains(expanded[0], "read") {
+		t.Errorf("expanded row = %q, want the compact row first", expanded[0])
+	}
+	if !strings.Contains(expanded[1], "127.0.0.1 localhost") {
+		t.Errorf("expanded body = %q, want the tool output", expanded[1])
 	}
 
 	// A zero width must not panic or produce a negative-width wrap.
-	if got := r.toolRenderLines("read", nil, sdk.ToolRenderContext{}, nil, 0); len(got) != 1 {
+	if got := r.toolRenderLines("read", nil, sdk.ToolRenderContext{}, nil, false, 0); len(got) != 1 {
 		t.Errorf("zero-width call lines = %d, want 1", len(got))
+	}
+}
+
+// TestToolRendererCtxRunSummary covers the one-line summary for ctx_run args.
+func TestToolRendererCtxRunSummary(t *testing.T) {
+	r, _ := modalRuntime(t)
+	args := map[string]any{"action": "execute", "command": "herdr pane read w3N:p1 --lines 40"}
+	lines := r.toolRenderLines("ctx_run", args, sdk.ToolRenderContext{
+		ToolCallID:   "ctx-1",
+		ArgsComplete: true,
+	}, nil, false, 100)
+	if len(lines) != 1 {
+		t.Fatalf("lines = %d, want 1", len(lines))
+	}
+	joined := joinLines(lines)
+	if !strings.Contains(joined, "ctx_run") {
+		t.Errorf("row = %q, want tool name", joined)
+	}
+	if !strings.Contains(joined, "herdr pane read") {
+		t.Errorf("row = %q, want command summary", joined)
+	}
+	if strings.Contains(joined, "ctx_run ...") || strings.HasSuffix(strings.TrimSpace(joined), "...") {
+		// Allow truncation ellipsis on the right, but not a bare "..." summary.
+		summary := toolSummary("ctx_run", args)
+		if summary.content == "..." {
+			t.Errorf("toolSummary content = %q, want the command", summary.content)
+		}
+	}
+}
+
+// TestToolRendererHidesGroupedNonDisplayTool covers hideGroupedToolRender on
+// the host ToolRenderer path: only the last grouped tool paints.
+func TestToolRendererHidesGroupedNonDisplayTool(t *testing.T) {
+	r, _ := modalRuntime(t)
+	group := r.newToolGroup(0)
+	first := newTestTool("call-a", "ctx_run", map[string]any{"command": "echo a"}).succeeded("a-out")
+	second := newTestTool("call-b", "ctx_run", map[string]any{"command": "echo b"}).succeeded("b-out")
+	group.addTool(first)
+	group.addTool(second)
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.mu.Unlock()
+
+	hidden := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{
+		ToolCallID:   "call-a",
+		ArgsComplete: true,
+	}, strPtr("a-out"), false, 80)
+	if hidden != nil {
+		t.Fatalf("first grouped tool lines = %v, want nil (hidden)", hidden)
+	}
+
+	shown := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{
+		ToolCallID:   "call-b",
+		ArgsComplete: true,
+	}, strPtr("b-out"), false, 80)
+	if len(shown) == 0 {
+		t.Fatal("display tool rendered no lines")
+	}
+	joined := joinLines(shown)
+	if !strings.Contains(joined, "ctx_run") {
+		t.Errorf("group render = %q, want tool rows", joined)
+	}
+	if !strings.Contains(joined, "echo a") || !strings.Contains(joined, "echo b") {
+		t.Errorf("group render = %q, want both tool summaries", joined)
+	}
+	if strings.Contains(joined, "a-out") || strings.Contains(joined, "b-out") {
+		t.Errorf("group render = %q, want folded results", joined)
 	}
 }
 

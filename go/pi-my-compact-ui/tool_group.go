@@ -65,9 +65,36 @@ func (r *runtimeState) newToolGroupLocked(nowMs int64) *toolGroupComponent {
 // addTool without a lock, and nowMs would deadlock under one.
 func (g *toolGroupComponent) addTool(tool *toolComponent) {
 	now := g.tui.nowMs()
+	keepID := ""
+	if tool != nil {
+		keepID = tool.toolCallID
+	}
 	g.tui.mu.Lock()
-	defer g.tui.mu.Unlock()
 	g.addToolAt(tool, now)
+	stale := g.siblingCardInvalidatesExceptLocked(keepID)
+	g.tui.mu.Unlock()
+	for _, invalidate := range stale {
+		invalidate()
+	}
+}
+
+// siblingCardInvalidatesExceptLocked returns host Invalidate callbacks for
+// every grouped tool card except keepID. The caller holds mu and must invoke
+// the callbacks only after unlocking (host notify must not run under mu).
+func (g *toolGroupComponent) siblingCardInvalidatesExceptLocked(keepID string) []func() {
+	if g == nil || g.tui == nil {
+		return nil
+	}
+	out := make([]func(), 0, len(g.children))
+	for _, child := range g.children {
+		if child == nil || child.toolCallID == "" || child.toolCallID == keepID {
+			continue
+		}
+		if fn := g.tui.toolCardInvalidate[child.toolCallID]; fn != nil {
+			out = append(out, fn)
+		}
+	}
+	return out
 }
 
 // addToolAt is addTool for a caller that already holds mu and has read the
