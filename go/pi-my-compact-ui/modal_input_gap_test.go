@@ -99,6 +99,9 @@ func TestHiddenGroupedCardsReturnNoLines(t *testing.T) {
 			blank++
 		} else if len(lines) == 0 {
 			t.Fatal("display card rendered no lines")
+		} else if lines[0] == "" {
+			// ShellSelf prepends its own blank; the group must not also lead with one.
+			t.Fatalf("display tree starts with a blank line (would stack with ShellSelf): %q", lines[:min(3, len(lines))])
 		}
 	}
 	if blank != 4 {

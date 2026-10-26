@@ -437,7 +437,17 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 				return []string{}
 			}
 			r.mu.Unlock()
-			return owner.Render(width)
+			lines := owner.Render(width)
+			// Host renderSelfShell prepends one blank when content is non-empty
+			// (tool_execution_definition.go). A non-anchored group also starts
+			// with its own leading blank for in-chat embedding (TS path). On the
+			// PiG ToolRenderer path those stack into two blank rows above the
+			// group header; drop the group's copy so ShellSelf owns the single
+			// separator (report3: blanks <= 1).
+			if len(lines) > 0 && lines[0] == "" {
+				lines = lines[1:]
+			}
+			return lines
 		}
 	}
 	if resultPhase {
