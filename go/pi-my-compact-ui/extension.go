@@ -388,8 +388,11 @@ func (r *runtimeState) installToolRenderer(e *sdk.Extension) {
 	e.ToolRenderer(func(toolName string, _ func() *sdk.ToolRenderers) *sdk.ToolRenderers {
 		return &sdk.ToolRenderers{
 			Shell: sdk.ToolRenderShellSelf,
+			// The host ToolExecution card concatenates Call lines then Result
+			// lines into one shell. Only Call paints the compact row / group
+			// tree; Result adds expanded output body (or nothing when folded).
 			Call: func(_ sdk.Context, args map[string]any, render sdk.ToolRenderContext, width int) ([]string, error) {
-				return r.toolRenderLines(toolName, args, render, nil, false, width), nil
+				return r.toolRenderLines(toolName, args, render, nil, false, width, false), nil
 			},
 			Result: func(_ sdk.Context, result sdk.ToolRenderResult, options sdk.ToolRenderResultOptions, render sdk.ToolRenderContext, width int) ([]string, error) {
 				expanded := options.Expanded || render.Expanded
@@ -398,18 +401,19 @@ func (r *runtimeState) installToolRenderer(e *sdk.Extension) {
 					text := toolRenderResultText(result)
 					output = &text
 				}
-				return r.toolRenderLines(toolName, render.Args, render, output, expanded, width), nil
+				return r.toolRenderLines(toolName, render.Args, render, output, expanded, width, true), nil
 			},
 		}
 	})
 }
 
-// toolRenderLines renders one host tool card. Grouped tools follow the TS
-// hideGroupedToolRender contract on the PiG ToolRenderer path: only the group's
-// display tool paints (the full tree when there are multiple entries); the
-// others return no lines so the host hides the card. Result text stays folded
-// unless the host reports Expanded (Ctrl+O).
-func (r *runtimeState) toolRenderLines(name string, args map[string]any, render sdk.ToolRenderContext, output *string, expanded bool, width int) []string {
+// toolRenderLines renders one host tool card phase. The host concatenates Call
+// then Result into one ShellSelf card (see ToolExecutionComponent.updateDisplay),
+// so Call owns the compact row / group tree and Result only contributes the
+// expanded output body. Grouped tools follow the TS hideGroupedToolRender
+// contract: only the group's display tool paints; the others return no lines
+// so the host hides the card. resultPhase selects the Result half.
+func (r *runtimeState) toolRenderLines(name string, args map[string]any, render sdk.ToolRenderContext, output *string, expanded bool, width int, resultPhase bool) []string {
 	if width < 1 {
 		width = 1
 	}
@@ -423,9 +427,34 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 			return nil
 		}
 		if groupHasTreeLocked(owner) {
+			// Call paints the whole tree once; Result must stay empty or the
+			// host stacks a second identical tree under the first.
+			if resultPhase {
+				r.mu.Unlock()
+				return nil
+			}
 			r.mu.Unlock()
 			return owner.Render(width)
 		}
+	}
+	if resultPhase {
+		// Single-row cards: Call already drew the row; Result only adds body.
+		if !expanded || output == nil || strings.TrimSpace(*output) == "" {
+			r.mu.Unlock()
+			return nil
+		}
+		inner := maxInt(1, width)
+		var lines []string
+		for _, raw := range strings.Split(strings.TrimRight(*output, "\n"), "\n") {
+			wrapped := tui.WrapTextWithAnsi(raw, inner)
+			if len(wrapped) == 0 {
+				lines = append(lines, "")
+				continue
+			}
+			lines = append(lines, wrapped...)
+		}
+		r.mu.Unlock()
+		return lines
 	}
 	group := r.lastActiveGroup
 	if existing != nil && existing.owner != nil {
@@ -437,17 +466,6 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 	tool := r.toolRenderToolLocked(name, args, render)
 	frame := toolSpinnerFrame(r.nowMsLocked(), r.spinnerStartMs)
 	lines := []string{group.toolRowLocked("", tool, frame, width, false)}
-	if expanded && output != nil && strings.TrimSpace(*output) != "" {
-		inner := maxInt(1, width)
-		for _, raw := range strings.Split(strings.TrimRight(*output, "\n"), "\n") {
-			wrapped := tui.WrapTextWithAnsi(raw, inner)
-			if len(wrapped) == 0 {
-				lines = append(lines, "")
-				continue
-			}
-			lines = append(lines, wrapped...)
-		}
-	}
 	r.mu.Unlock()
 	return lines
 }

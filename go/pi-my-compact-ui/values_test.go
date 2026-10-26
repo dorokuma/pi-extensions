@@ -291,6 +291,9 @@ func TestToolSummary(t *testing.T) {
 		{"generic commands", "ctx_run", map[string]any{"action": "batch", "commands": []any{map[string]any{"command": "gh run list"}}}, toolSummaryValue{"ctx_run", "gh run list"}},
 		{"generic action only", "ctx_run", map[string]any{"action": "execute"}, toolSummaryValue{"ctx_run", "execute"}},
 		{"generic nothing", "mystery", map[string]any{"other": 1}, toolSummaryValue{"mystery", "..."}},
+		{"generic first string", "mystery", map[string]any{"other": "hello-there"}, toolSummaryValue{"mystery", "hello-there"}},
+		{"jev_check task", "jev_check", map[string]any{"task": "gate_scan", "payload": "long\nbody"}, toolSummaryValue{"jev_check", "gate_scan"}},
+		{"jev_check task role", "jev_check", map[string]any{"task": "contract_lint", "role": "researcher", "payload": "x"}, toolSummaryValue{"jev_check", "contract_lint role=researcher"}},
 	}
 	for _, tc := range cases {
 		if got := toolSummary(tc.tool, tc.args); got != tc.want {

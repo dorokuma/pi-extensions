@@ -81,7 +81,7 @@ func TestToolRendererCompactRow(t *testing.T) {
 		ExecutionStarted: true,
 		IsPartial:        true,
 		DurationMs:       &duration,
-	}, nil, false, width)
+	}, nil, false, width, false)
 	if len(call) != 1 {
 		t.Fatalf("call lines = %d, want the single compact row", len(call))
 	}
@@ -100,31 +100,29 @@ func TestToolRendererCompactRow(t *testing.T) {
 	folded := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
 		ToolCallID:   "call-1",
 		ArgsComplete: true,
-	}, &output, false, width)
-	if len(folded) != 1 {
-		t.Fatalf("folded result lines = %d, want the compact row only", len(folded))
-	}
-	if strings.Contains(joinLines(folded), "127.0.0.1") {
-		t.Errorf("folded result = %q, want no output body", folded)
+	}, &output, false, width, true)
+	if folded != nil {
+		t.Fatalf("folded result lines = %v, want nil (Call owns the row)", folded)
 	}
 
-	expanded := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
+	expandedBody := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
 		ToolCallID:   "call-1",
 		ArgsComplete: true,
 		Expanded:     true,
-	}, &output, true, width)
-	if len(expanded) != 2 {
-		t.Fatalf("expanded result lines = %d, want the compact row plus the output", len(expanded))
+	}, &output, true, width, true)
+	if len(expandedBody) != 1 {
+		t.Fatalf("expanded result lines = %d, want the output body only", len(expandedBody))
 	}
-	if !strings.Contains(expanded[0], "read") {
-		t.Errorf("expanded row = %q, want the compact row first", expanded[0])
+	if !strings.Contains(expandedBody[0], "127.0.0.1 localhost") {
+		t.Errorf("expanded body = %q, want the tool output", expandedBody[0])
 	}
-	if !strings.Contains(expanded[1], "127.0.0.1 localhost") {
-		t.Errorf("expanded body = %q, want the tool output", expanded[1])
+	hostCard := append(append([]string{}, call...), expandedBody...)
+	if len(hostCard) != 2 || !strings.Contains(hostCard[0], "read") {
+		t.Errorf("host Call+Result card = %q, want row then body", hostCard)
 	}
 
 	// A zero width must not panic or produce a negative-width wrap.
-	if got := r.toolRenderLines("read", nil, sdk.ToolRenderContext{}, nil, false, 0); len(got) != 1 {
+	if got := r.toolRenderLines("read", nil, sdk.ToolRenderContext{}, nil, false, 0, false); len(got) != 1 {
 		t.Errorf("zero-width call lines = %d, want 1", len(got))
 	}
 }
@@ -136,7 +134,7 @@ func TestToolRendererCtxRunSummary(t *testing.T) {
 	lines := r.toolRenderLines("ctx_run", args, sdk.ToolRenderContext{
 		ToolCallID:   "ctx-1",
 		ArgsComplete: true,
-	}, nil, false, 100)
+	}, nil, false, 100, false)
 	if len(lines) != 1 {
 		t.Fatalf("lines = %d, want 1", len(lines))
 	}
@@ -173,17 +171,29 @@ func TestToolRendererHidesGroupedNonDisplayTool(t *testing.T) {
 	hidden := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{
 		ToolCallID:   "call-a",
 		ArgsComplete: true,
-	}, strPtr("a-out"), false, 80)
+	}, strPtr("a-out"), false, 80, false)
 	if hidden != nil {
-		t.Fatalf("first grouped tool lines = %v, want nil (hidden)", hidden)
+		t.Fatalf("first grouped tool Call lines = %v, want nil (hidden)", hidden)
+	}
+	if got := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{
+		ToolCallID:   "call-a",
+		ArgsComplete: true,
+	}, strPtr("a-out"), false, 80, true); got != nil {
+		t.Fatalf("first grouped tool Result lines = %v, want nil (hidden)", got)
 	}
 
 	shown := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{
 		ToolCallID:   "call-b",
 		ArgsComplete: true,
-	}, strPtr("b-out"), false, 80)
+	}, strPtr("b-out"), false, 80, false)
 	if len(shown) == 0 {
-		t.Fatal("display tool rendered no lines")
+		t.Fatal("display tool Call rendered no lines")
+	}
+	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{
+		ToolCallID:   "call-b",
+		ArgsComplete: true,
+	}, strPtr("b-out"), false, 80, true); got != nil {
+		t.Fatalf("display tool Result lines = %v, want nil (Call owns the tree)", got)
 	}
 	joined := joinLines(shown)
 	if !strings.Contains(joined, "ctx_run") {
@@ -194,6 +204,75 @@ func TestToolRendererHidesGroupedNonDisplayTool(t *testing.T) {
 	}
 	if strings.Contains(joined, "a-out") || strings.Contains(joined, "b-out") {
 		t.Errorf("group render = %q, want folded results", joined)
+	}
+}
+
+// TestToolRendererGroupTreeAppearsOnce concatenates every card's Call+Result
+// output for a multi-tool group and checks the group tree is painted once.
+// After the display tool switches, the previous display card returns empty.
+func TestToolRendererGroupTreeAppearsOnce(t *testing.T) {
+	r, _ := modalRuntime(t)
+	group := r.newToolGroup(0)
+	first := newTestTool("call-a", "ctx_run", map[string]any{"command": "echo a"}).succeeded("a-out")
+	second := newTestTool("call-b", "ctx_run", map[string]any{"command": "echo b"}).succeeded("b-out")
+	third := newTestTool("call-c", "ctx_run", map[string]any{"command": "echo c"}).succeeded("c-out")
+	group.addTool(first)
+	group.addTool(second)
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.mu.Unlock()
+
+	// While second is the display tool, first is hidden and second paints.
+	if got := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{ToolCallID: "call-a", ArgsComplete: true}, nil, false, 80, false); got != nil {
+		t.Fatalf("old display Call after switch = %v, want nil", got)
+	}
+	mid := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, nil, false, 80, false)
+	if len(mid) == 0 {
+		t.Fatal("second Call should paint the tree")
+	}
+
+	group.addTool(third)
+
+	// After third takes display rights, second must clear (both phases).
+	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, false); got != nil {
+		t.Fatalf("previous display Call after switch = %v, want nil", got)
+	}
+	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, true); got != nil {
+		t.Fatalf("previous display Result after switch = %v, want nil", got)
+	}
+
+	var host []string
+	for _, id := range []string{"call-a", "call-b", "call-c"} {
+		var tool *toolComponent
+		switch id {
+		case "call-a":
+			tool = first
+		case "call-b":
+			tool = second
+		default:
+			tool = third
+		}
+		host = append(host, r.toolRenderLines("ctx_run", tool.args, sdk.ToolRenderContext{ToolCallID: id, ArgsComplete: true}, strPtr(id+"-out"), false, 80, false)...)
+		host = append(host, r.toolRenderLines("ctx_run", tool.args, sdk.ToolRenderContext{ToolCallID: id, ArgsComplete: true}, strPtr(id+"-out"), false, 80, true)...)
+	}
+	joined := joinLines(host)
+	if strings.Count(joined, "echo a") != 1 || strings.Count(joined, "echo b") != 1 || strings.Count(joined, "echo c") != 1 {
+		t.Fatalf("concatenated host cards = %q, want each tool summary once", joined)
+	}
+	// Header / tree only from the display Call: one leading blank from group.Render.
+	headers := 0
+	for _, line := range host {
+		plain := tuiStrip(line)
+		if strings.Contains(plain, "tool") && (strings.Contains(plain, "calling") || strings.Contains(plain, "done") || strings.HasPrefix(strings.TrimSpace(plain), "✓") || strings.HasPrefix(strings.TrimSpace(plain), "·")) {
+			// group header lines mention state, not "ctx_run"
+			if !strings.Contains(plain, "ctx_run") {
+				headers++
+			}
+		}
+	}
+	if headers != 1 {
+		t.Fatalf("group header count = %d in %q, want 1", headers, joined)
 	}
 }
 
@@ -1625,4 +1704,23 @@ func TestPreparingToolAbsorbedThenCompleted(t *testing.T) {
 	if tui.renderCount() == 0 {
 		t.Error("the tool end should request a render")
 	}
+}
+
+func tuiStrip(s string) string {
+	var b strings.Builder
+	inEsc := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }

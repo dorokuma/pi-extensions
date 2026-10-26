@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -206,6 +207,24 @@ func toolSummary(name string, args map[string]any) toolSummaryValue {
 		return toolSummaryValue{name: "subagent", content: oneLine(argsString(args, "task", "..."), -1)}
 	case "codemode":
 		return toolSummaryValue{name: "codemode", content: oneLine(argsString(args, "code", "..."), -1)}
+	case "jev_check":
+		task := strings.TrimSpace(argsString(args, "task", ""))
+		role := strings.TrimSpace(argsString(args, "role", ""))
+		content := task
+		if role != "" {
+			if content != "" {
+				content += " role=" + role
+			} else {
+				content = "role=" + role
+			}
+		}
+		if content == "" {
+			content = firstShortStringArg(args)
+		}
+		if content == "" {
+			content = "..."
+		}
+		return toolSummaryValue{name: name, content: oneLine(content, -1)}
 	default:
 		// TS prefers path/query/name/description/url. PiG sessions often use
 		// ctx_run (command/argv/commands/action/code) instead of bash, so the
@@ -226,8 +245,66 @@ func toolSummary(name string, args map[string]any) toolSummaryValue {
 		if action := strings.TrimSpace(argsString(args, "action", "")); action != "" {
 			return toolSummaryValue{name: name, content: oneLine(action, -1)}
 		}
+		if fallback := firstShortStringArg(args); fallback != "" {
+			return toolSummaryValue{name: name, content: oneLine(fallback, -1)}
+		}
 		return toolSummaryValue{name: name, content: oneLine("...", -1)}
 	}
+}
+
+// firstShortStringArg picks the first short string parameter for a one-line
+// summary when no known field matched. Long / multiline values (payloads,
+// file bodies) are skipped so the card stays compact.
+func firstShortStringArg(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	preferred := []string{"task", "role", "message", "prompt", "text", "content", "input", "label", "title", "pattern", "action"}
+	seen := map[string]bool{}
+	for _, key := range preferred {
+		seen[key] = true
+		if text := shortStringArgValue(args[key]); text != "" {
+			return text
+		}
+	}
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		if seen[key] {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if text := shortStringArgValue(args[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// shortStringArgValue returns a trimmed single-line string suitable for a
+// tool-card summary, or "" when the value is missing, non-string, empty, or
+// too large to preview.
+func shortStringArgValue(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		text = strings.TrimSpace(text[:i])
+		if text == "" {
+			return ""
+		}
+	}
+	if len(text) > 120 {
+		return ""
+	}
+	return text
 }
 
 // argvJoined joins a ctx_run-style argv list into one summary line.
