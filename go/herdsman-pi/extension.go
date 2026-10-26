@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 )
@@ -957,22 +958,34 @@ func FormatHiddenAgentUpdates(events []AgentEventWireRecord) string {
 }
 
 // isNormalHerdsmanContext mirrors the TS helper.
+//
+// A `toolResult` is never herdsman's own injection: herdsman only writes
+// customType-tagged entries and marker-prefixed context blocks, and a tool
+// result that merely *echoes* the marker (reading this repository's markers.go,
+// grepping for the constant, a wake report quoted back) is evidence the model
+// must still see. So tool results are always kept, and only herdsman's own
+// messages are dropped.
 func isNormalHerdsmanContext(message map[string]any) bool {
+	if role, _ := message["role"].(string); role == "toolResult" {
+		return false
+	}
 	customType, _ := message["customType"].(string)
 	return customType == herdsmanAgentContextCustomType ||
 		customType == herdsmanWakeQueuedCustomType ||
-		contentIncludesMarker(message["content"], agentContextMarker)
+		contentStartsWithMarker(message["content"], agentContextMarker)
 }
 
-// contentIncludesMarker mirrors the TS helper.
-func contentIncludesMarker(content any, marker string) bool {
+// contentStartsWithMarker mirrors the TS helper: only content that *starts*
+// with the marker is herdsman's own injected block. A `Contains` test also
+// swallowed tool results and assistant text that merely mention the marker.
+func contentStartsWithMarker(content any, marker string) bool {
 	switch typed := content.(type) {
 	case string:
-		return strings.Contains(typed, marker)
+		return strings.HasPrefix(strings.TrimLeftFunc(typed, unicode.IsSpace), marker)
 	case []any:
 		for _, block := range typed {
 			record := recordOf(block)
-			if contentIncludesMarker(record["text"], marker) || contentIncludesMarker(record["content"], marker) {
+			if contentStartsWithMarker(record["text"], marker) || contentStartsWithMarker(record["content"], marker) {
 				return true
 			}
 		}
