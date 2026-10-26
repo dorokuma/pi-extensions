@@ -13,6 +13,7 @@
    `herdsman-bridge` / `ctx-orchestrate` / `jev-gate` / `exclude-tools-guard` / `magpie-image`
    的源码修改必须落在 `extensions/<name>/src/`，**类型检查通过后**再
    `bash install.sh <name>` 同步到部署目录（`/reload` 或新会话生效）。不要在部署目录就地改。
+   其中 `magpie-image` 的源在 `extensions/magpie-image/`，当前未部署；需 `bash install.sh magpie-image` 才部署。
 
 3. **外生（federated）扩展改动回宿主仓**：`codegraph-go` / `ctxmode` / `pi-cache-stats`
    的源**留在各自宿主仓**（`/root/workspace/codegraph-go`、`/root/workspace/ctxmode`、
@@ -43,7 +44,7 @@
 
 | 类别 | 扩展 | 权威源 | 本仓职责 |
 |---|---|---|---|
-| hosted（内生） | auto-continue / no-tables / herdsman-bridge / ctx-orchestrate / jev-gate / exclude-tools-guard / magpie-image | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
+| hosted（内生） | auto-continue / no-tables / herdsman-bridge / ctx-orchestrate / jev-gate / exclude-tools-guard / magpie-image（源在 `extensions/magpie-image/`，当前未部署；需 `bash install.sh magpie-image` 才部署） | 本仓 `extensions/<name>/src/` | 唯一权威源，逐字节同步 |
 | federated（外生） | codegraph-go / ctxmode / pi-cache-stats | 各自宿主仓 | 仅级联调用其 `install.sh` |
 | external（外部） | herdr-agent-state | herdr 二进制（带外） | 只读巡检，绝不写 |
 
