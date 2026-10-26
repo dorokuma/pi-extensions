@@ -1,5 +1,7 @@
+# Default PiG home: $PIG_HOME if set, else ~/.pig (production home after trial drop).
+PIG_HOME_DIR ?= $(or $(PIG_HOME),$(HOME)/.pig)
 PIG := ./bin/pig-test
-PIG_ISOLATED_DIR ?= /root/.pig-test/agent
+PIG_ISOLATED_DIR ?= $(PIG_HOME_DIR)/agent
 COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod)))
 
 .PHONY: all build test vet sdk-check install-test examples-smoke examples-run help
@@ -13,7 +15,7 @@ help:
 	@echo "  vet             - Run static analysis on root module and all component modules"
 	@echo "  sdk-check       - Compare local pigsdk against staged PiG SDK md5sum"
 	@echo "  install-test    - Validate and install into isolated directory (PIG_ISOLATED_DIR)"
-	@echo "  examples-smoke  - Load examples/hello in isolated PiG and call hello_ping (JSON output; makes one model call)"
+	@echo "  examples-smoke  - Load examples/hello in PiG and call hello_ping (JSON output; makes one model call)"
 	@echo "  examples-run    - Same as examples-smoke, plain text output (makes one model call)"
 	@echo "  help            - Show this help message"
 
@@ -45,14 +47,14 @@ sdk-check:
 	@tmpdir=$$(mktemp -d /tmp/sdk-check.XXXXXX); \
 	trap 'rm -rf "$$tmpdir"' 0 1 2 15; \
 	staged=""; \
-	for d in /root/.pig-test/state/pigsdk/sdk-*; do \
+	for d in "$(PIG_HOME_DIR)"/state/pigsdk/sdk-*; do \
 		case "$$d" in \
 			*/sdk-py-*|*/sdk-rs-*|*'*') continue ;; \
 			*) [ -d "$$d" ] && staged="$$d" ;; \
 		esac; \
 	done; \
 	if [ -z "$$staged" ] || [ ! -d "$$staged" ]; then \
-		echo "SKIP: staged SDK not found"; \
+		echo "SKIP: staged SDK not found under $(PIG_HOME_DIR)/state/pigsdk"; \
 		exit 0; \
 	fi; \
 	echo "Checking pigsdk against staged SDK: $$staged"; \

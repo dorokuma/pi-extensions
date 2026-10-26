@@ -18,9 +18,9 @@ import (
 //	PIG_HOME             when set, the default directory is $PIG_HOME/agent/logs
 //
 // The default without PIG_HOME is the TS location, <home>/.pi/agent/logs, so a
-// plain run keeps parity. A PiG run started with PIG_HOME (the isolated test
-// home bin/pig-test pins, and any other isolated home) must not write into the
-// production ~/.pi, so its own home takes over the default.
+// plain run keeps parity. A PiG run started with PIG_HOME set (any redirected
+// or isolated home) must not write into the production ~/.pi, so its own home
+// takes over the default.
 
 // diagState is the process-wide diagnostics sink: the log path is resolved once,
 // and a failure to write degrades diagnostics instead of failing the extension.

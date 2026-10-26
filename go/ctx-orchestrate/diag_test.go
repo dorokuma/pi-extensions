@@ -49,9 +49,9 @@ func TestResolveDiagDir(t *testing.T) {
 }
 
 // TestDiagDefaultsToPigHome is the isolation regression: with CTX_ORCH_DIAG_DIR
-// unset and PIG_HOME set (which is what ./bin/pig-test pins), one diagnostics
-// line must land in $PIG_HOME/agent/logs and nothing may be created under the
-// real home. Before the fix the PIG_HOME branch did not exist, so the run wrote
+// unset and PIG_HOME set, one diagnostics line must land in $PIG_HOME/agent/logs
+// and nothing may be created under the real home. Before the fix the PIG_HOME
+// branch did not exist, so the run wrote
 // into $HOME/.pi/agent/logs.
 func TestDiagDefaultsToPigHome(t *testing.T) {
 	pigHome := t.TempDir()
