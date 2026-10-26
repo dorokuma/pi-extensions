@@ -11,6 +11,7 @@ use (
 	./ctxmode
 	./exclude-tools-guard
 	./herdr-agent-state
+	./herdsman-pi
 	./jev-gate
 	./moshi-hooks
 	./no-tables
