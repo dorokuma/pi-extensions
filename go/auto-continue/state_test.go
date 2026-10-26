@@ -153,7 +153,7 @@ type harness struct {
 }
 
 // newHarness builds a State over a t.TempDir() preference file, a fake
-// scheduler and a fake clock: no test touches ~/.pi, ~/.pig-test or sleeps.
+// scheduler and a fake clock: no test touches ~/.pi, ~/.pig or sleeps.
 func newHarness(t *testing.T, env map[string]string) *harness {
 	t.Helper()
 	clock := &fakeClock{ms: 1_000_000}

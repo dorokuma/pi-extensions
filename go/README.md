@@ -78,7 +78,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 - 隔离目录验证：
   ```sh
   make install-test
-  # 默认使用 PIG_ISOLATED_DIR ?= /root/.pig-test/agent
+  # 默认使用 PIG_ISOLATED_DIR ?= $(PIG_HOME_DIR)/agent（PIG_HOME 或 ~/.pig）
   ```
 - 编译与验证 examples 扩展（通过 PiG runner 编译）：
   ```sh
@@ -95,19 +95,20 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
   make help
   ```
 
-## pig 调用必须走 bin/pig-test
+## pig 调用建议走 bin/pig-test
 
-迁移工程期间，**严禁裸调系统中的 `pig`**，所有调用必须通过包装脚本 `./bin/pig-test` 或 Makefile 执行。
+Makefile 的 `examples-*` 目标通过包装脚本 `./bin/pig-test` 调用系统 `pig`，避免环境变量把运行时重定向到生产 `/root/.pi/agent`。
 
-- **原因**：裸调 `pig` 会在缺少环境变量时触发默认回退机制，向宿主环境 `~/.pig` 写入文件（包括自动展开文档 bundle、生成锁文件、缓存及 agent 配置等；已实测证实 392 条目、10,455,075 字节污染，并在 [go/reports/batch-0.md](reports/batch-0.md) 第 10 节留存完整证据与清理记录）。
-- **隔离实现**：`./bin/pig-test` 在头部清除 `PIG_CODING_AGENT_DIR`、`PIG_CODING_AGENT_SESSION_DIR` 与 `PIG_USE_PI_DIRS` 环境变量（防止绕过 `PIG_HOME` 或指向生产 `/root/.pi/agent`），并写死 `export PIG_HOME=/root/.pig-test`，再 `exec /root/.local/bin/pig "$@"`，确保一切运行时状态与产物严格收敛在 `/root/.pig-test` 隔离根目录下。
+- **原因（历史）**：迁移早期裸调 `pig` 曾在缺少环境变量时向宿主 `~/.pig` 写入大量文件（见 [go/reports/batch-0.md](reports/batch-0.md) 第 10 节）。试用隔离目录 `/root/.pig-test` 已废弃；当前正式 PiG home 即为 `~/.pig`。
+- **包装实现**：`./bin/pig-test` 清除 `PIG_HOME`、`PIG_CODING_AGENT_DIR`、`PIG_CODING_AGENT_SESSION_DIR` 与 `PIG_USE_PI_DIRS`，再 `exec /root/.local/bin/pig "$@"`，使运行落在默认 `~/.pig`。
 - **用法示例**：
   ```sh
   # 运行 examples/hello 扩展
   ./bin/pig-test -e ./examples/hello -p "调用 hello_ping 工具并返回其结果"
 
-  # 诊断当前隔离路径配置
+  # 诊断当前路径配置
   ./bin/pig-test diagnose
+  # 或直接：pig diagnose
   ```
 
 ## examples 说明与限制
@@ -130,18 +131,17 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 3. **构建与运行标准入口**：
    必须使用 `make examples-smoke` 或 `make examples-run`（或通过 `./bin/pig-test -e ./examples/hello ...`）来进行编译与验证。
 
-## 隔离测试配置目录说明
+## 测试配置目录说明
 
-迁移期间必须确保新旧环境隔离运行：
-- PiG 仅在隔离配置目录（默认 `/root/.pig-test/agent`）下启动与验证。
+- 默认 PiG home 为 `$PIG_HOME` 或 `~/.pig`（`PIG_ISOLATED_DIR` 默认 `$(PIG_HOME_DIR)/agent`）。
 - Makefile 中的 `install-test` 预设了防御检查，严禁指向或覆盖原版生产目录 `/root/.pi/agent`。
-- 若指定的隔离目录不存在，`make install-test` 会给出明确提示并自动建立该目录，避免误操作。
+- 若指定目录不存在，`make install-test` 会给出明确提示并自动建立该目录，避免误操作。
 
 ## 硬规矩摘要
 
 1. **生产环境绝对不碰**：原版 pi 在全部 Go 版本验收前保持原样可用；严禁改动 `/root/.pi/agent/` 下任何文件，严禁修改 `~/.pi/agent/bin/pi` 启动器，严禁修改 `/root/.gemini/config/hooks.json`，严禁重启正在运行的 herdsman 守护进程。
 2. **提交与代码归属**：所有新代码进入 `/root/workspace/pi-extensions/go/`，每组件一个独立嵌套子 module（含独立 `go.mod`），一个组件一次提交；提交时只 add `go/`，绝不夹带仓内已有未提交改动（如 exclude-tools-guard），绝不写 `herdr-agent-state.ts`。
-3. **隔离运行**：PiG 仅在 `/root/.pig-test/agent` 下运行，绝对不读取或修改原版 pi 的会话与设置。
+3. **生产 pi 不碰**：PiG 使用 `~/.pig`；绝对不读取或修改原版 pi（`/root/.pi/agent`）的会话与设置。
 4. **全绿测试准入**：每个组件提交前必须保证 `go build ./...`、`go vet ./...`、`go test ./...` 全部通过，并对照原版 TS 行为编写对等单测，并在 PiG 实际加载跑通。
 5. **如实报告**：每批结束输出 `go/reports/batch-N.md`，忠实记录命令原文与行为差异，杜绝未验证推测。
 6. **不改 PiG 源码**：若遇 PiG 上游缺口先在报告记录并采取规避策略，不直接修改 PiG 源码。

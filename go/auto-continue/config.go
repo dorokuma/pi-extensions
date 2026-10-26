@@ -27,10 +27,10 @@ func DefaultPersist() Persist {
 // `join(homedir(), ".pi", "agent", "auto-continue.json")`. This port keeps that
 // as the production answer and adds one isolation rule: when PIG_HOME is set,
 // the file lives under PIG_HOME/agent/ instead. Go extensions run under PiG,
-// which sets PIG_HOME to its own home (the repo's ./bin/pig-test pins
-// /root/.pig-test); resolving into the isolated home keeps an isolated PiG run
-// from reading or creating /root/.pi/agent/auto-continue.json, which the
-// migration's hard rule forbids touching. Same resolution strategy as
+// which sets PIG_HOME to its own home when overridden; ./bin/pig-test clears
+// overrides so the default ~/.pig is used. Resolving under PIG_HOME keeps a
+// redirected PiG run from reading or creating /root/.pi/agent/auto-continue.json,
+// which the migration's hard rule forbids touching. Same resolution strategy as
 // pi-context-pruning's resolveGlobalSettingsPath. See README "与 TS 差异" D1.
 func SettingsPath() string {
 	if home := strings.TrimSpace(os.Getenv("PIG_HOME")); home != "" {

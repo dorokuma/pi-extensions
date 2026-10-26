@@ -1,7 +1,5 @@
 #!/bin/sh
-# 强制隔离 PiG 运行环境：写死 PIG_HOME=/root/.pig-test，并清除可绕过 PIG_HOME 的环境变量。
-# 裸调 pig 会写入 ~/.pig（详见 reports/batch-0.md 第 10 节），所有调用必须通过本包装脚本隔离。
-# 清除可能绕过 PIG_HOME 的代理配置与共享模式环境变量，防止指向生产 /root/.pi/agent 或泄漏：
-unset PIG_CODING_AGENT_DIR PIG_CODING_AGENT_SESSION_DIR PIG_USE_PI_DIRS 2>/dev/null || true
-export PIG_HOME=/root/.pig-test
+# Clear env vars that would redirect PiG away from the default home (~/.pig).
+# Trial isolation (/root/.pig-test) was dropped; bare pig now uses ~/.pig.
+unset PIG_HOME PIG_CODING_AGENT_DIR PIG_CODING_AGENT_SESSION_DIR PIG_USE_PI_DIRS 2>/dev/null || true
 exec /root/.local/bin/pig "$@"
