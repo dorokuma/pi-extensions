@@ -325,4 +325,91 @@ func TestExtensionRegistersPresenceAndAdoptsDaemonLocation(t *testing.T) {
 	}
 }
 
+// contextFilterCore is a bare extension instance: the context filter reads
+// nothing but the message list, so no host, daemon or timers are needed.
+func contextFilterCore() *HerdsmanExtension {
+	return NewExtension(&fakePi{}, ExtensionOptions{
+		Timers:     newManualTimers(),
+		Env:        envFunc(nil),
+		WakeFilter: &DefaultWakeFilterConfig,
+	})
+}
+
+// TestContextFilterKeepsToolResultsEchoingTheMarker is the regression guard for
+// the retro filter: the context hook dropped every message whose content merely
+// *contained* the marker, so a tool result that read this repository's
+// markers.go (or grepped for the constant, or quoted a wake report back) was
+// swallowed and the model was handed a turn with a hole in it. A tool result is
+// never herdsman's own injection, so it survives the filter verbatim.
+func TestContextFilterKeepsToolResultsEchoingTheMarker(t *testing.T) {
+	core := contextFilterCore()
+
+	// A `read` of markers.go: the file quotes the constant's compiled value as
+	// ordinary content, mid-text, inside a content block.
+	readResult := map[string]any{
+		"role":       "toolResult",
+		"toolName":   "read",
+		"toolCallId": "call_1",
+		"content": []any{map[string]any{
+			"type": "text",
+			"text": "const agentContextMarker = \"" + agentContextMarker + "\"\n",
+		}},
+	}
+	// A grep hit for the constant, echoed as a plain string.
+	grepResult := map[string]any{
+		"role":       "toolResult",
+		"toolName":   "bash",
+		"toolCallId": "call_2",
+		"content":    "markers.go:13:const agentContextMarker = \"" + agentContextMarker + "\"",
+	}
+	// A tool result that *starts* with the marker block, the way a herdsman
+	// message quoted back through a tool would: still a tool result, so still
+	// evidence the model must see.
+	wakeEcho := map[string]any{
+		"role":       "toolResult",
+		"toolCallId": "call_3",
+		"content":    "\n  " + agentContextMarker + "\n  policy block\n",
+	}
+
+	kept := core.HandleContext([]any{readResult, grepResult, wakeEcho})
+	if len(kept) != 3 {
+		t.Fatalf("kept %d of 3 tool results: %#v", len(kept), kept)
+	}
+	for _, raw := range kept {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("kept a non-message: %#v", raw)
+		}
+		if role, _ := message["role"].(string); role != "toolResult" {
+			t.Fatalf("kept role %q", role)
+		}
+	}
+}
+
+// TestContextFilterStillDropsHerdsmansOwnMessages pins the other half of the
+// contract: herdsman's own entries are still removed from the incoming list,
+// both by customType and by the marker prefix, while a message that only
+// mentions the marker mid-text is not herdsman's and is kept.
+func TestContextFilterStillDropsHerdsmansOwnMessages(t *testing.T) {
+	core := contextFilterCore()
+
+	injected := []any{
+		map[string]any{"customType": herdsmanAgentContextCustomType, "role": "user", "content": agentContextMarker + "\n  policy block\n"},
+		map[string]any{"customType": herdsmanWakeQueuedCustomType, "role": "user", "content": "queued wake replay"},
+		map[string]any{"role": "user", "content": agentContextMarker + "\n  policy block\n"},
+		// Leading whitespace is trimmed before the prefix test.
+		map[string]any{"role": "user", "content": "  \n" + agentContextMarker + "\n  policy block\n"},
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": agentContextMarker + "\n  policy block\n"}}},
+	}
+	if kept := core.HandleContext(injected); len(kept) != 0 {
+		t.Fatalf("kept %d herdsman messages: %#v", len(kept), kept)
+	}
+
+	// A mention in the middle of an assistant message is not herdsman's block.
+	mention := map[string]any{"role": "assistant", "content": "the marker " + agentContextMarker + " is split in markers.go"}
+	if kept := core.HandleContext([]any{mention}); len(kept) != 1 {
+		t.Fatalf("kept %d messages, want the assistant mention: %#v", len(kept), kept)
+	}
+}
+
 var _ = time.Second
