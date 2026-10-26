@@ -101,8 +101,8 @@ func TestToolRendererCompactRow(t *testing.T) {
 		ToolCallID:   "call-1",
 		ArgsComplete: true,
 	}, &output, false, width, true)
-	if folded != nil {
-		t.Fatalf("folded result lines = %v, want nil (Call owns the row)", folded)
+	if len(folded) != 0 {
+		t.Fatalf("folded result lines = %v, want empty (Call owns the row)", folded)
 	}
 
 	expandedBody := r.toolRenderLines("read", map[string]any{"path": "/etc/hosts"}, sdk.ToolRenderContext{
@@ -172,14 +172,14 @@ func TestToolRendererHidesGroupedNonDisplayTool(t *testing.T) {
 		ToolCallID:   "call-a",
 		ArgsComplete: true,
 	}, strPtr("a-out"), false, 80, false)
-	if hidden != nil {
-		t.Fatalf("first grouped tool Call lines = %v, want nil (hidden)", hidden)
+	if len(hidden) != 0 {
+		t.Fatalf("first grouped tool Call lines = %v, want empty (hidden)", hidden)
 	}
 	if got := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{
 		ToolCallID:   "call-a",
 		ArgsComplete: true,
-	}, strPtr("a-out"), false, 80, true); got != nil {
-		t.Fatalf("first grouped tool Result lines = %v, want nil (hidden)", got)
+	}, strPtr("a-out"), false, 80, true); len(got) != 0 {
+		t.Fatalf("first grouped tool Result lines = %v, want empty (hidden)", got)
 	}
 
 	shown := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{
@@ -192,8 +192,8 @@ func TestToolRendererHidesGroupedNonDisplayTool(t *testing.T) {
 	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{
 		ToolCallID:   "call-b",
 		ArgsComplete: true,
-	}, strPtr("b-out"), false, 80, true); got != nil {
-		t.Fatalf("display tool Result lines = %v, want nil (Call owns the tree)", got)
+	}, strPtr("b-out"), false, 80, true); len(got) != 0 {
+		t.Fatalf("display tool Result lines = %v, want empty (Call owns the tree)", got)
 	}
 	joined := joinLines(shown)
 	if !strings.Contains(joined, "ctx_run") {
@@ -224,8 +224,8 @@ func TestToolRendererGroupTreeAppearsOnce(t *testing.T) {
 	r.mu.Unlock()
 
 	// While second is the display tool, first is hidden and second paints.
-	if got := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{ToolCallID: "call-a", ArgsComplete: true}, nil, false, 80, false); got != nil {
-		t.Fatalf("old display Call after switch = %v, want nil", got)
+	if got := r.toolRenderLines("ctx_run", first.args, sdk.ToolRenderContext{ToolCallID: "call-a", ArgsComplete: true}, nil, false, 80, false); len(got) != 0 {
+		t.Fatalf("old display Call after switch = %v, want empty", got)
 	}
 	mid := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, nil, false, 80, false)
 	if len(mid) == 0 {
@@ -235,11 +235,11 @@ func TestToolRendererGroupTreeAppearsOnce(t *testing.T) {
 	group.addTool(third)
 
 	// After third takes display rights, second must clear (both phases).
-	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, false); got != nil {
-		t.Fatalf("previous display Call after switch = %v, want nil", got)
+	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, false); len(got) != 0 {
+		t.Fatalf("previous display Call after switch = %v, want empty", got)
 	}
-	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, true); got != nil {
-		t.Fatalf("previous display Result after switch = %v, want nil", got)
+	if got := r.toolRenderLines("ctx_run", second.args, sdk.ToolRenderContext{ToolCallID: "call-b", ArgsComplete: true}, strPtr("b-out"), false, 80, true); len(got) != 0 {
+		t.Fatalf("previous display Result after switch = %v, want empty", got)
 	}
 
 	var host []string

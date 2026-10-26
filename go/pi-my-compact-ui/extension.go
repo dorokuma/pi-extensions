@@ -424,14 +424,17 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 		owner := existing.owner
 		if !isGroupHostDisplayToolLocked(owner, existing) {
 			r.mu.Unlock()
-			return nil
+			// Empty slice (not nil): host ShellSelf renderSelfShell returns no
+			// rows only when len(content)==0; a JSON null on the wire can be
+			// confused with "absent frame" in some paths. [] is unambiguous.
+			return []string{}
 		}
 		if groupHasTreeLocked(owner) {
 			// Call paints the whole tree once; Result must stay empty or the
 			// host stacks a second identical tree under the first.
 			if resultPhase {
 				r.mu.Unlock()
-				return nil
+				return []string{}
 			}
 			r.mu.Unlock()
 			return owner.Render(width)
@@ -441,7 +444,7 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 		// Single-row cards: Call already drew the row; Result only adds body.
 		if !expanded || output == nil || strings.TrimSpace(*output) == "" {
 			r.mu.Unlock()
-			return nil
+			return []string{}
 		}
 		inner := maxInt(1, width)
 		var lines []string
@@ -578,13 +581,13 @@ func (r *runtimeState) handleSessionShutdown() {
 func (r *runtimeState) handleTerminalInput(data string) terminalInputVerdict {
 	if isKeyRelease(data) {
 		r.mu.Lock()
-		open := r.activeModalHandle != nil || r.activeSelectorHandle != nil
+		open := r.activeModalHandle != nil || r.activeSelectorHandle != nil || r.activeCustomRoot != nil
 		r.mu.Unlock()
 		return terminalInputVerdict{consume: open}
 	}
 	r.mu.Lock()
 	hasModal := r.activeModalHandle != nil
-	hasSelector := r.activeSelectorHandle != nil
+	hasSelector := r.activeSelectorHandle != nil || r.activeCustomRoot != nil
 	r.mu.Unlock()
 	if hasModal {
 		if matchesKey(data, "escape") || data == "q" || data == "Q" || isCtrlI(data) {

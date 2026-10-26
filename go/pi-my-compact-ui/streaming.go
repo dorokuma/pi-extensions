@@ -614,7 +614,16 @@ func (r *runtimeState) absorbGroupedPreparingLocked(comp *toolComponent) {
 			if !group.hasChildLocked(comp) {
 				group.children = append(group.children, comp)
 			}
+			// Host cards for non-display siblings must re-render empty (ShellSelf
+			// + [] lines). Without Invalidate they keep Default Spacer(1) or a
+			// stale tree and stack into the large blank gap in gap.png.
+			stale := group.siblingCardInvalidatesExceptLocked(comp.toolCallID)
 			group.invalidateLocked()
+			r.mu.Unlock()
+			for _, invalidate := range stale {
+				invalidate()
+			}
+			r.mu.Lock()
 			return
 		}
 	}

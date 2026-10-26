@@ -545,6 +545,7 @@ func TestCustomAdapterInputNeverClosesOnNavigation(t *testing.T) {
 func TestCustomRootSwitchesViewsInsteadOfStacking(t *testing.T) {
 	r, ui := selectorRuntimeWithCustomUI(t)
 	r.openInspectSelectorModal()
+	ui.waitCustomCalls(t, 1)
 	if ui.customCalls != 1 {
 		t.Fatalf("custom calls = %d, want 1 (a single root)", ui.customCalls)
 	}

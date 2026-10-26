@@ -347,7 +347,7 @@ const (
 // openCustomOverlay is the ctx.ui.custom branch of openDetailModal /
 // openInspectSelectorModal: it opens the component as a focused overlay and
 // reports the handle once the host mounted it. The ui.custom call happens
-// outside mu.
+// outside mu and must not block the caller (see the go statement below).
 func (r *runtimeState) openCustomOverlay(comp remoteComponent, widthPercent, maxHeightPercent int, onHandle func(overlayCloser), isDetail bool) {
 	r.mu.Lock()
 	ui := r.activeUIContext
@@ -369,9 +369,14 @@ func (r *runtimeState) openCustomOverlay(comp remoteComponent, widthPercent, max
 	}
 	closeFn = func(any) {}
 	options := customOverlayOptions{overlay: true, anchor: "center", widthPercent: widthPercent, maxHeightPercent: maxHeightPercent, onHandle: onHandle}
-	if _, err := ui.custom(factory, options); err != nil {
-		return
-	}
+	// Fire-and-forget like TS's un-awaited ctx.ui.custom(...). A synchronous
+	// wait here from OnTerminalInput deadlocks the host input ticket: the pump
+	// waits for the terminal_input verdict, Custom waits for Done, and keys
+	// never reach the overlay (see report2.md).
+	go func() {
+		defer func() { _ = recover() }()
+		_, _ = ui.custom(factory, options)
+	}()
 }
 
 // openCustomOverlayRoot opens one ctx.ui.Custom root that owns both modal views.
@@ -394,12 +399,23 @@ func (r *runtimeState) openCustomOverlayRoot(root *customRootComponent, selector
 		return root
 	}
 	closeFn = func(any) {}
-	options := customOverlayOptions{overlay: true, anchor: "center", widthPercent: widthPercent, maxHeightPercent: maxHeightPercent}
-	if _, err := ui.custom(factory, options); err != nil {
+	options := customOverlayOptions{overlay: true, anchor: "center", widthPercent: widthPercent, maxHeightPercent: maxHeightPercent, onHandle: func(handle overlayCloser) {
 		r.mu.Lock()
-		r.activeCustomRoot = nil
+		r.activeSelectorHandle = handle
 		r.mu.Unlock()
-	}
+	}}
+	rootRef := root
+	// Same fire-and-forget contract as openCustomOverlay / TS openInspectSelectorModal.
+	go func() {
+		defer func() { _ = recover() }()
+		if _, err := ui.custom(factory, options); err != nil {
+			r.mu.Lock()
+			if r.activeCustomRoot == rootRef {
+				r.activeCustomRoot = nil
+			}
+			r.mu.Unlock()
+		}
+	}()
 }
 
 // customRootComponent is the single ctx.ui.Custom root the two modals share when

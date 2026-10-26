@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
@@ -192,6 +193,26 @@ func (f *fakeUI) custom(factory remoteComponentFactory, options any) (any, error
 		return fn(factory, options)
 	}
 	return nil, nil
+}
+
+// waitCustomCalls waits until custom has been entered at least n times. openCustom*
+// fire-and-forget the host call, so tests must wait before reading customCalls.
+func (f *fakeUI) waitCustomCalls(t testing.TB, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		got := f.customCalls
+		f.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.mu.Lock()
+	got := f.customCalls
+	f.mu.Unlock()
+	t.Fatalf("customCalls = %d, want >= %d", got, n)
 }
 
 // lastInputHandler returns the terminal input handler the extension installed.
