@@ -12,13 +12,16 @@ import (
 	"strings"
 )
 
-// reportSectionHeaders is report.ts SECTION_HEADERS: the four headers a
-// pi-vcc summary always renders in this order.
-var reportSectionHeaders = []string{"Session Goal", "Files And Changes", "Commits", "Outstanding Context"}
+// reportSectionHeaders is report.ts SECTION_HEADERS: the headers a pi-vcc
+// summary always renders in this order. sectionCountOf asks summarize.sectionOf
+// for each of them, so a header only counts when it stands alone in the header
+// area.
+var reportSectionHeaders = []string{"Early Session Requests", "Files And Changes", "Commits", "User Messages"}
 
-// reportBriefSeparator is the `\n\n---\n\n` report.ts splits on to find the
-// brief transcript. summarize.go carries the same constant as
-// summarySeparator; the port keeps a local name so the two stay independent.
+// reportBriefSeparator is the `\n\n---\n\n` a summary joins its header area to
+// its brief transcript with. report.ts splits on it no more — briefLineCountOf
+// goes through summarize's briefOf, which knows the shape — so the port keeps
+// the name only for the tests that assemble a summary by hand.
 const reportBriefSeparator = "\n\n---\n\n"
 
 // reportEdgeCount is previewOf()'s default edgeCount: how many entries each end
@@ -84,8 +87,7 @@ type CompactReportAfter struct {
 	EstimatedTokens      int
 	SectionCount         int
 	SummaryPreview       string
-	GoalsCount           int
-	BlockersCount        int
+	EarlyRequestsCount   int
 	BriefTranscriptLines int
 }
 
@@ -212,12 +214,12 @@ func previewOf(messages []map[string]any, edgeCount int) string {
 	return strings.Join(lines, "\n")
 }
 
-// sectionCountOf is report.ts sectionCountOf(): how many of the four headers
-// the summary renders.
+// sectionCountOf is report.ts sectionCountOf(): how many of the headers the
+// summary renders as sections.
 func sectionCountOf(summary string) int {
 	count := 0
 	for _, header := range reportSectionHeaders {
-		if strings.Contains(summary, "["+header+"]") {
+		if sectionOf(summary, header) != "" {
 			count++
 		}
 	}
@@ -225,13 +227,14 @@ func sectionCountOf(summary string) int {
 }
 
 // briefLineCountOf is report.ts briefLineCountOf(): the brief transcript's line
-// count, or 0 when the summary has no brief transcript at all.
+// count, or 0 when the summary has no brief transcript at all (briefOf returns
+// "" both without a separator and for an empty brief).
 func briefLineCountOf(summary string) int {
-	idx := strings.Index(summary, reportBriefSeparator)
-	if idx < 0 {
+	brief := briefOf(summary)
+	if brief == "" {
 		return 0
 	}
-	return len(jsSplitLines(summary[idx+len(reportBriefSeparator):]))
+	return len(jsSplitLines(brief))
 }
 
 // queryTermRe is report.ts `/[\p{L}\p{N}_./-]{3,}/gu`: the words a probe query
@@ -298,7 +301,7 @@ func firstToolCallFile(blocks []NormalizedBlock) string {
 	return ""
 }
 
-// reportFirstOf is report.ts's `data.sessionGoal[0] ?? ""`.
+// reportFirstOf is report.ts's `data.earlyRequests[0] ?? ""`.
 func reportFirstOf(items []string) string {
 	if len(items) == 0 {
 		return ""
@@ -314,9 +317,8 @@ func probesOf(messages []map[string]any, summary string) []RecallProbe {
 		label string
 		text  string
 	}{
-		{"goal", reportFirstOf(data.SessionGoal)},
+		{"request", reportFirstOf(data.EarlyRequests)},
 		{"file", firstToolCallFile(blocks)},
-		{"problem", reportFirstOf(data.OutstandingContext)},
 	}
 	rendered := make([]RenderedEntry, 0, len(messages))
 	for i, msg := range messages {
@@ -382,8 +384,7 @@ func BuildCompactReport(input CompileInput) CompactReport {
 			EstimatedTokens:      EstimateTokensFromChars(float64(summaryChars), 0),
 			SectionCount:         sectionCountOf(summary),
 			SummaryPreview:       summary,
-			GoalsCount:           len(data.SessionGoal),
-			BlockersCount:        len(data.OutstandingContext),
+			EarlyRequestsCount:   len(data.EarlyRequests),
 			BriefTranscriptLines: briefLineCountOf(summary),
 		},
 		Compression: CompactReportCompression{

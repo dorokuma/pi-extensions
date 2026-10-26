@@ -52,6 +52,26 @@ func recallFixtureFile(t *testing.T) (string, []LineageEntryLike) {
 // strconvQuote quotes text for embedding in a JSON line.
 func strconvQuote(text string) string { return strconv.Quote(text) }
 
+// writeSessionFile writes the given session JSONL lines to a temp file and
+// returns its path plus the entries a lineage branch would hold.
+func writeSessionFile(t *testing.T, lines ...string) (string, []LineageEntryLike) {
+	t.Helper()
+	dir := t.TempDir()
+	sessionFile := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(sessionFile, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	entries := make([]LineageEntryLike, 0, len(lines))
+	for i, line := range lines {
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+			t.Fatalf("decode fixture line %d: %v", i, err)
+		}
+		entries = append(entries, LineageEntryLike(decoded))
+	}
+	return sessionFile, entries
+}
+
 // ── the view ────────────────────────────────────────────────────────────────
 
 func TestRecallView_LoadCaches(t *testing.T) {
@@ -300,6 +320,49 @@ func TestRunRecall_Touched(t *testing.T) {
 	// A write gets a ready #N:path drill-down.
 	if !strings.Contains(out, "query:'#2:format.go'") {
 		t.Fatalf("the drill-down hint is missing:\n%s", out)
+	}
+}
+
+// TestRunRecall_TouchedSkipsNonDrillableMultiPathEdit pins the 0.11.1
+// `drillable: false` guard of runTouched(): a multi-path edit names its files in
+// args.paths but carries no per-file content, so those files are listed without
+// a drill-down hint, and the hint points at the file that was really written.
+func TestRunRecall_TouchedSkipsNonDrillableMultiPathEdit(t *testing.T) {
+	multiPathEdit := `{"type":"message","id":"e1","parentId":"","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"edit","arguments":{"code":"rewrite both files","paths":["/root/p/a.go","/root/p/b.go"]}}]}}`
+	// A multi-path edit alone: both files are listed, neither has content to
+	// drill into, so no "File content at an entry" note is appended.
+	sessionFile, entries := writeSessionFile(t, multiPathEdit)
+	view := OpenRecallView(sessionFile, ScopeAll, fakeManager{branch: entries})
+	out := RunRecall(RecallRequest{
+		Action: RecallAction{Kind: ActionTouched, Page: 1},
+	}, view, recallHints)
+	if !strings.Contains(out, "a.go") || !strings.Contains(out, "b.go") {
+		t.Fatalf("the multi-path edit's files are missing:\n%s", out)
+	}
+	if !strings.Contains(out, "#0 (edit)") {
+		t.Fatalf("the multi-path edit's entry is missing:\n%s", out)
+	}
+	if strings.Contains(out, "--- File content at an entry: query:") {
+		t.Fatalf("a non-drillable edit got a drill-down hint:\n%s", out)
+	}
+
+	// The same multi-path edit plus a single-file write of b.go: the note skips
+	// a.go (its only entry is the non-drillable edit) and points at b.go's
+	// write entry.
+	bWrite := `{"type":"message","id":"e2","parentId":"e1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-2","name":"write","arguments":{"path":"/root/p/b.go","content":"package p\n"}}]}}`
+	sessionFile, entries = writeSessionFile(t, multiPathEdit, bWrite)
+	view = OpenRecallView(sessionFile, ScopeAll, fakeManager{branch: entries})
+	out = RunRecall(RecallRequest{
+		Action: RecallAction{Kind: ActionTouched, Page: 1},
+	}, view, recallHints)
+	if !strings.Contains(out, "#1 (write)") {
+		t.Fatalf("the write entry is missing:\n%s", out)
+	}
+	if !strings.Contains(out, "query:'#1:b.go'") {
+		t.Fatalf("the drill-down hint does not point at the write:\n%s", out)
+	}
+	if strings.Contains(out, "a.go'") {
+		t.Fatalf("the hint points at the non-drillable edit:\n%s", out)
 	}
 }
 

@@ -27,6 +27,10 @@ type NormalizedBlock struct {
 
 	// Text is user/assistant text, or a tool result's text.
 	Text string
+	// Injected is types.ts `injected`: the text came from an extension
+	// custom_message rather than from the user. It renders in the brief but is
+	// not read into [Early Session Requests] or [User Messages].
+	Injected bool
 	// Name is a tool call's name or a tool result's tool name.
 	Name string
 	// Args is a tool call's argument object.
@@ -47,6 +51,13 @@ type NormalizedBlock struct {
 
 func userBlock(text string, index int, hasIndex bool) NormalizedBlock {
 	return NormalizedBlock{Kind: KindUser, Text: text, SourceIndex: index, HasSource: hasIndex}
+}
+
+// userBlockInjected is a user block whose text an extension injected.
+func userBlockInjected(text string, index int, hasIndex bool, injected bool) NormalizedBlock {
+	block := userBlock(text, index, hasIndex)
+	block.Injected = injected
+	return block
 }
 
 // sourceRef renders ` (#N)` for a block with an index and "" otherwise
@@ -79,11 +90,13 @@ const (
 
 // SectionData is src/sections.ts SectionData: everything formatSummary renders.
 type SectionData struct {
-	SessionGoal        []string
-	OutstandingContext []string
-	FilesAndChanges    []string
-	Commits            []string
-	UserPreferences    []string
+	// EarlyRequests is the session's first user messages, pinned across
+	// compactions (extract/user-messages.ts).
+	EarlyRequests   []string
+	FilesAndChanges []string
+	Commits         []string
+	// UserMessages is the newest user messages after the early requests.
+	UserMessages []string
 	// TrackedCommands is populated only when settings.trackCommands is
 	// non-empty (see settings.go).
 	TrackedCommands []string

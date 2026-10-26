@@ -365,7 +365,7 @@ func FormatTrackedCommands(activity TrackedCommandActivity) []string {
 		for _, entry := range entries {
 			rendered = append(rendered, renderEntry(entry))
 		}
-		lines = append(lines, name+": "+CapItems(rendered, CommandsPerName, CommandSeparator, "tail"))
+		lines = append(lines, name+": "+CapItems(rendered, CommandsPerName, CommandSeparator))
 	}
 	return lines
 }

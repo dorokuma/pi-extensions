@@ -22,19 +22,19 @@ func section(title string, items []string) string {
 	return "[" + title + "]\n" + strings.Join(lines, "\n")
 }
 
-// CapItems is format.ts capItems(): join up to limit items, naming the overflow.
-// keep "head" keeps the oldest and ends with "(+N more)"; "tail" keeps the
-// newest and starts with "(+N earlier)".
-func CapItems(items []string, limit int, joinWith string, keep string) string {
+// CapItems is format.ts capItems(): join up to limit items (oldest first),
+// keeping the newest behind a leading "(+N earlier)". Keeping the oldest
+// instead froze a merged list on its first entries.
+func CapItems(items []string, limit int, joinWith string) string {
 	if len(items) <= limit {
 		return strings.Join(items, joinWith)
 	}
-	over := len(items) - limit
-	if keep == "tail" {
-		return "(+" + jsNumberString(float64(over)) + " earlier) " + strings.Join(items[len(items)-limit:], joinWith)
-	}
-	return strings.Join(items[:limit], joinWith) + " (+" + jsNumberString(float64(over)) + " more)"
+	return "(+" + jsNumberString(float64(len(items)-limit)) + " earlier) " + strings.Join(items[len(items)-limit:], joinWith)
 }
+
+// FilesPerCategory is format.ts FILES_PER_CATEGORY: files listed per
+// Files And Changes category, the newest kept.
+const FilesPerCategory = 10
 
 // capMarkerHeadRe and capMarkerTailRe are the two halves of
 // format.ts stripCapMarker.
@@ -44,7 +44,8 @@ var (
 )
 
 // StripCapMarker is format.ts stripCapMarker(): the inverse of CapItems, used
-// when a merge re-reads a capped line.
+// when a merge re-reads a capped line. It also strips the trailing "(+N more)"
+// that older versions wrote.
 func StripCapMarker(text string) string {
 	out := capMarkerHeadRe.ReplaceAllString(text, "")
 	return capMarkerTailRe.ReplaceAllString(out, "")
@@ -166,14 +167,13 @@ func FormatSummary(data SectionData, options FormatSummaryOptions) string {
 	if options.CapBriefTranscript != nil {
 		capBriefTranscript = *options.CapBriefTranscript
 	}
-	headerParts := make([]string, 0, 6)
+	headerParts := make([]string, 0, 5)
 	for _, part := range []string{
-		section("Session Goal", data.SessionGoal),
+		section("Early Session Requests", data.EarlyRequests),
 		section("Files And Changes", data.FilesAndChanges),
 		section("Commits", data.Commits),
 		section("Tracked Commands", data.TrackedCommands),
-		section("Outstanding Context", data.OutstandingContext),
-		section("User Preferences", data.UserPreferences),
+		section("User Messages", data.UserMessages),
 	} {
 		if part != "" {
 			headerParts = append(headerParts, part)
