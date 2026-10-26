@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 // Ports src/core/settings.ts.
@@ -73,9 +75,9 @@ var settingsKeyOrder = []string{
 // SettingsPath is settings.ts settingsPath(): $PI_VCC_CONFIG_PATH when set,
 // else the config file in pi's agent directory.
 //
-// pi's getAgentDir() honours $PI_CODING_AGENT_DIR; this port additionally
-// honours PIG_HOME/agent and PIG_CODING_AGENT_DIR so an isolated PiG run never
-// reads or writes the production ~/.pi/agent file (the migration's hard rule).
+// AgentDir() prefers PIG_EXT_HOST_INFO.agentDir (PiG extension host facts),
+// then $PI_CODING_AGENT_DIR / $PIG_CODING_AGENT_DIR / $PIG_HOME/agent, so an
+// isolated PiG run never reads or writes the production ~/.pi/agent file.
 // The resolution order is documented in README.md (差异 D1).
 func SettingsPath() string {
 	if custom := strings.TrimSpace(os.Getenv("PI_VCC_CONFIG_PATH")); custom != "" {
@@ -84,9 +86,16 @@ func SettingsPath() string {
 	return filepath.Join(AgentDir(), "pi-vcc-config.json")
 }
 
-// AgentDir is pi's getAgentDir(): $PI_CODING_AGENT_DIR, else the isolated PiG
-// home's agent dir, else ~/.pi/agent.
+// AgentDir is pi's getAgentDir() for this host.
+// Resolution: PIG_EXT_HOST_INFO.agentDir (via sdk.AgentDir; what PiG actually
+// injects into extension subprocesses), then $PI_CODING_AGENT_DIR,
+// $PIG_CODING_AGENT_DIR, $PIG_HOME/agent, else ~/.pi/agent.
 func AgentDir() string {
+	if dir, err := sdk.AgentDir(); err == nil {
+		if dir = strings.TrimSpace(dir); dir != "" {
+			return expandHome(dir)
+		}
+	}
 	if dir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")); dir != "" {
 		return expandHome(dir)
 	}

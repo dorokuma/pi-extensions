@@ -85,7 +85,7 @@
 ### D1 配置路径解析（`settings.go:79`）
 
 TS 固定读 `homedir()/.pi/agent/pi-vcc-config.json`；Go 侧 `AgentDir()`（`settings.go`）按
-`$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pi/agent` 解析，
+`PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pi/agent` 解析，
 且 `SettingsPath()` 额外认 `$PI_VCC_CONFIG_PATH` 显式覆盖。目的是隔离 PiG 运行时绝不读写
 生产 `~/.pi/agent` 配置（迁移硬规则），也是测试围栏的基础（`extension_test.go` 的 `TestMain`
 把 `PI_VCC_CONFIG_PATH` 指向临时文件）。

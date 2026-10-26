@@ -297,3 +297,17 @@ func TestSettingsPath_HonoursOverride(t *testing.T) {
 		t.Fatalf("SettingsPath under PI_CODING_AGENT_DIR = %q", got)
 	}
 }
+
+func TestAgentDir_ReadsPigExtHostInfo(t *testing.T) {
+	t.Setenv("PI_VCC_CONFIG_PATH", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_HOME", "")
+	t.Setenv("PIG_EXT_HOST_INFO", `{"agentDir":"/tmp/pig-agent-from-hostinfo","configDirName":".pig","version":"0.5.2"}`)
+	if got := AgentDir(); got != "/tmp/pig-agent-from-hostinfo" {
+		t.Fatalf("AgentDir from PIG_EXT_HOST_INFO = %q", got)
+	}
+	if got := SettingsPath(); got != filepath.Join("/tmp/pig-agent-from-hostinfo", "pi-vcc-config.json") {
+		t.Fatalf("SettingsPath from PIG_EXT_HOST_INFO = %q", got)
+	}
+}

@@ -355,17 +355,105 @@ func prefixTimestamp(entry map[string]any) any {
 	return value
 }
 
-// CollectLiveMessages is before-compact.ts collectLiveMessages(): the entries of
-// the live window, with the orphan-recovery rule for a missing firstKeptEntryId.
-func CollectLiveMessages(branchEntries []map[string]any) []EntryWithMessage {
-	// A context-edited history needs pi's buildSessionProjection, which the
-	// subprocess SDK does not expose; the TS code defers to the hook error in
-	// the same situation on an older host.
+// contextEditSpec is the latest context_edit for one targetId.
+// omit is true when replacement is JSON null (PiG/Pi: drop from model context).
+// content is replacement.content when the edit rewrites the target.
+type contextEditSpec struct {
+	omit    bool
+	content any
+	has     bool
+}
+
+// collectContextEdits walks branch entries in order; later edits for the same
+// targetId win (session-manager.ts buildSessionProjection edits Map).
+func collectContextEdits(branchEntries []map[string]any) map[string]contextEditSpec {
+	edits := map[string]contextEditSpec{}
 	for _, entry := range branchEntries {
-		if entryField(entry, "type") == "context_edit" {
-			return nil
+		if entryField(entry, "type") != "context_edit" {
+			continue
+		}
+		targetID := entryField(entry, "targetId")
+		if targetID == "" {
+			continue
+		}
+		replacement, present := entry["replacement"]
+		if !present || replacement == nil {
+			edits[targetID] = contextEditSpec{omit: true, has: true}
+			continue
+		}
+		replObj, ok := replacement.(map[string]any)
+		if !ok || replObj == nil {
+			edits[targetID] = contextEditSpec{omit: true, has: true}
+			continue
+		}
+		edits[targetID] = contextEditSpec{content: replObj["content"], has: true}
+	}
+	return edits
+}
+
+// applyContextEditToMessage is session-manager.ts projectContextEntry /
+// applyContextEditReplacement for the roles CollectLiveMessages surfaces.
+// A null replacement yields nil (omit). The returned map is a shallow copy
+// so the source entry's message is left unchanged.
+func applyContextEditToMessage(message map[string]any, edit contextEditSpec) map[string]any {
+	if !edit.has {
+		return message
+	}
+	if edit.omit {
+		return nil
+	}
+	role, _ := message["role"].(string)
+	content := edit.content
+	switch role {
+	case "user", "custom":
+		// replacement.content used as-is
+	case "assistant", "toolResult":
+		if text, ok := content.(string); ok {
+			content = []any{map[string]any{"type": "text", "text": text}}
+		}
+	default:
+		return message
+	}
+	out := make(map[string]any, len(message)+1)
+	for k, v := range message {
+		out[k] = v
+	}
+	out["content"] = content
+	return out
+}
+
+// appendLiveMessage converts entry to a live EntryWithMessage, applying any
+// context_edit for its id. Compaction and non-message entries yield nothing.
+func appendLiveMessage(live []EntryWithMessage, entry map[string]any, edits map[string]contextEditSpec) []EntryWithMessage {
+	if entryField(entry, "type") == "compaction" {
+		return live
+	}
+	id := entryField(entry, "id")
+	if edit, ok := edits[id]; ok && edit.omit {
+		return live
+	}
+	message := toLiveMessage(entry)
+	if message == nil {
+		return live
+	}
+	if edit, ok := edits[id]; ok {
+		message = applyContextEditToMessage(message, edit)
+		if message == nil {
+			return live
 		}
 	}
+	return append(live, EntryWithMessage{EntryID: id, Type: entryField(entry, "type"), Message: message})
+}
+
+// CollectLiveMessages is before-compact.ts collectLiveMessages(): the entries of
+// the live window, with the orphan-recovery rule for a missing firstKeptEntryId.
+//
+// When the branch holds context_edit entries, Pi's buildSessionProjection would
+// apply them; the extension subprocess has SessionManager.BuildSessionProjection
+// only for the live host session, not for an arbitrary branchEntries slice, so
+// this port applies the same jsonl semantics locally (targetId omit/replace).
+func CollectLiveMessages(branchEntries []map[string]any) []EntryWithMessage {
+	edits := collectContextEdits(branchEntries)
 
 	lastCompactionIdx := -1
 	lastKeptID := ""
@@ -394,13 +482,7 @@ func CollectLiveMessages(branchEntries []map[string]any) []EntryWithMessage {
 	live := make([]EntryWithMessage, 0, len(branchEntries))
 	if orphanRecovery {
 		for i := lastCompactionIdx + 1; i < len(branchEntries); i++ {
-			entry := branchEntries[i]
-			if entryField(entry, "type") == "compaction" {
-				continue
-			}
-			if message := toLiveMessage(entry); message != nil {
-				live = append(live, EntryWithMessage{EntryID: entryField(entry, "id"), Type: entryField(entry, "type"), Message: message})
-			}
+			live = appendLiveMessage(live, branchEntries[i], edits)
 		}
 		return live
 	}
@@ -413,12 +495,7 @@ func CollectLiveMessages(branchEntries []map[string]any) []EntryWithMessage {
 		if !foundKept {
 			continue
 		}
-		if entryField(entry, "type") == "compaction" {
-			continue
-		}
-		if message := toLiveMessage(entry); message != nil {
-			live = append(live, EntryWithMessage{EntryID: entryField(entry, "id"), Type: entryField(entry, "type"), Message: message})
-		}
+		live = appendLiveMessage(live, entry, edits)
 	}
 	return live
 }

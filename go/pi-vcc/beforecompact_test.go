@@ -257,15 +257,48 @@ func TestCollectLiveMessages_OrphanRecovery(t *testing.T) {
 	}
 }
 
-func TestCollectLiveMessages_ContextEditDefers(t *testing.T) {
-	// A context-edited history needs pi's projection, which the SDK does not
-	// expose here: the collector reports nothing and the hook errors out.
+func TestCollectLiveMessages_ContextEditOmitAndReplace(t *testing.T) {
+	// PiG/Pi context_edit: replacement null omits the target; a content
+	// replacement rewrites the target's message.content. Other live messages
+	// stay collectible (pig worker sessions always carry context_edit).
 	entries := []map[string]any{
-		{"id": "e1", "type": "context_edit"},
-		messageEntry("u0", "user", "text"),
+		messageEntry("u0", "user", "keep-me"),
+		messageEntry("a0", "assistant", "omit-me"),
+		messageEntry("u1", "user", "old-text"),
+		map[string]any{
+			"id": "ce-omit", "type": "context_edit", "targetId": "a0", "replacement": nil,
+		},
+		map[string]any{
+			"id": "ce-repl", "type": "context_edit", "targetId": "u1",
+			"replacement": map[string]any{"content": "new-text"},
+		},
+		messageEntry("a1", "assistant", "after"),
 	}
-	if live := CollectLiveMessages(entries); len(live) != 0 {
-		t.Fatalf("a context_edit history should yield no live entries: %#v", live)
+	live := CollectLiveMessages(entries)
+	if len(live) != 3 {
+		t.Fatalf("live len = %d, want 3 (omit a0): %#v", len(live), live)
+	}
+	if live[0].EntryID != "u0" || live[1].EntryID != "u1" || live[2].EntryID != "a1" {
+		t.Fatalf("ids = %v", []string{live[0].EntryID, live[1].EntryID, live[2].EntryID})
+	}
+	if got, _ := live[1].Message["content"].(string); got != "new-text" {
+		t.Fatalf("u1 content = %#v, want new-text", live[1].Message["content"])
+	}
+	if got, _ := live[0].Message["content"].(string); got != "keep-me" {
+		t.Fatalf("u0 content mutated: %#v", live[0].Message["content"])
+	}
+}
+
+func TestBuildOwnCut_ContextEditStillCuts(t *testing.T) {
+	entries := append(transcript(3), map[string]any{
+		"id": "ce1", "type": "context_edit", "targetId": "a0", "replacement": nil,
+	})
+	got := BuildOwnCut(entries, 1, nil)
+	if !got.OK {
+		t.Fatalf("BuildOwnCut with context_edit failed: %#v", got)
+	}
+	if got.FirstKeptEntryID == "" && !got.CompactAll {
+		t.Fatalf("expected a cut window, got %#v", got)
 	}
 }
 
