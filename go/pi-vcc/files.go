@@ -10,7 +10,9 @@ var fileReadTools = map[string]bool{
 	"read": true, "read_file": true, "view": true,
 }
 
-// fileWriteTools is files.ts FILE_WRITE_TOOLS.
+// Multi-file patch tools (apply_patch) carry their paths inside the diff
+// payload, not in a path arg, so ExtractPaths yields nothing for them; those
+// files are recovered from the hook-provided fileOps below.
 var fileWriteTools = map[string]bool{
 	"edit": true, "write": true, "edit_file": true, "write_file": true,
 	"multiedit": true, "quick_edit": true, "target_edit": true, "apply_patch": true,
@@ -104,19 +106,17 @@ func ExtractFiles(blocks []NormalizedBlock, fileOps *FileOps) FileActivity {
 		if block.Kind != KindToolCall {
 			continue
 		}
-		path, ok := extractPath(block.Args)
-		if !ok {
-			continue
-		}
 		name := strings.ToLower(block.Name)
-		if fileReadTools[name] {
-			activity.Read.Add(path)
-		}
-		if fileWriteTools[name] {
-			activity.Modified.Add(path)
-		}
-		if fileCreateTools[name] {
-			activity.Created.Add(path)
+		for _, path := range ExtractPaths(block.Args) {
+			if fileReadTools[name] {
+				activity.Read.Add(path)
+			}
+			if fileWriteTools[name] {
+				activity.Modified.Add(path)
+			}
+			if fileCreateTools[name] {
+				activity.Created.Add(path)
+			}
 		}
 	}
 

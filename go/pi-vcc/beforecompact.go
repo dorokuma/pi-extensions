@@ -272,6 +272,28 @@ func toLlmSafe(message map[string]any) []map[string]any {
 	return sdk.ConvertToLlm([]map[string]any{message})
 }
 
+// summarizerInputMessage is before-compact.ts's per-message conversion into the
+// summarizer input. convertToLlm turns an extension's custom_message and a
+// user-run `!cmd` (bashExecution) into plain user messages; 0.11.0 keeps a
+// `!cmd` as it is — the brief shows it as one `$ cmd (#N)` line (its output is
+// reachable through vcc_recall) and it is not read as user text — and marks a
+// custom_message injected so the early requests and [User Messages] read only
+// what the user wrote.
+func summarizerInputMessage(message, converted map[string]any) map[string]any {
+	switch messageRole(message) {
+	case "bashExecution":
+		return message
+	case "custom":
+		out := make(map[string]any, len(converted)+1)
+		for key, value := range converted {
+			out[key] = value
+		}
+		out["injected"] = true
+		return out
+	}
+	return converted
+}
+
 // prefixHasRenderableContent is before-compact.ts prefixHasRenderableContent():
 // whether the prefix contributes at least one block after the skipCustomTypes
 // filter, convertToLlm and normalize.

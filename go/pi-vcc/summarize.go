@@ -29,61 +29,186 @@ type RankedCompileInput struct {
 	Ranking *BriefRankingOptions
 }
 
+// earlyHeader is summarize.ts EARLY: the section the first summary pins and
+// every later compaction keeps as it is.
+const earlyHeader = "Early Session Requests"
+
 // headerNames is summarize.ts HEADER_NAMES, in rendering order.
 var headerNames = []string{
-	"Session Goal", "Files And Changes", "Commits", "Tracked Commands", "Outstanding Context", "User Preferences",
+	earlyHeader, "Files And Changes", "Commits", "Tracked Commands", "User Messages",
 }
 
 // summarySeparator is summarize.ts SEPARATOR.
 const summarySeparator = "\n\n---\n\n"
 
-// summarySeparatorRe is summarize.ts's `/\n\n---\n\n/` match used by sectionOf.
-var summarySeparatorIndex = "\n\n---\n\n"
+// sectionHeaderLineRe is summarize.ts HEADER_LINE_RE: a "[Title Case]" line
+// standing alone. JS's `$` (no /m flag) is end of input, and Go's `$` (no (?m)
+// flag) is end of text, so the two agree when the regex is applied to one line.
+var sectionHeaderLineRe = mustCompile(`^\[[A-Z][^\]\n]*\]$`)
+
+// splitSummary is summarize.ts splitSummary(): the header area and the brief
+// transcript. Without a leading header line the whole text is the brief; header
+// sections only (no separator) have no brief.
+func splitSummary(text string) (head, brief string) {
+	firstLine := text
+	if idx := strings.IndexByte(text, '\n'); idx >= 0 {
+		firstLine = text[:idx]
+	}
+	if !sectionHeaderLineRe.MatchString(firstLine) {
+		return "", jsTrimSpace(text)
+	}
+	idx := strings.Index(text, summarySeparator)
+	if idx < 0 {
+		return text, ""
+	}
+	return text[:idx], jsTrimSpace(text[idx+len(summarySeparator):])
+}
 
 // sectionOf is summarize.ts sectionOf(): one named section's text, header
-// included, trimmed.
+// included, trimmed. A section is the "[Title]" line standing alone in the
+// header area plus the lines up to the next blank line, so a transcript line
+// that merely mentions the name is never mistaken for the section.
 func sectionOf(text, header string) string {
-	tag := "[" + header + "]"
-	start := strings.Index(text, tag)
+	// summarize.ts: `splitSummary(text).head.split("\n")`.
+	head, _ := splitSummary(text)
+	lines := jsSplitLines(head)
+	start := -1
+	for i, line := range lines {
+		if line == "["+header+"]" {
+			start = i
+			break
+		}
+	}
 	if start < 0 {
 		return ""
 	}
-	after := text[start:]
-	nextSection := make([]int, 0, len(headerNames))
-	for _, name := range headerNames {
-		if name == header {
-			continue
-		}
-		if idx := strings.Index(after, "["+name+"]"); idx > 0 {
-			nextSection = append(nextSection, idx)
-		}
+	end := start + 1
+	for end < len(lines) && jsTrimSpace(lines[end]) != "" {
+		end++
 	}
-	candidates := nextSection
-	if sep := strings.Index(after, summarySeparatorIndex); sep > 0 {
-		candidates = append(candidates, sep)
-	}
-	sortInts(candidates)
-	if len(candidates) > 0 && candidates[0] != 0 {
-		return jsTrimSpace(after[:candidates[0]])
-	}
-	return jsTrimSpace(after)
+	return jsTrimSpace(strings.Join(lines[start:end], "\n"))
 }
 
 // briefOf is summarize.ts briefOf(): everything after the first separator.
 func briefOf(text string) string {
-	idx := strings.Index(text, summarySeparatorIndex)
-	if idx < 0 {
-		return ""
+	_, brief := splitSummary(text)
+	return brief
+}
+
+// isCleanLine is summarize.ts isClean(): an item line of a section.
+func isCleanLine(line string) bool {
+	return strings.HasPrefix(line, "- ") && !strings.Contains(line, "<skill") && !strings.Contains(line, "</skill")
+}
+
+// unwrapSection is summarize.ts unwrapSection(): both summaries went through
+// wrapLongLines (the fresh one in formatSummary), so rejoin each item's indented
+// continuation lines before a merge reads only "- " lines.
+func unwrapSection(text, header string) string {
+	return rejoinWrappedSection(sectionOf(text, header))
+}
+
+// goalMarkerRe is pinnedEarlyRequests()'s `/^- \[[^\]]*\]$/`: a
+// "- [skill: x]" / "- [Scope change]" marker line rather than a real request.
+var goalMarkerRe = mustCompile(`^- \[[^\]]*\]$`)
+
+// pinnedEarlyRequests is summarize.ts pinnedEarlyRequests(): the previous
+// summary's early requests, kept as they are: the first summary sets them. An
+// older version's [Session Goal] gives its first real line (not a
+// "- [skill: x]" / "- [Scope change]" marker).
+func pinnedEarlyRequests(prev string) []string {
+	early := make([]string, 0, EarlyRequestsKept)
+	for _, line := range jsSplitLines(unwrapSection(prev, earlyHeader)) {
+		if isCleanLine(line) {
+			early = append(early, line)
+		}
 	}
-	return jsTrimSpace(text[idx+len(summarySeparatorIndex):])
+	if len(early) > 0 {
+		if len(early) > EarlyRequestsKept {
+			early = early[:EarlyRequestsKept]
+		}
+		return early
+	}
+	for _, line := range jsSplitLines(unwrapSection(prev, "Session Goal")) {
+		if isCleanLine(line) && !goalMarkerRe.MatchString(line) {
+			return []string{line}
+		}
+	}
+	return nil
+}
+
+// commitsCap is summarize.ts COMMITS_CAP.
+const commitsCap = 8
+
+// commitHashLineRe is summarize.ts COMMIT_HASH_RE: a commit line that carries
+// its hash.
+var commitHashLineRe = mustCompile(`^- [0-9a-f]{7,12}: `)
+
+// bareCommit is summarize.ts bareCommit(): the line with its hash stripped, so a
+// hashed and a hashless line of one commit compare equal.
+func bareCommit(line string) string {
+	return commitHashLineRe.ReplaceAllString(line, "- ")
+}
+
+// dedupCommitLines is summarize.ts dedupCommitLines(): one line per commit,
+// first-seen order. A hashless line is the same commit as a hashed line with its
+// message (one side did not capture the hash): keep the hashed one, in the
+// earlier line's place.
+func dedupCommitLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		duplicate := false
+		for _, existing := range out {
+			if existing == line {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		bare := bareCommit(line)
+		if commitHashLineRe.MatchString(line) {
+			hashless := -1
+			for i, existing := range out {
+				if existing == bare {
+					hashless = i
+					break
+				}
+			}
+			if hashless >= 0 {
+				out[hashless] = line
+				continue
+			}
+			out = append(out, line)
+			continue
+		}
+		already := false
+		for _, existing := range out {
+			if bareCommit(existing) == bare {
+				already = true
+				break
+			}
+		}
+		if !already {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// cleanItemLines is the `text.split("\n").filter(isClean)` both merge paths use.
+func cleanItemLines(text string) []string {
+	out := make([]string, 0, 8)
+	for _, line := range jsSplitLines(text) {
+		if isCleanLine(line) {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // mergeHeaderSection is summarize.ts mergeHeaderSection().
 func mergeHeaderSection(header, prev, fresh string) string {
-	// Outstanding Context is volatile — always use fresh only.
-	if header == "Outstanding Context" {
-		return fresh
-	}
 	if prev == "" {
 		return fresh
 	}
@@ -97,27 +222,22 @@ func mergeHeaderSection(header, prev, fresh string) string {
 		return mergeTrackedCommandLines(prev, fresh)
 	}
 
-	isClean := func(line string) bool {
-		return strings.HasPrefix(line, "- ") && !strings.Contains(line, "<skill") && !strings.Contains(line, "</skill")
+	prevLines := cleanItemLines(prev)
+	freshLines := cleanItemLines(fresh)
+
+	if header == "User Messages" {
+		// summarize.ts: keepNewestUserMessages([...prevLines, ...freshLines])
+		merged := make([]string, 0, len(prevLines)+len(freshLines))
+		merged = append(merged, prevLines...)
+		merged = append(merged, freshLines...)
+		return "[" + header + "]\n" + strings.Join(KeepNewestUserMessages(merged), "\n")
 	}
-	combined := make([]string, 0, 16)
-	seen := make(map[string]bool, 16)
-	for _, text := range []string{prev, fresh} {
-		for _, line := range jsSplitLines(text) {
-			if !isClean(line) || seen[line] {
-				continue
-			}
-			seen[line] = true
-			combined = append(combined, line)
-		}
-	}
-	capLines := 15
-	if header == "Session Goal" || header == "Commits" {
-		capLines = 8
-	}
-	capped := combined
-	if len(capped) > capLines {
-		capped = capped[len(capped)-capLines:]
+
+	// Commits (and any non-pinned fallback section): one line per commit,
+	// capped from the tail.
+	capped := dedupCommitLines(append(append(make([]string, 0, len(prevLines)+len(freshLines)), prevLines...), freshLines...))
+	if len(capped) > commitsCap {
+		capped = capped[len(capped)-commitsCap:]
 	}
 	if len(capped) == 0 {
 		return ""
@@ -158,11 +278,11 @@ func mergeCategorizedLines(categories []string, prev, fresh, splitOn string, tou
 }
 
 // formatCategorizedLines is summarize.ts formatCategorizedLines().
-func formatCategorizedLines(header string, merged map[string]*orderedSet, categories []string, joinWith string, itemLimit int, keep string) string {
+func formatCategorizedLines(header string, merged map[string]*orderedSet, categories []string, joinWith string, itemLimit int) string {
 	lines := make([]string, 0, len(categories))
 	for _, category := range categories {
 		if merged[category].Len() > 0 {
-			lines = append(lines, "- "+category+": "+CapItems(merged[category].Items(), itemLimit, joinWith, keep))
+			lines = append(lines, "- "+category+": "+CapItems(merged[category].Items(), itemLimit, joinWith))
 		}
 	}
 	if len(lines) == 0 {
@@ -176,12 +296,14 @@ var fileCategories = []string{"Modified", "Created", "Read"}
 
 // mergeFileLines is summarize.ts mergeFileLines().
 func mergeFileLines(prev, fresh string) string {
-	merged := mergeCategorizedLines(fileCategories, prev, fresh, ",", false)
-	// Dedup: if already in Modified, drop from Created.
+	// Newest-last with re-touched files moved to the end, so the capped list
+	// follows the files being worked on instead of freezing on the first ones.
+	merged := mergeCategorizedLines(fileCategories, prev, fresh, ",", true)
+	// Dedup: if already in Modified, drop from Created (file existed before).
 	for _, path := range merged["Modified"].Items() {
 		merged["Created"].Delete(path)
 	}
-	return formatCategorizedLines("Files And Changes", merged, fileCategories, ", ", 10, "head")
+	return formatCategorizedLines("Files And Changes", merged, fileCategories, ", ", FilesPerCategory)
 }
 
 // categoryNameRe is summarize.ts's `/^- ([^:]+): /`.
@@ -217,7 +339,7 @@ func mergeTrackedCommandLines(prev, fresh string) string {
 		}
 	}
 	merged := mergeCategorizedLines(names, prev, fresh, CommandSeparator, true)
-	return formatCategorizedLines("Tracked Commands", merged, names, CommandSeparator, CommandsPerName, "tail")
+	return formatCategorizedLines("Tracked Commands", merged, names, CommandSeparator, CommandsPerName)
 }
 
 // mergeBriefTranscript is summarize.ts mergeBriefTranscript().
@@ -295,9 +417,9 @@ type mergePreviousOptions struct {
 // the group is captured and re-emitted by rejoinWrappedSection instead.
 var continuationIndentRe = mustCompile("\n[ \t]+(" + jsNotSpace + ")")
 
-// rejoinWrappedSection is sectionOf(prev, header) followed by the
-// `replace(/\n[ \t]+(?=\S)/g, " ")` rejoin: the stored summary went through
-// wrapLongLines, so an item's indented continuation lines are joined back.
+// rejoinWrappedSection is summarize.ts's `replace(/\n[ \t]+(?=\S)/g, " ")`:
+// the stored summary went through wrapLongLines, so an item's indented
+// continuation lines are joined back into one line.
 func rejoinWrappedSection(text string) string {
 	var b strings.Builder
 	i := 0
@@ -329,11 +451,17 @@ func isLineTerminatorOrSpaceByte(c byte) bool {
 
 // mergePrevious is summarize.ts mergePrevious().
 func mergePrevious(prev, fresh string, options mergePreviousOptions) string {
+	// Merge header sections.
+	early := pinnedEarlyRequests(prev)
 	headers := make([]string, 0, len(headerNames))
 	for _, header := range headerNames {
-		freshSec := sectionOf(fresh, header)
-		prevSec := rejoinWrappedSection(sectionOf(prev, header))
-		if merged := mergeHeaderSection(header, prevSec, freshSec); merged != "" {
+		merged := ""
+		if header == earlyHeader && len(early) > 0 {
+			merged = "[" + earlyHeader + "]\n" + strings.Join(early, "\n")
+		} else {
+			merged = mergeHeaderSection(header, unwrapSection(prev, header), unwrapSection(fresh, header))
+		}
+		if merged != "" {
 			headers = append(headers, merged)
 		}
 	}
@@ -377,25 +505,29 @@ func compileWithBriefBlocks(input CompileInput, options compileWithBriefBlocksOp
 	if options.briefBlocksFor != nil {
 		briefBlocks = options.briefBlocksFor(blocks)
 	}
-	data := BuildSections(BuildSectionsInput{
-		Blocks:        blocks,
-		BriefBlocks:   briefBlocks,
-		FileOps:       input.FileOps,
-		TrackCommands: input.TrackCommands,
-	})
+	// Strip any legacy RECALL_NOTE baked into prev summary (pre-fix format)
+	// so merge doesn't re-stack it inside the brief. TS's `prev` is
+	// `string | undefined`: the flag below is its definedness, which decides
+	// hasEarlyRequests, while a non-empty string decides the merge.
+	prevDefined := input.HasPreviousSummary && input.PreviousSummary != ""
+	prev := ""
+	if prevDefined {
+		prev = StripRecallNote(input.PreviousSummary)
+	}
 	capFresh := true
 	if options.capFreshBrief != nil {
 		capFresh = *options.capFreshBrief
 	}
+	data := BuildSections(BuildSectionsInput{
+		Blocks:           blocks,
+		BriefBlocks:      briefBlocks,
+		FileOps:          input.FileOps,
+		TrackCommands:    input.TrackCommands,
+		HasEarlyRequests: prevDefined && len(pinnedEarlyRequests(prev)) > 0,
+	})
 	fresh := FormatSummary(data, FormatSummaryOptions{CapBriefTranscript: &capFresh})
-	prev := ""
-	hasPrev := false
-	if input.HasPreviousSummary && input.PreviousSummary != "" {
-		prev = StripRecallNote(input.PreviousSummary)
-		hasPrev = true
-	}
 	merged := fresh
-	if hasPrev {
+	if prev != "" {
 		merged = mergePrevious(prev, fresh, mergePreviousOptions{preserveFreshBrief: options.preserveFreshBriefOnMerge})
 	}
 	if merged == "" {

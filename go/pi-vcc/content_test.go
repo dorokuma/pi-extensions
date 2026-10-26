@@ -200,6 +200,55 @@ func TestSummarizeToolArgs(t *testing.T) {
 	}
 }
 
+// TestExtractPaths pins tool-args.ts extractPaths(): a single path arg, else the
+// string entries of a `paths` array (a multi-file edit tool).
+func TestExtractPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+		want []string
+	}{
+		{"single path arg", map[string]any{"path": "/a/b"}, []string{"/a/b"}},
+		{"path arg wins over paths", map[string]any{"path": "/a", "paths": []any{"/b", "/c"}}, []string{"/a"}},
+		{"paths array", map[string]any{"paths": []any{"/a", "/b", "/c"}}, []string{"/a", "/b", "/c"}},
+		{"non-string entries dropped", map[string]any{"paths": []any{"/a", 42, "", "/d"}}, []string{"/a", "/d"}},
+		// TS's `if (one)` is truthiness: an empty path arg falls through.
+		{"empty path arg falls through", map[string]any{"path": "", "paths": []any{"/a"}}, []string{"/a"}},
+		{"no path at all", map[string]any{"command": "ls"}, nil},
+		{"paths not an array", map[string]any{"paths": "/a"}, nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := ExtractPaths(test.args)
+			if len(got) != len(test.want) {
+				t.Fatalf("ExtractPaths = %#v, want %#v", got, test.want)
+			}
+			for i := range test.want {
+				if got[i] != test.want[i] {
+					t.Fatalf("ExtractPaths = %#v, want %#v", got, test.want)
+				}
+			}
+		})
+	}
+}
+
+// TestSummarizeToolArgs_MultiPath pins the ` +N` tail a multi-path call renders.
+func TestSummarizeToolArgs_MultiPath(t *testing.T) {
+	if got := summarizeToolArgs(map[string]any{"paths": []any{"/a", "/b", "/c"}}); got != "path=/a +2" {
+		t.Fatalf("summarizeToolArgs = %q, want \"path=/a +2\"", got)
+	}
+}
+
+// TestToolOneLiner_MultiPath pins brief.ts toolOneLiner()'s ` +N` tail.
+func TestToolOneLiner_MultiPath(t *testing.T) {
+	if got := toolOneLiner("edit", map[string]any{"paths": []any{"/a", "/b"}}); got != `* edit "/a" +1` {
+		t.Fatalf("toolOneLiner = %q, want %q", got, `* edit "/a" +1`)
+	}
+	if got := toolOneLiner("edit", map[string]any{"path": "/a"}); got != `* edit "/a"` {
+		t.Fatalf("toolOneLiner = %q, want %q", got, `* edit "/a"`)
+	}
+}
+
 // ── IsContentBearing / ExtractToolCallText ─────────────────────────────────
 
 func TestIsContentBearing(t *testing.T) {
@@ -331,29 +380,5 @@ func TestCollapseSkillText(t *testing.T) {
 				t.Fatalf("CollapseSkillText(%q) = %q, want %q", test.in, got, test.want)
 			}
 		})
-	}
-}
-
-func TestCollapseSkillLines(t *testing.T) {
-	lines := []string{
-		"top",
-		`<skill name="pdf">`,
-		"card body one",
-		"card body two",
-		"</skill>",
-		`<skill name="pdf">`,
-		"again",
-		"</skill>",
-		"bottom",
-	}
-	got := CollapseSkillLines(lines)
-	want := []string{"top", "[skill: pdf]", "bottom"}
-	if len(got) != len(want) {
-		t.Fatalf("CollapseSkillLines = %#v, want %#v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("CollapseSkillLines = %#v, want %#v", got, want)
-		}
 	}
 }

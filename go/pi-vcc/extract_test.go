@@ -8,146 +8,182 @@ import (
 // Tests for src/extract/* and src/core/build-sections.ts: the extractors that
 // turn a normalized transcript into SectionData.
 
-// ── goals ───────────────────────────────────────────────────────────────────
+// ── user messages ────────────────────────────────────────────────────────
 
-func TestExtractGoals_FirstUserBullets(t *testing.T) {
-	blocks := []NormalizedBlock{
-		userBlock("- port sanitize.ts to Go\n- keep behavior identical", 0, true),
-		userBlock("ok", 1, true),
-	}
-	got := ExtractGoals(blocks)
-	if !containsStr(got, "port sanitize.ts to Go") || !containsStr(got, "keep behavior identical") {
-		t.Fatalf("ExtractGoals = %v", got)
-	}
-}
-
-func TestExtractGoals_FiltersNoise(t *testing.T) {
-	blocks := []NormalizedBlock{
-		userBlock("ok", 0, true),
-		userBlock("thanks!", 1, true),
-		userBlock("[error] something failed", 2, true),
-		userBlock("/root/some/path.txt", 3, true),
-	}
-	if got := ExtractGoals(blocks); len(got) != 0 {
-		t.Fatalf("noise was extracted as goals: %v", got)
-	}
-}
-
-func TestExtractGoals_ScopeChangeAppended(t *testing.T) {
+// TestExtractUserMessages_FirstMessagesAreTheEarlyRequests pins
+// user-messages.ts extractUserMessages(): what the user wrote, oldest first,
+// verbatim and clipped.
+func TestExtractUserMessages_FirstMessagesAreTheEarlyRequests(t *testing.T) {
 	blocks := []NormalizedBlock{
 		userBlock("port the extractor to Go", 0, true),
-		userBlock("Actually, instead rewrite the parser first", 1, true),
+		userBlock("ok", 1, true),             // one word: dropped
+		userBlock("好的", 2, true),             // one word: dropped
+		userBlock("keep the patch", 3, true), // kept
 	}
-	got := ExtractGoals(blocks)
-	joined := strings.Join(got, "\n")
-	if !strings.Contains(joined, "[Scope change]") {
-		t.Fatalf("the scope change was not marked: %v", got)
+	got := ExtractUserMessages(blocks)
+	want := []string{"port the extractor to Go", "keep the patch"}
+	if len(got) != len(want) {
+		t.Fatalf("ExtractUserMessages = %#v, want %#v", got, want)
 	}
-	if !strings.Contains(joined, "rewrite the parser first") {
-		t.Fatalf("the scope-change bullet was lost: %v", got)
-	}
-	// The original goal is still there, ahead of the marker.
-	if !strings.Contains(joined, "port the extractor to Go") {
-		t.Fatalf("the original goal was dropped: %v", got)
-	}
-	if strings.Index(joined, "port the extractor") > strings.Index(joined, "[Scope change]") {
-		t.Fatalf("the scope change was placed before the original goal: %v", got)
-	}
-}
-
-func TestExtractGoals_CapsAtEightLines(t *testing.T) {
-	blocks := []NormalizedBlock{
-		userBlock(strings.Repeat("build the thing line\n", 12), 0, true),
-	}
-	if got := ExtractGoals(blocks); len(got) > 8 {
-		t.Fatalf("ExtractGoals returned %d lines, over the cap of 8: %v", len(got), got)
-	}
-}
-
-func TestExtractGoals_StopsAtTemplateBoilerplate(t *testing.T) {
-	blocks := []NormalizedBlock{
-		userBlock("fix the login bug\nFor each file, list the exports.\nOutput:\n- noop", 0, true),
-	}
-	got := ExtractGoals(blocks)
-	if len(got) != 1 || got[0] != "fix the login bug" {
-		t.Fatalf("ExtractGoals = %v, want just the real goal", got)
-	}
-}
-
-// ── preferences ─────────────────────────────────────────────────────────────
-
-func TestExtractPreferences(t *testing.T) {
-	blocks := []NormalizedBlock{
-		userBlock("always use tabs for indentation", 0, true),
-		userBlock("don't want emojis in output", 1, true),
-		userBlock("what is this?", 2, true), // question: rejected
-		userBlock("just run it", 3, true),   // matches no pattern
-	}
-	got := ExtractPreferences(blocks)
-	if !containsStr(got, "always use tabs for indentation") {
-		t.Fatalf("ExtractPreferences = %v", got)
-	}
-	if !containsStr(got, "don't want emojis in output") {
-		t.Fatalf("ExtractPreferences lost the don't-want pattern: %v", got)
-	}
-	for _, item := range got {
-		if strings.Contains(item, "?") || item == "just run it" {
-			t.Fatalf("a non-preference was extracted: %q", item)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ExtractUserMessages = %#v, want %#v", got, want)
 		}
 	}
 }
 
-func TestExtractPreferences_OnePerBlock(t *testing.T) {
+// TestExtractUserMessages_ChineseMessagesAreKept pins the word-count floor in
+// the language this extension is used in most: a Chinese instruction is not a
+// one-word reply.
+func TestExtractUserMessages_ChineseMessagesAreKept(t *testing.T) {
 	blocks := []NormalizedBlock{
-		userBlock("always use tabs\nnever use spaces\nprefer gofmt", 0, true),
+		userBlock("把 Go 版 pi-vcc 同步升级到上游 0.11.1，并保留两个本地补丁", 0, true),
+		userBlock("这个报错是什么原因，帮我看看日志", 1, true),
 	}
-	if got := ExtractPreferences(blocks); len(got) != 1 {
-		t.Fatalf("ExtractPreferences returned %d prefs for one block, want 1: %v", len(got), got)
-	}
-}
-
-func TestDedupPreferencesAgainstGoals(t *testing.T) {
-	prefs := []string{"always use tabs", "unique preference"}
-	goals := []string{"Always use tabs"}
-	got := DedupPreferencesAgainstGoals(prefs, goals)
-	if len(got) != 1 || got[0] != "unique preference" {
-		t.Fatalf("DedupPreferencesAgainstGoals = %v", got)
+	got := ExtractUserMessages(blocks)
+	if len(got) != 2 {
+		t.Fatalf("ExtractUserMessages = %#v, want both messages", got)
 	}
 }
 
-// ── outstanding context ─────────────────────────────────────────────────────
-
-func TestExtractOutstandingContext(t *testing.T) {
+// TestExtractUserMessages_InjectedIsLeftOut pins the 0.11.0 rule: a message an
+// extension injected (a custom_message) is not the user's words.
+func TestExtractUserMessages_InjectedIsLeftOut(t *testing.T) {
 	blocks := []NormalizedBlock{
-		{Kind: KindAssistant, Text: "Some preamble.\nThe tests are still failing after the refactor."},
-		userBlock("The build is broken on arm64", 0, true),
-		{Kind: KindAssistant, Text: "- still broken\nThis line is fine."},
+		userBlock("the real task", 0, true),
+		userBlockInjected("an extension note", 1, true, true),
+		userBlock("a follow-up question", 2, true),
 	}
-	got := extractOutstandingContext(blocks)
-	joined := strings.Join(got, "\n")
-	if !strings.Contains(joined, "The tests are still failing after the refactor.") {
-		t.Fatalf("an assistant blocker was lost: %v", got)
-	}
-	// A user blocker is labelled so the section reader knows the source.
-	if !strings.Contains(joined, "[user] The build is broken on arm64") {
-		t.Fatalf("a user blocker was not labelled: %v", got)
-	}
-	// The bullet continuation fragment is skipped.
-	if strings.Contains(joined, "still broken") {
-		t.Fatalf("a bullet fragment was treated as a blocker: %v", got)
+	got := ExtractUserMessages(blocks)
+	if len(got) != 2 || got[0] != "the real task" || got[1] != "a follow-up question" {
+		t.Fatalf("ExtractUserMessages = %#v, want the two user messages", got)
 	}
 }
 
-func TestExtractOutstandingContext_CapsAtFive(t *testing.T) {
-	blocks := make([]NormalizedBlock, 0, 8)
-	for i := 0; i < 8; i++ {
-		blocks = append(blocks, NormalizedBlock{
-			Kind: KindAssistant,
-			Text: "Failure number " + jsNumberString(float64(i)) + " happened in the pipeline",
+// TestExtractUserMessages_DropsToolOpenedText pins userLine()'s opening-tag
+// rule: text that opens with a tag was put there by a tool.
+func TestExtractUserMessages_DropsToolOpenedText(t *testing.T) {
+	blocks := []NormalizedBlock{
+		userBlock("<peer_message>from a colleague</peer_message>", 0, true),
+		userBlock("<local-command-stdout>done</local-command-stdout>", 1, true),
+		userBlock("a real request", 2, true),
+	}
+	got := ExtractUserMessages(blocks)
+	if len(got) != 1 || got[0] != "a real request" {
+		t.Fatalf("ExtractUserMessages = %#v, want only the real request", got)
+	}
+}
+
+// TestExtractUserMessages_SkillTextKeepsTheTag pins userLine()'s skill rule: an
+// expanded skill alone is not the user's words, so its text is kept behind a
+// `[skill: name]` tag.
+func TestExtractUserMessages_SkillTextKeepsTheTag(t *testing.T) {
+	blocks := []NormalizedBlock{
+		userBlock("<skill name=\"pdf\">a long card body\nwith two lines</skill>\nplease read the PDF report", 0, true),
+	}
+	got := ExtractUserMessages(blocks)
+	if len(got) != 1 {
+		t.Fatalf("ExtractUserMessages = %#v", got)
+	}
+	if !strings.HasPrefix(got[0], "[skill: pdf] ") {
+		t.Fatalf("the skill tag was lost: %q", got[0])
+	}
+	if !strings.Contains(got[0], "please read the PDF report") {
+		t.Fatalf("the user's text was lost: %q", got[0])
+	}
+}
+
+// TestKeepNewestUserMessages pins keepNewestUserMessages(): the newest 15,
+// oldest first, a repeat moving to the end.
+func TestKeepNewestUserMessages(t *testing.T) {
+	lines := make([]string, 0, 17)
+	for i := 0; i < 17; i++ {
+		lines = append(lines, "line "+jsNumberString(float64(i)))
+	}
+	lines = append(lines, "line 0") // a repeat moves to the end
+	got := KeepNewestUserMessages(lines)
+	if len(got) != 15 {
+		t.Fatalf("KeepNewestUserMessages kept %d lines, want 15: %#v", len(got), got)
+	}
+	if got[14] != "line 0" || got[0] != "line 3" {
+		t.Fatalf("KeepNewestUserMessages = %#v", got)
+	}
+}
+
+// TestUserLine_ClipsAt300 pins USER_MESSAGE_CHARS.
+func TestUserLine_ClipsAt300(t *testing.T) {
+	long := "run the full verification suite for the whole repository " + strings.Repeat("and again ", 40)
+	got := userLine(long)
+	if jsLen(got) > 300 {
+		t.Fatalf("userLine kept %d units, over the 300-char clip", jsLen(got))
+	}
+}
+
+// TestUserMessageWordCount_IntlSegmenterCalibration pins the Go word count
+// against TS's `new Intl.Segmenter(undefined, { granularity: "word" })` on this
+// host, where the default locale resolves to zh-CN and ICU breaks CJK with its
+// Chinese dictionary. The `want` column was measured with node's Intl.Segmenter
+// (the reference implementation); `goWant` is what this port counts, and is what
+// the test pins. One long sentence is the only row where they differ: ICU's
+// dictionary splits one Han run into one word more than the ceil(n/2)
+// approximation in userMessages.go, which never changes an outcome because the
+// count only decides whether a message has at least two words.
+func TestUserMessageWordCount_IntlSegmenterCalibration(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		want   int // Intl.Segmenter (zh-CN)
+		goWant int // userMessageWordCount
+	}{
+		{"an English sentence", "hello world", 2, 2},
+		{"a contraction is one word", "don't", 1, 1},
+		{"a hyphenated pair is two", "e-mail", 2, 2},
+		{"a dotted number is one", "3.14", 1, 1},
+		{"a dashed number is two", "3-5", 2, 2},
+		{"korean joins per run", "한글 테스트", 2, 2},
+		{"chinese is dictionary broken", "中文消息测试", 3, 3},
+		{"a two-character reply is one word", "好的", 1, 1},
+		{"a three-character sentence is two", "没问题", 2, 2},
+		{"kana counts per character", "ひらがな", 4, 4},
+		{"mixed chinese and latin", "中文a测试", 3, 3},
+		{"punctuation only", "（）【】", 0, 0},
+		{"emoji is not a word", "🎉 很好", 1, 1},
+		{"a real instruction", "把 Go 版 pi-vcc 同步升级到上游 0.11.1 并且保留两个本地补丁", 16, 15},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := userMessageWordCount(test.in); got != test.goWant {
+				t.Fatalf("userMessageWordCount(%q) = %d, want %d (Intl.Segmenter counted %d)",
+					test.in, got, test.goWant, test.want)
+			}
 		})
 	}
-	if got := extractOutstandingContext(blocks); len(got) != 5 {
-		t.Fatalf("extractOutstandingContext returned %d items, want 5", len(got))
+}
+
+// TestUserMessageWordCount_ShortRepliesAreDocumented pins the short replies
+// against the ICU measurement: "好的" is one ICU word and one word here, while
+// ICU's dictionary splits the other two-character replies into two. Those are
+// read as one word here, so a two-character reply can be dropped where TS would
+// keep it. Nothing substantive is ever dropped: every longer sentence agrees
+// with ICU (see the calibration table above), and the outcome that matters —
+// a real instruction is never dropped — is pinned by
+// TestExtractUserMessages_ChineseMessagesAreKept.
+func TestUserMessageWordCount_ShortRepliesAreDocumented(t *testing.T) {
+	tests := []struct {
+		text string
+		icu  int
+		go_  int
+	}{
+		{"好的", 1, 1},
+		{"走吧", 2, 1},
+		{"是的", 2, 1},
+		{"没事", 2, 1},
+	}
+	for _, test := range tests {
+		if got := userMessageWordCount(test.text); got != test.go_ {
+			t.Fatalf("userMessageWordCount(%q) = %d, want %d (Intl.Segmenter counted %d)",
+				test.text, got, test.go_, test.icu)
+		}
 	}
 }
 
@@ -239,8 +275,11 @@ func TestFormatFileActivity_CapsCategoryAtTen(t *testing.T) {
 		})
 	}
 	joined := strings.Join(formatFileActivity(blocks, nil), "\n")
-	if !strings.Contains(joined, "(+2 more)") {
-		t.Fatalf("the cap marker is missing:\n%s", joined)
+	if !strings.Contains(joined, "(+2 earlier) f2.go, f3.go, f4.go, f5.go, f6.go, f7.go, f8.go, f9.go, f10.go, f11.go") {
+		t.Fatalf("the cap kept the wrong files:\n%s", joined)
+	}
+	if strings.Contains(joined, "f0.go") || strings.Contains(joined, "f1.go") {
+		t.Fatalf("the oldest files survived the cap:\n%s", joined)
 	}
 }
 
@@ -359,9 +398,8 @@ func TestExtractTrackedCommands_EmptyConfig(t *testing.T) {
 func TestBuildSections(t *testing.T) {
 	blocks := []NormalizedBlock{
 		userBlock("port the sanitizer to Go", 0, true),
-		// A separate turn: as a bullet of the first block, "always use tabs"
-		// would also be a goal and dedupPreferencesAgainstGoals would drop it
-		// from the preferences (that dedup is pinned by TestDedupPreferencesAgainstGoals).
+		// The second message is still one of the first three, so it is an early
+		// request too.
 		userBlock("always use tabs", 1, true),
 		{Kind: KindToolCall, Name: "edit", Args: map[string]any{"path": "/root/p/sanitize.go"}},
 		// A second absolute path under the same root lets the common-prefix trim run.
@@ -375,8 +413,14 @@ func TestBuildSections(t *testing.T) {
 		Blocks:        blocks,
 		TrackCommands: []string{"go"},
 	})
-	if !containsStr(data.SessionGoal, "port the sanitizer to Go") {
-		t.Fatalf("SessionGoal = %v", data.SessionGoal)
+	if !containsStr(data.EarlyRequests, "port the sanitizer to Go") {
+		t.Fatalf("EarlyRequests = %v", data.EarlyRequests)
+	}
+	if !containsStr(data.EarlyRequests, "always use tabs") {
+		t.Fatalf("EarlyRequests = %v, want the second message too", data.EarlyRequests)
+	}
+	if len(data.UserMessages) != 0 {
+		t.Fatalf("UserMessages = %v, want none: only two messages exist", data.UserMessages)
 	}
 	joinedFiles := strings.Join(data.FilesAndChanges, "\n")
 	if !strings.Contains(joinedFiles, "Modified: sanitize.go") || !strings.Contains(joinedFiles, "Read: main.go") {
@@ -385,14 +429,63 @@ func TestBuildSections(t *testing.T) {
 	if !containsStr(data.Commits, "1111111: feat: sanitize") {
 		t.Fatalf("Commits = %v", data.Commits)
 	}
-	if !containsStr(data.UserPreferences, "always use tabs") {
-		t.Fatalf("UserPreferences = %v", data.UserPreferences)
-	}
 	if len(data.TrackedCommands) == 0 || !strings.Contains(data.TrackedCommands[0], "go test ./...") {
 		t.Fatalf("TrackedCommands = %v", data.TrackedCommands)
 	}
 	if !strings.Contains(data.BriefTranscript, "[user]") || !strings.Contains(data.BriefTranscript, "[assistant]") {
 		t.Fatalf("BriefTranscript = %q", data.BriefTranscript)
+	}
+}
+
+// TestBuildSections_HasEarlyRequestsSkipsTheFirstMessages pins
+// build-sections.ts hasEarlyRequests: with the previous summary already holding
+// the early requests, this compaction's first messages are ordinary user
+// messages.
+func TestBuildSections_HasEarlyRequestsSkipsTheFirstMessages(t *testing.T) {
+	blocks := []NormalizedBlock{
+		userBlock("the original task book", 0, true),
+		userBlock("a follow-up question", 1, true),
+	}
+	data := BuildSections(BuildSectionsInput{Blocks: blocks, HasEarlyRequests: true})
+	if len(data.EarlyRequests) != 0 {
+		t.Fatalf("EarlyRequests = %v, want none", data.EarlyRequests)
+	}
+	if len(data.UserMessages) != 2 {
+		t.Fatalf("UserMessages = %v, want both messages", data.UserMessages)
+	}
+}
+
+// TestBuildSections_EarlyRequestsCapAtThree pins EARLY_REQUESTS_KEPT.
+func TestBuildSections_EarlyRequestsCapAtThree(t *testing.T) {
+	blocks := []NormalizedBlock{
+		userBlock("first request", 0, true),
+		userBlock("second request", 1, true),
+		userBlock("third request", 2, true),
+		userBlock("fourth request", 3, true),
+	}
+	data := BuildSections(BuildSectionsInput{Blocks: blocks})
+	if len(data.EarlyRequests) != 3 || data.EarlyRequests[0] != "first request" {
+		t.Fatalf("EarlyRequests = %v, want the first three", data.EarlyRequests)
+	}
+	if !containsStr(data.UserMessages, "fourth request") {
+		t.Fatalf("UserMessages = %v, want the fourth request", data.UserMessages)
+	}
+}
+
+// TestBuildSections_InjectedStaysOutOfBothSections pins the injected filter end
+// to end: an extension message renders in the brief but reaches neither
+// section.
+func TestBuildSections_InjectedStaysOutOfBothSections(t *testing.T) {
+	blocks := []NormalizedBlock{
+		userBlockInjected("an extension note", 0, true, true),
+		userBlock("the real task", 1, true),
+	}
+	data := BuildSections(BuildSectionsInput{Blocks: blocks})
+	if containsStr(data.EarlyRequests, "an extension note") || containsStr(data.UserMessages, "an extension note") {
+		t.Fatalf("an injected message reached a section: %v / %v", data.EarlyRequests, data.UserMessages)
+	}
+	if !strings.Contains(data.BriefTranscript, "an extension note") {
+		t.Fatalf("the injected message is missing from the brief:\n%s", data.BriefTranscript)
 	}
 }
 
@@ -410,5 +503,134 @@ func TestBuildSections_BriefBlocksOverride(t *testing.T) {
 	}
 	if !strings.Contains(data.BriefTranscript, "the real task") {
 		t.Fatalf("BriefBlocks content missing:\n%s", data.BriefTranscript)
+	}
+}
+
+// TestExtractCommits_CombinedFlag pins the 0.11.1 COMMIT_MSG_RE: a combined flag
+// such as -am or -qam still matches.
+func TestExtractCommits_CombinedFlag(t *testing.T) {
+	got := ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -am "fix: amend combined flag"`}},
+		{Kind: KindToolResult, Name: "bash", Text: "[main abc1234] fix: amend combined flag"},
+	})
+	if len(got) != 1 || got[0].Message != "fix: amend combined flag" || got[0].Hash != "abc1234" {
+		t.Fatalf("ExtractCommits(-am) = %#v", got)
+	}
+	got = ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -qam "fix: quiet combined flag"`}},
+	})
+	if len(got) != 1 || got[0].Message != "fix: quiet combined flag" || got[0].HasHash {
+		t.Fatalf("ExtractCommits(-qam) = %#v", got)
+	}
+}
+
+// TestExtractCommits_StdinHeredoc pins the 0.11.1 `-F -` path: the message comes
+// from stdin through a heredoc on the same command.
+func TestExtractCommits_StdinHeredoc(t *testing.T) {
+	got := ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": "git commit -F - <<'MSG'\nfeat: read the message from stdin\nMSG"}},
+	})
+	if len(got) != 1 || got[0].Message != "feat: read the message from stdin" {
+		t.Fatalf("ExtractCommits(-F -) = %#v", got)
+	}
+	// A path after -F cannot be read from the transcript, so it is not matched.
+	got = ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": "git commit -F /tmp/msg.txt"}},
+	})
+	if len(got) != 0 {
+		t.Fatalf("ExtractCommits(-F path) = %#v, want nothing", got)
+	}
+}
+
+// TestExtractCommits_MultipleInOneCommand pins the 0.11.1 segment split: every
+// `git commit` in one bash command is extracted, each with the hash of the
+// output line naming its subject.
+func TestExtractCommits_MultipleInOneCommand(t *testing.T) {
+	got := ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -m "first: one" && git commit -m "second: two"`}},
+		{Kind: KindToolResult, Name: "bash", Text: "[main aaa1111] first: one\n[main bbb2222] second: two"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("ExtractCommits(two commits) = %#v, want two", got)
+	}
+	if got[0].Message != "first: one" || got[0].Hash != "aaa1111" {
+		t.Fatalf("first commit = %#v", got[0])
+	}
+	if got[1].Message != "second: two" || got[1].Hash != "bbb2222" {
+		t.Fatalf("second commit = %#v", got[1])
+	}
+}
+
+// TestExtractCommits_ProseDoesNotSplit pins the command-boundary rule: a message
+// that says "git commit" is prose, not a second commit.
+func TestExtractCommits_ProseDoesNotSplit(t *testing.T) {
+	got := ExtractCommits([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -m "fix: mention git commit in prose"`}},
+		{Kind: KindToolResult, Name: "bash", Text: "[main abc1234] fix: mention git commit in prose"},
+	})
+	if len(got) != 1 {
+		t.Fatalf("ExtractCommits = %#v, want one commit", got)
+	}
+}
+
+// TestExtractCommits_HashlessAndHashedAreOneCommit pins the dedup: the same
+// message seen hashless (`-q` prints no hash) and hashed is one commit, and the
+// hashed one wins — in the slot of the first occurrence, not at the tail. An
+// unrelated commit in between keeps its own entry, and a later hashless repeat
+// of the first message does not drop the hash it already carries.
+func TestExtractCommits_HashlessAndHashedAreOneCommit(t *testing.T) {
+	got := ExtractCommits([]NormalizedBlock{
+		// `-q` prints nothing, so the quiet commit's own result carries no hash
+		// and the result two blocks on cannot be read as its hash.
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -q -m "fix: quiet"`}},
+		{Kind: KindToolResult, Name: "bash", Text: ""},
+		// An unrelated hashed commit between the two "fix: quiet" calls.
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -m "chore: middle"`}},
+		{Kind: KindToolResult, Name: "bash", Text: "[main def5678] chore: middle"},
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -m "fix: quiet"`}},
+		{Kind: KindToolResult, Name: "bash", Text: "[main abc1234] fix: quiet"},
+		// A hashless repeat of the first message must not downgrade it.
+		{Kind: KindToolCall, Name: "bash", Args: map[string]any{"command": `git commit -q -m "fix: quiet"`}},
+	})
+	if len(got) != 2 {
+		t.Fatalf("ExtractCommits = %#v, want two commits", got)
+	}
+	if !got[0].HasHash || got[0].Hash != "abc1234" || got[0].Message != "fix: quiet" {
+		t.Fatalf("first commit = %#v, want the hashed fix: quiet upgraded in place", got[0])
+	}
+	if !got[1].HasHash || got[1].Hash != "def5678" || got[1].Message != "chore: middle" {
+		t.Fatalf("second commit = %#v, want the chore: middle entry", got[1])
+	}
+}
+
+// TestExtractFiles_MultiPath pins files.ts's extractPaths loop: a multi-file edit
+// tool names its files in args.paths.
+func TestExtractFiles_MultiPath(t *testing.T) {
+	activity := ExtractFiles([]NormalizedBlock{
+		{Kind: KindToolCall, Name: "edit", Args: map[string]any{
+			"code": "rewrite both", "paths": []any{"/root/p/a.go", "/root/p/b.go"},
+		}},
+	}, nil)
+	if !activity.Modified.Has("a.go") || !activity.Modified.Has("b.go") {
+		t.Fatalf("Modified = %v, want both paths", activity.Modified.Items())
+	}
+}
+
+// TestExtractUserMessages_InjectedSurvivesNormalize pins the 0.11.0 injected
+// marker end to end: normalize.ts reads it off the raw message, filter-noise.ts
+// keeps it, and the section extraction leaves the message out.
+func TestExtractUserMessages_InjectedSurvivesNormalize(t *testing.T) {
+	blocks := FilterNoise(Normalize([]map[string]any{
+		{"role": "user", "content": "the real task: port the extractor to Go", "injected": true},
+		{"role": "user", "content": "a second real message about the tests"},
+	}, nil))
+	got := ExtractUserMessages(blocks)
+	if len(got) != 1 || got[0] != "a second real message about the tests" {
+		t.Fatalf("ExtractUserMessages = %#v, want only the user's own message", got)
+	}
+	// The injected message still renders in the brief transcript.
+	data := BuildSections(BuildSectionsInput{Blocks: blocks})
+	if !strings.Contains(data.BriefTranscript, "the real task: port the extractor to Go") {
+		t.Fatalf("the injected message is missing from the brief:\n%s", data.BriefTranscript)
 	}
 }

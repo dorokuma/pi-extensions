@@ -12,24 +12,27 @@ func TestCapItems(t *testing.T) {
 	items := []string{"a", "b", "c", "d", "e"}
 	tests := []struct {
 		name string
-		keep string
 		want string
 	}{
-		{"head keeps the oldest with a more marker", "head", "a, b, c (+2 more)"},
-		{"tail keeps the newest with an earlier marker", "tail", "(+2 earlier) c, d, e"},
+		{"keeps the newest with an earlier marker", "(+2 earlier) c, d, e"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := CapItems(items, 3, ", ", test.keep); got != test.want {
+			if got := CapItems(items, 3, ", "); got != test.want {
 				t.Fatalf("CapItems = %q, want %q", got, test.want)
 			}
 		})
 	}
-	if got := CapItems(items[:2], 3, ", ", "head"); got != "a, b" {
+	if got := CapItems(items[:2], 3, ", "); got != "a, b" {
 		t.Fatalf("CapItems under the limit = %q", got)
 	}
-	if got := CapItems(items, 5, ", ", "head"); got != "a, b, c, d, e" {
+	if got := CapItems(items, 5, ", "); got != "a, b, c, d, e" {
 		t.Fatalf("CapItems at the limit = %q", got)
+	}
+	// The overflow count is the number of dropped items, and the separator is the
+	// caller's (tracked commands join with " | ").
+	if got := CapItems(items, 4, " | "); got != "(+1 earlier) b | c | d | e" {
+		t.Fatalf("CapItems(items, 4, \" | \") = %q", got)
 	}
 }
 
@@ -89,7 +92,7 @@ func TestWrapLongLines_IndentedContinuation(t *testing.T) {
 
 func TestCapBrief(t *testing.T) {
 	lines := make([]string, 0, 130)
-	lines = append(lines, "- goal")
+	lines = append(lines, "- request")
 	for i := 0; i < 130; i++ {
 		lines = append(lines, "line "+jsNumberString(float64(i)))
 	}
@@ -110,7 +113,7 @@ func TestCapBrief(t *testing.T) {
 // section is never presented without its title.
 func TestCapBrief_CutsAtASectionHeader(t *testing.T) {
 	lines := make([]string, 0, 200)
-	lines = append(lines, "[Session Goal]", "- old goal")
+	lines = append(lines, "[User Messages]", "- old request")
 	for i := 0; i < 100; i++ {
 		lines = append(lines, "filler "+jsNumberString(float64(i)))
 	}
@@ -130,18 +133,17 @@ func TestCapBrief_CutsAtASectionHeader(t *testing.T) {
 
 func TestFormatSummary_SectionsAndOrder(t *testing.T) {
 	data := SectionData{
-		SessionGoal:        []string{"fix auth"},
-		FilesAndChanges:    []string{"Modified: a.go"},
-		Commits:            []string{"abc1234: fix"},
-		TrackedCommands:    []string{"git: status"},
-		OutstandingContext: []string{"still failing"},
-		UserPreferences:    []string{"answer in Chinese"},
-		BriefTranscript:    "[user]\nhello",
+		EarlyRequests:   []string{"fix auth"},
+		FilesAndChanges: []string{"Modified: a.go"},
+		Commits:         []string{"abc1234: fix"},
+		TrackedCommands: []string{"git: status"},
+		UserMessages:    []string{"then run the tests"},
+		BriefTranscript: "[user]\nhello",
 	}
 	got := FormatSummary(data, FormatSummaryOptions{})
 	wantOrder := []string{
-		"[Session Goal]", "[Files And Changes]", "[Commits]", "[Tracked Commands]",
-		"[Outstanding Context]", "[User Preferences]",
+		"[Early Session Requests]", "[Files And Changes]", "[Commits]", "[Tracked Commands]",
+		"[User Messages]",
 	}
 	lastIdx := -1
 	for _, header := range wantOrder {
@@ -154,6 +156,13 @@ func TestFormatSummary_SectionsAndOrder(t *testing.T) {
 		}
 		lastIdx = idx
 	}
+	// The 0.10.2 sections are gone; an old [Session Goal] line in the brief
+	// transcript is transcript text, not a section.
+	for _, gone := range []string{"[Session Goal]", "[Outstanding Context]", "[User Preferences]"} {
+		if strings.Contains(got, gone) {
+			t.Fatalf("the summary still renders %s:\n%s", gone, got)
+		}
+	}
 	if !strings.Contains(got, "\n\n---\n\n") {
 		t.Fatalf("summary has no separator before the brief:\n%s", got)
 	}
@@ -164,11 +173,11 @@ func TestFormatSummary_SectionsAndOrder(t *testing.T) {
 }
 
 func TestFormatSummary_EmptySectionsAreOmitted(t *testing.T) {
-	got := FormatSummary(SectionData{SessionGoal: []string{"x"}}, FormatSummaryOptions{})
+	got := FormatSummary(SectionData{EarlyRequests: []string{"x"}}, FormatSummaryOptions{})
 	if strings.Contains(got, "[Commits]") {
 		t.Fatalf("an empty section was rendered:\n%s", got)
 	}
-	if !strings.HasPrefix(got, "[Session Goal]\n- x") {
+	if !strings.HasPrefix(got, "[Early Session Requests]\n- x") {
 		t.Fatalf("unexpected summary: %q", got)
 	}
 }
@@ -184,7 +193,7 @@ func TestFormatSummary_CapBriefTranscriptOption(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		lines = append(lines, "line "+jsNumberString(float64(i)))
 	}
-	data := SectionData{SessionGoal: []string{"goal"}, BriefTranscript: strings.Join(lines, "\n")}
+	data := SectionData{EarlyRequests: []string{"goal"}, BriefTranscript: strings.Join(lines, "\n")}
 	capped := FormatSummary(data, FormatSummaryOptions{})
 	uncapped := FormatSummary(data, FormatSummaryOptions{CapBriefTranscript: boolPtr(false)})
 	if jsLen(capped) >= jsLen(uncapped) {

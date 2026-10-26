@@ -32,6 +32,10 @@ type SearchResult struct {
 type FileTouch struct {
 	Index    int
 	ToolName string
+	// Drillable is TS's `drillable !== false`: false when the call names the
+	// file but carries no file content to drill into (a multi-path script edit),
+	// true otherwise (absent in TS).
+	Drillable bool
 }
 
 // TouchedFile is search-entries.ts TouchedFile.
@@ -347,10 +351,15 @@ type FileIndicator struct {
 	ToolName  string
 	Path      string
 	LineCount int
+	// Drillable is false when the call carries no per-file content (a
+	// multi-path script edit): there is nothing to drill into.
+	Drillable bool
 }
 
 // GetFileIndicators is search-entries.ts getFileIndicators(): the file calls of
-// one message with their non-empty content line counts.
+// one message with their non-empty content line counts. A multi-path edit names
+// its files in args.paths and carries no per-file content, so it yields one
+// non-drillable indicator per path.
 func GetFileIndicators(msg map[string]any) []FileIndicator {
 	out := make([]FileIndicator, 0, 2)
 	parts := toolCallParts(msg["content"])
@@ -359,15 +368,13 @@ func GetFileIndicators(msg map[string]any) []FileIndicator {
 		if args == nil {
 			args = map[string]any{}
 		}
-		if !IsContentBearing(args) {
+		drillable := IsContentBearing(args)
+		// search-entries.ts: a multi-path edit is content-bearing=false yet still
+		// reports the files its script edits, which args.paths lists.
+		_, hasCode := args["code"].(string)
+		_, hasPaths := args["paths"].([]any)
+		if !drillable && !(hasCode && hasPaths) {
 			continue
-		}
-		path := ""
-		for _, key := range []string{"path", "filePath", "file_path", "file"} {
-			if value, ok := args[key].(string); ok {
-				path = value
-				break
-			}
 		}
 		totalText := ExtractToolCallText(args)
 		nonEmpty := 0
@@ -377,7 +384,9 @@ func GetFileIndicators(msg map[string]any) []FileIndicator {
 			}
 		}
 		name, _ := part["name"].(string)
-		out = append(out, FileIndicator{ToolName: name, Path: path, LineCount: nonEmpty})
+		for _, path := range ExtractPaths(args) {
+			out = append(out, FileIndicator{ToolName: name, Path: path, LineCount: nonEmpty, Drillable: drillable})
+		}
 	}
 	return out
 }
@@ -399,7 +408,7 @@ func GetTouchedFiles(messages []map[string]any, rendered []RenderedEntry) []Touc
 				byPath[fm.Path] = file
 				order = append(order, fm.Path)
 			}
-			file.Entries = append(file.Entries, FileTouch{Index: index, ToolName: fm.ToolName})
+			file.Entries = append(file.Entries, FileTouch{Index: index, ToolName: fm.ToolName, Drillable: fm.Drillable})
 		}
 	}
 	out := make([]TouchedFile, 0, len(order))

@@ -108,13 +108,12 @@ func TestVerify_RecallNote_V1d(t *testing.T) {
 // renderSample is verify.mjs's `render`: the body plus a note, wrapped.
 func renderSample(note string) string {
 	data := SectionData{
-		SessionGoal:        []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
-		OutstandingContext: []string{"pi must be restarted for the patch to take effect"},
-		FilesAndChanges:    []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
-		Commits:            []string{},
-		UserPreferences:    []string{"answer in Chinese"},
-		TrackedCommands:    []string{"git: status --porcelain"},
-		BriefTranscript:    "user: append the sentence\nassistant: done",
+		EarlyRequests:   []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
+		UserMessages:    []string{"append the recall-note sentence to format.ts"},
+		FilesAndChanges: []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
+		Commits:         []string{},
+		TrackedCommands: []string{"git: status --porcelain"},
+		BriefTranscript: "user: append the sentence\nassistant: done",
 	}
 	body := FormatSummary(data, FormatSummaryOptions{})
 	return WrapLongLinesDefault(body + patchSep + note)
@@ -260,13 +259,12 @@ func TestVerify_RecallNote_V4c(t *testing.T) {
 	newRendered := jsSplitLines(renderSample(RecallNote))
 	// body lines + "", "---", "" — derived, not hardcoded.
 	data := SectionData{
-		SessionGoal:        []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
-		OutstandingContext: []string{"pi must be restarted for the patch to take effect"},
-		FilesAndChanges:    []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
-		Commits:            []string{},
-		UserPreferences:    []string{"answer in Chinese"},
-		TrackedCommands:    []string{"git: status --porcelain"},
-		BriefTranscript:    "user: append the sentence\nassistant: done",
+		EarlyRequests:   []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
+		UserMessages:    []string{"append the recall-note sentence to format.ts"},
+		FilesAndChanges: []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
+		Commits:         []string{},
+		TrackedCommands: []string{"git: status --porcelain"},
+		BriefTranscript: "user: append the sentence\nassistant: done",
 	}
 	bodyLines := len(jsSplitLines(WrapLongLinesDefault(FormatSummary(data, FormatSummaryOptions{}))))
 	head := bodyLines + 3
@@ -284,13 +282,12 @@ func TestVerify_RecallNote_V4c(t *testing.T) {
 // sentence.
 func TestVerify_RecallNote_V4d(t *testing.T) {
 	data := SectionData{
-		SessionGoal:        []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
-		OutstandingContext: []string{"pi must be restarted for the patch to take effect"},
-		FilesAndChanges:    []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
-		Commits:            []string{},
-		UserPreferences:    []string{"answer in Chinese"},
-		TrackedCommands:    []string{"git: status --porcelain"},
-		BriefTranscript:    "user: append the sentence\nassistant: done",
+		EarlyRequests:   []string{"Patch pi-vcc so the summary tail always tells the model to recall the task book"},
+		UserMessages:    []string{"append the recall-note sentence to format.ts"},
+		FilesAndChanges: []string{"src/core/format.ts: appended one sentence to RECALL_NOTE"},
+		Commits:         []string{},
+		TrackedCommands: []string{"git: status --porcelain"},
+		BriefTranscript: "user: append the sentence\nassistant: done",
 	}
 	bodyLines := len(jsSplitLines(WrapLongLinesDefault(FormatSummary(data, FormatSummaryOptions{}))))
 	head := bodyLines + 3

@@ -48,7 +48,9 @@ func toolCalls(content any) string {
 	return strings.Join(rendered, ", ")
 }
 
-// extractFilesFromContent is render-entries.ts extractFilesFromContent().
+// extractFilesFromContent is render-entries.ts extractFilesFromContent():
+// `toolCallParts(content).flatMap((c) => extractPaths(c.arguments))` — every
+// path each tool call names.
 func extractFilesFromContent(content any) []string {
 	parts := toolCallParts(content)
 	out := make([]string, 0, len(parts))
@@ -57,9 +59,7 @@ func extractFilesFromContent(content any) []string {
 		if args == nil {
 			args = map[string]any{}
 		}
-		if path, ok := extractPath(args); ok {
-			out = append(out, path)
-		}
+		out = append(out, ExtractPaths(args)...)
 	}
 	return out
 }

@@ -618,3 +618,29 @@ func TestPreviewContent(t *testing.T) {
 		t.Fatalf("previewContent(non-content) = %q", got)
 	}
 }
+
+// TestSummarizerInputMessage pins before-compact.ts's per-message conversion: a
+// `!cmd` (bashExecution) is passed through as it is, and an extension's
+// custom_message is marked injected so the early requests read only what the
+// user wrote.
+func TestSummarizerInputMessage(t *testing.T) {
+	raw := map[string]any{"role": "bashExecution", "content": "$ make test"}
+	if got := summarizerInputMessage(raw, map[string]any{"role": "user", "content": "$ make test"}); got["content"] != "$ make test" {
+		t.Fatalf("a bashExecution message was rewritten: %#v", got)
+	}
+	converted := map[string]any{"role": "user", "content": "an extension note"}
+	got := summarizerInputMessage(map[string]any{"role": "custom", "content": "x"}, converted)
+	if got["injected"] != true {
+		t.Fatalf("a custom_message was not marked injected: %#v", got)
+	}
+	if got["content"] != "an extension note" {
+		t.Fatalf("the converted content was lost: %#v", got)
+	}
+	// The caller's map is not mutated: the flag lands on a copy.
+	if _, present := converted["injected"]; present {
+		t.Fatalf("the converted message was mutated: %#v", converted)
+	}
+	if got := summarizerInputMessage(map[string]any{"role": "user", "content": "hi"}, converted); got["injected"] != nil {
+		t.Fatalf("an ordinary message was marked: %#v", got)
+	}
+}

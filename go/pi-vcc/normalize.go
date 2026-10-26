@@ -17,8 +17,11 @@ func normalizeOne(msg map[string]any, msgIndex int, hasIndex bool) []NormalizedB
 	case "user":
 		blocks := make([]NormalizedBlock, 0, 2)
 		text := Sanitize(TextOf(msg["content"]))
+		// normalize.ts: `injected === true` marks an extension custom_message
+		// that convertToLlm turned into a user message (hooks/before-compact.ts).
+		injected, _ := msg["injected"].(bool)
 		if text != "" {
-			blocks = append(blocks, userBlock(text, msgIndex, hasIndex))
+			blocks = append(blocks, userBlockInjected(text, msgIndex, hasIndex, injected))
 		}
 		if content, ok := msg["content"].([]any); ok {
 			for _, rawPart := range content {

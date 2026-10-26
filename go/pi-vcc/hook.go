@@ -219,7 +219,7 @@ func handleSessionBeforeCompact(ext *sdk.Extension, state *extensionState, ctx s
 		if len(converted) == 0 {
 			continue
 		}
-		convertedMessages = append(convertedMessages, converted[0])
+		convertedMessages = append(convertedMessages, summarizerInputMessage(message, converted[0]))
 		sourceIndices = append(sourceIndices, lookupGlobalIndex(globalIndexByID, agentSelectedIDs[i]))
 	}
 

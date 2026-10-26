@@ -589,7 +589,9 @@ func runTouched(page int, view *RecallView) string {
 	for _, file := range touched[start:end] {
 		var write *FileTouch
 		for i := len(file.Entries) - 1; i >= 0; i-- {
-			if writesFileRe.MatchString(file.Entries[i].ToolName) {
+			// recall-run.ts: `e.drillable !== false && WRITES_FILE.test(e.toolName)` —
+			// a call with no file content has nothing to query the entry for.
+			if file.Entries[i].Drillable && writesFileRe.MatchString(file.Entries[i].ToolName) {
 				write = &file.Entries[i]
 				break
 			}

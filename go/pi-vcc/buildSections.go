@@ -1,7 +1,5 @@
 package pivcc
 
-import "strings"
-
 // Ports src/core/build-sections.ts: blocks -> SectionData.
 
 // BuildSectionsInput is build-sections.ts BuildSectionsInput.
@@ -14,75 +12,14 @@ type BuildSectionsInput struct {
 	FileOps *FileOps
 	// TrackCommands names the commands to record in [Tracked Commands].
 	TrackCommands []string
-}
-
-// blockerRe is build-sections.ts BLOCKER_RE.
-var blockerRe = compileIgnoreCase(`\b(fail(ed|s|ure|ing)?|broken|cannot|can't|won't work|does not work|doesn't work|still (broken|failing|wrong)|blocked|blocker|not (fixed|resolved|working)|crash(es|ed|ing)?)\b`)
-
-// continuationBulletRe is build-sections.ts's `/^\s*[-*+>]\s/`.
-var continuationBulletRe = mustCompile(`^` + jsSpace + `*[-*+>]` + jsSpace)
-
-// continuationParenRe is build-sections.ts's `/^\s*\(/`.
-var continuationParenRe = mustCompile(`^` + jsSpace + `*\(`)
-
-// sentenceStartRe is build-sections.ts's `/^\s*["'` + "`" + `*_]?[A-Z` + "`" + `]/`.
-var sentenceStartRe = mustCompile(`^` + jsSpace + `*["'` + "`" + `*_]?[A-Z` + "`" + `]`)
-
-// extractOutstandingContext is build-sections.ts extractOutstandingContext():
-// unresolved errors and pending questions from the last 20 blocks, capped at 5.
-func extractOutstandingContext(blocks []NormalizedBlock) []string {
-	items := make([]string, 0, 5)
-	start := 0
-	if len(blocks) > 20 {
-		start = len(blocks) - 20
-	}
-	for _, block := range blocks[start:] {
-		if block.Kind != KindAssistant && block.Kind != KindUser {
-			continue
-		}
-		for _, line := range NonEmptyLines(block.Text) {
-			if !blockerRe.MatchString(line) {
-				continue
-			}
-			if jsLen(line) < 15 {
-				continue
-			}
-			// Skip continuation fragments.
-			if continuationBulletRe.MatchString(line) {
-				continue
-			}
-			if continuationParenRe.MatchString(line) {
-				continue
-			}
-			// Require a sentence-like start.
-			if !sentenceStartRe.MatchString(line) {
-				continue
-			}
-			clipped := ClipSentence(line, 150)
-			if block.Kind == KindUser {
-				clipped = "[user] " + clipped
-			}
-			duplicate := false
-			for _, existing := range items {
-				if existing == clipped {
-					duplicate = true
-					break
-				}
-			}
-			if !duplicate {
-				items = append(items, clipped)
-			}
-			break
-		}
-	}
-	if len(items) > 5 {
-		items = items[:5]
-	}
-	return items
+	// HasEarlyRequests is build-sections.ts hasEarlyRequests: the previous
+	// summary already holds the early requests, so this compaction's first
+	// messages are ordinary user messages.
+	HasEarlyRequests bool
 }
 
 // formatFileActivity is build-sections.ts formatFileActivity(): the files
-// section's lines, capped at 10 per category.
+// section's lines, capped at FILES_PER_CATEGORY per category (the newest kept).
 func formatFileActivity(blocks []NormalizedBlock, fileOps *FileOps) []string {
 	activity := ExtractFiles(blocks, fileOps)
 	// Dedup: if already Modified, drop from Created.
@@ -90,21 +27,17 @@ func formatFileActivity(blocks []NormalizedBlock, fileOps *FileOps) []string {
 		activity.Created.Delete(path)
 	}
 	lines := make([]string, 0, 3)
-	capSet := func(set *orderedSet, limit int) string {
-		items := set.Items()
-		if len(items) <= limit {
-			return strings.Join(items, ", ")
-		}
-		return strings.Join(items[:limit], ", ") + " (+" + jsNumberString(float64(len(items)-limit)) + " more)"
+	capSet := func(set *orderedSet) string {
+		return CapItems(set.Items(), FilesPerCategory, ", ")
 	}
 	if activity.Modified.Len() > 0 {
-		lines = append(lines, "Modified: "+capSet(activity.Modified, 10))
+		lines = append(lines, "Modified: "+capSet(activity.Modified))
 	}
 	if activity.Created.Len() > 0 {
-		lines = append(lines, "Created: "+capSet(activity.Created, 10))
+		lines = append(lines, "Created: "+capSet(activity.Created))
 	}
 	if activity.Read.Len() > 0 {
-		lines = append(lines, "Read: "+capSet(activity.Read, 10))
+		lines = append(lines, "Read: "+capSet(activity.Read))
 	}
 	return lines
 }
@@ -115,15 +48,21 @@ func BuildSections(input BuildSectionsInput) SectionData {
 	if input.BriefBlocks != nil {
 		briefBlocks = input.BriefBlocks
 	}
-	sessionGoal := ExtractGoals(input.Blocks)
-	userPreferences := DedupPreferencesAgainstGoals(ExtractPreferences(input.Blocks), sessionGoal)
+	// The early requests are the session's first user messages, picked by
+	// position; they are not repeated in [User Messages].
+	messages := ExtractUserMessages(input.Blocks)
+	early := messages
+	if input.HasEarlyRequests {
+		early = nil
+	} else if len(early) > EarlyRequestsKept {
+		early = early[:EarlyRequestsKept]
+	}
 	return SectionData{
-		SessionGoal:        sessionGoal,
-		OutstandingContext: extractOutstandingContext(input.Blocks),
-		FilesAndChanges:    formatFileActivity(input.Blocks, input.FileOps),
-		Commits:            FormatCommits(ExtractCommits(input.Blocks), 8),
-		UserPreferences:    userPreferences,
-		TrackedCommands:    FormatTrackedCommands(ExtractTrackedCommands(input.Blocks, input.TrackCommands)),
-		BriefTranscript:    StringifyBrief(BuildBriefSections(briefBlocks)),
+		EarlyRequests:   early,
+		FilesAndChanges: formatFileActivity(input.Blocks, input.FileOps),
+		Commits:         FormatCommits(ExtractCommits(input.Blocks), 8),
+		UserMessages:    KeepNewestUserMessages(messages[len(early):]),
+		TrackedCommands: FormatTrackedCommands(ExtractTrackedCommands(input.Blocks, input.TrackCommands)),
+		BriefTranscript: StringifyBrief(BuildBriefSections(briefBlocks)),
 	}
 }

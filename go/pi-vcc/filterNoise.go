@@ -53,7 +53,8 @@ func cleanUserText(text string) string {
 // FilterNoise is filter-noise.ts filterNoise(): it drops noise tool calls and
 // results, drops noise-only user blocks, and cleans the surviving user text.
 // The cleaned user block keeps no source index, exactly as TS rebuilds it as
-// `{ kind: "user", text: cleaned }`.
+// `{ kind: "user", text: cleaned, ...(b.injected ? { injected: true } : {}) }`
+// — the injected marker survives, everything else does not.
 func FilterNoise(blocks []NormalizedBlock) []NormalizedBlock {
 	out := make([]NormalizedBlock, 0, len(blocks))
 	for _, block := range blocks {
@@ -71,7 +72,7 @@ func FilterNoise(blocks []NormalizedBlock) []NormalizedBlock {
 			if cleaned == "" {
 				continue
 			}
-			out = append(out, NormalizedBlock{Kind: KindUser, Text: cleaned})
+			out = append(out, NormalizedBlock{Kind: KindUser, Text: cleaned, Injected: block.Injected})
 			continue
 		}
 		out = append(out, block)

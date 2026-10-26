@@ -79,8 +79,8 @@ func TestHook_SessionBeforeCompactProducesSummary(t *testing.T) {
 	if summary == "" {
 		t.Fatal("the hook returned no summary")
 	}
-	if !strings.Contains(summary, "[Session Goal]") {
-		t.Fatalf("the summary has no session goal:\n%s", summary)
+	if !strings.Contains(summary, "[Early Session Requests]") {
+		t.Fatalf("the summary has no early session requests:\n%s", summary)
 	}
 	details, _ := compaction["details"].(map[string]any)
 	if details["compactor"] != CompactionDetailsCompactor {

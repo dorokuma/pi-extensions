@@ -367,8 +367,12 @@ func toolOneLiner(name string, args map[string]any) string {
 			return "* " + name + " \"" + value + "\""
 		}
 	}
-	if path, ok := extractPath(args); ok {
-		return "* " + name + " \"" + path + "\""
+	// brief.ts: `const [path, ...more] = extractPaths(args); if (path) return
+	// `* name "path"` with ` +${more.length}` when more files follow — a
+	// multi-path edit shows how many further files it named.
+	paths := ExtractPaths(args)
+	if len(paths) > 0 {
+		return "* " + name + " \"" + paths[0] + "\"" + morePathsSuffix(paths[1:])
 	}
 	if name == "bash" || name == "Bash" {
 		raw := ""

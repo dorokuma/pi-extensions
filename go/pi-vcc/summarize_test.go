@@ -18,10 +18,10 @@ func longBrief(prefix string, n int) string {
 }
 
 func TestSectionOf(t *testing.T) {
-	text := "[Session Goal]\n- fix auth\n\n[Commits]\n- abc: x\n\n---\n\nbrief"
-	got := sectionOf(text, "Session Goal")
-	if got != "[Session Goal]\n- fix auth" {
-		t.Fatalf("sectionOf(Session Goal) = %q", got)
+	text := "[Early Session Requests]\n- fix auth\n\n[Commits]\n- abc: x\n\n---\n\nbrief"
+	got := sectionOf(text, "Early Session Requests")
+	if got != "[Early Session Requests]\n- fix auth" {
+		t.Fatalf("sectionOf(Early Session Requests) = %q", got)
 	}
 	if got := sectionOf(text, "Commits"); got != "[Commits]\n- abc: x" {
 		t.Fatalf("sectionOf(Commits) = %q", got)
@@ -31,66 +31,269 @@ func TestSectionOf(t *testing.T) {
 	}
 }
 
+// TestSectionOf_HeaderAreaOnly pins 0.11.1 (#60): a section is a "[Title]" line
+// standing alone in the header area, so a transcript line that merely starts
+// with the name is not a section.
+func TestSectionOf_HeaderAreaOnly(t *testing.T) {
+	text := "[Early Session Requests]\n- fix auth\n\n---\n\n[user]\nsee [Tracked Commands] for the log\n[assistant]\n" +
+		"[Tracked Commands] is not a section here"
+	if got := sectionOf(text, "Tracked Commands"); got != "" {
+		t.Fatalf("a transcript mention was read as a section: %q", got)
+	}
+	// A wrapped item keeps its continuation lines: the section runs to the next
+	// blank line.
+	wrapped := "[Early Session Requests]\n- a very long request\n  continues here\n\n[Commits]\n- abc: x"
+	if got := sectionOf(wrapped, "Early Session Requests"); got != "[Early Session Requests]\n- a very long request\n  continues here" {
+		t.Fatalf("the section was cut at the continuation line: %q", got)
+	}
+	// Without a leading header line the whole text is the brief, so no section
+	// is found at all.
+	if got := sectionOf("[user]\njust a transcript", "Early Session Requests"); got != "" {
+		t.Fatalf("a brief-only text produced a section: %q", got)
+	}
+}
+
 func TestBriefOf(t *testing.T) {
-	text := "[Session Goal]\n- x" + patchSep + "[user]\nhi"
+	text := "[Early Session Requests]\n- x" + patchSep + "[user]\nhi"
 	if got := briefOf(text); got != "[user]\nhi" {
 		t.Fatalf("briefOf = %q", got)
 	}
-	if got := briefOf("no separator here"); got != "" {
+	// Text that does not open with a header line is a brief in its entirety:
+	// TS's splitSummary returns the trimmed text with no head.
+	if got := briefOf("no separator here"); got != "no separator here" {
 		t.Fatalf("briefOf without a separator = %q", got)
 	}
 }
 
-func TestMergeHeaderSection_GoalDedupAndCap(t *testing.T) {
-	prev := "[Session Goal]\n- a\n- b"
-	fresh := "[Session Goal]\n- b\n- c"
-	got := mergeHeaderSection("Session Goal", prev, fresh)
+// TestSplitSummary_NoLeadingHeader pins the shape rule: text that does not open
+// with a header line is the brief, and header sections with no separator have
+// no brief.
+func TestSplitSummary_NoLeadingHeader(t *testing.T) {
+	head, brief := splitSummary("[user]\nhi\n\n[assistant]\nthere")
+	if head != "" || brief != "[user]\nhi\n\n[assistant]\nthere" {
+		t.Fatalf("splitSummary = (%q, %q), want (\"\", the whole text as brief)", head, brief)
+	}
+	head, brief = splitSummary("[Early Session Requests]\n- x\n\n[Commits]\n- y")
+	if head != "[Early Session Requests]\n- x\n\n[Commits]\n- y" || brief != "" {
+		t.Fatalf("splitSummary = (%q, %q), want (the text, \"\")", head, brief)
+	}
+}
+
+func TestMergeHeaderSection_EarlyRequestsDedupAndCap(t *testing.T) {
+	prev := "[Early Session Requests]\n- a\n- b"
+	fresh := "[Early Session Requests]\n- b\n- c"
+	got := mergeHeaderSection(earlyHeader, prev, fresh)
 	// Union without duplicate b, then the 8-line cap applied from the tail.
-	want := "[Session Goal]\n- a\n- b\n- c"
+	want := "[Early Session Requests]\n- a\n- b\n- c"
 	if got != want {
 		t.Fatalf("mergeHeaderSection = %q, want %q", got, want)
 	}
 
-	// Eleven distinct goals cap to the last eight. Both sides must be non-empty:
+	// Nine distinct requests cap to the last eight. Both sides must be non-empty:
 	// with an empty prev, mergeHeaderSection returns fresh verbatim (the TS
 	// `if (!prev) return fresh`), so the cap is applied on a real merge.
-	many := make([]string, 0, 11)
-	for i := 0; i < 11; i++ {
+	many := make([]string, 0, 9)
+	for i := 0; i < 9; i++ {
 		many = append(many, "- g"+jsNumberString(float64(i)))
 	}
-	capped := mergeHeaderSection("Session Goal", "[Session Goal]\n- seed", strings.Join(many, "\n"))
+	capped := mergeHeaderSection(earlyHeader, "[Early Session Requests]\n- seed", strings.Join(many, "\n"))
 	if lines := jsSplitLines(capped); len(lines) != 9 { // header + 8
-		t.Fatalf("capped Session Goal has %d lines, want 9:\n%s", len(lines), capped)
+		t.Fatalf("capped Early Session Requests has %d lines, want 9:\n%s", len(lines), capped)
 	}
-	if !strings.Contains(capped, "- g10") || strings.Contains(capped, "- g0\n") || strings.HasSuffix(capped, "- g0") {
+	if !strings.Contains(capped, "- g8") || strings.Contains(capped, "- g0\n") || strings.HasSuffix(capped, "- g0") {
 		t.Fatalf("the cap kept the wrong end:\n%s", capped)
 	}
 	// An unmerged pass-through keeps everything, per the TS short-circuit.
-	if passthrough := mergeHeaderSection("Session Goal", "", strings.Join(many, "\n")); jsSplitLines(passthrough)[0] != "- g0" {
+	if passthrough := mergeHeaderSection(earlyHeader, "", strings.Join(many, "\n")); jsSplitLines(passthrough)[0] != "- g0" {
 		t.Fatalf("the pass-through path truncated the input:\n%s", passthrough)
 	}
 }
 
-func TestMergeHeaderSection_OutstandingContextIsFreshOnly(t *testing.T) {
-	prev := "[Outstanding Context]\n- old problem"
-	fresh := "[Outstanding Context]\n- new problem"
-	if got := mergeHeaderSection("Outstanding Context", prev, fresh); got != fresh {
-		t.Fatalf("Outstanding Context should be fresh only, got %q", got)
+// TestMergeHeaderSection_CommitsDedupHashedAndHashless pins the 0.11.1 commit
+// merge: one line per commit, a hashless line replaced in place by the hashed
+// line of the same commit.
+func TestMergeHeaderSection_CommitsDedupHashedAndHashless(t *testing.T) {
+	prev := "[Commits]\n- abc1234: fix auth\n- drop the dead code"
+	fresh := "[Commits]\n- fix auth\n- add the docs"
+	got := mergeHeaderSection("Commits", prev, fresh)
+	if strings.Count(got, "fix auth") != 1 {
+		t.Fatalf("the same commit was kept twice:\n%s", got)
 	}
-	if got := mergeHeaderSection("Outstanding Context", prev, ""); got != "" {
-		t.Fatalf("Outstanding Context with no fresh text should be empty, got %q", got)
+	if !strings.Contains(got, "- abc1234: fix auth") {
+		t.Fatalf("the hashed line lost its place:\n%s", got)
+	}
+	if !strings.Contains(got, "- add the docs") {
+		t.Fatalf("a fresh commit was lost:\n%s", got)
+	}
+	// The hashed line stays where the first copy was.
+	if strings.Index(got, "abc1234") > strings.Index(got, "add the docs") {
+		t.Fatalf("the hashed line moved to the tail:\n%s", got)
 	}
 }
 
-func TestMergeHeaderSection_DropsSkillLines(t *testing.T) {
-	prev := "[User Preferences]\n- prefer tabs\n- <skill name=\"x\">"
-	fresh := "[User Preferences]\n- answer in Chinese"
-	got := mergeHeaderSection("User Preferences", prev, fresh)
-	if strings.Contains(got, "<skill") {
-		t.Fatalf("a skill line survived the merge:\n%s", got)
+// TestMergeHeaderSection_UserMessagesKeepsNewest pins the User Messages merge:
+// the newest 15 lines, oldest first, a repeat moving to the end.
+func TestMergeHeaderSection_UserMessagesKeepsNewest(t *testing.T) {
+	prevLines := make([]string, 0, 15)
+	for i := 0; i < 15; i++ {
+		prevLines = append(prevLines, "- old "+jsNumberString(float64(i)))
 	}
-	if !strings.Contains(got, "prefer tabs") || !strings.Contains(got, "answer in Chinese") {
-		t.Fatalf("merge lost a preference:\n%s", got)
+	prev := "[User Messages]\n" + strings.Join(prevLines, "\n")
+	fresh := "[User Messages]\n- old 0\n- brand new"
+	got := mergeHeaderSection("User Messages", prev, fresh)
+	lines := jsSplitLines(got)
+	if len(lines) != 16 { // header + 15
+		t.Fatalf("User Messages has %d lines, want 16:\n%s", len(lines), got)
+	}
+	if !strings.HasSuffix(got, "- brand new") {
+		t.Fatalf("the newest message is not last:\n%s", got)
+	}
+	if strings.Count(got, "old 0") != 1 {
+		t.Fatalf("the repeated line was duplicated:\n%s", got)
+	}
+	// The repeated line moved to the end, so the oldest dropped out.
+	if strings.Contains(got, "old 1\n") || strings.HasSuffix(got, "old 1") {
+		t.Fatalf("the oldest message survived the cap:\n%s", got)
+	}
+}
+
+// TestDedupCommitLines pins dedupCommitLines(): first-seen order, the hashed
+// line kept where the hashless one stood.
+func TestDedupCommitLines(t *testing.T) {
+	got := dedupCommitLines([]string{
+		"- abc1234: one",
+		"- two",
+		"- abc1234: one",
+		"- two",
+		"- def4567: three",
+	})
+	want := []string{"- abc1234: one", "- two", "- def4567: three"}
+	if len(got) != len(want) {
+		t.Fatalf("dedupCommitLines = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dedupCommitLines = %#v, want %#v", got, want)
+		}
+	}
+	// A hashless line seen first is upgraded in place, not moved to the tail.
+	got = dedupCommitLines([]string{"- one", "- other", "- abc1234: one"})
+	want = []string{"- abc1234: one", "- other"}
+	if len(got) != len(want) {
+		t.Fatalf("dedupCommitLines = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dedupCommitLines = %#v, want %#v", got, want)
+		}
+	}
+}
+
+// TestPinnedEarlyRequests_FromEarlySection pins the first summary's requests
+// being kept as they are.
+func TestPinnedEarlyRequests_FromEarlySection(t *testing.T) {
+	prev := "[Early Session Requests]\n- first request\n- second request\n- third request\n- fourth request"
+	got := pinnedEarlyRequests(prev)
+	want := []string{"- first request", "- second request", "- third request"}
+	if len(got) != len(want) {
+		t.Fatalf("pinnedEarlyRequests = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("pinnedEarlyRequests = %#v, want %#v", got, want)
+		}
+	}
+}
+
+// TestPinnedEarlyRequests_OldSessionGoalDegrades pins the 0.11.0 compatibility
+// path: a previous summary written by 0.10.2 has no [Early Session Requests],
+// so its first real [Session Goal] line is pinned instead.
+func TestPinnedEarlyRequests_OldSessionGoalDegrades(t *testing.T) {
+	prev := "[Session Goal]\n- [Scope change]\n- port the extractor to Go\n- keep the patch"
+	got := pinnedEarlyRequests(prev)
+	if len(got) != 1 || got[0] != "- port the extractor to Go" {
+		t.Fatalf("pinnedEarlyRequests = %#v, want the first real goal line", got)
+	}
+	// A summary with neither section pins nothing.
+	if got := pinnedEarlyRequests("[Commits]\n- abc1234: x"); len(got) != 0 {
+		t.Fatalf("pinnedEarlyRequests = %#v, want nothing", got)
+	}
+}
+
+// TestUnwrapSection pins unwrapSection(): a wrapped item's continuation lines
+// are rejoined before a merge reads the item.
+func TestUnwrapSection(t *testing.T) {
+	text := "[Early Session Requests]\n- a very long request\n  continued on the next line\n\n[Commits]\n- abc: x"
+	got := unwrapSection(text, "Early Session Requests")
+	if strings.Contains(got, "\n  ") {
+		t.Fatalf("the continuation line was not rejoined: %q", got)
+	}
+	if !strings.Contains(got, "a very long request continued on the next line") {
+		t.Fatalf("unwrapSection lost text: %q", got)
+	}
+}
+
+// TestMergePrevious_PinsTheEarlyRequests pins the 0.11.0 rule: the first
+// summary sets the early requests and every later compaction keeps them, so the
+// fresh session's own first messages are not re-collected.
+func TestMergePrevious_PinsTheEarlyRequests(t *testing.T) {
+	prev := "[Early Session Requests]\n- the original task book" + patchSep + "[user]\nold"
+	fresh := "[Early Session Requests]\n- a later message" + patchSep + "[user]\nnew"
+	got := mergePrevious(prev, fresh, mergePreviousOptions{})
+	if !strings.Contains(got, "[Early Session Requests]\n- the original task book") {
+		t.Fatalf("the pinned early requests were lost:\n%s", got)
+	}
+	if strings.Contains(got, "a later message") {
+		t.Fatalf("a fresh early request replaced the pinned ones:\n%s", got)
+	}
+	if !strings.Contains(got, "[user]\nold") || !strings.Contains(got, "[user]\nnew") {
+		t.Fatalf("the brief did not roll forward:\n%s", got)
+	}
+}
+
+// TestCompile_HasEarlyRequestsSkipsTheFreshOnes pins hasEarlyRequests: with a
+// previous summary that already holds early requests, this compaction's first
+// user messages stay ordinary [User Messages].
+func TestCompile_HasEarlyRequestsSkipsTheFreshOnes(t *testing.T) {
+	previous := WrapLongLinesDefault("[Early Session Requests]\n- the original task book" + patchSep + "[user]\nold")
+	got := Compile(CompileInput{
+		Messages: []map[string]any{
+			{"role": "user", "content": "a follow-up question about the parser"},
+			{"role": "assistant", "content": "looking at it"},
+		},
+		PreviousSummary:    previous,
+		HasPreviousSummary: true,
+	})
+	if !strings.Contains(got, "[Early Session Requests]\n- the original task book") {
+		t.Fatalf("the pinned early requests were lost:\n%s", got)
+	}
+	if !strings.Contains(got, "[User Messages]\n- a follow-up question about the parser") {
+		t.Fatalf("the follow-up did not become a user message:\n%s", got)
+	}
+}
+
+// TestCompile_FirstCompactionCollectsEarlyRequests pins the other side: with no
+// previous summary the first three user messages are the early requests and are
+// not repeated in [User Messages].
+func TestCompile_FirstCompactionCollectsEarlyRequests(t *testing.T) {
+	got := Compile(CompileInput{Messages: []map[string]any{
+		{"role": "user", "content": "first request: port the extractor"},
+		{"role": "assistant", "content": "on it"},
+		{"role": "user", "content": "second request: keep the patch"},
+		{"role": "user", "content": "third request: add the tests"},
+		{"role": "user", "content": "fourth request: update the docs"},
+	}})
+	if !strings.Contains(got, "[Early Session Requests]\n- first request: port the extractor") {
+		t.Fatalf("the early requests were not collected:\n%s", got)
+	}
+	if !strings.Contains(got, "- fourth request: update the docs") {
+		t.Fatalf("the fourth request is missing from [User Messages]:\n%s", got)
+	}
+	// The header part is what the merge owns; the brief transcript keeps every
+	// message verbatim, so only the part before the separator is counted.
+	head, _ := splitSummary(WrapLongLinesDefault(got))
+	if strings.Count(head, "first request: port the extractor") != 1 {
+		t.Fatalf("an early request was repeated in the header:\n%s", head)
 	}
 }
 
@@ -153,20 +356,20 @@ func TestMergeTrackedCommandLines_DiscoverNames(t *testing.T) {
 }
 
 func TestMergePrevious_RollsTheBriefForward(t *testing.T) {
-	prev := "[Session Goal]\n- a" + patchSep + "[user]\nold"
-	fresh := "[Session Goal]\n- b" + patchSep + "[user]\nnew"
+	prev := "[User Messages]\n- a" + patchSep + "[user]\nold"
+	fresh := "[User Messages]\n- b" + patchSep + "[user]\nnew"
 	got := mergePrevious(prev, fresh, mergePreviousOptions{})
 	if !strings.Contains(got, "[user]\nold") || !strings.Contains(got, "[user]\nnew") {
 		t.Fatalf("the brief did not roll forward:\n%s", got)
 	}
 	if !strings.Contains(got, "- a") || !strings.Contains(got, "- b") {
-		t.Fatalf("the goal did not merge:\n%s", got)
+		t.Fatalf("the user messages did not merge:\n%s", got)
 	}
 }
 
 func TestMergePrevious_PreserveFreshBriefCapsTheOldPart(t *testing.T) {
-	prev := "[Session Goal]\n- a" + patchSep + longBrief("oldline", 200)
-	fresh := "[Session Goal]\n- b" + patchSep + longBrief("newline", 10)
+	prev := "[User Messages]\n- a" + patchSep + longBrief("oldline", 200)
+	fresh := "[User Messages]\n- b" + patchSep + longBrief("newline", 10)
 	got := mergePrevious(prev, fresh, mergePreviousOptions{preserveFreshBrief: true})
 	lines := jsSplitLines(got)
 	// BRIEF_MAX_LINES is a budget for the brief, and mergeBriefTranscriptWithFreshBudget
@@ -224,7 +427,7 @@ func TestCompile_EmptyInputIsEmpty(t *testing.T) {
 }
 
 func TestCompile_StripsPreviousNoteBeforeMerging(t *testing.T) {
-	previous := WrapLongLinesDefault("[Session Goal]\n- old" + patchSep + RecallNote)
+	previous := WrapLongLinesDefault("[Early Session Requests]\n- old" + patchSep + RecallNote)
 	got := Compile(CompileInput{
 		Messages:           []map[string]any{{"role": "user", "content": "next task"}},
 		PreviousSummary:    previous,
@@ -284,7 +487,7 @@ func TestCompileRanked_InheritsFileOps(t *testing.T) {
 
 func TestRejoinWrappedSection(t *testing.T) {
 	// A wrapped item's indented continuation joins back into one line.
-	wrapped := "[Session Goal]\n- fix the auth bug\n  in the login flow"
+	wrapped := "[Early Session Requests]\n- fix the auth bug\n  in the login flow"
 	got := rejoinWrappedSection(wrapped)
 	if strings.Contains(got, "\n  in") {
 		t.Fatalf("the continuation line was not rejoined: %q", got)

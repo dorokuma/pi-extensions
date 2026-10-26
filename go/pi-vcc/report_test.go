@@ -150,13 +150,13 @@ func TestReport_PreviewClipsLongSummaries(t *testing.T) {
 }
 
 func TestReport_SectionCountOf(t *testing.T) {
-	summary := "[Session Goal]\n- x\n[Files And Changes]\nModified: a.go\n[Outstanding Context]\n- y"
+	summary := "[Early Session Requests]\n- x\n[Files And Changes]\nModified: a.go\n[User Messages]\n- y"
 	if got := sectionCountOf(summary); got != 3 {
 		t.Fatalf("sectionCountOf = %d, want 3", got)
 	}
 	// A header that is only mentioned in the text does not count: the test is
 	// for the `[Header]` anchor.
-	if got := sectionCountOf("Session Goal and Commits"); got != 0 {
+	if got := sectionCountOf("Early Session Requests and Commits"); got != 0 {
 		t.Fatalf("sectionCountOf = %d for an anchorless summary, want 0", got)
 	}
 	if got := sectionCountOf(""); got != 0 {
@@ -165,16 +165,16 @@ func TestReport_SectionCountOf(t *testing.T) {
 }
 
 func TestReport_BriefLineCountOf(t *testing.T) {
-	if got := briefLineCountOf("[Session Goal]\n- x"); got != 0 {
+	if got := briefLineCountOf("[Early Session Requests]\n- x"); got != 0 {
 		t.Fatalf("briefLineCountOf = %d for a summary with no separator, want 0", got)
 	}
-	summary := "[Session Goal]\n- x" + reportBriefSeparator + "user: one\nassistant: two\nuser: three"
+	summary := "[Early Session Requests]\n- x" + reportBriefSeparator + "user: one\nassistant: two\nuser: three"
 	if got := briefLineCountOf(summary); got != 3 {
 		t.Fatalf("briefLineCountOf = %d, want 3", got)
 	}
-	// An empty brief transcript is one (empty) line, as JS's split leaves it.
-	if got := briefLineCountOf("[Session Goal]\n- x" + reportBriefSeparator); got != 1 {
-		t.Fatalf("briefLineCountOf = %d for an empty brief, want 1", got)
+	// An empty brief transcript counts as no brief at all: TS's `brief ? ... : 0`.
+	if got := briefLineCountOf("[Early Session Requests]\n- x" + reportBriefSeparator); got != 0 {
+		t.Fatalf("briefLineCountOf = %d for an empty brief, want 0", got)
 	}
 }
 
@@ -279,13 +279,13 @@ func TestReport_ProbesOf(t *testing.T) {
 	if len(labels) == 0 {
 		t.Fatal("no probes were produced")
 	}
-	if labels[0] != "goal" {
-		t.Fatalf("probe order = %v, want the goal first", labels)
+	if labels[0] != "request" {
+		t.Fatalf("probe order = %v, want the request first", labels)
 	}
 	// The goal line survives the summary, so the goal probe is mentioned.
 	for _, probe := range probes {
-		if probe.Label == "goal" && !probe.SummaryMentioned {
-			t.Fatalf("the goal probe is not mentioned by the summary:\n%s", summary)
+		if probe.Label == "request" && !probe.SummaryMentioned {
+			t.Fatalf("the request probe is not mentioned by the summary:\n%s", summary)
 		}
 	}
 }
