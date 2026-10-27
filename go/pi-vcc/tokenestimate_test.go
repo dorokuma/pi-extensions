@@ -283,6 +283,11 @@ func TestScaffoldSettings_KnownKeysFirst(t *testing.T) {
 }
 
 func TestSettingsPath_HonoursOverride(t *testing.T) {
+	// AgentDir() prefers PIG_EXT_HOST_INFO.agentDir (what a PiG host injects into
+	// every extension subprocess), so the env-var fallbacks asserted below only
+	// win once that channel is cleared. Without this the test resolves to the
+	// hosting agent's own directory and fails under a PiG-run test environment.
+	t.Setenv("PIG_EXT_HOST_INFO", "")
 	t.Setenv("PI_VCC_CONFIG_PATH", "/tmp/custom-pi-vcc.json")
 	if got := SettingsPath(); got != "/tmp/custom-pi-vcc.json" {
 		t.Fatalf("SettingsPath = %q", got)
