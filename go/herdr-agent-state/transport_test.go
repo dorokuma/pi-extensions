@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,21 @@ func createTempSocket(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "herdr.sock")
+}
+
+// herdrSuccessReply mirrors the real Herdr success_response envelope
+// ({"id":...,"result":...}): the request id is echoed and a result object is
+// carried. The pre-fix fake servers replied with a bare {"result":null}, which
+// no longer satisfies the id-matching validation.
+func herdrSuccessReply(rawLine string) []byte {
+	var head struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal([]byte(rawLine), &head)
+	idBytes, _ := json.Marshal(head.ID)
+	out := append([]byte(`{"id":`), idBytes...)
+	out = append(out, []byte(`,"result":{}}`+"\n")...)
+	return out
 }
 
 // TestTransport_RealUnixSocket_Protocol verifies communication over a real unix socket.
@@ -77,7 +93,7 @@ func TestTransport_RealUnixSocket_Protocol(t *testing.T) {
 				mu.Unlock()
 
 				// Reply to acknowledge receipt (triggers client finish(true))
-				_, _ = conn.Write([]byte("{\"result\":null}\n"))
+				_, _ = conn.Write(herdrSuccessReply(line))
 			}
 			_ = conn.Close()
 		}
@@ -89,14 +105,14 @@ func TestTransport_RealUnixSocket_Protocol(t *testing.T) {
 	absPath := "/root/workspace/test/session.jsonl"
 	sessionID := "sess-id-12345"
 	startSource := "startup"
-	client.SendReportAgentSession(SessionRef{Path: &absPath, ID: &sessionID}, &startSource)
+	client.SendReportAgentSession(SessionRef{Path: &absPath, ID: &sessionID}, &startSource, nil)
 
 	// Test 2: Send report_agent with only session ID
 	msg := "waiting for user input"
-	client.SendReportAgent(SessionRef{ID: &sessionID}, "blocked", &msg, NextReportSeq())
+	client.SendReportAgent(SessionRef{ID: &sessionID}, "blocked", &msg, NextReportSeq(), nil)
 
 	// Test 3: Send report_agent with working state and no message
-	client.SendReportAgent(SessionRef{Path: &absPath}, "working", nil, NextReportSeq())
+	client.SendReportAgent(SessionRef{Path: &absPath}, "working", nil, NextReportSeq(), nil)
 
 	// Wait for requests to arrive using condition polling
 	_ = pollCondition(1*time.Second, func() bool {
@@ -123,7 +139,7 @@ func TestTransport_RealUnixSocket_Protocol(t *testing.T) {
 	if !hasSuffix(m1.raw, "\n") {
 		t.Errorf("m1 expected newline terminated")
 	}
-	if m1.params["pane_id"] != "pane-test-1" || m1.params["source"] != "herdr:pi" || m1.params["agent"] != "pi" {
+	if m1.params["pane_id"] != "pane-test-1" || m1.params["source"] != SourcePi || m1.params["agent"] != "pi" {
 		t.Errorf("m1 unexpected standard fields: %+v", m1.params)
 	}
 	if m1.params["agent_session_path"] != absPath {
@@ -293,8 +309,106 @@ func pollCondition(timeout time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// TestTransport_NonJSONGarbage verifies that receiving non-JSON garbage bytes
-// from server still satisfies delivery success, pinning TS data event behavior (C2).
+// TestTransport_JSONErrorResponseIsNotSuccess is the pre-registered negative control
+// for the JSON error-response bug (brief2 B step 2: "解析匹配响应id、success/error并校验而非仅bytes").
+// A herdr reply carrying an "error" envelope must NOT be counted as a successful report:
+// the old implementation accepted any received bytes, so this case FAILS before the fix.
+func TestTransport_JSONErrorResponseIsNotSuccess(t *testing.T) {
+	sockPath := createTempSocket(t)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reader := bufio.NewReader(conn)
+			_, _ = reader.ReadString('\n')
+			// Herdr ErrorResponse envelope: {"id":..., "error":{"code":...,"message":...}}
+			_, _ = conn.Write([]byte("{\"id\":\"garbage-req\",\"error\":{\"code\":\"pane_not_found\",\"message\":\"no such pane\"}}\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	client := NewClient(sockPath, "pane-error-test", nil, []time.Duration{100 * time.Millisecond})
+	if ok := client.SendRequestAttempt(Request{ID: "garbage-req", Method: "pane.report_agent"}, 100*time.Millisecond); ok {
+		t.Fatal("expected SendRequestAttempt to return false when herdr answers with a JSON error envelope, matching the official error_response schema")
+	}
+}
+
+// TestSource_NotReservedByHerdr is the regression for the reserved-source bug.
+// Herdr ships a built-in "pi" integration whose source is "herdr:pi"; a report
+// carrying that source is answered {"result":{"type":"ok"}} yet silently
+// discarded, so the pane keeps agent_status "unknown" (observed live on
+// w3N:pE). This case pins the identity we send instead: agent stays "pi", the
+// source is stable, unique, and never in Herdr's own "herdr:" namespace.
+func TestSource_NotReservedByHerdr(t *testing.T) {
+	if AgentPi != "pi" {
+		t.Fatalf("expected agent %q, got %q", "pi", AgentPi)
+	}
+	if SourcePi == "herdr:pi" {
+		t.Fatal("source must not be \"herdr:pi\": Herdr's own built-in pi integration owns it and silently drops such reports")
+	}
+	if strings.HasPrefix(SourcePi, "herdr:") {
+		t.Fatalf("source must not start with \"herdr:\" (Herdr reserves that prefix for its own integrations), got %q", SourcePi)
+	}
+	if SourcePi == "" {
+		t.Fatal("source must be a non-empty stable identifier")
+	}
+
+	// Every report must carry the same source.
+	client := NewClient("dummy.sock", "pane-source-test", nil, []time.Duration{10 * time.Millisecond})
+	sessPath := "/root/workspace/test/session.jsonl"
+	if req, ok := client.BuildReportAgentSessionRequest(SessionRef{Path: &sessPath}, nil, nil); !ok {
+		t.Fatal("expected a session report request")
+	} else if req.Params.(ReportAgentSessionParams).Source != SourcePi {
+		t.Fatalf("session report source = %q, want %q", req.Params.(ReportAgentSessionParams).Source, SourcePi)
+	}
+	rel := client.BuildReleaseAgentRequest()
+	if rel.Params.(ReleaseAgentParams).Source != SourcePi {
+		t.Fatalf("release source = %q, want %q", rel.Params.(ReleaseAgentParams).Source, SourcePi)
+	}
+}
+
+// TestTransport_IDMismatchIsNotSuccess covers the id-matching half of the response
+// validation: a success envelope whose id does not match the request is rejected.
+func TestTransport_IDMismatchIsNotSuccess(t *testing.T) {
+	sockPath := createTempSocket(t)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reader := bufio.NewReader(conn)
+			_, _ = reader.ReadString('\n')
+			// Well-formed success envelope, but the id belongs to another request.
+			_, _ = conn.Write([]byte("{\"id\":\"some-other-request\",\"result\":{}}\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	client := NewClient(sockPath, "pane-id-mismatch-test", nil, []time.Duration{100 * time.Millisecond})
+	if ok := client.SendRequestAttempt(Request{ID: "mismatch-req", Method: "pane.report_agent"}, 100*time.Millisecond); ok {
+		t.Fatal("expected SendRequestAttempt to return false when the response id does not match the request id")
+	}
+}
+
+// TestTransport_NonJSONGarbage pins the corrected delivery contract: a reply that is
+// not a parseable Herdr envelope is NOT a successful report. The TS port counted any
+// received bytes as delivered (socket.on("data")), which is exactly the "仅 bytes"
+// behaviour the official contract forbids; this case was updated with the fix.
 func TestTransport_NonJSONGarbage(t *testing.T) {
 	sockPath := createTempSocket(t)
 	listener, err := net.Listen("unix", sockPath)
@@ -318,9 +432,88 @@ func TestTransport_NonJSONGarbage(t *testing.T) {
 	}()
 
 	client := NewClient(sockPath, "pane-garbage-test", nil, []time.Duration{100 * time.Millisecond})
-	ok := client.SendRequestAttempt(Request{ID: "garbage-req", Method: "pane.report_agent"}, 100*time.Millisecond)
-	if !ok {
-		t.Fatal("expected SendRequestAttempt to return true when receiving non-JSON bytes, matching TS socket.on('data')")
+	if ok := client.SendRequestAttempt(Request{ID: "garbage-req", Method: "pane.report_agent"}, 100*time.Millisecond); ok {
+		t.Fatal("expected SendRequestAttempt to return false for non-JSON bytes: delivery must be validated against the Herdr response envelope, not inferred from received bytes")
+	}
+}
+
+// TestTransport_FragmentedResponseFrame is the regression for the response
+// reader: Herdr's reply may reach the client in more than one TCP segment, so
+// the response frame must be read completely (up to the newline) before it is
+// validated. A frame that never completes must not be counted as a successful
+// delivery. One behaviour branch (frame completeness), no extra cases.
+func TestTransport_FragmentedResponseFrame(t *testing.T) {
+	sockPath := createTempSocket(t)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				reply := herdrSuccessReply(line)
+				// Deliver the reply in two segments with a gap in between, so
+				// the first read only sees half of the frame.
+				half := len(reply) / 2
+				_, _ = c.Write(reply[:half])
+				time.Sleep(200 * time.Millisecond)
+				_, _ = c.Write(reply[half:])
+				time.Sleep(50 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	client := NewClient(sockPath, "pane-fragment-test", nil, []time.Duration{500 * time.Millisecond})
+	req := Request{ID: "fragment-req", Method: "pane.report_agent"}
+	if !client.SendRequestAttempt(req, 500*time.Millisecond) {
+		t.Fatal("expected a complete response frame that arrives in two segments to be accepted")
+	}
+
+	// A frame that never completes must not be counted as a delivery.
+	truncPath := createTempSocket(t)
+	truncListener, err := net.Listen("unix", truncPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer truncListener.Close()
+
+	go func() {
+		for {
+			conn, err := truncListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				reply := herdrSuccessReply(line)
+				// Only half of the frame is delivered and the connection is
+				// held open: the frame never completes.
+				_, _ = c.Write(reply[:len(reply)/2])
+				time.Sleep(500 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	truncClient := NewClient(truncPath, "pane-truncated-test", nil, []time.Duration{200 * time.Millisecond})
+	if truncClient.SendRequestAttempt(req, 200*time.Millisecond) {
+		t.Fatal("expected a truncated response frame not to be counted as a successful delivery")
 	}
 }
 
@@ -378,6 +571,10 @@ type mockSessionProvider struct {
 	fileErr     error
 	sessionID   string
 	idErr       error
+	// idleHook, when set, is called by IsIdle before it answers. It lets a
+	// test hold a handler inside the lock-free IsIdle() query and drive a
+	// concurrent session shutdown in that window.
+	idleHook func()
 }
 
 func (m *mockSessionProvider) Mode() string {
@@ -385,6 +582,9 @@ func (m *mockSessionProvider) Mode() string {
 }
 
 func (m *mockSessionProvider) IsIdle() (bool, error) {
+	if m.idleHook != nil {
+		m.idleHook()
+	}
 	return m.isIdle, m.idleErr
 }
 
@@ -442,7 +642,7 @@ func TestAgentStart_SessionSeqOrdering(t *testing.T) {
 				received = append(received, msgRecord{raw: line, method: req.Method, seq: seq})
 				mu.Unlock()
 
-				_, _ = conn.Write([]byte("{\"result\":null}\n"))
+				_, _ = conn.Write(herdrSuccessReply(line))
 			}
 			_ = conn.Close()
 		}
@@ -586,7 +786,7 @@ func TestSessionStart_AsyncNonBlockingAndSeqOrdering(t *testing.T) {
 					received = append(received, msgRecord{raw: line, method: req.Method, seq: seq})
 					mu.Unlock()
 
-					_, _ = c.Write([]byte("{\"result\":null}\n"))
+					_, _ = c.Write(herdrSuccessReply(line))
 				}
 			}(conn)
 		}
