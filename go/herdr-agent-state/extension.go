@@ -52,6 +52,7 @@ func Extension() *sdk.Extension {
 	e.OnEvent(sdk.EventSessionStart, sm.HandleSessionStart)
 	e.OnEvent(sdk.EventAgentStart, sm.HandleAgentStart)
 	e.OnEvent(sdk.EventAgentSettled, sm.HandleAgentSettled)
+	e.OnEvent(sdk.EventSessionShutdown, sm.HandleSessionShutdown)
 
 	return e
 }

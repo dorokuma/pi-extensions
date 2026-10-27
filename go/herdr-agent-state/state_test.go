@@ -55,7 +55,7 @@ func TestStateMachine_Transitions(t *testing.T) {
 					})
 					mu.Unlock()
 				}
-				_, _ = conn.Write([]byte("{\"result\":null}\n"))
+				_, _ = conn.Write(herdrSuccessReply(line))
 			}
 			_ = conn.Close()
 		}
@@ -206,7 +206,7 @@ func TestQueue_CoalescingAndSerialization(t *testing.T) {
 				receivedStates = append(receivedStates, p.State)
 				mu.Unlock()
 
-				_, _ = conn.Write([]byte("{\"result\":null}\n"))
+				_, _ = conn.Write(herdrSuccessReply(line))
 			}
 			activeConnections.Add(-1)
 			_ = conn.Close()
@@ -221,6 +221,7 @@ func TestQueue_CoalescingAndSerialization(t *testing.T) {
 
 	// Step 1: Trigger state 1 (working)
 	sm.mu.Lock()
+	sm.rootSession = true
 	sm.agentActive = true
 	sm.mu.Unlock()
 	sm.PublishState(true) // Starts transmission of state 1 ("working")
@@ -272,6 +273,62 @@ func TestQueue_CoalescingAndSerialization(t *testing.T) {
 	}
 	if receivedStates[1] != "idle" {
 		t.Errorf("expected 2nd sent state to be 'idle' (coalescing dropped 'blocked'), got %s", receivedStates[1])
+	}
+}
+
+// TestAgentActivity_NewerStartSupersedesStaleIdle is the regression for the
+// stale idle observation: agent_settled reads IsIdle() outside the lock, so an
+// agent_start that arrives in that window is the newer event. The outdated idle
+// result of the settled handler must not overwrite the newer "working" state.
+// One behaviour branch, no extra cases.
+func TestAgentActivity_NewerStartSupersedesStaleIdle(t *testing.T) {
+	client := NewClient("dummy.sock", "pane-activity-test", nil, []time.Duration{10 * time.Millisecond})
+	sm := NewStateManager(client)
+
+	sessPath := "/root/workspace/test/session.jsonl"
+	busyProvider := &mockSessionProvider{
+		mode:        "tui",
+		isIdle:      false,
+		sessionFile: &sessPath,
+	}
+
+	// 1. The session starts with a busy agent -> working.
+	sm.handleSessionStartCore(busyProvider, nil)
+	if state, _ := sm.DesiredState(); state != "working" {
+		t.Fatalf("expected state 'working' after the session start, got %q", state)
+	}
+
+	// 2. agent_settled observes the idle state outside the lock and blocks
+	// inside the query.
+	gate := make(chan struct{})
+	idleEntered := make(chan struct{})
+	settleProvider := &mockSessionProvider{
+		mode:        "tui",
+		isIdle:      true,
+		sessionFile: &sessPath,
+		idleHook: func() {
+			close(idleEntered)
+			<-gate
+		},
+	}
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		sm.handleAgentSettledCore(settleProvider)
+	}()
+	<-idleEntered
+
+	// 3. The agent starts again while the settled handler is still waiting:
+	// this is the newer event and must win.
+	sm.handleAgentStartCore(busyProvider)
+
+	// 4. The outdated idle observation of the settled handler must be dropped.
+	close(gate)
+	<-settled
+	time.Sleep(50 * time.Millisecond)
+
+	if state, _ := sm.DesiredState(); state != "working" {
+		t.Fatalf("expected the newer agent_start to keep state 'working', got %q", state)
 	}
 }
 
