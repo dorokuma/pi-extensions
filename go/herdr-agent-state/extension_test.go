@@ -600,7 +600,7 @@ func TestRelease_AndResumeArgv(t *testing.T) {
 				t.Fatalf("release_agent params missing required %q: %+v", key, release.params)
 			}
 		}
-		if release.params["pane_id"] != "pane-release-test" || release.params["source"] != SourcePi || release.params["agent"] != "pi" {
+		if release.params["pane_id"] != "pane-release-test" || release.params["source"] != SourcePi || release.params["agent"] != "pig" {
 			t.Fatalf("unexpected release_agent identity fields: %+v", release.params)
 		}
 

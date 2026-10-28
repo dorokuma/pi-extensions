@@ -283,8 +283,8 @@ func TestExtensionRegistersPresenceAndAdoptsDaemonLocation(t *testing.T) {
 	if !ok {
 		t.Fatalf("sessionRef: %#v", params["sessionRef"])
 	}
-	if sessionRef["agent"] != "pi" || sessionRef["kind"] != "path" ||
-		sessionRef["source"] != "herdr:pi" || sessionRef["value"] != "/tmp/pi-session.jsonl" {
+	if sessionRef["agent"] != "pig" || sessionRef["kind"] != "path" ||
+		sessionRef["source"] != "herdr:pig" || sessionRef["value"] != "/tmp/pi-session.jsonl" {
 		t.Fatalf("unexpected sessionRef: %#v", sessionRef)
 	}
 	status := f.ctx.Status("herdsman")

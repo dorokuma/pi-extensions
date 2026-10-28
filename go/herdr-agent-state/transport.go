@@ -43,7 +43,7 @@ const (
 	// identifies your integration. Keep it stable and unique. Don't start it with
 	// herdr:, because Herdr's own integrations use that prefix."
 	SourcePi = "pig"
-	AgentPi  = "pi"
+	AgentPi  = "pig"
 )
 
 // Sequence generator matching TS: let reportSeq = Date.now() * 1000; reportSeq += 1;

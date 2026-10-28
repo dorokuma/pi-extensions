@@ -66,7 +66,8 @@ func uiRenderRaw(messageDetails any, expanded bool) string {
 func TestAgentUIFormatsIdentitiesAndRejectsMalformedTokens(t *testing.T) {
 	cases := []struct{ agent, want string }{
 		{"claude", "Claude"}, {"PI", "unknown"}, {"codex", "Codex"},
-		{"gemini", "Gemini"}, {"opencode", "OpenCode"}, {"custom-agent", "custom-agent"},
+		{"gemini", "Gemini"}, {"opencode", "OpenCode"}, {"pig", "pig"},
+		{"custom-agent", "custom-agent"},
 	}
 	for _, entry := range cases {
 		if got := AgentDisplayName(entry.agent); got != entry.want {
