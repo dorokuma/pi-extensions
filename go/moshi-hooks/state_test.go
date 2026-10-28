@@ -630,25 +630,25 @@ func TestResolveTranscriptPathStages(t *testing.T) {
 	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
 
 	// Stage 1: an explicit session file wins over everything.
-	if got := resolveTranscriptPath("/mgr/t.jsonl", map[string]any{"transcript_path": "/ev/t.jsonl"}, "sid", "/work"); got != "/mgr/t.jsonl" {
+	if got, _ := resolveTranscriptPath("/mgr/t.jsonl", map[string]any{"transcript_path": "/ev/t.jsonl"}, "sid", "/work"); got != "/mgr/t.jsonl" {
 		t.Fatalf("stage1 = %q, want /mgr/t.jsonl", got)
 	}
 
 	// Stage 2: event transcript fields, in priority order.
 	for _, key := range []string{"transcript_path", "transcriptPath", "sessionFile", "session_file", "sessionPath"} {
 		event := map[string]any{key: "/ev/" + key + ".jsonl"}
-		if got := resolveTranscriptPath("", event, "sid", "/work"); got != "/ev/"+key+".jsonl" {
+		if got, _ := resolveTranscriptPath("", event, "sid", "/work"); got != "/ev/"+key+".jsonl" {
 			t.Fatalf("stage2 %s = %q", key, got)
 		}
 	}
 
 	// Stage 3: the session-id scan finds the transcript in a different cwd dir.
 	other := writeSessionFile(t, agentDir, "/other/cwd", "2026-10-25T00-00-00-000Z_sid-9.jsonl", `{"type":"session"}`)
-	if got := resolveTranscriptPath("", nil, "sid-9", "/work/moshi"); got != other {
+	if got, _ := resolveTranscriptPath("", nil, "sid-9", "/work/moshi"); got != other {
 		t.Fatalf("stage3 = %q, want %q", got, other)
 	}
 	// A sessionID equal to agentSource never scans.
-	if got := resolveTranscriptPath("", nil, agentSource, "/nonexistent"); got != "" {
+	if got, _ := resolveTranscriptPath("", nil, agentSource, "/nonexistent"); got != "" {
 		t.Fatalf("agentSource id must not scan, got %q", got)
 	}
 
@@ -660,11 +660,11 @@ func TestResolveTranscriptPathStages(t *testing.T) {
 	if err := os.Chtimes(older, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	if got := resolveTranscriptPath("", nil, "no-such-id", cwd); got != newer {
-		t.Fatalf("stage4 = %q, want %q", got, newer)
+	if got, guessed := resolveTranscriptPath("", nil, "no-such-id", cwd); got != newer || !guessed {
+		t.Fatalf("stage4 = %q (guessed %v), want %q guessed", got, guessed, newer)
 	}
 	// An unknown cwd yields nothing.
-	if got := resolveTranscriptPath("", nil, "no-such-id", "/no/dir"); got != "" {
+	if got, _ := resolveTranscriptPath("", nil, "no-such-id", "/no/dir"); got != "" {
 		t.Fatalf("stage4 unknown cwd = %q, want empty", got)
 	}
 }
@@ -679,7 +679,7 @@ func TestStage4ChildSessionIsDetected(t *testing.T) {
 
 	// The stage-4 path is also what lineage detection reads: a transcript the
 	// host never handed us still identifies the session as a child.
-	resolved := resolveTranscriptPath("", nil, "no-such-id", cwd)
+	resolved, _ := resolveTranscriptPath("", nil, "no-such-id", cwd)
 	if resolved != path {
 		t.Fatalf("stage4 resolved %q, want %q", resolved, path)
 	}
@@ -708,9 +708,21 @@ func TestSessionTranscriptIsCached(t *testing.T) {
 	// (resolveTranscriptPath is what Send() calls while assembling the next
 	// payload, so it is the seam where the cache must take effect.)
 	other := writeSessionFile(t, agentDir, "/work/moshi", "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
-	got := resolveTranscriptPath("", nil, "session-1", "/work/moshi")
+	got, _ := resolveTranscriptPath("", nil, "session-1", "/work/moshi")
 	if got != "/cached/t.jsonl" {
 		t.Fatalf("cached path not reused: got %q (disk fallback %q), want /cached/t.jsonl", got, other)
+	}
+
+	// A payload carrying a stage-5 guess (flagged by resolveTranscriptPath)
+	// must never enter the cache: caching it would resurrect the shadow that
+	// blocks the stage-4 id scan.
+	guessPayload := payloadFor("SessionStart")
+	guessPayload.SessionID = "session-2"
+	guessPayload.TranscriptPath = other
+	guessPayload.TranscriptPathGuessed = true
+	h.deliverOne(guessPayload)
+	if got := sessionTranscripts["session-2"]; got != "" {
+		t.Fatalf("guessed path entered the cache: sessionTranscripts = %q, want empty", got)
 	}
 }
 
@@ -721,29 +733,45 @@ func TestAuthoritativeTranscriptPathOverridesCachedGuess(t *testing.T) {
 	cwd := "/work/moshi"
 
 	// session_start fired before this session's transcript hit disk: the
-	// stage-5 cwd fallback resolved to an older session's file, and
-	// handleEvent cached that guess under this session id.
+	// stage-5 cwd fallback resolved to an older session's file. The payload
+	// carries it flagged as a guess, so handleEvent must NOT cache it — a
+	// cached guess would shadow the stage-4 id scan below.
 	stale := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
-	guess := resolveTranscriptPath("", nil, "session-1", cwd)
-	if guess != stale {
-		t.Fatalf("stage5 guess = %q, want %q", guess, stale)
+	guess, guessed := resolveTranscriptPath("", nil, "session-1", cwd)
+	if guess != stale || !guessed {
+		t.Fatalf("stage5 guess = %q (guessed %v), want %q guessed", guess, guessed, stale)
 	}
 	payload := payloadFor("SessionStart")
 	payload.TranscriptPath = guess
+	payload.TranscriptPathGuessed = guessed
 	h.deliverOne(payload)
-	if got := sessionTranscripts["session-1"]; got != stale {
-		t.Fatalf("cached guess = %q, want %q", got, stale)
+	if got := sessionTranscripts["session-1"]; got != "" {
+		t.Fatalf("cached guess = %q, want empty (guesses are never cached)", got)
 	}
 
-	// A later event carries the authoritative transcript path: it must win
-	// over the cached guess and upgrade the cache — the old cache-first
-	// ordering returned the stale guess forever.
+	// The session's own transcript now lands on disk. A later event with no
+	// transcript path at all must reach the stage-4 id scan — if the guess
+	// above had entered sessionTranscripts, stage 3 would return the stale
+	// file forever. This is the defect the guessed flag fixes.
 	authoritative := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_session-1.jsonl", `{"type":"session"}`)
+	if got, _ := resolveTranscriptPath("", nil, "session-1", cwd); got != authoritative {
+		t.Fatalf("stage-4 id scan blocked: got %q, want %q", got, authoritative)
+	}
+
+	// An event-carried path still wins over a stale cache entry and upgrades
+	// it — seed one through a non-guessed payload first.
+	stalePayload := payloadFor("SessionStart")
+	stalePayload.SessionID = "session-3"
+	stalePayload.TranscriptPath = stale
+	h.deliverOne(stalePayload)
+	if got := sessionTranscripts["session-3"]; got != stale {
+		t.Fatalf("seeded cache = %q, want %q", got, stale)
+	}
 	event := map[string]any{"transcript_path": authoritative}
-	if got := resolveTranscriptPath("", event, "session-1", cwd); got != authoritative {
+	if got, _ := resolveTranscriptPath("", event, "session-3", cwd); got != authoritative {
 		t.Fatalf("event-carried path lost to cached guess: got %q, want %q", got, authoritative)
 	}
-	if got := sessionTranscripts["session-1"]; got != authoritative {
+	if got := sessionTranscripts["session-3"]; got != authoritative {
 		t.Fatalf("cache not upgraded: got %q, want %q", got, authoritative)
 	}
 }

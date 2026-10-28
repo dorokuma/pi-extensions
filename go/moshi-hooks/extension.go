@@ -111,15 +111,17 @@ func Send(eventName string, event map[string]any, ctx sdk.Context, extra map[str
 
 	id := sessionID(event, ctx)
 	cwd := firstString(safeCwd(ctx), processCwd())
+	transcriptPath, guessed := resolveTranscriptPath(safeSessionFile(ctx), event, id, cwd)
 	payload := &HookPayload{
-		HookEventName:    eventName,
-		SessionID:        id,
-		TranscriptPath:   resolveTranscriptPath(safeSessionFile(ctx), event, id, cwd),
-		Cwd:              cwd,
-		Model:            modelLabelForCtx(ctx),
-		ContextRemaining: contextRemainingFrom(ctx),
-		AgentKind:        agentKind(event),
-		Extra:            extra,
+		HookEventName:         eventName,
+		SessionID:             id,
+		TranscriptPath:        transcriptPath,
+		TranscriptPathGuessed: guessed,
+		Cwd:                   cwd,
+		Model:                 modelLabelForCtx(ctx),
+		ContextRemaining:      contextRemainingFrom(ctx),
+		AgentKind:             agentKind(event),
+		Extra:                 extra,
 	}
 	handleEvent(payload, event)
 }

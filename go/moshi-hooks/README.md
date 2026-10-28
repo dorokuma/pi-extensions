@@ -141,8 +141,11 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
 `PIG_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR` → `PIG_HOME` →
 `XDG_CONFIG_HOME/pig` → `~/.pig`；前两级拼 `/sessions`，后三级拼
 `/agent/sessions`。解析结果中**权威来源（stage 1/2）与 stage 4 的 id 匹配**按 sessionID
-缓存在 `sessionTranscripts`，后续不带路径的事件仍能定位 transcript；stage 5
-的 cwd 猜测不缓存，避免把另一会话的文件误当本会话权威值。packed-go cell 里源码改动由 PiG 自动重编，无需
+缓存在 `sessionTranscripts`（`resolveTranscriptPath` 是唯一写方，
+`handleEvent` 不再重复写入），后续不带路径的事件仍能定位 transcript；stage 5
+的 cwd 猜测不缓存，避免把另一会话的文件误当本会话权威值——猜测随
+`TranscriptPathGuessed` 标记返回，`sessionIsChild` 也不拿它做 lineage 判定
+（旧文件可能带 `parentSession` 误抑制本会话）。packed-go cell 里源码改动由 PiG 自动重编，无需
 手工 install。
 
 ## 3. 与 TS 的差异（逐条，附理由）

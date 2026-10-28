@@ -77,7 +77,9 @@ var (
 	// a stage-4 session-id match, so a later event that arrives without one
 	// still knows where the session's transcript lives. Stage-5 cwd guesses
 	// are never stored here — they may name another session's file and would
-	// shadow the real one once it appears
+	// shadow the real one once it appears. resolveTranscriptPath is the only
+	// writer: handleEvent records its verdict in TranscriptPathGuessed
+	// instead of re-caching the value
 	// (TS pig: state.transcriptPath, set inside transcriptPath()).
 	sessionTranscripts = map[string]string{}
 )
@@ -275,20 +277,24 @@ func eventString(event map[string]any, key string) string {
 //  2. event fields — transcript_path / transcriptPath / sessionFile /
 //     session_file / sessionPath; also authoritative, refreshes the cache.
 //  3. sessionTranscripts[sessionID] — a path already resolved and cached by
-//     stage 1/2 or handleEvent; consulted only when no authoritative value
-//     is present this time.
+//     stage 1/2; consulted only when no authoritative value is present this
+//     time.
 //  4. findSessionFileByID(sessionID) — the session-id scan of the sessions
 //     root; a real session match, cached.
 //  5. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
 //     cwd's session directory; a guess, returned but never cached.
-func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) string {
+//
+// guessed reports whether the result is a fallible stage-5 guess (true) or a
+// trusted stage 1-4 value (false). Callers use it to keep guesses out of both
+// the cache and lineage detection.
+func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) (path string, guessed bool) {
 	// Stage 1: the host session file is authoritative — take it verbatim and
 	// record it so later events without one still resolve.
 	if sessionFile != "" {
 		stateMu.Lock()
 		sessionTranscripts[sessionID] = sessionFile
 		stateMu.Unlock()
-		return sessionFile
+		return sessionFile, false
 	}
 	// Stage 2: event-carried transcript fields are authoritative too — they
 	// replace whatever an earlier guess cached.
@@ -296,16 +302,16 @@ func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, 
 		stateMu.Lock()
 		sessionTranscripts[sessionID] = fromEvent
 		stateMu.Unlock()
-		return fromEvent
+		return fromEvent, false
 	}
-	// Stage 3: the cache handleEvent and stages 1/2 fill. Send() calls us
-	// before handleEvent takes stateMu, so take it here for the read — the
-	// critical section is a single map lookup.
+	// Stage 3: the cache stages 1/2/4 fill. Send() calls us before
+	// handleEvent takes stateMu, so take it here for the read — the critical
+	// section is a single map lookup.
 	stateMu.Lock()
 	cached := sessionTranscripts[sessionID]
 	stateMu.Unlock()
 	if cached != "" {
-		return cached
+		return cached, false
 	}
 	// Stage 4: a filename-bound session id is a real match (a wrongly-guessed
 	// stage-5 file never reaches the cache, so the scan stays reachable once
@@ -314,13 +320,14 @@ func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, 
 		stateMu.Lock()
 		sessionTranscripts[sessionID] = byID
 		stateMu.Unlock()
-		return byID
+		return byID, false
 	}
 	// Stage 5: newest *.jsonl under this cwd is a heuristic only — the file
 	// may belong to a different session that happens to share the cwd. It is
-	// returned for this event but never cached, so a later authoritative
-	// stage-1/2 value or a stage-4 id match can still correct it.
-	return newestJsonl(pigSessionDirForCwd(cwd))
+	// returned flagged as a guess so it is never cached, and a later
+	// authoritative stage-1/2 value or a stage-4 id match can still correct
+	// it.
+	return newestJsonl(pigSessionDirForCwd(cwd)), true
 }
 
 // promptSequenceForSubmit mirrors internal/agentstate.PromptSequenceForSubmit:
@@ -361,15 +368,20 @@ func recordTaskCompletion(state *SessionState, signature string, at float64) boo
 // Extra carries the per-hook fields the caller merges in (`prompt`,
 // `last_assistant_message`), which win over the base fields exactly like the
 // TS object spread `{...base, ...extra}`.
+//
+// TranscriptPathGuessed records resolveTranscriptPath's verdict on
+// TranscriptPath: false for a trusted stage 1-4 value, true for a stage-5 cwd
+// guess. Only handleEvent reads it — the field never leaves the process.
 type HookPayload struct {
-	HookEventName    string
-	SessionID        string
-	TranscriptPath   string
-	Cwd              string
-	Model            string
-	ContextRemaining *float64
-	AgentKind        string
-	Extra            map[string]any
+	HookEventName         string
+	SessionID             string
+	TranscriptPath        string
+	TranscriptPathGuessed bool
+	Cwd                   string
+	Model                 string
+	ContextRemaining      *float64
+	AgentKind             string
+	Extra                 map[string]any
 }
 
 // field reads a payload property by its TS name.
@@ -407,7 +419,14 @@ func (p *HookPayload) str(key string) string { return firstString(p.field(key)) 
 // (TS pig: sessionIsChild). This file is generated for Pi, so the omp
 // agent_kind branch the generated TS carries for other families is gone.
 func sessionIsChild(state *SessionState, payload *HookPayload, event map[string]any) bool {
-	filePath := firstString(payload.TranscriptPath, eventTranscriptPath(event), state.TranscriptPath)
+	filePath := ""
+	if !payload.TranscriptPathGuessed {
+		// A stage-5 cwd guess may name another session's file: reading its
+		// header would suppress this session as a false lineage child. Trusted
+		// resolutions (stage 1-4) still identify the session on their own.
+		filePath = payload.TranscriptPath
+	}
+	filePath = firstString(filePath, eventTranscriptPath(event), state.TranscriptPath)
 	if filePath == "" {
 		return false
 	}
@@ -501,10 +520,12 @@ func handleEvent(payload *HookPayload, event map[string]any) {
 	defer stateMu.Unlock()
 
 	state := stateFor(sessionID)
-	if payload.TranscriptPath != "" {
-		// Authoritative for this session: the payload's path came through
-		// resolveTranscriptPath, which never returns a stage-5 guess as
-		// authoritative — handleEvent simply records the resolved value.
+	if payload.TranscriptPath != "" && !payload.TranscriptPathGuessed {
+		// Cache ownership stays with resolveTranscriptPath, which already
+		// stored every trusted (non-guessed) value; this write only matters
+		// for payloads built by hand, and it must never admit a stage-5
+		// guess — that would resurrect the cached-guess shadowing the
+		// stage-4 id scan was meant to fix.
 		sessionTranscripts[sessionID] = payload.TranscriptPath
 	}
 	isChild := sessionIsChild(state, payload, event)
