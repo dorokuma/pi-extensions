@@ -1,6 +1,7 @@
 package rpivaskuserquestion
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -528,5 +529,46 @@ func TestIsKeyReleaseAndRepeat(t *testing.T) {
 	}
 	if IsKeyRelease("\x1b[A") || IsKeyRepeat("\x1b[A") {
 		t.Fatal("legacy sequence reported as a Kitty event")
+	}
+}
+
+// TestExtensionDefersBusSubscriptionToOnLoaded asserts the answer subscription is
+// deferred to OnLoaded instead of being made inside the factory: a factory-time
+// Events().On dials the host socket and waits on a synchronous host RPC, which
+// deadlocks /reload when the host is still admitting an earlier member. This fake
+// host accepts the connection and never answers it, so a factory-time
+// subscription shows up as exactly that accepted connection.
+func TestExtensionDefersBusSubscriptionToOnLoaded(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "host.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+
+	t.Setenv("PIG_EXT_SOCKET", sockPath)
+
+	done := make(chan *sdk.Extension, 1)
+	go func() { done <- Extension() }()
+
+	select {
+	case extension := <-done:
+		if extension == nil {
+			t.Fatal("Extension() returned nil")
+		}
+	case conn := <-accepted:
+		_ = conn.Close()
+		t.Fatal("Extension() opened the host socket from the factory: the bus subscription must be deferred to OnLoaded")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Extension() did not return: a factory-time host call blocks the reload")
 	}
 }

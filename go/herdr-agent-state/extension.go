@@ -43,10 +43,21 @@ func Extension() *sdk.Extension {
 	client := NewClient(endpoint, cfg.PaneID, nil, nil)
 	sm := NewStateManager(client)
 
-	// Event bus: herdr:blocked
-	if _, err := e.Events().On("herdr:blocked", sm.HandleHerdrBlocked); err != nil {
-		log.Printf("[herdr-agent-state] failed to subscribe to herdr:blocked: %v", err)
-	}
+	// Event bus: herdr:blocked, subscribed from OnLoaded rather than here: a
+	// subscription made while the factory runs dials the host socket itself and
+	// waits on a synchronous host RPC (EventBus.On -> factoryBusConn), which
+	// deadlocks /reload while the host is still accepting an earlier member's
+	// connection. Per the SDK's OnLoaded contract (pigsdk/host_state_subscriptions.go)
+	// the handler runs once this extension is registered with the host and has
+	// received its state, before the host serves any request (session_start
+	// included) — a listener dispatch excepted, since a dispatch does not wait
+	// behind the handler. So ctx.Events() rides the running connection, and the
+	// subscription is in place before agent blocking can emit it.
+	e.OnLoaded(func(ctx sdk.Context) {
+		if _, err := ctx.Events().On("herdr:blocked", sm.HandleHerdrBlocked); err != nil {
+			log.Printf("[herdr-agent-state] failed to subscribe to herdr:blocked: %v", err)
+		}
+	})
 
 	// Pi/PiG lifecycle events
 	e.OnEvent(sdk.EventSessionStart, sm.HandleSessionStart)

@@ -82,14 +82,26 @@ func Extension() *sdk.Extension {
 	answers := NewAnswerChannel(func(channel string, payload any) error {
 		return e.Events().Emit(channel, payload)
 	})
-	if _, err := e.Events().On(AskUserAnswerEvent, func(_ sdk.Context, payload any) error {
-		answers.Handle(payload)
-		return nil
-	}); err != nil {
-		// A bus that cannot be reached is a load-time failure the host reports; the
-		// tool still registers so the extension is not silently dead.
-		_, _ = fmt.Fprint(os.Stderr, logName+": events.on failed: "+err.Error()+"\n")
-	}
+	// Subscribed from OnLoaded rather than in the factory: a subscription made
+	// while the factory runs dials the host socket itself and waits on a
+	// synchronous host RPC (EventBus.On -> factoryBusConn), which deadlocks
+	// /reload while the host is still accepting an earlier member's connection.
+	// Per the SDK's OnLoaded contract (pigsdk/host_state_subscriptions.go) the
+	// handler runs once the extension is registered and has received its state,
+	// before the host serves any request (session_start included) — a listener
+	// dispatch excepted, since a dispatch does not wait behind the handler. So the
+	// asking tool cannot run before this subscription is in place, and ctx.Events()
+	// rides the running connection.
+	e.OnLoaded(func(ctx sdk.Context) {
+		if _, err := ctx.Events().On(AskUserAnswerEvent, func(_ sdk.Context, payload any) error {
+			answers.Handle(payload)
+			return nil
+		}); err != nil {
+			// A bus that cannot be reached is a load-time failure the host reports; the
+			// tool still registers so the extension is not silently dead.
+			_, _ = fmt.Fprint(os.Stderr, logName+": events.on failed: "+err.Error()+"\n")
+		}
+	})
 
 	// Guidance is read once at load, exactly as registerAskUserQuestionTool does.
 	guidance := ValidateGuidanceFields(LoadConfig().Guidance)
