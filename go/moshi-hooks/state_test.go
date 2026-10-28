@@ -690,11 +690,27 @@ func TestStage4ChildSessionIsDetected(t *testing.T) {
 
 func TestSessionTranscriptIsCached(t *testing.T) {
 	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// First event resolves the transcript (here: straight from the payload) and
+	// caches it under the session id.
 	payload := payloadFor("SessionStart")
 	payload.TranscriptPath = "/cached/t.jsonl"
 	h.deliverOne(payload)
 	if got := sessionTranscripts["session-1"]; got != "/cached/t.jsonl" {
 		t.Fatalf("sessionTranscripts = %q, want /cached/t.jsonl", got)
+	}
+
+	// A second event carrying no transcript path of its own reuses the cached
+	// value — even when the disk fallback chain would resolve to a *different*
+	// file. Without the level-0 cache lookup the fallback wins and this fails.
+	// (resolveTranscriptPath is what Send() calls while assembling the next
+	// payload, so it is the seam where the cache must take effect.)
+	other := writeSessionFile(t, agentDir, "/work/moshi", "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
+	got := resolveTranscriptPath("", nil, "session-1", "/work/moshi")
+	if got != "/cached/t.jsonl" {
+		t.Fatalf("cached path not reused: got %q (disk fallback %q), want /cached/t.jsonl", got, other)
 	}
 }
 

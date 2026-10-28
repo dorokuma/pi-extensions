@@ -257,10 +257,13 @@ func eventString(event map[string]any, key string) string {
 	return value
 }
 
-// resolveTranscriptPath is the four-level transcript resolution chain
-// (TS pig: transcriptPath). MOSHI's Chat View tails this file, so it must be
-// the real pig transcript — never a path under ~/.pi.
+// resolveTranscriptPath is the transcript resolution chain (TS pig:
+// transcriptPath). MOSHI's Chat View tails this file, so it must be the real
+// pig transcript — never a path under ~/.pi.
 //
+//  0. sessionTranscripts[sessionID] — a path this session already resolved
+//     and handleEvent cached (under stateMu), so later events skip the disk
+//     scan entirely.
 //  1. sessionFile — the host sessionManager's getSessionFile(), the
 //     authoritative answer.
 //  2. event fields — transcript_path / transcriptPath / sessionFile /
@@ -270,6 +273,15 @@ func eventString(event map[string]any, key string) string {
 //  4. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
 //     cwd's session directory.
 func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) string {
+	// Level 0: the cache handleEvent fills from this payload's resolved path.
+	// Send() calls us before handleEvent takes stateMu, so take it here for
+	// the read — the critical section is a single map lookup.
+	stateMu.Lock()
+	cached := sessionTranscripts[sessionID]
+	stateMu.Unlock()
+	if cached != "" {
+		return cached
+	}
 	if sessionFile != "" {
 		return sessionFile
 	}
