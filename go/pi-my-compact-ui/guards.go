@@ -1,6 +1,8 @@
 package compactui
 
 import (
+	"strings"
+
 	"github.com/MichaelKinsy/PiG/extensions/sdk/tui"
 )
 
@@ -119,28 +121,74 @@ func hideGroupedToolRender(tool *toolComponent) {
 	// display tool. toolComponent.Render already returns nil while owner != nil.
 }
 
-// isGroupHostDisplayToolLocked reports whether this tool is the one host card
-// that should paint the whole group. The caller holds mu. The last child is
-// the display tool so newly added calls take over the tree as they stream in.
-func isGroupHostDisplayToolLocked(group *toolGroupComponent, tool *toolComponent) bool {
-	if group == nil || tool == nil || len(group.children) == 0 {
-		return false
-	}
-	return group.children[len(group.children)-1] == tool
+// preparingToolCallIDPrefix marks a provisional tool call whose stream has not
+// carried a real call id yet (TS L730 `preparing:${index}`). The host mounts a
+// tool card in message_update only once the streamed block carries an id
+// (interactive_events.go: MessageUpdateEvent with pta.id != ""), so a call with
+// this placeholder has no card to paint with.
+const preparingToolCallIDPrefix = "preparing:"
+
+// hostCardForCallID reports whether the host has (or already mounted) a tool
+// card for this call id.
+func hostCardForCallID(id string) bool {
+	return id != "" && !strings.HasPrefix(id, preparingToolCallIDPrefix)
 }
 
-// groupHasTreeLocked reports whether the group needs the multi-entry tree
-// (header + rail). A lone tool entry keeps the single-row card shape.
-func groupHasTreeLocked(group *toolGroupComponent) bool {
-	if group == nil {
+// hasHostToolCard is hostCardForCallID for a tool component.
+func hasHostToolCard(tool *toolComponent) bool {
+	if tool == nil {
 		return false
 	}
-	visible := group.visibleEntriesLocked()
-	if len(visible) > 1 {
-		return true
+	return hostCardForCallID(tool.toolCallID)
+}
+
+// displayToolLocked returns the tool component whose host card paints this
+// group, or nil when no card can paint it. The caller holds mu.
+//
+// The newest visible *tool* entry owns the display rights, so newly added calls
+// take the tree over as they stream in. A call that is still streaming lives
+// only in the group entry (its component is not mounted in children yet), so the
+// entry -- not the last mounted child -- decides who paints. The scan is a
+// reverse walk, not a read at the last index: a thinking run that keeps
+// streaming after the call, or an absorbed `cache miss` notice, is the newest
+// visible entry while the tool that paints the tree is the one before it. Such
+// an entry draws no card of its own, so stopping there left the group with no
+// display card at all -- the whole tree disappeared -- or, with an older call
+// mounted, took the tree back to that stale card.
+func (g *toolGroupComponent) displayToolLocked() *toolComponent {
+	if g == nil {
+		return nil
 	}
-	if len(visible) == 1 && visible[0].kind != "tool" {
-		return true
+	visible := g.visibleEntriesLocked()
+	for i := len(visible) - 1; i >= 0; i-- {
+		entry := visible[i]
+		if entry.kind != "tool" || entry.tool == nil {
+			continue
+		}
+		// A stream that has not carried an id yet has no host card: letting the
+		// placeholder take the display rights invalidated the card that painted
+		// the tree while nothing could paint it in return.
+		if !hasHostToolCard(entry.tool) {
+			continue
+		}
+		return entry.tool
 	}
-	return false
+	for i := len(g.children) - 1; i >= 0; i-- {
+		child := g.children[i]
+		if !hasHostToolCard(child) {
+			continue
+		}
+		return child
+	}
+	return nil
+}
+
+// isGroupHostDisplayToolLocked reports whether this tool is the one host card
+// that should paint the whole group (displayToolLocked). Only one card can
+// answer true, so the tree is never painted twice.
+func isGroupHostDisplayToolLocked(group *toolGroupComponent, tool *toolComponent) bool {
+	if group == nil || tool == nil {
+		return false
+	}
+	return group.displayToolLocked() == tool
 }

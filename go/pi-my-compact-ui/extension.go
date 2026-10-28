@@ -2,6 +2,7 @@ package compactui
 
 import (
 	"os"
+	"sort"
 	"strings"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
@@ -43,6 +44,13 @@ func NewExtension() *sdk.Extension {
 	r.installGrouping()
 	r.installNativeThinkingSuppression()
 	r.installCompactionSummaryRendering(nil)
+
+	// L256-334: the native thinking suppression. The TS patch removes the
+	// thinking blocks from the host's own render; the PiG form is the registered
+	// Markdown transformer, which the host applies to the "assistant-thinking"
+	// Markdown as well and which renders no lines for an empty result
+	// (transformMarkdown, assistant.go).
+	e.MarkdownTransformer(transformMarkdownFunc)
 
 	// PLAN.md §4: registerToolRenderer. The resolver hands every tool card the
 	// compact one-line format the group uses, so a PiG subprocess session draws
@@ -195,8 +203,11 @@ func (r *runtimeState) ensureToolComponent(id, name string, args map[string]any)
 		}
 		existing.executionStarted = true
 		existing.isPartial = true
-		r.absorbGroupedPreparingLocked(existing)
+		changed := r.absorbGroupedPreparingLocked(existing)
 		r.mu.Unlock()
+		for _, group := range changed {
+			r.invalidateGroupCardsExcept(group, existing.toolCallID)
+		}
 		r.invalidateGroupedTool(existing)
 		requestRender(tui)
 		return existing
@@ -240,6 +251,31 @@ func (r *runtimeState) findGroupedToolByIDLocked(toolCallID string) *toolCompone
 	return nil
 }
 
+// groupOwnerForToolLocked is the group a host card's tool belongs to. The
+// caller holds mu. A mounted tool carries its owner directly. A call that is
+// still streaming has its toolComponent only in the group entry (nothing has
+// mounted it in children yet), so the entry's preparing record names the group;
+// the TS tree hangs the preparing object itself on the entry for the same
+// reason. Without this the streaming frames fall through to the bare
+// single-row branch and the card paints outside the compact tree.
+func (r *runtimeState) groupOwnerForToolLocked(tool *toolComponent) *toolGroupComponent {
+	if tool == nil {
+		return nil
+	}
+	if tool.owner != nil {
+		return tool.owner
+	}
+	for _, group := range r.groupsListLocked() {
+		for _, entry := range group.entries {
+			if entry.kind != "tool" || entry.tool != tool || entry.preparing == nil {
+				continue
+			}
+			return entry.preparing.owner
+		}
+	}
+	return nil
+}
+
 // applyToolResult records a finished result on the matching grouped tool, so
 // the group render and both modals see the arguments, the output, the status
 // and the elapsed time of a real execution.
@@ -262,12 +298,12 @@ func (r *runtimeState) applyToolResult(id string, result *toolResult) {
 	if group == nil {
 		group = r.lastActiveGroup
 	}
-	tui := r.capturedTui
 	r.mu.Unlock()
-	if group != nil {
-		group.invalidate()
-	}
-	requestRender(tui)
+	// A group only re-renders through a dirty card or its Invalidate hook, and the
+	// spinner of a finished call has already stopped: the completed tool may not
+	// be the display tool, so every card of the group is invalidated and the one
+	// that paints the tree repaints from the shared state.
+	r.invalidateGroupCards(group)
 }
 
 // replaySessionHistory rebuilds the ported tree of a resumed session: one
@@ -409,9 +445,9 @@ func (r *runtimeState) installToolRenderer(e *sdk.Extension) {
 
 // toolRenderLines renders one host tool card phase. The host concatenates Call
 // then Result into one ShellSelf card (see ToolExecutionComponent.updateDisplay),
-// so Call owns the compact row / group tree and Result only contributes the
-// expanded output body. Grouped tools follow the TS hideGroupedToolRender
-// contract: only the group's display tool paints; the others return no lines
+// so Call owns the group tree and Result contributes nothing for a grouped call.
+// Grouped tools follow the TS hideGroupedToolRender contract: only the group's
+// display tool paints, and it paints only the tree; the others return no lines
 // so the host hides the card. resultPhase selects the Result half.
 func (r *runtimeState) toolRenderLines(name string, args map[string]any, render sdk.ToolRenderContext, output *string, expanded bool, width int, resultPhase bool) []string {
 	if width < 1 {
@@ -420,8 +456,8 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 	r.mu.Lock()
 	r.rememberToolCardInvalidateLocked(render)
 	existing := r.findGroupedToolByIDLocked(render.ToolCallID)
-	if existing != nil && existing.owner != nil {
-		owner := existing.owner
+	owner := r.groupOwnerForToolLocked(existing)
+	if existing != nil && owner != nil {
 		if !isGroupHostDisplayToolLocked(owner, existing) {
 			r.mu.Unlock()
 			// Empty slice (not nil): host ShellSelf renderSelfShell returns no
@@ -429,29 +465,33 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 			// confused with "absent frame" in some paths. [] is unambiguous.
 			return []string{}
 		}
-		if groupHasTreeLocked(owner) {
-			// Call paints the whole tree once; Result must stay empty or the
-			// host stacks a second identical tree under the first.
-			if resultPhase {
-				r.mu.Unlock()
-				return []string{}
-			}
+		if resultPhase {
+			// hideGroupedToolRender (TS L1100-1110) patches the tool's own render to
+			// nothing while the call belongs to a group, and ToolGroupComponent's
+			// setExpanded is a no-op (TS L822-823): the original never shows a
+			// grouped tool's output body, in any expansion state, because the group
+			// owns the whole card. Ctrl+O on a grouped card therefore only re-renders
+			// the tree; the output body lives in the detail view (Ctrl+I).
 			r.mu.Unlock()
-			lines := owner.Render(width)
-			// Host renderSelfShell prepends one blank when content is non-empty
-			// (tool_execution_definition.go). A non-anchored group also starts
-			// with its own leading blank for in-chat embedding (TS path). On the
-			// PiG ToolRenderer path those stack into two blank rows above the
-			// group header; drop the group's copy so ShellSelf owns the single
-			// separator (report3: blanks <= 1).
-			if len(lines) > 0 && lines[0] == "" {
-				lines = lines[1:]
-			}
-			return lines
+			return []string{}
 		}
+		r.mu.Unlock()
+		lines := owner.Render(width)
+		// Host renderSelfShell prepends one blank when content is non-empty
+		// (tool_execution_definition.go). A non-anchored group also starts
+		// with its own leading blank for in-chat embedding (TS path). On the
+		// PiG ToolRenderer path those stack into two blank rows above the
+		// group header; drop the group's copy so ShellSelf owns the single
+		// separator (report3: blanks <= 1).
+		if len(lines) > 0 && lines[0] == "" {
+			lines = lines[1:]
+		}
+		return lines
 	}
 	if resultPhase {
-		// Single-row cards: Call already drew the row; Result only adds body.
+		// Single-row cards (a lone card the extension never grouped, or a grouped
+		// card that is not its group's display tool but still reaches this branch):
+		// Call already drew the row/tree; Result only adds body.
 		if !expanded || output == nil || strings.TrimSpace(*output) == "" {
 			r.mu.Unlock()
 			return []string{}
@@ -470,8 +510,8 @@ func (r *runtimeState) toolRenderLines(name string, args map[string]any, render 
 		return lines
 	}
 	group := r.lastActiveGroup
-	if existing != nil && existing.owner != nil {
-		group = existing.owner
+	if owner != nil {
+		group = owner
 	}
 	if group == nil {
 		group = &toolGroupComponent{tui: r}
@@ -730,15 +770,20 @@ func (r *runtimeState) handleMessageStart(data map[string]any) {
 		// nowMs takes the lock itself, so read the clock before entering it.
 		now := r.nowMs()
 		r.mu.Lock()
+		// Every group whose visible state changes in this branch is repainted once
+		// after mu is released: the seal below, the finalized run's owner, and the
+		// groups whose provisional entries are converted or detached.
+		var changed []*toolGroupComponent
 		if group := r.lastActiveGroup; group != nil && !group.sealed {
 			group.sealed = true
 			group.invalidateLocked()
+			changed = appendChangedGroup(changed, group)
 		}
 		r.turnStartMs = now
 		// TS L2312-2316 finalizes the previous run *before* the reset clears
 		// activeThinking; doing it after would leave a leftover run's `active`
 		// flag stuck at true forever.
-		r.finalizeActiveThinkingLocked()
+		changed = appendChangedGroup(changed, r.finalizeActiveThinkingLocked())
 		r.resetTurnLocked()
 		r.lastStreamingComp = nil
 		empties := make([]*toolGroupComponent, 0, len(r.groups))
@@ -751,20 +796,35 @@ func (r *runtimeState) handleMessageStart(data map[string]any) {
 			r.removeGroupFromContainer(r.lastChatContainer, group)
 			r.deleteGroupLocked(group)
 		}
-		r.turnStartMs = now
-		r.resetTurnLocked()
-		r.lastStreamingComp = nil
-		preparing := make([]*preparingTool, 0, len(r.preparingByIndex))
-		for _, tool := range r.preparingByIndex {
-			preparing = append(preparing, tool)
+		// A provisional call whose stream already carried a real id has a host card on
+		// screen: the host mounts one as soon as the streamed block has an id, and the
+		// card keeps painting outside the compact tree once the entry is gone. Such a
+		// call is converted into an interrupted group entry in place -- the same policy
+		// handleAgentEnd applies, so the two turn-end paths cannot disagree (brief2 R4
+		// C1). Only a call whose stream never carried an id, which has no card, is
+		// detached. The index order is the stream order, as in handleAgentEnd.
+		indices := make([]int, 0, len(r.preparingByIndex))
+		for index := range r.preparingByIndex {
+			indices = append(indices, index)
 		}
-		r.mu.Unlock()
-		for _, tool := range preparing {
-			r.detachPreparingTool(tool)
+		sort.Ints(indices)
+		for _, index := range indices {
+			tool := r.preparingByIndex[index]
+			if tool == nil {
+				continue
+			}
+			changed = appendChangedGroup(changed, tool.owner)
+			if group := tool.owner; group != nil && hostCardForCallID(tool.toolCallID) {
+				r.interruptPreparingToolLocked(tool, now)
+				continue
+			}
+			r.detachPreparingToolLocked(tool)
 		}
-		r.mu.Lock()
 		r.preparingByIndex = map[int]*preparingTool{}
 		r.mu.Unlock()
+		for _, group := range changed {
+			r.invalidateGroupCards(group)
+		}
 		return
 	}
 	if role == "assistant" {
@@ -980,31 +1040,75 @@ func (r *runtimeState) handleAgentEnd() {
 	now := r.nowMs()
 	r.mu.Lock()
 	r.agentWorkPhase = nil
-	preparing := make([]*preparingTool, 0, len(r.preparingByIndex))
-	for _, tool := range r.preparingByIndex {
-		preparing = append(preparing, tool)
+	// The index order is the stream order: map iteration must not decide which
+	// provisional call is converted first (the sibling invalidations of all of
+	// them are collected together below).
+	indices := make([]int, 0, len(r.preparingByIndex))
+	for index := range r.preparingByIndex {
+		indices = append(indices, index)
 	}
-	r.mu.Unlock()
-	for _, tool := range preparing {
-		r.detachPreparingTool(tool)
+	sort.Ints(indices)
+	// A provisional call whose stream already carried a real id has a host card
+	// on screen: the host mounts one as soon as the streamed block carries an id
+	// and keeps it when the turn is aborted (Esc/error) without a
+	// tool_execution_start. The original keeps that very component inside the
+	// group (addTool moves it into group.children, and the agent_end walk marks
+	// it _interrupted), so it renders as an interrupted row inside the tree.
+	// Detaching it instead left the card with no group -- a bare row outside the
+	// tree -- and the sibling card that had already yielded the display rights
+	// stayed blank, so the whole group vanished. Only a call with no id at all,
+	// which has no card, is still detached.
+	var changed []*toolGroupComponent
+	for _, index := range indices {
+		tool := r.preparingByIndex[index]
+		if tool == nil {
+			continue
+		}
+		// Every card of a changed group is repainted once after mu is released.
+		changed = appendChangedGroup(changed, tool.owner)
+		if group := tool.owner; group != nil && hostCardForCallID(tool.toolCallID) {
+			r.interruptPreparingToolLocked(tool, now)
+			continue
+		}
+		r.detachPreparingToolLocked(tool)
 	}
-	r.mu.Lock()
 	r.preparingByIndex = map[int]*preparingTool{}
 	if group := r.lastActiveGroup; group != nil && !group.sealed {
 		group.sealed = true
+		// Sealing flips the header to its final state and stops the spinner; the
+		// card keeps its last frame until its Invalidate hook fires.
+		group.invalidateLocked()
+		changed = appendChangedGroup(changed, group)
 	}
+	// The walk below mutates already-sealed groups too: it stamps a missing group
+	// end and marks an unfinished call interrupted, both of which change what the
+	// tree shows, so a mutated group joins the repaint list even when it was
+	// sealed long ago.
 	for _, group := range r.groupsListLocked() {
+		mutated := false
 		for _, tool := range group.children {
 			if tool.groupEndAt == nil && !r.hasDurationLocked(tool.toolCallID) {
 				at := now
 				tool.groupEndAt = &at
+				mutated = true
 			}
 			if tool.result == nil && !r.hasDurationLocked(tool.toolCallID) {
 				r.interruptedToolCallID[tool.toolCallID] = true
 				tool.interrupted = true
+				mutated = true
 			}
 		}
+		if mutated {
+			group.invalidateLocked()
+			changed = appendChangedGroup(changed, group)
+		}
 	}
+	// TS L2410-2428 order: finalize the active run *before* the empty-group
+	// cleanup. Clearing `active` drops an empty run out of visibleEntries, so a
+	// group holding nothing but an empty thinking run is empty by the time the
+	// cleanup looks at it; checking first left exactly that group behind as a
+	// zombie empty group on screen (brief2 R4 C2).
+	changed = appendChangedGroup(changed, r.finalizeActiveThinkingLocked())
 	empties := make([]*toolGroupComponent, 0, len(r.groups))
 	for _, group := range r.groupsListLocked() {
 		if !group.hasVisibleEntriesLocked() {
@@ -1019,7 +1123,9 @@ func (r *runtimeState) handleAgentEnd() {
 	tui := r.capturedTui
 	elapsedMs := now - r.turnStartMs
 	r.mu.Unlock()
-	r.finalizeActiveThinking()
+	for _, group := range changed {
+		r.invalidateGroupCards(group)
+	}
 	r.refreshSealedThinkingTokens(nil)
 	if selector != nil {
 		selector.refreshEntries(false)
@@ -1084,8 +1190,12 @@ func (r *runtimeState) sealHistoricalGroupsFrom(historical []*toolGroupComponent
 	tui := r.capturedTui
 	groups := r.groupsListLocked()
 	r.mu.Unlock()
+	// Sealing stamps an end on every unfinished call and marks it interrupted, so
+	// each group's tree changed and its cards have to repaint -- including the
+	// historical ones a `/resume` restored, whose cards otherwise kept the frame
+	// they were first drawn with.
 	for _, group := range groups {
-		group.invalidate()
+		r.invalidateGroupCards(group)
 	}
 	if !anyOpen {
 		r.stopAnimation()

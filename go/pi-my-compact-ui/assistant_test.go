@@ -3,6 +3,8 @@ package compactui
 import (
 	"strings"
 	"testing"
+
+	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 // This file covers src/assistant-patches.ts (L193-521) and
@@ -232,5 +234,118 @@ func TestThemeHelpersWithoutTheme(t *testing.T) {
 	}
 	if got := boldOf(th, "text"); got != "«text»" {
 		t.Errorf("boldOf = %q", got)
+	}
+}
+
+// ── native thinking suppression (brief2 R4 B) ───────────────────────────────
+
+// TestMarkdownTransformerSuppressesNativeThinking is the regression for brief2
+// R4 B. R3 concluded that the host's native thinking block could not be
+// suppressed; the host code says otherwise: the transformers a session registers
+// are installed for the assistant markdown *and* for the assistant-thinking
+// markdown (internal/codingagent/interactive_chat.go:71-72, message types
+// "assistant" / "assistant-thinking"), and tui/markdown.go:297-318 returns
+// zero rendered lines when the transformed text's JSTrim is empty. A transformer
+// that answers "" for the thinking type therefore removes the native thinking
+// body exactly as the TS prototype patch does, whatever hideThinkingBlock says.
+//
+// The registration itself cannot be read back (sdk.Extension keeps its
+// markdownTransform field private and exposes no getter), so the wiring is
+// pinned at compile time by transformMarkdownFunc and this test covers the
+// behaviour of the function that is handed to the host.
+func TestMarkdownTransformerSuppressesNativeThinking(t *testing.T) {
+	r := testRuntime(t)
+	cases := []struct {
+		name     string
+		message  string
+		markdown string
+		want     string
+	}{
+		{
+			name:     "native thinking body is dropped",
+			message:  markdownMessageTypeAssistantThinking,
+			markdown: "Let me read the file.",
+			want:     "",
+		},
+		{
+			name:     "native thinking keeps no fence either",
+			message:  markdownMessageTypeAssistantThinking,
+			markdown: "```mermaid\ngraph TD\n  A-->B\n```",
+			want:     "",
+		},
+		{
+			name:     "assistant text is returned unchanged",
+			message:  "assistant",
+			markdown: "# Title\n\nbody **bold** with `code`",
+			want:     "# Title\n\nbody **bold** with `code`",
+		},
+		{
+			name:     "user text is returned unchanged",
+			message:  "user",
+			markdown: "please read /tmp/a.txt",
+			want:     "please read /tmp/a.txt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.transformMarkdown(tc.markdown, sdk.MarkdownTransformContext{
+				MessageType:    tc.message,
+				IsStreaming:    true,
+				AvailableWidth: 80,
+			})
+			if got != tc.want {
+				t.Errorf("transformMarkdown(%q, %q) = %q, want %q", tc.message, tc.markdown, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMarkdownTransformerLeavesTreeThinkingRow is the "do the two paths interfere?"
+// check brief2 R4 B asks for explicitly: suppressing the host's native thinking
+// must not take the group's own thinking row with it.
+//
+// They are independent by construction, and this test pins both halves:
+//   - the in-tree row is drawn by the extension itself (thinkingRow returns one
+//     plain string, painted through the ToolRenderer by toolRenderLines), so it
+//     never passes through a host Markdown component and never reaches
+//     transformMarkdown;
+//   - the same text handed to the host as "assistant-thinking" markdown renders
+//     zero lines, which is what removes the native block.
+func TestMarkdownTransformerLeavesTreeThinkingRow(t *testing.T) {
+	r, _, _ := startedRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	group := r.newToolGroup(0)
+	tool := newTestTool("call-a", "read", map[string]any{"path": "/a"}).succeeded("a-out")
+	group.addTool(tool)
+	const thought = "Let me read the file."
+	r.mu.Lock()
+	// owner stays nil: addThinkingLocked assigns the group and refuses an entry
+	// that already belongs to one.
+	group.addThinkingLocked(&thinkingEntry{
+		kind:        "thinking",
+		id:          1,
+		text:        thought,
+		tokens:      6,
+		tokensExact: true,
+	})
+	group.sealed = true
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.mu.Unlock()
+
+	tree := r.toolRenderLines("read", tool.args, sdk.ToolRenderContext{ToolCallID: "call-a"}, nil, false, 80, false)
+	if !containsLine(tree, "thinking") || !containsLine(tree, thought) {
+		t.Fatalf("card lines = %v, want the group's own thinking row inside the tree", tree)
+	}
+	if !strings.Contains(tree[0], "done") {
+		t.Errorf("tree header = %q, want the sealed group's terminal state", tree[0])
+	}
+
+	// The very same text, on the host's native path, renders nothing.
+	if got := r.transformMarkdown(thought, sdk.MarkdownTransformContext{
+		MessageType:    markdownMessageTypeAssistantThinking,
+		AvailableWidth: 80,
+	}); got != "" {
+		t.Errorf("native thinking transform = %q, want an empty result (zero rendered rows)", got)
 	}
 }

@@ -82,18 +82,29 @@ func TestToolRendererCompactRow(t *testing.T) {
 		IsPartial:        true,
 		DurationMs:       &duration,
 	}, nil, false, width, false)
-	if len(call) != 1 {
-		t.Fatalf("call lines = %d, want the single compact row", len(call))
+	if len(call) != 2 {
+		t.Fatalf("call lines = %d, want the tree (header + row)", len(call))
 	}
 	joined := joinLines(call)
 	if !strings.Contains(joined, "read") || !strings.Contains(joined, "/etc/hosts") {
-		t.Errorf("call row = %q, want the tool name and its summary", joined)
+		t.Errorf("call rows = %q, want the tool name and its summary", joined)
 	}
-	if !strings.Contains(joined, "1.50s") {
-		t.Errorf("call row = %q, want the elapsed time from DurationMs", joined)
+	// The tree path times the call from the group's own start (the pinned test
+	// clock), the same source the multi-entry tree uses; the host DurationMs
+	// only fed the old bare-row path.
+	if !strings.Contains(call[1], "(0ms)") {
+		t.Errorf("call row = %q, want the elapsed label", call[1])
 	}
-	if tuiLen(call[0]) > width {
-		t.Errorf("call row width = %d, want <= %d", tuiLen(call[0]), width)
+	if !strings.Contains(call[0], "tool calling...") {
+		t.Errorf("call header = %q, want the tree header", call[0])
+	}
+	if !strings.Contains(call[1], "└  ") {
+		t.Errorf("call row = %q, want the tree rail", call[1])
+	}
+	for _, line := range call {
+		if tuiLen(line) > width {
+			t.Errorf("call line width = %d, want <= %d", tuiLen(line), width)
+		}
 	}
 
 	output := "127.0.0.1 localhost\n"
@@ -110,18 +121,17 @@ func TestToolRendererCompactRow(t *testing.T) {
 		ArgsComplete: true,
 		Expanded:     true,
 	}, &output, true, width, true)
-	if len(expandedBody) != 1 {
-		t.Fatalf("expanded result lines = %d, want the output body only", len(expandedBody))
-	}
-	if !strings.Contains(expandedBody[0], "127.0.0.1 localhost") {
-		t.Errorf("expanded body = %q, want the tool output", expandedBody[0])
+	if len(expandedBody) != 0 {
+		t.Fatalf("expanded result lines = %v, want none: a grouped tool renders nothing of its own, so Ctrl+O adds no output body (TS L1100-1110 hideGroupedToolRender + L822-823 setExpanded no-op); the detail view is Ctrl+I", expandedBody)
 	}
 	hostCard := append(append([]string{}, call...), expandedBody...)
-	if len(hostCard) != 2 || !strings.Contains(hostCard[0], "read") {
-		t.Errorf("host Call+Result card = %q, want row then body", hostCard)
+	if len(hostCard) != 2 || !strings.Contains(hostCard[1], "read") {
+		t.Errorf("host Call+Result card = %q, want the tree alone (header + row, no output body)", hostCard)
 	}
 
-	// A zero width must not panic or produce a negative-width wrap.
+	// A zero width must not panic or produce a negative-width wrap. The empty
+	// render context carries no call id, so the card is the ungrouped one and
+	// keeps the plain single row.
 	if got := r.toolRenderLines("read", nil, sdk.ToolRenderContext{}, nil, false, 0, false); len(got) != 1 {
 		t.Errorf("zero-width call lines = %d, want 1", len(got))
 	}
@@ -350,7 +360,10 @@ func TestToolExecutionHandlers(t *testing.T) {
 	}
 }
 
-// Test handleMessageStart role user resets the turn (TS L2358-2400).
+// Test handleMessageStart role user resets the turn (TS L2358-2400). The same
+// user turn seals the open group, finalizes the leftover thinking run, drops the
+// empty groups and converts a provisional call with a real id in place, so the
+// four steps the handler performs after `now` are asserted together.
 func TestMessageStartUser(t *testing.T) {
 	r, _, _ := startedRuntime(t)
 	group := r.newToolGroup(0)
@@ -360,6 +373,19 @@ func TestMessageStartUser(t *testing.T) {
 	r.lastActiveGroup = group
 	r.pendingTextSeal = true
 	r.handledTextIndexes[0] = true
+	r.mu.Unlock()
+
+	// A provisional call whose stream already carried a real id has a host card,
+	// so the new user turn converts it into an interrupted group entry instead of
+	// detaching it (the same policy handleAgentEnd applies).
+	streaming := newTestTool("call-a", "ctx_run", map[string]any{"command": "sleep 5"}).pending()
+	provisional := &preparingTool{
+		toolCallID: "call-a", toolName: "ctx_run", args: streaming.args,
+		owner: group, comp: streaming, hasIndex: true,
+	}
+	r.mu.Lock()
+	group.entries = append(group.entries, groupEntry{kind: "tool", tool: streaming, preparing: provisional})
+	r.preparingByIndex[0] = provisional
 	r.mu.Unlock()
 
 	_ = r.createThinkingEntry()
@@ -374,8 +400,11 @@ func TestMessageStartUser(t *testing.T) {
 	pending := r.pendingTextSeal
 	handled := len(r.handledTextIndexes)
 	turnStart := r.turnStartMs
-	streaming := r.lastStreamingComp
+	streamingComp := r.lastStreamingComp
 	preparing := len(r.preparingByIndex)
+	linked := group.entries[len(group.entries)-1].preparing != nil
+	inChildren := group.hasChildLocked(streaming)
+	interrupted := streaming.interrupted && r.interruptedToolCallID["call-a"]
 	r.mu.Unlock()
 	if active != nil || pending || handled != 0 || preparing != 0 {
 		t.Errorf("turn state not reset: active=%v pending=%v handled=%d preparing=%d", active != nil, pending, handled, preparing)
@@ -383,8 +412,14 @@ func TestMessageStartUser(t *testing.T) {
 	if turnStart != 42_000 {
 		t.Errorf("turnStartMs = %d", turnStart)
 	}
-	if streaming != nil {
+	if streamingComp != nil {
 		t.Error("lastStreamingComp should be cleared")
+	}
+	if linked {
+		t.Error("the provisional entry kept its preparing link, want the call converted in place")
+	}
+	if !inChildren || !interrupted {
+		t.Errorf("converted call: inChildren=%v interrupted=%v, want the interrupted group entry the agent_end walk sees", inChildren, interrupted)
 	}
 }
 
@@ -1063,6 +1098,65 @@ type noopHandle struct{}
 
 func (noopHandle) hide() {}
 
+// TestToolCardInvalidateRunsOffLock covers the invalidation channel the UI and
+// TUI probes above cannot see: toolCardInvalidate is a raw func map, and
+// invalidateGroupCards must collect those hooks under mu and invoke them after
+// unlocking, because each one is a host call that re-enters the host render
+// path. The probe fails the test when mu is still held at the call, so moving a
+// callback inside the lock in invalidateGroupCardsExcept turns this test red.
+//
+// The three paths that repaint a group are driven in turn: the seal at a new
+// user message, the agent_end walk that marks an unfinished call interrupted
+// (Esc or a stream error), and a tool result landing afterwards.
+func TestToolCardInvalidateRunsOffLock(t *testing.T) {
+	r, _, _ := startedRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+
+	calls := 0
+	probe := func() {
+		if lockHeldNow(r) {
+			t.Error("toolCardInvalidate ran while the runtime lock was held")
+			return
+		}
+		calls++
+	}
+
+	open := r.newToolGroup(0)
+	other := r.newToolGroup(0)
+	running := newTestTool("call-a", "ctx_run", map[string]any{"command": "sleep 5"}).pending()
+	finished := newTestTool("call-b", "read", map[string]any{"path": "/b"}).pending()
+	r.mu.Lock()
+	r.addGroupLocked(open)
+	r.addGroupLocked(other)
+	r.lastActiveGroup = open
+	r.toolCardInvalidate = map[string]func(){"call-a": probe, "call-b": probe}
+	r.mu.Unlock()
+	open.addTool(running)
+	other.addTool(finished)
+
+	// (a) A new user message seals the open group and repaints its cards.
+	before := calls
+	r.handleMessageStart(map[string]any{"message": map[string]any{"role": "user"}})
+	if calls == before {
+		t.Fatal("sealing at a user message did not run the card invalidate hook")
+	}
+
+	// (b) Esc/abort: agent_end marks the still-running calls interrupted and
+	// repaints the groups it mutates, sealed or not.
+	before = calls
+	r.handleAgentEnd()
+	if calls == before {
+		t.Fatal("the agent_end interrupt walk did not run the card invalidate hook")
+	}
+
+	// (c) A tool result lands after the abort and repaints its group.
+	before = calls
+	r.applyToolResult("call-b", doneResult("b"))
+	if calls == before {
+		t.Fatal("applyToolResult did not run the card invalidate hook")
+	}
+}
+
 // Test a full turn under concurrent readers: the race detector is the
 // assertion. Every path below is one the host really drives concurrently
 // (renders on the TUI thread, events on the request goroutines).
@@ -1703,6 +1797,361 @@ func TestPreparingToolAbsorbedThenCompleted(t *testing.T) {
 	}
 	if tui.renderCount() == 0 {
 		t.Error("the tool end should request a render")
+	}
+}
+
+// TestDisplayToolSkipsTrailingNonToolEntry covers the display-rights rule of a
+// group whose newest visible entry is not a tool (brief2 R3 M1). A thinking run
+// that keeps streaming after the call, or an absorbed `cache miss` notice, used
+// to take the tree away from the group's only tool: the streaming call lives in
+// `entries` only (nothing mounted it in children yet), so reading the last
+// visible entry alone found no tool, fell back to the empty child list and left
+// every card of the group unpainted -- the whole tree vanished from the screen.
+func TestDisplayToolSkipsTrailingNonToolEntry(t *testing.T) {
+	cases := []struct {
+		name    string
+		trailer groupEntry
+	}{
+		{
+			name: "thinking",
+			trailer: groupEntry{kind: "thinking", think: &thinkingEntry{
+				kind: "thinking", id: 1, active: true, text: "weighing options",
+			}},
+		},
+		{
+			name:    "notice",
+			trailer: groupEntry{kind: "notice", notice: &noticeEntry{kind: "notice", text: "cache miss: 42 tokens re-billed"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := modalRuntime(t)
+			group := r.newToolGroup(0)
+			comp := newTestTool("call-a", "ctx_run", map[string]any{"command": "echo a"})
+			comp.isPartial = true
+			prep := &preparingTool{
+				toolCallID: "call-a", toolName: "ctx_run", args: comp.args,
+				owner: group, comp: comp, hasIndex: true,
+			}
+			r.mu.Lock()
+			group.entries = []groupEntry{{kind: "tool", tool: comp, preparing: prep}, tc.trailer}
+			r.addGroupLocked(group)
+			r.lastActiveGroup = group
+			displayOK := isGroupHostDisplayToolLocked(group, comp)
+			displayID := group.displayCardIDLocked()
+			r.mu.Unlock()
+
+			if !displayOK {
+				t.Errorf("isGroupHostDisplayToolLocked = false: the trailing %s entry holds the display rights while no other card paints the group", tc.name)
+			}
+			if displayID != "call-a" {
+				t.Errorf("displayCardIDLocked = %q, want the streaming call's card call-a", displayID)
+			}
+			lines := r.toolRenderLines("ctx_run", comp.args, sdk.ToolRenderContext{
+				ToolCallID: "call-a",
+				IsPartial:  true,
+			}, nil, false, 80, false)
+			if len(lines) < 2 {
+				t.Fatalf("card lines = %v, want the group tree (header + row)", lines)
+			}
+			if !containsLine(lines, "echo a") {
+				t.Errorf("card lines = %v, want the tool row inside the tree", lines)
+			}
+		})
+	}
+}
+
+// TestAgentEndKeepsInterruptedStreamingTool is the regression for a streaming
+// call the host already mounted as a card and that is then cut short by Esc (or
+// a stream error) before tool_execution_start (brief2 R3 M2). The host mounts a
+// card as soon as the streamed block carries an id (interactive_events.go,
+// MessageUpdateEvent -> appendToChat) and keeps it across the abort; the
+// original keeps that component in the group (addTool moves it into
+// group.children, agent_end's walk marks it `_interrupted`), so it renders as an
+// interrupted row inside the tree. Detaching the provisional entry instead left
+// the card with no group -- a bare row outside the tree -- and the sibling card
+// that had already yielded the display rights stayed blank.
+func TestAgentEndKeepsInterruptedStreamingTool(t *testing.T) {
+	r, _, _ := startedRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	r.handleMessageStart(map[string]any{
+		"message": map[string]any{"role": "assistant", "content": []any{}},
+	})
+
+	firstBlock := map[string]any{"type": "toolCall", "id": "call-a", "name": "read", "arguments": map[string]any{"path": "/a"}}
+	secondBlock := map[string]any{"type": "toolCall", "id": "call-b", "name": "ctx_run", "arguments": map[string]any{"command": "sleep 5"}}
+	message := map[string]any{"role": "assistant", "content": []any{firstBlock, secondBlock}}
+	for _, index := range []float64{0, 1} {
+		r.handleMessageUpdate(map[string]any{
+			"message":               message,
+			"assistantMessageEvent": map[string]any{"type": "toolcall_start", "contentIndex": index},
+		})
+	}
+
+	invalidates := map[string]int{}
+	r.mu.Lock()
+	group := r.lastActiveGroup
+	var firstComp, secondComp *toolComponent
+	if group != nil {
+		for _, entry := range group.entries {
+			if entry.kind != "tool" || entry.tool == nil {
+				continue
+			}
+			switch entry.tool.toolCallID {
+			case "call-a":
+				firstComp = entry.tool
+			case "call-b":
+				secondComp = entry.tool
+			}
+		}
+	}
+	r.toolCardInvalidate = map[string]func(){
+		"call-a": func() { invalidates["call-a"]++ },
+		"call-b": func() { invalidates["call-b"]++ },
+	}
+	r.mu.Unlock()
+	if group == nil || firstComp == nil || secondComp == nil {
+		t.Fatalf("streamed calls not mounted: group=%v first=%v second=%v", group != nil, firstComp != nil, secondComp != nil)
+	}
+
+	// Esc/abort: the host keeps both mounted cards and emits agent_end without
+	// ever sending tool_execution_start.
+	r.handleAgentEnd()
+
+	r.mu.Lock()
+	kept, linked := 0, 0
+	for _, entry := range group.entries {
+		if entry.kind != "tool" || entry.tool == nil {
+			continue
+		}
+		kept++
+		if entry.preparing != nil {
+			linked++
+		}
+	}
+	_, interruptedMap := r.interruptedToolCallID["call-b"]
+	displaySecond := isGroupHostDisplayToolLocked(group, secondComp)
+	displayFirst := isGroupHostDisplayToolLocked(group, firstComp)
+	groupSealed := group.sealed
+	r.mu.Unlock()
+
+	if kept != 2 {
+		t.Errorf("group entries after agent_end = %d, want both streamed calls kept inside the tree", kept)
+	}
+	if linked != 0 {
+		t.Errorf("%d entries are still linked to a provisional record, want the call converted in place", linked)
+	}
+	if !groupSealed {
+		t.Error("agent_end should seal the open group")
+	}
+	if !interruptedMap || !secondComp.interrupted {
+		t.Error("the interrupted streamed call is not marked interrupted")
+	}
+	if !displaySecond || displayFirst {
+		t.Errorf("display rights: second=%v first=%v, want the newest call to paint the tree", displaySecond, displayFirst)
+	}
+	if got := toolStatus(secondComp, group); got != "error" {
+		t.Errorf("status = %q, want error for an interrupted call", got)
+	}
+
+	tree := r.toolRenderLines("ctx_run", secondComp.args, sdk.ToolRenderContext{
+		ToolCallID: "call-b",
+		IsError:    true,
+	}, nil, false, 80, false)
+	if len(tree) < 3 {
+		t.Fatalf("interrupted card lines = %v, want the group tree (header + both rows)", tree)
+	}
+	if !containsLine(tree, "sleep 5") || !containsLine(tree, "read") {
+		t.Errorf("interrupted card lines = %v, want both streamed calls inside the tree", tree)
+	}
+	if got := r.toolRenderLines("read", firstComp.args, sdk.ToolRenderContext{
+		ToolCallID: "call-a",
+		IsError:    true,
+	}, nil, false, 80, false); len(got) != 0 {
+		t.Errorf("sibling card lines = %v, want empty (the display card owns the tree)", got)
+	}
+	if invalidates["call-b"] == 0 {
+		t.Error("the interrupted card was not invalidated: it keeps painting the pending frame")
+	}
+	if invalidates["call-a"] == 0 {
+		t.Error("the sibling card was not invalidated: it keeps its previous frame")
+	}
+}
+
+// TestStateChangeInvalidatesDisplayCard covers the three state changes that left
+// the tree on screen showing its previous frame (brief2 R3 S2): a non-display
+// tool finishing after the spinner stopped, an absorbed `cache miss` notice, and
+// the agent_end seal. A host card re-renders only when it is dirty or its
+// Invalidate hook fires (tui/tool_execution.go: Render reuses definitionCall
+// until Invalidate), so each of them has to invalidate the group's cards.
+func TestStateChangeInvalidatesDisplayCard(t *testing.T) {
+	r, _, _ := startedRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	group := r.newToolGroup(0)
+	older := newTestTool("call-a", "read", map[string]any{"path": "/a"}).pending()
+	display := newTestTool("call-b", "ctx_run", map[string]any{"command": "echo b"}).pending()
+	group.addTool(older)
+	group.addTool(display)
+	invalidates := map[string]int{}
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.toolCardInvalidate = map[string]func(){
+		"call-a": func() { invalidates["call-a"]++ },
+		"call-b": func() { invalidates["call-b"]++ },
+	}
+	r.mu.Unlock()
+
+	// 1) A non-display tool finishes: the display card still paints the old row.
+	r.applyToolResult("call-a", doneResult("a-out"))
+	if invalidates["call-b"] == 0 {
+		t.Error("applyToolResult left the display card with its previous frame")
+	}
+
+	// 2) An absorbed cache-miss notice appends a visible entry.
+	invalidates["call-a"], invalidates["call-b"] = 0, 0
+	chat := newContainer(r)
+	r.mu.Lock()
+	r.lastChatContainer = chat
+	r.mu.Unlock()
+	if !r.absorbCacheMissNotice(chat, "cache miss: 1234 tokens re-billed") {
+		t.Fatal("the cache-miss notice was not absorbed into the open group")
+	}
+	if invalidates["call-b"] == 0 {
+		t.Error("absorbCacheMissNotice left the display card with its previous frame")
+	}
+
+	// 3) agent_end seals the group: the header flips to its final state and the
+	// spinner stops, so the card has to repaint.
+	invalidates["call-a"], invalidates["call-b"] = 0, 0
+	r.handleAgentEnd()
+	if invalidates["call-b"] == 0 {
+		t.Error("agent_end left the display card with its previous frame")
+	}
+	tree := r.toolRenderLines("ctx_run", display.args, sdk.ToolRenderContext{ToolCallID: "call-b"}, nil, false, 80, false)
+	if len(tree) == 0 {
+		t.Fatal("the sealed group's display card rendered no lines")
+	}
+	if !strings.Contains(tree[0], "tools done") {
+		t.Errorf("header = %q, want the sealed group's final state", tree[0])
+	}
+}
+
+// hostCardModel is the host's ToolExecutionComponent contract for one card: it
+// paints through the extension's ToolRenderer, and it keeps that frame until its
+// Invalidate hook fires (tui/tool_execution.go: Render reuses definitionCall
+// until Invalidate). A test that asserts on card.lines therefore asserts on what
+// the user actually sees, not on what the extension would render today.
+type hostCardModel struct {
+	r           *runtimeState
+	name        string
+	args        map[string]any
+	toolCallID  string
+	width       int
+	lines       []string
+	invalidates int
+}
+
+func newHostCardModel(r *runtimeState, name, toolCallID string, args map[string]any, width int) *hostCardModel {
+	card := &hostCardModel{r: r, name: name, args: args, toolCallID: toolCallID, width: width}
+	card.paint()
+	return card
+}
+
+func (c *hostCardModel) paint() {
+	c.lines = c.r.toolRenderLines(c.name, c.args, sdk.ToolRenderContext{ToolCallID: c.toolCallID}, nil, false, c.width, false)
+}
+
+func (c *hostCardModel) invalidate() {
+	c.invalidates++
+	c.paint()
+}
+
+// TestTextSealRepaintsHostCardOnce is the regression for brief2 R4 A: after a
+// normal turn whose tool calls all finished and whose final text had already
+// streamed, the tree header stayed at "waiting for response..." for good.
+//
+// Three decisions compounded. flushPendingTextSeal set active.sealed and only
+// dropped the extension's own render cache; needsAnimationLocked answers false
+// for a sealed group, so the animation tick stopped repainting the card; and
+// handleAgentEnd skips its seal branch for an already-sealed group. None of them
+// told the host, so the ToolExecutionComponent kept the frame it painted before
+// the seal -- and for a finished turn nothing repaints it again.
+//
+// The fix routes every group-state change through invalidateGroupCards, so this
+// asserts both halves of the contract: the header reaches its terminal state and
+// the display card is invalidated exactly once (no silent no-op, no repaint
+// storm).
+func TestTextSealRepaintsHostCardOnce(t *testing.T) {
+	r, _, _ := startedRuntime(t)
+	now := int64(1_000)
+	r.setClock(func() int64 { return now })
+
+	// Turn start, assistant message start, one tool call streams in with a real
+	// id, executes and finishes: the ordinary "tool then answer" turn.
+	r.handleMessageStart(map[string]any{"message": map[string]any{"role": "user", "content": []any{}}})
+	assistant := map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"type": "toolCall", "id": "call-a", "name": "read", "arguments": map[string]any{"path": "/a"}},
+		map[string]any{"type": "text", "text": "all done"},
+	}}
+	r.handleMessageStart(map[string]any{"message": assistant})
+	r.handleMessageUpdate(map[string]any{
+		"message":               assistant,
+		"assistantMessageEvent": map[string]any{"type": "toolcall_start", "contentIndex": float64(0)},
+	})
+	r.handleToolExecutionStart(map[string]any{"toolCallId": "call-a", "toolName": "read", "args": map[string]any{"path": "/a"}})
+	now = 1_200
+	r.handleToolExecutionEnd(map[string]any{
+		"toolCallId": "call-a",
+		"result":     map[string]any{"content": []any{map[string]any{"type": "text", "text": "a-out"}}},
+	})
+	// The turn's tools are done and the model has been asked for its answer: this
+	// is the frame the R3 attachments caught, and the one that used to stick.
+	r.setAgentWorkPhase(strPtr(phaseWaitingResponse))
+
+	card := newHostCardModel(r, "read", "call-a", map[string]any{"path": "/a"}, 80)
+	r.mu.Lock()
+	r.toolCardInvalidate = map[string]func(){"call-a": card.invalidate}
+	group := r.lastActiveGroup
+	r.mu.Unlock()
+	if group == nil {
+		t.Fatal("the streamed call did not open a group")
+	}
+	if !containsLine(card.lines, "waiting for response...") {
+		t.Fatalf("pre-seal card frame = %v, want the open group's \"waiting for response...\" header", card.lines)
+	}
+
+	// The final text streams: flushPendingTextSeal seals the group and anchors it
+	// before that text.
+	now = 1_300
+	r.handleMessageUpdate(map[string]any{
+		"message":               assistant,
+		"assistantMessageEvent": map[string]any{"type": "text_delta", "contentIndex": float64(1)},
+	})
+	if !group.sealed {
+		t.Fatal("the text delta did not seal the open group")
+	}
+
+	// Then the turn ends.
+	r.handleAgentEnd()
+
+	if got := card.invalidates; got != 1 {
+		t.Errorf("display card invalidations across seal + agent_end = %d, want exactly 1", got)
+	}
+	if len(card.lines) == 0 {
+		t.Fatal("the sealed group's display card rendered no lines")
+	}
+	if containsLine(card.lines, "waiting for response...") {
+		t.Errorf("card frame after the turn = %v, want the terminal header, not the pre-seal frame", card.lines)
+	}
+	if !strings.Contains(card.lines[0], "tools done") {
+		t.Errorf("tree header = %q, want the sealed group's terminal state", card.lines[0])
+	}
+	// The frame is not just terminal, it is current: it must match a fresh render.
+	fresh := &hostCardModel{r: r, name: "read", args: map[string]any{"path": "/a"}, toolCallID: "call-a", width: 80}
+	fresh.paint()
+	if joinLines(card.lines) != joinLines(fresh.lines) {
+		t.Errorf("painted frame = %v, want the current render %v", card.lines, fresh.lines)
 	}
 }
 

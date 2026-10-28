@@ -111,7 +111,7 @@ func (r *runtimeState) sealOpenGroupAtAssistantText(assistant *assistantMessageC
 		}
 		r.mu.Unlock()
 	}
-	open.invalidate()
+	r.invalidateGroupCards(open)
 }
 
 // hasVisibleTextMarkdown reports whether the container holds a text Markdown.
@@ -171,10 +171,11 @@ func (r *runtimeState) ensureThinkingGroup() {
 		r.unattachedThinking = r.unattachedThinking[1:]
 		group.addThinkingLocked(entry)
 	}
-	tui := r.capturedTui
+	// The group gained a visible entry, so the card that paints it must
+	// re-render: the host keeps a card's last frame until the card is dirty or
+	// its Invalidate hook fires.
 	r.mu.Unlock()
-	group.invalidate()
-	requestRender(tui)
+	r.invalidateGroupCards(group)
 }
 
 // flushPendingTextSeal is flushPendingTextSeal (L1246-1270): once real text has
@@ -221,7 +222,12 @@ func (r *runtimeState) flushPendingTextSeal() {
 		r.pendingTextOrdinal = nil
 		r.mu.Unlock()
 		r.finalizeActiveThinking()
-		active.invalidate()
+		// Sealing flips the header from "waiting for response..." to its terminal
+		// state and stops the spinner. Without the card invalidation the host kept
+		// painting the pre-seal frame until the next unrelated repaint -- for a
+		// normal turn that is never, so the tree header stayed at "waiting for
+		// response..." after the turn had finished (brief2 R4 A).
+		r.invalidateGroupCards(active)
 		return
 	}
 	r.mu.Lock()
@@ -453,9 +459,11 @@ func (r *runtimeState) absorbCacheMissNotice(parent *container, text string) boo
 	r.noticeEntrySeq++
 	group.addNoticeLocked(entry)
 	r.lastActiveGroup = group
-	tui := r.capturedTui
+	// The group gained a visible entry, so the card that paints the tree has to
+	// re-render: a host card only repaints when it is dirty or its Invalidate
+	// hook fires, and the notice itself has no card.
 	r.mu.Unlock()
-	requestRender(tui)
+	r.invalidateGroupCards(group)
 	return true
 }
 
@@ -513,7 +521,7 @@ func (r *runtimeState) addChildTo(parent *container, comp component) {
 				open.sealed = true
 				r.mu.Unlock()
 				r.finalizeActiveThinking()
-				open.invalidate()
+				r.invalidateGroupCards(open)
 			}
 		} else {
 			if open := r.findOpenGroup(); open != nil {
@@ -550,6 +558,8 @@ func (r *runtimeState) removeChildFrom(parent *container, comp component) {
 			r.deleteGroupLocked(group)
 		}
 		r.mu.Unlock()
+		// The tree lost a row; a card that keeps its last frame would still show it.
+		r.invalidateGroupCards(group)
 		return
 	}
 	r.releaseAssistantAnchors(comp)

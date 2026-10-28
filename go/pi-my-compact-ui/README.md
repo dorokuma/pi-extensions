@@ -26,12 +26,12 @@ PiG 的**紧凑对话 UI 扩展**：把一次 assistant 回合里连续流出的
    （`tool_group.go:165`），空 run 不占行。
 3. **分组生命周期**：只有「最近的开放组」吸收新条目；遇到真实文本输出即 seal
    （`grouping.go:89`），seal 后该组只读、不再追加，等待提示消失
-   （`tool_group.go:200`）。
+   （`tool_group.go:235`）。
 4. **历史思考重挂**：流式过程中思考已即时显示过的文本不重复渲染
    （`assistant.go:22`）；assistant 文本到达时把尚未显示的思考挂到该文本锚点之前
-   （`grouping.go:677`），并对容器做幻影 padding 剥离（`grouping.go:777`）。
+   （`grouping.go:684`），并对容器做幻影 padding 剥离（`grouping.go:784`）。
 5. **cache miss 折叠**：从注入文本中提取 cache miss 通知，转为组内一条 notice 行，
-   并抑制其在 chat 层重复出现（`grouping.go:381` / `grouping.go:426`）。
+   并抑制其在 chat 层重复出现（`grouping.go:388` / `grouping.go:433`）。
 6. **时间口径**：优先用已记录时长，其次 group 结束时间差，最后 start 至今的实时差；
    中断或被 seal 且无结果的调用显示 `0ms`（`streaming.go:150`）。
 7. **动画有界**：只有一个待触发 tick（`runtime_glue.go:95`），组不再需要动画时链条
@@ -57,7 +57,7 @@ TS 原版是单线程进程内扩展：事件回调、`requestRender`、动画 t
    可见条目、计算折叠行，解锁后才调 `scheduleAnimation`、`tui.TruncateToWidth`
    与拼装返回值。
 3. **禁止嵌套取锁**：凡是持锁的辅助函数一律有 `*Locked` 孪生版本（如
-   `visibleEntriesLocked` `tool_group.go:165`、`workPhaseLabelLocked` `tool_group.go:272`、
+   `visibleEntriesLocked` `tool_group.go:165`、`workPhaseLabelLocked` `tool_group.go:307`、
    `toolElapsedLocked` `streaming.go:158`、`invalidateLocked` `tool_group.go:326`、
    `nowMsLocked` `accessors.go:35`）。写侧同理：`addTool`/`addThinking`/`addNotice`/
    `removeTool` 自持锁，其 `*Locked` 变体供已持锁调用方（`grouping.go`、
@@ -79,21 +79,30 @@ removeChild / clear`（`installGrouping`）、`AssistantMessageComponent.prototy
 边界是：
 
 1. **分组容器改为自持容器**：Go 侧自己实现 `container`（`component.go:26`）与
-   `component` 接口（`component.go:14`），`installGrouping`（`grouping.go:589`）改为在
+   `component` 接口（`component.go:14`），`installGrouping`（`grouping.go:596`）改为在
    本扩展自己的容器树上执行等价调度；TS 里「替换掉宿主 addChild」的拦截语义由
-   `addChildTo`（`grouping.go:467`）/ `removeChildFrom`（`grouping.go:543`）/
-   `clearPatched`（`grouping.go:560`）在本容器上复刻。
+   `addChildTo`（`grouping.go:474`）/ `removeChildFrom`（`grouping.go:550`）/
+   `clearPatched`（`grouping.go:567`）在本容器上复刻。
 2. **助手思考补丁改为渲染层重写**：TS 直接 patch `AssistantMessageComponent` 让它在
    历史消息里重排 thinking 块；Go 侧改为在渲染 assistant 消息时由
-   `applyAssistantThinkingPatch`（`assistant.go:173`）产出等价内容，并由
-   `stripAssistantPhantomPadding`（`grouping.go:777`）清掉原实现留下的空行。
+   `applyAssistantThinkingPatch`（`assistant.go:221`）产出等价内容，并由
+   `stripAssistantPhantomPadding`（`grouping.go:787`）清掉原实现留下的空行。
 3. **压缩摘要标题改为自带组件**：TS patch `updateDisplay`；Go 侧自带
    `compactionHeaderComponent`（`component.go:301`），由
    `installCompactionSummaryRendering`（`compaction.go:70`）挂载。
 4. **分组内工具不再渲染**：TS 把已分组工具的 `render` 打成空实现；Go 侧在
-   `hideGroupedToolRender`（`guards.go:111`）里把该工具的渲染输出置空，效果一致。
-5. **原生 thinking widget 抑制**：TS 通过 patch 让原生 widget 不再占位；Go 侧识别并
-   跳过它（`grouping.go:829` `isNativeThinkingWidget`）。
+   `hideGroupedToolRender`（`guards.go:115`）里把该工具的渲染输出置空，效果一致。
+5. **原生 thinking 抑制：口径与原版一致，实现路径改为 Markdown 变换**。原版
+   `installNativeThinkingSuppression`（bundle L256-334）对含 thinking 的消息**无条件**
+   过滤掉所有 thinking 块（`content.filter(item => item?.type !== "thinking")`）；本移植
+   沿用同一口径，只是改用宿主真正暴露的那道缝：factory 注册 `e.MarkdownTransformer`
+   （`extension.go:53`）→ `transformMarkdown`（`assistant.go:189`）对
+   `MessageType == "assistant-thinking"` 返回空串，宿主 `tui/markdown.go` 对变换后
+   `JSTrim(content) == ""` 的文本（`markdown.go:314`；异步分支 `markdown.go:295-303`）
+   返回 **0 行**。这与本移植前的行为不同（移植前原生 thinking 正文照常显示）；异步代理
+   带来的两条代价见下文「能力边界声明」。宿主侧原有的「识别并跳过原生 thinking widget」
+   （`grouping.go:839` `isNativeThinkingWidget`）只作用于本移植自己的树，与这条宿主路径
+   互不依赖。
 6. **符号键改用显式字段**：TS 用 `Symbol.for(...)` 的 `PARENT_KEY` / `PATCH_KEY` 等
    把补丁状态挂在宿主组件上；Go 侧无此机制，改为结构体字段与 `map`（如
    `toolComponent.owner`、`runtimeState.groups`），语义等价且可被 race detector 覆盖。
@@ -111,10 +120,11 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
 | 宿主面 | 本移植的落地 |
 |---|---|
 | `ctx.SetWidgetRenderer("compact-anim", ...)` | `extension.go:560` `renderWidget`（widget 行） |
-| `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart`（`extension.go:474`）里设置，原生 thinking 标签留空 |
+| `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart`（`extension.go:580`）里设置，原生 thinking 标签留空 |
+| `ext.MarkdownTransformer(...)` | `extension.go:53` 注册 `transformMarkdown`（`assistant.go:189`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
 | `ctx.OnTerminalInput` | `extension.go:525` `handleTerminalInput`，`Ctrl+I` 开检查器 |
 | `ctx.Custom` / `AddOverlay` | `runtime_glue.go:195` / `runtime_glue.go:259` 两个 overlay |
-| `ext.ToolRenderer(...)` | `extension.go:387` `installToolRenderer`：Call/Result 都返回 `toolRowLocked` 的紧凑单行 + 结果文本 |
+| `ext.ToolRenderer(...)` | `extension.go:412` `installToolRenderer`：Call/Result 都返回 `toolRowLocked` 的紧凑单行 + 结果文本 |
 
 工具卡片的具体走法：`installToolRenderer` 注册的 resolver 对**所有工具**返回
 `Shell: sdk.ToolRenderShellSelf` 的渲染器，`Call` 渲染该工具调用所属分组（或一个临时分组）
@@ -129,29 +139,123 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
 
 生产事件与分组的挂接（`必修 1` 的其余部分）：
 
-- `session_start` 建默认主容器（`ensureChatContainerLocked`，`extension.go:146`），
-  并用 `replaySessionHistory`（`extension.go:278`）按历史 session entries 重建
+- `session_start` 建默认主容器（`ensureChatContainerLocked`，`extension.go:154`），
+  并用 `replaySessionHistory`（`extension.go:314`）按历史 session entries 重建
   `AssistantMessageComponent` / `ToolExecutionComponent` / `ToolGroupComponent`，
-  随后由 `sealHistoricalGroupsFrom`（`extension.go:981`）按 `session_start` 时刻的快照
+  随后由 `sealHistoricalGroupsFrom`（`extension.go:1153`）按 `session_start` 时刻的快照
   代次封口，恢复的会话因此可用 `Ctrl+I` / `/compact-inspect` 回看。
-- `message_start(role="assistant")` 先调 `assistantMessageStartLocked`（`state.go:268`）
+- `message_start(role="assistant")` 先调 `assistantMessageStartLocked`（`state.go:273`）
   重置上一条消息流的状态，再挂上 live `AssistantMessageComponent`
-  （`ensureLiveAssistantLocked`，`extension.go:155`）——顺序反了会把刚挂上的组件
+  （`ensureLiveAssistantLocked`，`extension.go:163`）——顺序反了会把刚挂上的组件
   连同 `lastStreamingComp` 一起清掉，首个 thinking 流就找不到挂载点
   （`TestMessageStartAssistantKeepsLiveAssistant`）。
 - `tool_execution_start` 由 `ensureToolComponent`（`extension.go:179`）找到或创建真实
   工具组件并走 `addChildTo` → `maybeGroup` 分组。流式阶段挂上的 `preparing` 条目由
-  `absorbPreparingTool`（`streaming.go:516`）接管；当真实工具就是该条目挂载的那个组件时，
-  由 `absorbGroupedPreparingLocked`（`streaming.go:588`）**原地**完成「provisional →
+  `absorbPreparingTool`（`streaming.go:543`）接管；当真实工具就是该条目挂载的那个组件时，
+  由 `absorbGroupedPreparingLocked`（`streaming.go:615`）**原地**完成「provisional →
   执行中」的转换：解除条目的 `preparing` 链接、清除 `comp.preparing`、把 `comp.owner`
   指回该组并补进 `group.children`（组件不从组里摘掉，也不新增第二条目）。`children`
   正是 `agent_end` / `sealHistoricalGroups` 遍历标记中断的名单，漏了它中断态就漏一个工具
   （`TestPreparingToolAbsorbedInPlace`、`TestPreparingToolAbsorbedThenCompleted`）。
-- `tool_execution_end` 由 `applyToolResult`（`extension.go:246`）把 `result` / `isError` /
+- `tool_execution_end` 由 `applyToolResult`（`extension.go:271`）把 `result` / `isError` /
   `isPartial` / 组结束时间写回组件，使分组渲染与两个弹窗拿到完整参数、结果与耗时。
 
 已验证的命令结果原文见下方「测试与验证证据」；上面第 1–7 条涉及的每个 Go 函数都有对应
 单测（见 `grouping_test.go`、`assistant_test.go`、`compaction.go` 相关用例）。
+
+### 重绘通道：`invalidateGroupCards`
+
+宿主 `ToolExecutionComponent` 只在卡片变脏或其 `Invalidate` 钩子被调用时重画
+（`tui/tool_execution.go`），而既不是显示卡、也没在动画的卡片永远不变脏。所以**组的可见
+状态一改变，就必须主动失效它的宿主卡片**，否则屏上留的是上一帧（brief2 R4 A 就是这么
+暴露的：整个回合结束后树头还停在 `waiting for response...`）。
+
+这条通道被收拢成一个锁外辅助，不允许各处再手写收集：
+
+- `invalidateGroupCards(group)` / `invalidateGroupCardsExcept(group, keepID)`
+  （`tool_group.go:83` / `tool_group.go:91`）—— 内部取 `mu` 收集
+  `siblingCardInvalidatesExceptLocked` 的回调，**解锁后**才调宿主；同时清掉组自己的渲染
+  缓存；一个钩子都没有时回落 `requestRender`。
+- 所有会改变组可见状态的入口都走它：封口（`flushPendingTextSeal`
+  `grouping.go:183`、`sealOpenGroupAtAssistantText`、`addChildTo` 的 `isError && !hasTools`
+  分支）、回合结束（`handleAgentEnd` `extension.go:1038`，含对**已 seal 组**补盖
+  `groupEndAt` / 标 interrupted 的遍历分支）、新 user 消息封口与 preparing 转换
+  （`handleMessageStart` `extension.go:766`）、历史封口（`sealHistoricalGroupsFrom`
+  `extension.go:1153`）、思考运行收敛与 token 回填（`finalizeActiveThinking`
+  `streaming.go:73`、`refreshSealedThinkingTokens` `streaming.go:113`）、条目增删
+  （`addTool` / `removeTool` / `removeToolLocked` `tool_group.go:272`、
+  `detachPreparingTool` / `clearPreparingTools`）、流式工具帧（`noteStreamingToolCall`
+  `streaming.go:713`）、结果回写（`applyToolResult`）、notice 吸收
+  （`absorbCacheMissNotice`）。
+- 已持 `mu` 的调用方（`handleAgentEnd` / `handleMessageStart` / `sealHistoricalGroupsFrom`）
+  用 `appendChangedGroup` 收集**每个组一次**，解锁后再统一失效，保证不零次、也不重复刷屏。
+  回归：`TestTextSealRepaintsHostCardOnce`（`extension_test.go`）用「只在 Invalidate 时重画」
+  的 `hostCardModel` 模拟宿主卡片，断言封口 + `agent_end` 后显示卡失效**恰好 1 次**且帧内
+  容等于当前渲染。
+
+### 能力边界声明（重要：口径不外推）
+
+1. **「0 帧树外」只覆盖本回合新产生的流式帧**。不覆盖下面两类历史/边界场景：
+   - **`/resume` 历史重放帧**：`replayAssistantMessage`（`extension.go:339`）对每个历史
+     `toolCall` 构造 `toolComponent` 后走 `addChildTo`（`grouping.go:475`）→
+     `maybeGroup`（`grouping.go:330`）→ `joinOpenGroup`（`grouping.go:294`）/新建组 +
+     `spliceInsert`（`component.go:110`），所以历史工具**被折进组**，不是树外裸行；
+     而且重放期间没有任何 seal（`sealHistoricalGroups` 要等 `session_start` 重放完才跑），
+     也没有助手文本边界去封口，于是**跨多个历史回合的工具会折进同一个合并组**。组的树
+     只有最新一条工具卡持有 display 权（`displayCardIDLocked` `tool_group.go:184`），其余
+     入组卡在 `toolRenderLines` 里按「非 display」返回空内容（渲染 0 行，不留下空白块）。
+     所以可见症状是「**一张卡画出整棵合并树**」，多个历史回合的工具全挤在同一棵树里，
+     其余入组卡什么也不画；不是树外裸行。另：
+     `resetGroupsLocked`（`state.go:169`）全仓无调用点，跨会话恢复时旧组不会被摘除。
+     状态：**已实测（2026-10-28，真实 TUI，无模型调用）**。同一会话重放后的稳定态里历史
+     工具**在树内**，两个回合的调用与第 1 回合的 thinking 行折进**同一个组、由同一张卡
+     画出**（`✓ done` + 3 行树），**未出现「历史工具卡整片空白」**；把本行的历史封口临时
+     换回 R4 之前的 `group.invalidate()` 重跑，稳定帧逐字节相同 ⇒ R4 的失效通道在这个
+     场景没有引入可见回归。帧原文与对照记录见
+     `.agents/notes/attachments/brief2-r5/`（`resume-key-frames.txt` /
+     `resume-measurement.txt`）。
+   - **组提前 seal 场景：与原版一致，不是移植缺陷**。`toolStatus` 的判据在 TS（bundle
+     L130-137）与 Go（`values.go:372`）逐行等价、顺序一致：`isError/interrupted →
+     error`；`sealed && !result → error`；`isPartial || (executionStarted && !result) →
+     pending`。所以组在工具仍在执行时被 seal（真实文本输出 / 新 user 消息封口）会让该
+     工具立刻翻 `✗`、耗时锁成 `0ms`——这是**与原版一致的原版行为**，不是缺 `isPartial`
+     守卫，不要为此补一个原版没有的守卫。
+
+   两条性质不同：`toolStatus` 那条不是问题；`/resume` 重放属存量行为，brief2 只保证 R4
+   的失效通道不让它更差（真实 TUI 实测结论见下方「测试与验证证据」）。
+2. **原生 thinking（`hideThinkingBlock`）的口径：与原版一致**。
+   - **与原版一致**：原版 `installNativeThinkingSuppression`（bundle L256-334）对含
+     thinking 的消息**无条件**过滤掉所有 thinking 块
+     （`content.filter(item => item?.type !== "thinking")`），与本移植的
+     `transformMarkdown`（`assistant.go:189`）对 `assistant-thinking` 返回空串等价。所以
+     `hideThinkingBlock: false` 时宿主原生 thinking **正文不出现**：宿主
+     `tui/markdown.go` 对变换后 `JSTrim(content) == ""` 的文本返回 0 行
+     （`markdown.go:314`；异步分支 `markdown.go:295-303`）。旧结论「不可抑制」已被证伪，
+     见 `.agents/notes/20261028-brief2-first-frame-r3.md` 的更正段与
+     `attachments/brief2-r4/` 的实测帧。**与本移植前行为不同**：移植前没有这道过滤，
+     原生 thinking 正文照常显示。
+   - 组内的 thinking 行不受影响：它是扩展自己画的一行文本，经 `ToolRenderer` 交给宿主，
+     从不经过宿主的 Markdown 组件，也就从不进入 `transformMarkdown`
+     （`TestMarkdownTransformerLeavesTreeThinkingRow`）。
+   - `hideThinkingBlock: true` 时宿主仍然画**一行**（`tui/assistant_message_block.go` 的隐藏态
+     是 `NewPaddedText(斜体 + label + reset)`，本扩展把 label 置为 `""`），屏上留的是
+     一行空白，不是零行。
+   - **异步 Markdown 变换的两条代价**：注册 transformer 后宿主
+     `hasAsyncMarkdownTransformers()`（`interactive_chat.go:121`）为真，
+     `newAssistantMessageBlock`（`interactive_chat.go:65`）随即给**所有** assistant
+     markdown（正文与 thinking）都装上子进程异步代理，代价是：
+     1. **每帧一次 IPC，且未就绪时扣留一帧**：每个块的每次渲染都是一次
+        `conn.requestWithInactivity`（`markdown_transform_proxy.go:158`）；代理未就绪时
+        `Markdown.Render` 返回上一帧缓存或 nil（`tui/markdown.go:295-303`）；
+     2. **变换被放弃/失败时宿主拿到未变换文本 ⇒ 可能闪现一帧**：连接缺失
+        （`markdown_transform_proxy.go:160`）、渲染器 inactivity 边界放弃（`giveUp`
+        `markdown_transform_proxy.go:196` / `:219`）、请求出错（`:223`）时代理都直接
+        返回**未变换**的 markdown；`ApplyMarkdownTransformers`（`markdowntransform.go:51`）
+        在 context 结束后同样返回已变换的部分。于是原生 thinking 正文在代理放弃/失败时
+        会**闪现一帧**。
+
+     因此不能把「原生 thinking 永远 0 行」当绝对结论：**正常路径 0 行，代理放弃/失败
+     时可能闪现 1 帧**。这是代理模型的固有代价，未用 hack 掩盖。
 
 ## TS → Go 模块对照
 
@@ -215,37 +319,37 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L256 | `installNativeThinkingSuppression` | `assistant.go:148` | `installNativeThinkingSuppression` |
 | L319 | `ensureAssistantThinkingPatched` | `assistant.go:156` | `ensureAssistantThinkingPatched` |
 | L327 | `getAssistantContentState` | `state.go:174` | `assistantContentState` |
-| L327 | `getAssistantContentState` | `grouping.go:849` | `getAssistantContentStateLocked` |
-| L335 | `removeGroupFromContainer` | `grouping.go:597` | `removeGroupFromContainer` |
-| L345 | `detachGroup` | `grouping.go:611` | `detachGroupLocked` |
-| L352 | `removeComponentFromContainer` | `grouping.go:859` | `removeComponentFromContainer` |
+| L327 | `getAssistantContentState` | `grouping.go:856` | `getAssistantContentStateLocked` |
+| L335 | `removeGroupFromContainer` | `grouping.go:604` | `removeGroupFromContainer` |
+| L345 | `detachGroup` | `grouping.go:618` | `detachGroupLocked` |
+| L352 | `removeComponentFromContainer` | `grouping.go:866` | `removeComponentFromContainer` |
 | L358 | `TurnDividerComponent` | `assistant.go:232` | `renderWidth` |
 | L358 | `TurnDividerComponent` | `component.go:314` | `turnDividerComponent` |
-| L377 | `placeTurnDividerBeforeText` | `grouping.go:867` | `placeTurnDividerBeforeText` |
+| L377 | `placeTurnDividerBeforeText` | `grouping.go:874` | `placeTurnDividerBeforeText` |
 | L383 | `insertTurnDivider` | `state.go:181` | `dividerPlacement` |
-| L383 | `insertTurnDivider` | `grouping.go:885` | `insertTurnDivider` |
+| L383 | `insertTurnDivider` | `grouping.go:892` | `insertTurnDivider` |
 | L415 | `isVisibleTextMarkdown` | `guards.go:102` | `isVisibleTextMarkdown` |
-| L418 | `placeAnchoredGroupBeforeText` | `grouping.go:633` | `placeAnchoredGroupBeforeText` |
-| L431 | `insertAnchoredGroup` | `grouping.go:657` | `insertAnchoredGroup` |
+| L418 | `placeAnchoredGroupBeforeText` | `grouping.go:640` | `placeAnchoredGroupBeforeText` |
+| L431 | `insertAnchoredGroup` | `grouping.go:664` | `insertAnchoredGroup` |
 | L439 | `anchorGroupBeforeCurrentText` | `state.go:187` | `groupAnchor` |
-| L439 | `anchorGroupBeforeCurrentText` | `grouping.go:677` | `anchorGroupBeforeCurrentText` |
-| L470 | `restoreAssistantAnchor` | `grouping.go:722` | `restoreAssistantAnchor` |
-| L484 | `releaseAssistantAnchors` | `grouping.go:751` | `releaseAssistantAnchors` |
-| L498 | `stripAssistantPhantomPadding` | `grouping.go:777` | `stripAssistantPhantomPadding` |
-| L511 | `isNativeThinkingWidget` | `grouping.go:829` | `isNativeThinkingWidget` |
+| L439 | `anchorGroupBeforeCurrentText` | `grouping.go:684` | `anchorGroupBeforeCurrentText` |
+| L470 | `restoreAssistantAnchor` | `grouping.go:729` | `restoreAssistantAnchor` |
+| L484 | `releaseAssistantAnchors` | `grouping.go:758` | `releaseAssistantAnchors` |
+| L498 | `stripAssistantPhantomPadding` | `grouping.go:784` | `stripAssistantPhantomPadding` |
+| L511 | `isNativeThinkingWidget` | `grouping.go:836` | `isNativeThinkingWidget` |
 | L523 | `toolElapsed` | `streaming.go:150` | `toolElapsed` |
 | L564 | `loadSessionToolTimings` | `streaming.go:216` | `loadSessionToolTimings` |
 | L598 | `findGroupedTool` | `streaming.go:289` | `findGroupedTool` |
-| L609 | `invalidateGroupedTool` | `streaming.go:314` | `invalidateGroupedTool` |
-| L619 | `findOpenGroup` | `streaming.go:335` | `findOpenGroup` |
-| L626 | `placeGroupAfter` | `streaming.go:355` | `placeGroupAfter` |
-| L637 | `openToolGroup` | `streaming.go:384` | `openToolGroup` |
+| L609 | `invalidateGroupedTool` | `streaming.go:322` | `invalidateGroupedTool` |
+| L619 | `findOpenGroup` | `streaming.go:343` | `findOpenGroup` |
+| L626 | `placeGroupAfter` | `streaming.go:363` | `placeGroupAfter` |
+| L637 | `openToolGroup` | `streaming.go:392` | `openToolGroup` |
 | L658 | `attachPreparingTool` | `state.go:228` | `preparingTool` |
-| L658 | `attachPreparingTool` | `streaming.go:426` | `attachPreparingTool` |
-| L667 | `detachPreparingTool` | `streaming.go:463` | `detachPreparingTool` |
-| L675 | `takePreparingTool` | `streaming.go:485` | `takePreparingTool` |
-| L693 | `absorbPreparingTool` | `streaming.go:516` | `absorbPreparingTool` |
-| L704 | `clearPreparingTools` | `streaming.go:564` | `clearPreparingTools` |
+| L658 | `attachPreparingTool` | `streaming.go:434` | `attachPreparingTool` |
+| L667 | `detachPreparingTool` | `streaming.go:490` | `detachPreparingTool` |
+| L675 | `takePreparingTool` | `streaming.go:512` | `takePreparingTool` |
+| L693 | `absorbPreparingTool` | `streaming.go:543` | `absorbPreparingTool` |
+| L704 | `clearPreparingTools` | `streaming.go:591` | `clearPreparingTools` |
 | L708 | `noteStreamingToolCall` | `streaming.go:625` | `noteStreamingToolCall` |
 | L756 | `thinkingSpinnerFrame` | `values.go:450` | `thinkingSpinnerFrame` |
 | L763 | `disableMouseTracking` | `values.go:479` | `disableMouseTrackingSequence` |
@@ -267,7 +371,7 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L878 | `hasActiveThinking` | `tool_group.go:220` | `hasActiveThinkingLocked` |
 | L882 | `hasThinking` | `tool_group.go:237` | `hasThinkingLocked` |
 | L885 | `hasTools` | `tool_group.go:254` | `hasToolsLocked` |
-| L889 | `workPhaseLabel` | `tool_group.go:272` | `workPhaseLabelLocked` |
+| L889 | `workPhaseLabel` | `tool_group.go:307` | `workPhaseLabelLocked` |
 | L903 | `needsAnimation` | `tool_group.go:299` | `needsAnimationLocked` |
 | L907 | `iconFor` | `tool_group.go:335` | `iconFor` |
 | L911 | `colorFor` | `tool_group.go:347` | `colorFor` |
@@ -294,15 +398,15 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L1187 | `absorbThinkingBeforeText` | `grouping.go:57` | `absorbThinkingBeforeText` |
 | L1206 | `sealOpenGroupAtAssistantText` | `grouping.go:89` | `sealOpenGroupAtAssistantText` |
 | L1221 | `ensureThinkingGroup` | `grouping.go:129` | `ensureThinkingGroup` |
-| L1245 | `flushPendingTextSeal` | `grouping.go:182` | `flushPendingTextSeal` |
-| L1267 | `getPrecedingAssistantThinking` | `grouping.go:235` | `precedingAssistantThinking` |
-| L1287 | `attachPrecedingThinkingToGroup` | `grouping.go:264` | `attachPrecedingThinkingToGroup` |
-| L1304 | `joinOpenGroup` | `grouping.go:288` | `joinOpenGroup` |
-| L1322 | `maybeGroup` | `grouping.go:324` | `maybeGroup` |
+| L1245 | `flushPendingTextSeal` | `grouping.go:189` | `flushPendingTextSeal` |
+| L1267 | `getPrecedingAssistantThinking` | `grouping.go:242` | `precedingAssistantThinking` |
+| L1287 | `attachPrecedingThinkingToGroup` | `grouping.go:271` | `attachPrecedingThinkingToGroup` |
+| L1304 | `joinOpenGroup` | `grouping.go:295` | `joinOpenGroup` |
+| L1322 | `maybeGroup` | `grouping.go:331` | `maybeGroup` |
 | L1358 | `extractCacheMissNotice` | `state.go:212` | `noticeEntry` |
-| L1358 | `extractCacheMissNotice` | `grouping.go:381` | `extractCacheMissNotice` |
-| L1377 | `absorbCacheMissNotice` | `grouping.go:426` | `absorbCacheMissNotice` |
-| L1401 | `installGrouping` | `grouping.go:589` | `installGrouping` |
+| L1358 | `extractCacheMissNotice` | `grouping.go:388` | `extractCacheMissNotice` |
+| L1377 | `absorbCacheMissNotice` | `grouping.go:433` | `absorbCacheMissNotice` |
+| L1401 | `installGrouping` | `grouping.go:596` | `installGrouping` |
 | L1515 | `CompactionHeaderComponent` | `component.go:301` | `compactionHeaderComponent` |
 | L1536 | `installCompactionSummaryRendering` | `compaction.go:70` | `installCompactionSummaryRendering` |
 | L1565 | `DetailModalComponent` | `modals.go:22` | `detailModalComponent` |
@@ -338,7 +442,7 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L2310 | `on:message_start` | `extension.go:660` | `handleMessageStart` |
 | L2349 | `on:message_end` | `extension.go:725` | `handleMessageEnd` |
 | L2358 | `on:message_update` | `extension.go:756` | `handleMessageUpdate` |
-| L2407 | `on:agent_end` | `extension.go:912` | `handleAgentEnd` |
+| L2407 | `on:agent_end` | `extension.go:1038` | `handleAgentEnd` |
 
 共 150 行，TS 侧与 Go 侧行号均由脚本从文件实测取定义行。
 
@@ -531,3 +635,22 @@ standalone module root 报错。说明：非交互模式下 `-p` 不分发 `/com
    假阳性；「同 goroutine 持锁调用宿主」这类真实违规在窗口内永远拿不到锁，仍会失败。
 6. **命令的 TUI 观感未跑**：非交互 `-p` 不分发斜杠命令；`/compact-inspect` 与
    `/compact-ui-config` 的交互由 `modals_test.go` / `settings.go` 单测覆盖逻辑。
+7. **单条目组仍画树（PiG 卡片路径的有意偏离）**：TS `renderCollapsed` 在只剩 1 个
+   可见条目时不画层级，输出一行裸行。PiG 侧组是通过宿主工具卡片绘制的，裸行与
+   「这张卡根本没进 compact 框架」在画面上无法区分，正是首帧跳框的表现；因此
+   `tool_group.go` 的 `renderCollapsed` 去掉了单条目裸行分支，任何可见条目都在
+   header + 树轨里（`tool_group.go` 内注释记录了该偏离）。随之 `groupHasTreeLocked`
+   谓词失效被删除。
+8. **入组工具的 `Ctrl+O` 不补输出体（对齐原版）**：TS 把入组工具的 `render` 补丁成
+   空（bundle L1100-1110，`if (this?.[PARENT_KEY]) return []`），且
+   `ToolGroupComponent.setExpanded` 是空实现（bundle L822-823）：原版对入组工具在任何
+   展开态都不画输出体，整张卡由组的 `renderCollapsed` 独占。卡片路径原本按「可见条目数
+   是否为 1」在 Result 阶段补展开输出体，r3 已删除该分支（`extension.go`
+   `toolRenderLines`），工具详情走 `Ctrl+I`。
+9. **display 权与中断的流式调用（r3）**：组内「谁画整棵树」取 `visible` 倒序最后一个
+   带真实 `toolCallID` 的 tool 条目（`guards.go` `displayToolLocked`）——末位是
+   thinking/notice、或还没有 id 的 `preparing:` 占位条目时不换卡，避免整棵树无人绘制。
+   `agent_end` 时已有真实 id 的流式调用**不 detach**，就地转成组内「已中断」条目
+   （`streaming.go` `interruptPreparingToolLocked`；对齐 TS 把组件留在 `children` 并由
+   agent_end 标 `_interrupted`，bundle L826-840 / L2407-2430），只有无 id 的占位条目
+   仍删除。
