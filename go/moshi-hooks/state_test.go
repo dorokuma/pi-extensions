@@ -678,12 +678,17 @@ func TestStage4ChildSessionIsDetected(t *testing.T) {
 	path := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_child1.jsonl", `{"type":"session","parentSession":"parent-1"}`)
 
 	// The stage-4 path is also what lineage detection reads: a transcript the
-	// host never handed us still identifies the session as a child.
-	resolved, _ := resolveTranscriptPath("", nil, "no-such-id", cwd)
-	if resolved != path {
-		t.Fatalf("stage4 resolved %q, want %q", resolved, path)
+	// host never handed us still identifies the session as a child. The
+	// session id names the file (findSessionFileByID matches the _child1
+	// suffix), so resolveTranscriptPath returns it as a trusted stage-4 hit —
+	// guessed stays false and the payload needs no explicit flag, exactly like
+	// a payload Send() assembles from this resolution.
+	resolved, guessed := resolveTranscriptPath("", nil, "child1", cwd)
+	if resolved != path || guessed {
+		t.Fatalf("stage4 resolved %q (guessed %v), want %q not guessed", resolved, guessed, path)
 	}
 	payload := payloadFor("UserPromptSubmit")
+	payload.SessionID = "child1"
 	payload.TranscriptPath = resolved
 	h.deliverNothing(payload)
 }
