@@ -278,4 +278,21 @@ func (r *runtimeState) assistantMessageStartLocked() {
 	r.pendingTextSeal = false
 	r.pendingTextOrdinal = nil
 	r.lastStreamingComp = nil
+	// A new assistant message starts a new stream, so a content index no longer
+	// identifies a call of the previous message: the id is the only stable key
+	// across messages (findGroupedTool only falls back to the index while a
+	// stream has no id yet). Keeping the index match alive let a first frame
+	// whose stream carries no id yet find the previous message's completed call
+	// in the same slot and overwrite its arguments. A still-provisional entry
+	// keeps its index: it belongs to the message that is still arriving.
+	for _, group := range r.groupsListLocked() {
+		if group.sealed {
+			continue
+		}
+		for _, entry := range group.entries {
+			if entry.kind == "tool" && entry.tool != nil && !entry.tool.preparing {
+				entry.tool.hasIndex = false
+			}
+		}
+	}
 }

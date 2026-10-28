@@ -160,14 +160,16 @@ func (r *runtimeState) scheduleAnimation() {
 			}
 			any = true
 			group.invalidateLocked()
-			if len(group.children) == 0 {
+			// The display tool is the newest visible entry, which while a call
+			// streams is still only a group entry (nothing mounted it in
+			// children yet). Selecting the last mounted child instead would
+			// leave the streaming entry's card -- the one that paints the tree
+			// -- without a tick, and invalidate a card that no longer paints.
+			displayID := group.displayCardIDLocked()
+			if displayID == "" {
 				continue
 			}
-			display := group.children[len(group.children)-1]
-			if display == nil || display.toolCallID == "" {
-				continue
-			}
-			if fn := r.toolCardInvalidate[display.toolCallID]; fn != nil {
+			if fn := r.toolCardInvalidate[displayID]; fn != nil {
 				invalidates = append(invalidates, fn)
 			}
 		}

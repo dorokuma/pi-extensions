@@ -64,6 +64,66 @@ func (r *runtimeState) newToolGroupLocked(nowMs int64) *toolGroupComponent {
 	}
 }
 
+// invalidateGroupCards is the one channel through which a change in a group's
+// visible state reaches the host, and the reason the port has no scattered
+// hand-written invalidate collections left.
+//
+// A host ToolExecutionComponent keeps the frame it last painted until the card
+// is dirty or its Invalidate hook fires (tui/tool_execution.go: Render reuses
+// definitionCall until Invalidate). A card that is neither the group's display
+// tool nor animating is never dirty, so sealing a group, marking a call
+// interrupted, changing a token count or adding/removing an entry is invisible
+// on screen without this call -- the failure brief2 R4 A is about: the tree
+// header stayed at "waiting for response..." for a whole turn.
+//
+// It takes mu itself, because the callbacks siblingCardInvalidatesExceptLocked
+// returns are host calls and must not run under mu. A caller that already holds
+// mu therefore collects the groups it changed and calls this after unlocking
+// (see handleAgentEnd / sealHistoricalGroupsFrom / handleMessageStart).
+func (r *runtimeState) invalidateGroupCards(group *toolGroupComponent) {
+	r.invalidateGroupCardsExcept(group, "")
+}
+
+// invalidateGroupCardsExcept is invalidateGroupCards for a caller that wants one
+// card left alone: keepID names a card whose own render path repaints it in the
+// same frame anyway (a newly added entry, a call taking the display rights), so
+// invalidating it would only queue a redundant host repaint.
+func (r *runtimeState) invalidateGroupCardsExcept(group *toolGroupComponent, keepID string) {
+	if group == nil {
+		return
+	}
+	r.mu.Lock()
+	stale := group.siblingCardInvalidatesExceptLocked(keepID)
+	tui := r.capturedTui
+	r.mu.Unlock()
+	group.invalidate()
+	for _, invalidate := range stale {
+		invalidate()
+	}
+	// No card hook is registered for this group (a thinking-only group that no
+	// host card paints yet, or a test without a host): fall back to a frame
+	// request so the state change still reaches the screen.
+	if len(stale) == 0 && keepID == "" {
+		requestRender(tui)
+	}
+}
+
+// appendChangedGroup records a group whose visible state changed, once, so a
+// caller that has to release mu before repainting collects one entry per group
+// no matter how many of its entries it touched (the group list is tiny, so the
+// scan is cheaper than a map and keeps the order stable).
+func appendChangedGroup(list []*toolGroupComponent, group *toolGroupComponent) []*toolGroupComponent {
+	if group == nil {
+		return list
+	}
+	for _, existing := range list {
+		if existing == group {
+			return list
+		}
+	}
+	return append(list, group)
+}
+
 // addTool is addTool (L838-853): absorb a provisional entry, hide the tool's
 // own render, and append it in stream order.
 //
@@ -77,30 +137,55 @@ func (g *toolGroupComponent) addTool(tool *toolComponent) {
 	}
 	g.tui.mu.Lock()
 	g.addToolAt(tool, now)
-	stale := g.siblingCardInvalidatesExceptLocked(keepID)
 	g.tui.mu.Unlock()
-	for _, invalidate := range stale {
-		invalidate()
-	}
+	// The new entry takes the display rights, so its own card repaints from the
+	// dirty state; only the siblings that yielded those rights need a nudge.
+	g.tui.invalidateGroupCardsExcept(g, keepID)
 }
 
 // siblingCardInvalidatesExceptLocked returns host Invalidate callbacks for
 // every grouped tool card except keepID. The caller holds mu and must invoke
 // the callbacks only after unlocking (host notify must not run under mu).
+// Entries are walked, not just children: a call that is still streaming has
+// its toolComponent only in the group entry (nothing has mounted it in
+// children yet), and its host card already exists and paints.
 func (g *toolGroupComponent) siblingCardInvalidatesExceptLocked(keepID string) []func() {
 	if g == nil || g.tui == nil {
 		return nil
 	}
-	out := make([]func(), 0, len(g.children))
-	for _, child := range g.children {
-		if child == nil || child.toolCallID == "" || child.toolCallID == keepID {
-			continue
+	seen := make(map[string]bool, len(g.children)+len(g.entries))
+	out := make([]func(), 0, len(g.children)+len(g.entries))
+	collect := func(id string) {
+		if id == "" || id == keepID || seen[id] {
+			return
 		}
-		if fn := g.tui.toolCardInvalidate[child.toolCallID]; fn != nil {
+		seen[id] = true
+		if fn := g.tui.toolCardInvalidate[id]; fn != nil {
 			out = append(out, fn)
 		}
 	}
+	for _, entry := range g.entries {
+		if entry.kind == "tool" && entry.tool != nil {
+			collect(entry.tool.toolCallID)
+		}
+	}
+	for _, child := range g.children {
+		if child != nil {
+			collect(child.toolCallID)
+		}
+	}
 	return out
+}
+
+// displayCardIDLocked is the tool call id of the host card that paints this
+// group (displayToolLocked): the newest visible tool entry that has a host card
+// -- a streaming entry lives only in entries, nothing has mounted it in children
+// yet -- with the last mounted card as the fallback. The caller holds mu.
+func (g *toolGroupComponent) displayCardIDLocked() string {
+	if display := g.displayToolLocked(); display != nil {
+		return display.toolCallID
+	}
+	return ""
 }
 
 // addToolAt is addTool for a caller that already holds mu and has read the
@@ -169,14 +254,21 @@ func (g *toolGroupComponent) hasChildLocked(tool *toolComponent) bool {
 	return false
 }
 
-// removeTool is removeTool (L866-874). It takes mu itself.
+// removeTool is removeTool (L866-874). It takes mu itself and routes the
+// resulting repaint through invalidateGroupCards: dropping an entry changes
+// what the tree shows, and a card that keeps its last frame would still list
+// the removed row.
 func (g *toolGroupComponent) removeTool(tool *toolComponent) {
 	g.tui.mu.Lock()
-	defer g.tui.mu.Unlock()
 	g.removeToolLocked(tool)
+	g.tui.mu.Unlock()
+	g.tui.invalidateGroupCards(g)
 }
 
-// removeToolLocked is removeTool for a caller that already holds mu.
+// removeToolLocked is removeTool for a caller that already holds mu. It only
+// drops the entries: the caller has to route the repaint through
+// invalidateGroupCards after releasing mu (removeTool, removeChildFrom and
+// absorbGroupedPreparingLocked all do).
 func (g *toolGroupComponent) removeToolLocked(tool *toolComponent) {
 	for i, child := range g.children {
 		if child == tool {
@@ -550,23 +642,18 @@ func stripThinkingMarkup(text string) string {
 
 // renderCollapsed is renderCollapsed (L1006-1071): header plus one line per
 // entry in stream order, folding the oldest entries past the configured cap.
-// A single visible entry renders without a tree rail or header. The caller
-// holds mu.
+//
+// PiG-path deviation from TS L993 ("when there is only 1 visible entry, do not
+// show hierarchy"): on this path the group is painted through the host tool
+// card, and the TS bare row is indistinguishable from a card that never
+// joined the compact framework -- exactly the first-frame jump brief2 is
+// about. A lone visible entry therefore keeps the tree form (header + rail),
+// so every entry a group shows is inside the framework from its first frame.
+// The caller holds mu.
 func (g *toolGroupComponent) renderCollapsed(width int, visible []groupEntry) []string {
 	th := g.tui.themeLocked()
 	frame := toolSpinnerFrame(g.tui.nowMsLocked(), g.tui.spinnerStartMs)
 	workPhase, hasWorkPhase := g.workPhaseLabelLocked()
-	if len(visible) == 1 && !hasWorkPhase {
-		entry := visible[0]
-		switch entry.kind {
-		case "tool":
-			return []string{g.toolRowLocked("", entry.tool, frame, width, false)}
-		case "notice":
-			return []string{g.noticeRow("", entry.notice, width, false)}
-		default:
-			return []string{g.thinkingRow("", entry.think, width, false)}
-		}
-	}
 	lines := make([]string, 0, len(visible)+1)
 	pendingTools := make([]groupEntry, 0, len(visible))
 	for _, entry := range visible {

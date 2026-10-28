@@ -439,39 +439,47 @@ func TestRowWidths(t *testing.T) {
 	}
 }
 
-// Test renderCollapsed single entry (TS L1006-1013): no header, no rail.
+// Test renderCollapsed with one visible entry: the lone entry keeps the tree
+// form (header + rail). This is a deliberate PiG-path deviation from TS L993
+// ("when there is only 1 visible entry, do not show hierarchy"): on this path
+// the group paints through the host tool card, and the TS bare row is
+// indistinguishable from a card outside the compact framework -- the
+// first-frame jump brief2 rejects (any frame outside the tree fails).
 func TestRenderCollapsedSingleEntry(t *testing.T) {
 	r, _ := newGroupRuntime(t)
 	group := r.newToolGroup(0)
 	group.entries = []groupEntry{{kind: "tool", tool: newTestTool("t", "read", map[string]any{"path": "/x"}).succeeded("ok")}}
 	lines := group.renderCollapsed(60, group.visibleEntries())
-	if len(lines) != 1 {
-		t.Fatalf("single-entry render = %d lines, want 1: %v", len(lines), lines)
+	if len(lines) != 2 {
+		t.Fatalf("single-entry render = %d lines, want header + row: %v", len(lines), lines)
 	}
-	if strings.Contains(lines[0], "└") || strings.Contains(lines[0], "│") {
-		t.Errorf("single entry should have no tree rail: %q", lines[0])
+	if !strings.Contains(lines[0], "tools done") {
+		t.Errorf("single entry should carry the tree header: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "└  ") {
+		t.Errorf("single entry should carry the tree rail: %q", lines[1])
 	}
 
 	// The same rule applies to a single notice and a single thinking run.
 	noticeGroup := r.newToolGroup(0)
 	noticeGroup.entries = []groupEntry{{kind: "notice", notice: &noticeEntry{kind: "notice", text: "cache miss: 1 tokens re-billed"}}}
-	if lines := noticeGroup.renderCollapsed(60, noticeGroup.visibleEntries()); len(lines) != 1 {
-		t.Errorf("single notice = %v", lines)
+	if lines := noticeGroup.renderCollapsed(60, noticeGroup.visibleEntries()); len(lines) != 2 || !strings.Contains(lines[1], "└  ") {
+		t.Errorf("single notice = %v, want header + railed row", lines)
 	}
 	thinkGroup := r.newToolGroup(0)
 	thinkGroup.entries = []groupEntry{{kind: "thinking", think: &thinkingEntry{kind: "thinking", text: "why"}}}
-	if lines := thinkGroup.renderCollapsed(60, thinkGroup.visibleEntries()); len(lines) != 1 {
-		t.Errorf("single thinking = %v", lines)
+	if lines := thinkGroup.renderCollapsed(60, thinkGroup.visibleEntries()); len(lines) != 2 || !strings.Contains(lines[1], "└  ") {
+		t.Errorf("single thinking = %v, want header + railed row", lines)
 	}
 
-	// A work phase forces the header even with one entry.
+	// A work phase still labels the header with one entry.
 	r.mu.Lock()
 	r.addGroupLocked(group)
 	r.lastActiveGroup = group
 	r.agentWorkPhase = strPtr(phaseWorking)
 	r.mu.Unlock()
-	if lines := group.renderCollapsed(60, group.visibleEntries()); len(lines) < 2 {
-		t.Errorf("a work phase should add the header: %v", lines)
+	if lines := group.renderCollapsed(60, group.visibleEntries()); len(lines) < 2 || !strings.Contains(lines[0], "working...") {
+		t.Errorf("a work phase should label the header: %v", lines)
 	}
 }
 

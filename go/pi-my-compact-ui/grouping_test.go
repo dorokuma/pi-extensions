@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 // This file covers src/thinking.ts (L1112-1165), src/streaming-tools.ts
@@ -564,6 +566,59 @@ func TestNoteStreamingToolCall(t *testing.T) {
 
 	// An event that locates no call is ignored.
 	r.noteStreamingToolCall(content, streamEvent{typ: "toolcall_delta"})
+}
+
+// Test noteStreamingToolCall keeps a call's identity when the wire reuses a
+// content index (brief2). The model can rewrite a block in place, so the
+// stream carries a brand-new call in a slot an already-executed call owned.
+// The call id, once present, must identify the call on its own: folding by
+// the shared index overwrites the finished call's arguments and leaves the
+// new call without a group entry, so its host card paints a bare row outside
+// the compact tree for the whole streaming window.
+func TestNoteStreamingToolCallIDWinsOverReusedIndex(t *testing.T) {
+	r, _ := newGroupRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	chat := newContainer(r)
+	assistant := r.newTestAssistant()
+	r.mu.Lock()
+	r.lastChatContainer = chat
+	r.lastStreamingComp = assistant
+	r.mu.Unlock()
+	chat.children = []component{assistant}
+
+	// A finished call that streamed at content index 0.
+	first := newTestTool("call-a", "read", map[string]any{"path": "/a"})
+	first.contentIndex = 0
+	first.hasIndex = true
+	first.succeeded("a-out")
+	group := r.newToolGroup(0)
+	group.addTool(first)
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.mu.Unlock()
+
+	// The block at index 0 now carries a different call.
+	content := []contentBlock{{typ: "toolCall", block: streamBlock{id: "call-b", name: "ctx_kb", typ: "toolCall", arguments: map[string]any{"query": "q"}}}}
+	r.noteStreamingToolCall(content, streamEvent{typ: "toolcall_end", contentIndex: intPtrValue(0)})
+
+	r.mu.Lock()
+	preparing := r.preparingByIndex[0]
+	firstArgs := first.args["path"]
+	groupEntries := len(group.entries)
+	r.mu.Unlock()
+	if preparing == nil {
+		t.Fatal("no provisional entry was created for the new call")
+	}
+	if preparing.toolCallID != "call-b" {
+		t.Errorf("provisional entry id = %q, want call-b", preparing.toolCallID)
+	}
+	if firstArgs != "/a" {
+		t.Errorf("the finished call's arguments were overwritten: %v", firstArgs)
+	}
+	if groupEntries != 2 {
+		t.Errorf("group entries = %d, want the finished call plus the new one", groupEntries)
+	}
 }
 
 // Test noteStreamingToolCall updates an already-grouped tool (TS L532-541).
@@ -1782,4 +1837,103 @@ func TestGroupingConcurrentReads(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestStreamingFirstFrameWithoutIDKeepsDisplay covers both id-less first-frame
+// edge cases of brief2 R3 S1. (a) A provisional entry whose stream carries no
+// call id yet has no host card (the host creates one only once the block has an
+// id), so it must not take the display rights from the card that can paint the
+// tree -- and once the id arrives it must take over and invalidate that card.
+// (b) A new assistant message starts a new stream: the content index a block
+// occupies no longer identifies a call of the previous message, so the first
+// id-less frame must not match a completed call there and overwrite its
+// arguments.
+func TestStreamingFirstFrameWithoutIDKeepsDisplay(t *testing.T) {
+	r, _ := newGroupRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	chat := newContainer(r)
+	assistant := r.newTestAssistant()
+	group := r.newToolGroup(0)
+	finished := newTestTool("call-a", "read", map[string]any{"path": "/a"})
+	finished.contentIndex = 0
+	finished.hasIndex = true
+	finished.succeeded("a-out")
+	group.addTool(finished)
+	invalidates := map[string]int{}
+	r.mu.Lock()
+	r.lastChatContainer = chat
+	r.lastStreamingComp = assistant
+	r.addGroupLocked(group)
+	r.lastActiveGroup = group
+	r.toolCardInvalidate = map[string]func(){
+		"call-a": func() { invalidates["call-a"]++ },
+	}
+	r.mu.Unlock()
+	chat.children = []component{assistant, group}
+
+	// (a) The next call's first frame carries no id: the host has mounted no card
+	// for it, so the finished call's card stays the one that paints the tree.
+	content := []contentBlock{
+		{typ: "text", block: streamBlock{text: "next"}},
+		{typ: "toolCall", block: streamBlock{name: "ctx_run", typ: "toolCall", arguments: map[string]any{"command": "echo a"}}},
+	}
+	r.noteStreamingToolCall(content, streamEvent{typ: "toolcall_start", contentIndex: intPtrValue(1)})
+	r.mu.Lock()
+	preparing := r.preparingByIndex[1]
+	displayFinished := isGroupHostDisplayToolLocked(group, finished)
+	displayID := group.displayCardIDLocked()
+	r.mu.Unlock()
+	if preparing == nil {
+		t.Fatal("no provisional entry was created for the id-less frame")
+	}
+	if preparing.toolCallID != "preparing:1" {
+		t.Errorf("provisional id = %q, want the preparing:1 placeholder", preparing.toolCallID)
+	}
+	if !displayFinished {
+		t.Error("the id-less provisional entry took the display rights: its host card does not exist yet, so the screen loses the whole tree")
+	}
+	if displayID != "call-a" {
+		t.Errorf("displayCardIDLocked = %q, want the mounted card call-a", displayID)
+	}
+	tree := r.toolRenderLines("read", finished.args, sdk.ToolRenderContext{
+		ToolCallID:   "call-a",
+		ArgsComplete: true,
+	}, nil, false, 80, false)
+	if len(tree) < 3 {
+		t.Fatalf("tree lines = %v, want the header, the finished call and the streaming row", tree)
+	}
+
+	// The real id arrives: the host has now mounted the card, so the call takes
+	// the tree over and the card that painted until then is invalidated.
+	invalidates["call-a"] = 0
+	content[1].block.id = "call-new"
+	r.noteStreamingToolCall(content, streamEvent{typ: "toolcall_delta", contentIndex: intPtrValue(1)})
+	r.mu.Lock()
+	displayNew := isGroupHostDisplayToolLocked(group, preparing.comp)
+	displayOld := isGroupHostDisplayToolLocked(group, finished)
+	r.mu.Unlock()
+	if !displayNew || displayOld {
+		t.Errorf("after the id arrived: new=%v old=%v, want the new call to paint the tree", displayNew, displayOld)
+	}
+	if invalidates["call-a"] == 0 {
+		t.Error("the previous display card was not invalidated when the real id arrived: it keeps painting the tree next to the new one")
+	}
+
+	// (b) A new assistant message must not let its first id-less frame match the
+	// previous message's completed call by content index.
+	r.handleMessageStart(map[string]any{
+		"message": map[string]any{"role": "assistant", "content": []any{}},
+	})
+	first := []contentBlock{{typ: "toolCall", block: streamBlock{name: "write", typ: "toolCall", arguments: map[string]any{"path": "/b"}}}}
+	r.noteStreamingToolCall(first, streamEvent{typ: "toolcall_start", contentIndex: intPtrValue(0)})
+	r.mu.Lock()
+	finishedArgs := finished.args["path"]
+	finishedIndex, finishedHasIndex := finished.contentIndex, finished.hasIndex
+	r.mu.Unlock()
+	if finishedArgs != "/a" {
+		t.Errorf("the previous message's tool arguments were overwritten: %v", finished.args)
+	}
+	if finishedHasIndex {
+		t.Errorf("the previous message's call still answers content index %d", finishedIndex)
+	}
 }
