@@ -554,9 +554,9 @@ func (e *HerdsmanExtension) HandleSessionStart(ctx Context) {
 	sessionID := ctx.SessionID()
 	e.subscriberID = &sessionID
 	e.sessionRef = &AgentSessionRef{
-		Agent:  "pi",
+		Agent:  "pig",
 		Kind:   "path",
-		Source: "herdr:pi",
+		Source: "herdr:pig",
 		Value:  ctx.SessionFile(),
 	}
 	e.launchIdentity = herdrLaunchIdentity(e.env)

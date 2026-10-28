@@ -20,6 +20,7 @@ var agentDisplayNames = map[string]string{
 	"gemini":   "Gemini",
 	"opencode": "OpenCode",
 	"pi":       "Pi",
+	"pig":      "pig",
 }
 
 // safeAgentToken mirrors `HERDR_AGENT_TOKEN.test(value) ? value : null`.

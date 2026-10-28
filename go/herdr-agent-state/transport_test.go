@@ -139,7 +139,7 @@ func TestTransport_RealUnixSocket_Protocol(t *testing.T) {
 	if !hasSuffix(m1.raw, "\n") {
 		t.Errorf("m1 expected newline terminated")
 	}
-	if m1.params["pane_id"] != "pane-test-1" || m1.params["source"] != SourcePi || m1.params["agent"] != "pi" {
+	if m1.params["pane_id"] != "pane-test-1" || m1.params["source"] != SourcePi || m1.params["agent"] != "pig" {
 		t.Errorf("m1 unexpected standard fields: %+v", m1.params)
 	}
 	if m1.params["agent_session_path"] != absPath {
@@ -345,11 +345,12 @@ func TestTransport_JSONErrorResponseIsNotSuccess(t *testing.T) {
 // Herdr ships a built-in "pi" integration whose source is "herdr:pi"; a report
 // carrying that source is answered {"result":{"type":"ok"}} yet silently
 // discarded, so the pane keeps agent_status "unknown" (observed live on
-// w3N:pE). This case pins the identity we send instead: agent stays "pi", the
-// source is stable, unique, and never in Herdr's own "herdr:" namespace.
+// w3N:pE). This case pins the identity we send instead: agent stays "pig",
+// matching the pig runtime, and the source is stable, unique, and never in
+// Herdr's own "herdr:" namespace.
 func TestSource_NotReservedByHerdr(t *testing.T) {
-	if AgentPi != "pi" {
-		t.Fatalf("expected agent %q, got %q", "pi", AgentPi)
+	if AgentPi != "pig" {
+		t.Fatalf("expected agent %q, got %q", "pig", AgentPi)
 	}
 	if SourcePi == "herdr:pi" {
 		t.Fatal("source must not be \"herdr:pi\": Herdr's own built-in pi integration owns it and silently drops such reports")
