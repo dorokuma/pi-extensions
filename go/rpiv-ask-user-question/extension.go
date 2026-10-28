@@ -86,9 +86,12 @@ func Extension() *sdk.Extension {
 	// while the factory runs dials the host socket itself and waits on a
 	// synchronous host RPC (EventBus.On -> factoryBusConn), which deadlocks
 	// /reload while the host is still accepting an earlier member's connection.
-	// OnLoaded runs once the extension registered and before any request is
-	// served — so before the tool can ask — and ctx.Events() rides the running
-	// connection.
+	// Per the SDK's OnLoaded contract (pigsdk/host_state_subscriptions.go) the
+	// handler runs once the extension is registered and has received its state,
+	// before the host serves any request (session_start included) — a listener
+	// dispatch excepted, since a dispatch does not wait behind the handler. So the
+	// asking tool cannot run before this subscription is in place, and ctx.Events()
+	// rides the running connection.
 	e.OnLoaded(func(ctx sdk.Context) {
 		if _, err := ctx.Events().On(AskUserAnswerEvent, func(_ sdk.Context, payload any) error {
 			answers.Handle(payload)
