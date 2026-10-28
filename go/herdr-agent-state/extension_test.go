@@ -904,3 +904,48 @@ func TestExtension_EventWiring(t *testing.T) {
 		t.Fatal("Extension() should return non-nil extension when enabled")
 	}
 }
+
+// TestExtension_DefersBusSubscriptionToOnLoaded asserts the herdr:blocked
+// subscription is deferred to OnLoaded instead of being made inside the factory.
+// A factory-time Events().On dials the host socket and waits on a synchronous
+// host RPC; when /reload admits several extensions at once the host can still be
+// accepting an earlier member, so that wait never ends and the reload deadlocks.
+// This fake host accepts the connection and never answers it, so a factory-time
+// subscription shows up as exactly that accepted connection.
+func TestExtension_DefersBusSubscriptionToOnLoaded(t *testing.T) {
+	sockPath := createTempSocket(t)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+
+	t.Setenv("PIG_EXT_SOCKET", sockPath)
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_SOCKET_PATH", sockPath)
+	t.Setenv("HERDR_PANE_ID", "pane-factory")
+
+	done := make(chan *sdk.Extension, 1)
+	go func() { done <- Extension() }()
+
+	select {
+	case ext := <-done:
+		if ext == nil {
+			t.Fatal("Extension() returned nil")
+		}
+	case conn := <-accepted:
+		_ = conn.Close()
+		t.Fatal("Extension() opened the host socket from the factory: the bus subscription must be deferred to OnLoaded")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Extension() did not return: a factory-time host call blocks the reload")
+	}
+}

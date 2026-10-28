@@ -43,10 +43,18 @@ func Extension() *sdk.Extension {
 	client := NewClient(endpoint, cfg.PaneID, nil, nil)
 	sm := NewStateManager(client)
 
-	// Event bus: herdr:blocked
-	if _, err := e.Events().On("herdr:blocked", sm.HandleHerdrBlocked); err != nil {
-		log.Printf("[herdr-agent-state] failed to subscribe to herdr:blocked: %v", err)
-	}
+	// Event bus: herdr:blocked, subscribed from OnLoaded rather than here: a
+	// subscription made while the factory runs dials the host socket itself and
+	// waits on a synchronous host RPC (EventBus.On -> factoryBusConn), which
+	// deadlocks /reload while the host is still accepting an earlier member's
+	// connection. OnLoaded runs once this extension registered with the host and
+	// before any request is served, so ctx.Events() rides the running connection
+	// and the subscription is in place long before agent blocking can emit it.
+	e.OnLoaded(func(ctx sdk.Context) {
+		if _, err := ctx.Events().On("herdr:blocked", sm.HandleHerdrBlocked); err != nil {
+			log.Printf("[herdr-agent-state] failed to subscribe to herdr:blocked: %v", err)
+		}
+	})
 
 	// Pi/PiG lifecycle events
 	e.OnEvent(sdk.EventSessionStart, sm.HandleSessionStart)
