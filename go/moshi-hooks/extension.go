@@ -50,7 +50,7 @@ func safeSessionID(ctx sdk.Context) (value string) {
 }
 
 // safeSessionFile reads sessionManager.getSessionFile(); an in-memory session
-// has none. It is level 1 of the four-level transcriptPath chain
+// has none. It is stage 1 of the transcriptPath chain
 // (TS pig: transcriptPath).
 func safeSessionFile(ctx sdk.Context) (value string) {
 	defer func() { _ = recover() }()

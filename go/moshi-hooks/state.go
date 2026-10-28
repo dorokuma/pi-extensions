@@ -73,8 +73,11 @@ var (
 	sessions             = map[string]*SessionState{}
 	transcriptChildCache = map[string]bool{}
 	// sessionTranscripts caches the transcript path each session resolved
-	// through the four-level chain below, so a later event that arrives
-	// without one still knows where the session's transcript lives
+	// through authoritative sources (stage 1/2 of resolveTranscriptPath) or
+	// a stage-4 session-id match, so a later event that arrives without one
+	// still knows where the session's transcript lives. Stage-5 cwd guesses
+	// are never stored here — they may name another session's file and would
+	// shadow the real one once it appears
 	// (TS pig: state.transcriptPath, set inside transcriptPath()).
 	sessionTranscripts = map[string]string{}
 )
@@ -261,36 +264,62 @@ func eventString(event map[string]any, key string) string {
 // transcriptPath). MOSHI's Chat View tails this file, so it must be the real
 // pig transcript — never a path under ~/.pi.
 //
-//  0. sessionTranscripts[sessionID] — a path this session already resolved
-//     and handleEvent cached (under stateMu), so later events skip the disk
-//     scan entirely.
+// Authoritative sources outrank the cache: a stage-4/5 guess made before the
+// transcript landed on disk (e.g. session_start resolving to the previous
+// session's file under the same cwd) must not shadow the real sessionFile
+// when it arrives. Stages 1-3 are trusted and refresh the cache; stages 4-5
+// are fallible guesses that are never cached.
+//
 //  1. sessionFile — the host sessionManager's getSessionFile(), the
-//     authoritative answer.
+//     authoritative answer; always wins and refreshes the cache.
 //  2. event fields — transcript_path / transcriptPath / sessionFile /
-//     session_file / sessionPath.
-//  3. findSessionFileByID(sessionID) — the session-id scan of the sessions
-//     root.
-//  4. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
-//     cwd's session directory.
+//     session_file / sessionPath; also authoritative, refreshes the cache.
+//  3. sessionTranscripts[sessionID] — a path already resolved and cached by
+//     stage 1/2 or handleEvent; consulted only when no authoritative value
+//     is present this time.
+//  4. findSessionFileByID(sessionID) — the session-id scan of the sessions
+//     root; a real session match, cached.
+//  5. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
+//     cwd's session directory; a guess, returned but never cached.
 func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) string {
-	// Level 0: the cache handleEvent fills from this payload's resolved path.
-	// Send() calls us before handleEvent takes stateMu, so take it here for
-	// the read — the critical section is a single map lookup.
+	// Stage 1: the host session file is authoritative — take it verbatim and
+	// record it so later events without one still resolve.
+	if sessionFile != "" {
+		stateMu.Lock()
+		sessionTranscripts[sessionID] = sessionFile
+		stateMu.Unlock()
+		return sessionFile
+	}
+	// Stage 2: event-carried transcript fields are authoritative too — they
+	// replace whatever an earlier guess cached.
+	if fromEvent := eventTranscriptPath(event); fromEvent != "" {
+		stateMu.Lock()
+		sessionTranscripts[sessionID] = fromEvent
+		stateMu.Unlock()
+		return fromEvent
+	}
+	// Stage 3: the cache handleEvent and stages 1/2 fill. Send() calls us
+	// before handleEvent takes stateMu, so take it here for the read — the
+	// critical section is a single map lookup.
 	stateMu.Lock()
 	cached := sessionTranscripts[sessionID]
 	stateMu.Unlock()
 	if cached != "" {
 		return cached
 	}
-	if sessionFile != "" {
-		return sessionFile
-	}
-	if fromEvent := eventTranscriptPath(event); fromEvent != "" {
-		return fromEvent
-	}
+	// Stage 4: a filename-bound session id is a real match (a wrongly-guessed
+	// stage-5 file never reaches the cache, so the scan stays reachable once
+	// the session's own transcript exists).
 	if byID := findSessionFileByID(sessionID); byID != "" {
+		stateMu.Lock()
+		sessionTranscripts[sessionID] = byID
+		stateMu.Unlock()
 		return byID
 	}
+	// Stage 5: newest *.jsonl under this cwd is a heuristic only — the file
+	// may belong to a different session that happens to share the cwd. It is
+	// returned for this event but never cached, so a later authoritative
+	// stage-1/2 value or a stage-4 id match can still correct it.
 	return newestJsonl(pigSessionDirForCwd(cwd))
 }
 
@@ -473,6 +502,9 @@ func handleEvent(payload *HookPayload, event map[string]any) {
 
 	state := stateFor(sessionID)
 	if payload.TranscriptPath != "" {
+		// Authoritative for this session: the payload's path came through
+		// resolveTranscriptPath, which never returns a stage-5 guess as
+		// authoritative — handleEvent simply records the resolved value.
 		sessionTranscripts[sessionID] = payload.TranscriptPath
 	}
 	isChild := sessionIsChild(state, payload, event)

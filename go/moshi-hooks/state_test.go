@@ -714,6 +714,40 @@ func TestSessionTranscriptIsCached(t *testing.T) {
 	}
 }
 
+func TestAuthoritativeTranscriptPathOverridesCachedGuess(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+
+	// session_start fired before this session's transcript hit disk: the
+	// stage-5 cwd fallback resolved to an older session's file, and
+	// handleEvent cached that guess under this session id.
+	stale := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
+	guess := resolveTranscriptPath("", nil, "session-1", cwd)
+	if guess != stale {
+		t.Fatalf("stage5 guess = %q, want %q", guess, stale)
+	}
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = guess
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != stale {
+		t.Fatalf("cached guess = %q, want %q", got, stale)
+	}
+
+	// A later event carries the authoritative transcript path: it must win
+	// over the cached guess and upgrade the cache — the old cache-first
+	// ordering returned the stale guess forever.
+	authoritative := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_session-1.jsonl", `{"type":"session"}`)
+	event := map[string]any{"transcript_path": authoritative}
+	if got := resolveTranscriptPath("", event, "session-1", cwd); got != authoritative {
+		t.Fatalf("event-carried path lost to cached guess: got %q, want %q", got, authoritative)
+	}
+	if got := sessionTranscripts["session-1"]; got != authoritative {
+		t.Fatalf("cache not upgraded: got %q, want %q", got, authoritative)
+	}
+}
+
 func TestPromptSequenceForSubmit(t *testing.T) {
 	cases := []struct {
 		state SessionState

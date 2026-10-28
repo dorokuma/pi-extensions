@@ -125,19 +125,24 @@ sessionManager」的 `transcriptPath` 扩成四级回退链——因为 packed-g
    `getSessionFile()`，权威答案。
 2. **event 字段**——`transcript_path` / `transcriptPath` / `sessionFile` /
    `session_file` / `sessionPath`（`eventTranscriptPath`）。
-3. **`findSessionFileByID(sessionID)`**——按 sessionID 扫 sessions root 下每个
+3. **`sessionTranscripts` 缓存**——仅当 stage 1/2 权威值缺失时兜底；
+   权威值一旦出现立即覆盖缓存（「升级」而非固化），修正「stage 5 猜错后
+   永久挡住权威路径」的场景。
+4. **`findSessionFileByID(sessionID)`**——按 sessionID 扫 sessions root 下每个
    cwd 目录找 `*_<sessionId>.jsonl`；覆盖「pane cwd 与 session-dir cwd 不一致」
-   （从 tab 根拉起但被派到 worktree 的 worker）。
-4. **`newestJsonl(pigSessionDirForCwd(cwd))`**——本 cwd session 目录里最新的
+   （从 tab 根拉起但被派到 worktree 的 worker）。真实会话匹配，同样回写缓存。
+5. **`newestJsonl(pigSessionDirForCwd(cwd))`**——本 cwd session 目录里最新的
    `.jsonl`（`session_start` 早于首次落盘，UserPromptSubmit 时文件已在）。
+   纯猜测（文件可能属同 cwd 的另一会话），**不回写缓存**，后续权威值仍可纠正。
 
 sessions root 解析（`pigSessionsRoot`）与 PiG node shim
 （`runtime-node/shims/pig-config.mjs`）同序：`PIG_EXT_HOST_INFO` JSON 的
 `agentDir`（直接解析 env，不走 sdk.AgentDir 全局缓存，便于 `t.Setenv` 隔离）→
 `PIG_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR` → `PIG_HOME` →
 `XDG_CONFIG_HOME/pig` → `~/.pig`；前两级拼 `/sessions`，后三级拼
-`/agent/sessions`。解析结果按 sessionID 缓存在 `sessionTranscripts`，后续不带
-路径的事件仍能定位 transcript。packed-go cell 里源码改动由 PiG 自动重编，无需
+`/agent/sessions`。解析结果中**权威来源（stage 1/2）与 stage 4 的 id 匹配**按 sessionID
+缓存在 `sessionTranscripts`，后续不带路径的事件仍能定位 transcript；stage 5
+的 cwd 猜测不缓存，避免把另一会话的文件误当本会话权威值。packed-go cell 里源码改动由 PiG 自动重编，无需
 手工 install。
 
 ## 3. 与 TS 的差异（逐条，附理由）
