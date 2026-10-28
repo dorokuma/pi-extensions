@@ -688,6 +688,49 @@ func TestStage4ChildSessionIsDetected(t *testing.T) {
 	h.deliverNothing(payload)
 }
 
+func TestGuessedTranscriptPathStaysOutOfSessionState(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+
+	// session_start fired before this session's transcript hit disk: stage 5
+	// resolves to the newest *.jsonl under the cwd — here a sibling session's
+	// file whose header carries parentSession. The payload flags it as a
+	// guess, so SessionStart must not store it in state.TranscriptPath:
+	// sessionIsChild falls back to that field and would read the foreign
+	// header on the next event, suppressing this session as a false child.
+	own := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_aaa.jsonl", `{"type":"session","id":"session-1"}`)
+	child := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_child1.jsonl", `{"type":"session","parentSession":"parent-1"}`)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(own, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	guess, guessed := resolveTranscriptPath("", nil, "session-1", cwd)
+	if guess != child || !guessed {
+		t.Fatalf("stage5 guess = %q (guessed %v), want %q guessed", guess, guessed, child)
+	}
+
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = guess
+	payload.TranscriptPathGuessed = guessed
+	h.deliverOne(payload)
+	if got := sessions["session-1"].TranscriptPath; got != "" {
+		t.Fatalf("state.TranscriptPath = %q, want empty (guesses never enter state)", got)
+	}
+
+	// The next event resolves the same guess, but neither the payload nor
+	// the stored state may hand it to lineage detection: this session is
+	// not the child the foreign header describes.
+	prompt := payloadFor("UserPromptSubmit")
+	prompt.TranscriptPath = guess
+	prompt.TranscriptPathGuessed = true
+	prompt.Extra = map[string]any{"prompt": "hello"}
+	if envelope := h.deliverOne(prompt); envelope.EventName != "SessionStart" {
+		t.Fatalf("EventName = %q, want SessionStart (foreign transcript must not mark this session a child)", envelope.EventName)
+	}
+}
+
 func TestSessionTranscriptIsCached(t *testing.T) {
 	h := newHarness(t, nil)
 	agentDir := t.TempDir()

@@ -52,7 +52,10 @@ func nowSeconds() float64 { return float64(now().UnixNano()) / 1e9 }
 // agent process, so plain maps carry state across events
 // (TS: interface SessionState, L373).
 type SessionState struct {
-	Model                   string
+	Model string
+	// TranscriptPath holds authoritative resolutions only — a stage-5
+	// cwd guess never lands in state because sessionIsChild reads this
+	// field as its last fallback.
 	TranscriptPath          string
 	SessionStartTime        float64
 	FirstPromptPushedAt     float64
@@ -537,7 +540,11 @@ func handleEvent(payload *HookPayload, event map[string]any) {
 		if payload.Model != "" {
 			state.Model = payload.Model
 		}
-		if payload.TranscriptPath != "" {
+		if payload.TranscriptPath != "" && !payload.TranscriptPathGuessed {
+			// state.TranscriptPath stores authoritative values only — a
+			// stage-5 guess never lands here: sessionIsChild falls back to
+			// this field and would read a foreign session's header,
+			// suppressing this session as a false lineage child.
 			state.TranscriptPath = payload.TranscriptPath
 		}
 		state.SessionStartTime = nowSeconds()
