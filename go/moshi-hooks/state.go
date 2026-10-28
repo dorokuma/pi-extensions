@@ -20,8 +20,14 @@ import (
 )
 
 const (
-	// agentSource and agentDisplayName are baked in per agent family; this file
-	// is generated for Pi (TS L18-19).
+	// agentSource and agentDisplayName are deliberately reported as "pi", not
+	// "pig": moshi-hook's phone-side Chat View parser only recognizes the
+	// registered agent roster (~20 sources), and "pi" is already registered,
+	// so masquerading as pi reuses the phone app's piFamilyTranscriptEngine
+	// and its Tier B rendering. The display name stays "Pi" for the same
+	// reason — the daemon and app render it verbatim. transcriptPath and the
+	// herdr pane fields still point at this pig session's real state, so Chat
+	// View opens the right transcript (TS pig L20-28 / TS L18-19).
 	agentSource      = "pi"
 	agentDisplayName = "Pi"
 
@@ -60,11 +66,17 @@ type SessionState struct {
 }
 
 var (
-	// stateMu guards sessions and transcriptChildCache. handleEvent holds it for
-	// the whole normalization so one session's sequence stays consistent.
+	// stateMu guards sessions, transcriptChildCache and sessionTranscripts.
+	// handleEvent holds it for the whole normalization so one session's
+	// sequence stays consistent.
 	stateMu              sync.Mutex
 	sessions             = map[string]*SessionState{}
 	transcriptChildCache = map[string]bool{}
+	// sessionTranscripts caches the transcript path each session resolved
+	// through the four-level chain below, so a later event that arrives
+	// without one still knows where the session's transcript lives
+	// (TS pig: state.transcriptPath, set inside transcriptPath()).
+	sessionTranscripts = map[string]string{}
 )
 
 // stateFor returns the session's state, creating it on first sight
@@ -84,7 +96,190 @@ func ResetSessionsForTest() {
 	stateMu.Lock()
 	sessions = map[string]*SessionState{}
 	transcriptChildCache = map[string]bool{}
+	sessionTranscripts = map[string]string{}
 	stateMu.Unlock()
+}
+
+// pigSessionsRoot returns the root directory that holds one subdirectory per
+// session cwd: <agentDir>/sessions, the same layout pi uses under
+// ~/.pi/agent/sessions (TS pig: pigSessionsRoot). The agent dir resolves like
+// PiG's node shim (runtime-node/shims/pig-config.mjs):
+//
+//  1. PIG_EXT_HOST_INFO — a JSON object the host hands extensions; its
+//     agentDir field wins. The env is parsed directly (no sdk.AgentDir
+//     global cache) so t.Setenv keeps tests isolated.
+//  2. PIG_CODING_AGENT_DIR, then PI_CODING_AGENT_DIR.
+//  3. PIG_HOME, then XDG_CONFIG_HOME/pig, then ~/.pig — these are config
+//     roots, so "agent/sessions" is appended.
+func pigSessionsRoot() string {
+	if hostInfo := os.Getenv("PIG_EXT_HOST_INFO"); hostInfo != "" {
+		var parsed struct {
+			AgentDir string `json:"agentDir"`
+		}
+		if err := json.Unmarshal([]byte(hostInfo), &parsed); err == nil && parsed.AgentDir != "" {
+			return filepath.Join(parsed.AgentDir, "sessions")
+		}
+	}
+	if envDir := firstString(os.Getenv("PIG_CODING_AGENT_DIR"), os.Getenv("PI_CODING_AGENT_DIR")); envDir != "" {
+		return filepath.Join(envDir, "sessions")
+	}
+	xdg := ""
+	if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
+		xdg = filepath.Join(xdgConfig, "pig")
+	}
+	home := ""
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		home = filepath.Join(homeDir, ".pig")
+	}
+	configRoot := firstString(os.Getenv("PIG_HOME"), xdg, home)
+	if configRoot == "" {
+		return ""
+	}
+	return filepath.Join(configRoot, "agent", "sessions")
+}
+
+// encodeSessionCwd encodes a cwd exactly like PiG's
+// session.DefaultDirForCWD: the leading / or \ goes away, every remaining
+// / \ : becomes -, and the result is wrapped in "--" (TS pig:
+// encodeSessionCwd).
+func encodeSessionCwd(cwd string) string {
+	safe := cwd
+	if len(safe) > 0 && (safe[0] == '/' || safe[0] == '\\') {
+		safe = safe[1:]
+	}
+	var builder strings.Builder
+	for _, r := range safe {
+		if r == '/' || r == '\\' || r == ':' {
+			builder.WriteByte('-')
+		} else {
+			builder.WriteRune(r)
+		}
+	}
+	return "--" + builder.String() + "--"
+}
+
+// pigSessionDirForCwd is the per-cwd session directory; "" when the cwd or
+// the sessions root is unknown (TS pig: pigSessionDirForCwd).
+func pigSessionDirForCwd(cwd string) string {
+	root := pigSessionsRoot()
+	if cwd == "" || root == "" {
+		return ""
+	}
+	return filepath.Join(root, encodeSessionCwd(cwd))
+}
+
+// newestJsonl is the newest *.jsonl in a directory; "" when none exists yet
+// (session_start fires before the first transcript write — the file lands
+// by the time UserPromptSubmit does) (TS pig: newestJsonl).
+func newestJsonl(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	best := ""
+	var bestTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if best == "" || !info.ModTime().Before(bestTime) {
+			bestTime = info.ModTime()
+			best = filepath.Join(dir, entry.Name())
+		}
+	}
+	return best
+}
+
+// findSessionFileByID scans the per-cwd session directories for
+// <timestamp>_<sessionId>.jsonl. Session ids are unique per transcript, so
+// this identifies the session's file even when ctx.cwd and the host's
+// session-dir cwd disagree (a worker launched from a tab root but told to
+// work in a worktree). Only the one-level scan of the sessions root runs;
+// it stays cheap because the root holds one directory per project cwd
+// (TS pig: findSessionFileById).
+func findSessionFileByID(sessionID string) string {
+	if sessionID == "" || sessionID == agentSource {
+		return ""
+	}
+	root := pigSessionsRoot()
+	if root == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	suffix := "_" + sessionID + ".jsonl"
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		names, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, name := range names {
+			if strings.Contains(name.Name(), suffix) {
+				return filepath.Join(dir, name.Name())
+			}
+		}
+	}
+	return ""
+}
+
+// eventTranscriptPath is level 2 of the resolution chain: transcript fields a
+// host may put straight onto the event payload (TS pig reads the same names
+// off the ctx object, which carries them through here).
+func eventTranscriptPath(event map[string]any) string {
+	return firstString(
+		eventString(event, "transcript_path"),
+		eventString(event, "transcriptPath"),
+		eventString(event, "sessionFile"),
+		eventString(event, "session_file"),
+		eventString(event, "sessionPath"),
+	)
+}
+
+// eventString reads a non-empty string off an event map; nil-safe.
+func eventString(event map[string]any, key string) string {
+	if event == nil {
+		return ""
+	}
+	value, _ := event[key].(string)
+	return value
+}
+
+// resolveTranscriptPath is the four-level transcript resolution chain
+// (TS pig: transcriptPath). MOSHI's Chat View tails this file, so it must be
+// the real pig transcript — never a path under ~/.pi.
+//
+//  1. sessionFile — the host sessionManager's getSessionFile(), the
+//     authoritative answer.
+//  2. event fields — transcript_path / transcriptPath / sessionFile /
+//     session_file / sessionPath.
+//  3. findSessionFileByID(sessionID) — the session-id scan of the sessions
+//     root.
+//  4. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
+//     cwd's session directory.
+func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) string {
+	if sessionFile != "" {
+		return sessionFile
+	}
+	if fromEvent := eventTranscriptPath(event); fromEvent != "" {
+		return fromEvent
+	}
+	if byID := findSessionFileByID(sessionID); byID != "" {
+		return byID
+	}
+	return newestJsonl(pigSessionDirForCwd(cwd))
 }
 
 // promptSequenceForSubmit mirrors internal/agentstate.PromptSequenceForSubmit:
@@ -168,19 +363,10 @@ func (p *HookPayload) str(key string) string { return firstString(p.field(key)) 
 
 // sessionIsChild reports whether the session was created by fork/clone/
 // newSession with lineage, in which case it stays out of the inbox
-// (TS L451).
-//
-// With agentSource "pi" the first two branches are the ones this generated file
-// can reach: the omp branch is keyed on agentSource and the third branch
-// returns early for every other family.
-func sessionIsChild(state *SessionState, payload *HookPayload) bool {
-	if agentSource == "omp" {
-		return payload.str("agent_kind") == "sub"
-	}
-	if agentSource != "pi" && agentSource != "omo" {
-		return false
-	}
-	filePath := firstString(payload.TranscriptPath, state.TranscriptPath)
+// (TS pig: sessionIsChild). This file is generated for Pi, so the omp
+// agent_kind branch the generated TS carries for other families is gone.
+func sessionIsChild(state *SessionState, payload *HookPayload, event map[string]any) bool {
+	filePath := firstString(payload.TranscriptPath, eventTranscriptPath(event), state.TranscriptPath)
 	if filePath == "" {
 		return false
 	}
@@ -262,8 +448,9 @@ func baseEnvelope(payload *HookPayload, sessionID, eventName string) *Envelope {
 }
 
 // handleEvent normalizes one event and queues at most one envelope
-// (TS: handleEvent, L532).
-func handleEvent(payload *HookPayload) {
+// (TS: handleEvent, L532). event is the raw host event the payload was built
+// from; sessionIsChild consults it as a transcript-field fallback.
+func handleEvent(payload *HookPayload, event map[string]any) {
 	sessionID := payload.SessionID
 	if sessionID == "" {
 		sessionID = newSessionID()
@@ -273,16 +460,15 @@ func handleEvent(payload *HookPayload) {
 	defer stateMu.Unlock()
 
 	state := stateFor(sessionID)
-	isChild := sessionIsChild(state, payload)
+	if payload.TranscriptPath != "" {
+		sessionTranscripts[sessionID] = payload.TranscriptPath
+	}
+	isChild := sessionIsChild(state, payload, event)
 
 	switch payload.HookEventName {
 	case "SessionStart":
-		// A child session's start would repoint the pane at a session whose
-		// transcript the daemon cannot serve — but only OMP subagents run in the
-		// parent process (agentSource check), and this file is generated for Pi.
-		if isChild && agentSource == "omp" {
-			return
-		}
+		// A lineage child's start still announces itself: the pane takeover is
+		// intended (the TS pig SessionStart branch has no isChild filter).
 		if payload.Model != "" {
 			state.Model = payload.Model
 		}
@@ -340,7 +526,7 @@ func handleEvent(payload *HookPayload) {
 		// Pi owns the approval prompt and decision; Moshi mirrors the waiting
 		// state so the daemon's TUI bridge can send a remote decision into the
 		// native prompt.
-		if isChild && agentSource == "omp" {
+		if isChild {
 			return
 		}
 		toolName := payload.str("tool_name")
@@ -431,7 +617,7 @@ func handleEvent(payload *HookPayload) {
 		SendEnvelope(envelope)
 
 	case "PermissionResolved":
-		if isChild && agentSource == "omp" {
+		if isChild {
 			return
 		}
 		title := agentDisplayName + " resumed"

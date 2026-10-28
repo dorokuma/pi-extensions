@@ -1,7 +1,9 @@
 package moshihooks
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -531,6 +533,168 @@ func TestRecordTaskCompletionSuppressesOnlyTheSameSignature(t *testing.T) {
 	}
 	if recordTaskCompletion(defaults, "", 301) {
 		t.Fatal("empty signature inside the cooldown must be suppressed")
+	}
+}
+
+// writeSessionFile writes one transcript into <agentDir>/sessions/<cwd-dir>/
+// and returns its path; header is the first jsonl line.
+func writeSessionFile(t *testing.T, agentDir, cwd, name, header string) string {
+	t.Helper()
+	dir := filepath.Join(agentDir, "sessions", encodeSessionCwd(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	file := filepath.Join(dir, name)
+	if err := os.WriteFile(file, []byte(header+"\n{\"type\":\"message\"}\n"), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	return file
+}
+
+func TestEncodeSessionCwd(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/work/moshi", "--work-moshi--"},
+		{"/a/b:c", "--a-b-c--"},
+		{"C:\\Users\\me", "--C--Users-me--"},
+		{"relative/dir", "--relative-dir--"},
+	}
+	for _, test := range cases {
+		if got := encodeSessionCwd(test.in); got != test.want {
+			t.Fatalf("encodeSessionCwd(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+func TestPigSessionsRootPriorityChain(t *testing.T) {
+	// Level by level: each higher-priority source shadows everything below.
+	t.Run("host info wins", func(t *testing.T) {
+		h := newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    fmt.Sprintf(`{"agentDir":%q}`, "/host/agent"),
+			"PIG_CODING_AGENT_DIR": "/env/agent",
+			"PIG_HOME":             "/home/pig",
+		})
+		_ = h
+		if got := pigSessionsRoot(); got != "/host/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q, want /host/agent/sessions", got)
+		}
+	})
+	t.Run("coding agent dir next", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    "",
+			"PIG_CODING_AGENT_DIR": "/env/agent",
+			"PIG_HOME":             "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/env/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("pi agent dir is the pig fallback", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":   "",
+			"PI_CODING_AGENT_DIR": "/pi/agent",
+			"PIG_HOME":            "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/pi/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("pig home appends agent", func(t *testing.T) {
+		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "PIG_HOME": "/home/pig"})
+		if got := pigSessionsRoot(); got != "/home/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("xdg pig config appends agent", func(t *testing.T) {
+		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "XDG_CONFIG_HOME": "/xdg"})
+		if got := pigSessionsRoot(); got != "/xdg/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("host info without agentDir falls through", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    `{"other":true}`,
+			"PIG_CODING_AGENT_DIR": "",
+			"PI_CODING_AGENT_DIR":  "",
+			"PIG_HOME":             "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/home/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+}
+
+func TestResolveTranscriptPathStages(t *testing.T) {
+	h := newHarness(t, nil)
+	_ = h
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// Stage 1: an explicit session file wins over everything.
+	if got := resolveTranscriptPath("/mgr/t.jsonl", map[string]any{"transcript_path": "/ev/t.jsonl"}, "sid", "/work"); got != "/mgr/t.jsonl" {
+		t.Fatalf("stage1 = %q, want /mgr/t.jsonl", got)
+	}
+
+	// Stage 2: event transcript fields, in priority order.
+	for _, key := range []string{"transcript_path", "transcriptPath", "sessionFile", "session_file", "sessionPath"} {
+		event := map[string]any{key: "/ev/" + key + ".jsonl"}
+		if got := resolveTranscriptPath("", event, "sid", "/work"); got != "/ev/"+key+".jsonl" {
+			t.Fatalf("stage2 %s = %q", key, got)
+		}
+	}
+
+	// Stage 3: the session-id scan finds the transcript in a different cwd dir.
+	other := writeSessionFile(t, agentDir, "/other/cwd", "2026-10-25T00-00-00-000Z_sid-9.jsonl", `{"type":"session"}`)
+	if got := resolveTranscriptPath("", nil, "sid-9", "/work/moshi"); got != other {
+		t.Fatalf("stage3 = %q, want %q", got, other)
+	}
+	// A sessionID equal to agentSource never scans.
+	if got := resolveTranscriptPath("", nil, agentSource, "/nonexistent"); got != "" {
+		t.Fatalf("agentSource id must not scan, got %q", got)
+	}
+
+	// Stage 4: the newest *.jsonl in this cwd's session directory.
+	cwd := "/work/moshi"
+	older := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_aaa.jsonl", `{"type":"session"}`)
+	newer := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_bbb.jsonl", `{"type":"session"}`)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(older, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if got := resolveTranscriptPath("", nil, "no-such-id", cwd); got != newer {
+		t.Fatalf("stage4 = %q, want %q", got, newer)
+	}
+	// An unknown cwd yields nothing.
+	if got := resolveTranscriptPath("", nil, "no-such-id", "/no/dir"); got != "" {
+		t.Fatalf("stage4 unknown cwd = %q, want empty", got)
+	}
+}
+
+func TestStage4ChildSessionIsDetected(t *testing.T) {
+	h := newHarness(t, nil)
+	_ = h
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+	path := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_child1.jsonl", `{"type":"session","parentSession":"parent-1"}`)
+
+	// The stage-4 path is also what lineage detection reads: a transcript the
+	// host never handed us still identifies the session as a child.
+	resolved := resolveTranscriptPath("", nil, "no-such-id", cwd)
+	if resolved != path {
+		t.Fatalf("stage4 resolved %q, want %q", resolved, path)
+	}
+	payload := payloadFor("UserPromptSubmit")
+	payload.TranscriptPath = resolved
+	h.deliverNothing(payload)
+}
+
+func TestSessionTranscriptIsCached(t *testing.T) {
+	h := newHarness(t, nil)
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = "/cached/t.jsonl"
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != "/cached/t.jsonl" {
+		t.Fatalf("sessionTranscripts = %q, want /cached/t.jsonl", got)
 	}
 }
 

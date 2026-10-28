@@ -24,7 +24,8 @@ PiG 的 moshi-hook 生命周期钩子扩展。它把 Pi 的会话事件归一化
 | `FlushSends(timeout)`：等待队列排空或超时 | socket.go:182 / socket.go:232 |
 | `session_shutdown` 传 1000ms | `ShutdownFlushTimeout`（socket.go:23）+ extension.go:172 注册处 |
 | 终端上下文进程级解析一次（含测试重置） | `TerminalContextForProcess`（terminal.go:164）/ `ResetTerminalContextForTest`（terminal.go:176） |
-| 子代理（lineage 子会话）不进收件箱；header 判定按路径缓存 | `sessionIsChild`（state.go:176）/ `transcriptHeaderIsChild`（state.go:202） |
+| 子代理（lineage 子会话）不进收件箱；header 判定按路径缓存 | `sessionIsChild` / `transcriptHeaderIsChild`（state.go） |
+| transcriptPath 四级回退链（见下） | `resolveTranscriptPath`（state.go） |
 | stop 去重：完成态下 5s 内同签名只发一次 | `recordTaskCompletion`（state.go:106） |
 
 envelope 字段顺序 = TS 插入顺序（`baseEnvelope` 的 21 个基础字段，然后按事件追加
@@ -59,7 +60,7 @@ JSON 名逐字照抄 TS 属性名（`herdrWorkspaceId`、`herdrTabId`、`toolUse
 | L238-246 | `textFromMessage` | text.go:118 |
 | L248-258 | `modelLabel` | text.go:132（宿主取值：extension.go:66） |
 | L260-275 | `sessionID` | extension.go:101 |
-| L277-286 | `transcriptPath` | extension.go:54（`safeSessionFile`） |
+| L277-286（基线 TS）/ TS pig 的 `transcriptPath` 四级链 | `resolveTranscriptPath`（state.go）＋ `safeSessionFile`（extension.go） |
 | L288-298 | `contextRemaining` | extension.go:77 |
 | L300-308 | `newSessionID` | text.go:215 |
 | L310-322 | 9 条 markdown 正则 | text.go:39-73 |
@@ -112,6 +113,32 @@ JSON 名逐字照抄 TS 属性名（`herdrWorkspaceId`、`herdrTabId`、`toolUse
 | `agent_end` | extension.go:194 | 逆序找最后一条 `role=="assistant"`，只记不发 |
 | `agent_settled` | extension.go:201 | `send("AgentEnd", extra={last_assistant_message})` 并清空 |
 | `session_shutdown` | extension.go:209 | `send("SessionEnd")` + `FlushSends(1s)` |
+
+### 2.3 pig 适配：transcriptPath 四级回退链
+
+`extensions/moshi-hooks-pig/` 的 TS 版（已随本改动删除）把 pi 版「只问
+sessionManager」的 `transcriptPath` 扩成四级回退链——因为 packed-go cell
+里宿主可能不给 `getSessionFile`，而 MOSHI Chat View 必须落到**本 pig 会话**的
+真实 jsonl（绝不能用 `~/.pi` 下的路径）。Go 版把该链原样吃进 `state.go`：
+
+1. **`sessionFile`**（`safeSessionFile`，extension.go）—— sessionManager
+   `getSessionFile()`，权威答案。
+2. **event 字段**——`transcript_path` / `transcriptPath` / `sessionFile` /
+   `session_file` / `sessionPath`（`eventTranscriptPath`）。
+3. **`findSessionFileByID(sessionID)`**——按 sessionID 扫 sessions root 下每个
+   cwd 目录找 `*_<sessionId>.jsonl`；覆盖「pane cwd 与 session-dir cwd 不一致」
+   （从 tab 根拉起但被派到 worktree 的 worker）。
+4. **`newestJsonl(pigSessionDirForCwd(cwd))`**——本 cwd session 目录里最新的
+   `.jsonl`（`session_start` 早于首次落盘，UserPromptSubmit 时文件已在）。
+
+sessions root 解析（`pigSessionsRoot`）与 PiG node shim
+（`runtime-node/shims/pig-config.mjs`）同序：`PIG_EXT_HOST_INFO` JSON 的
+`agentDir`（直接解析 env，不走 sdk.AgentDir 全局缓存，便于 `t.Setenv` 隔离）→
+`PIG_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR` → `PIG_HOME` →
+`XDG_CONFIG_HOME/pig` → `~/.pig`；前两级拼 `/sessions`，后三级拼
+`/agent/sessions`。解析结果按 sessionID 缓存在 `sessionTranscripts`，后续不带
+路径的事件仍能定位 transcript。packed-go cell 里源码改动由 PiG 自动重编，无需
+手工 install。
 
 ## 3. 与 TS 的差异（逐条，附理由）
 

@@ -20,7 +20,6 @@
     "extensions/exclude-tools-guard/src/**/*.ts",
     "extensions/jev-gate/src/**/*.ts",
     "extensions/magpie-image/src/**/*.ts",
-    "extensions/moshi-hooks-pig/src/**/*.ts",
     "extensions/no-tables/src/**/*.ts"
   ],
   "exclude": [
