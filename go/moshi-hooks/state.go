@@ -320,7 +320,16 @@ func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, 
 	// stage-5 file never reaches the cache, so the scan stays reachable once
 	// the session's own transcript exists).
 	if byID := findSessionFileByID(sessionID); byID != "" {
+		// Re-check inside the lock: the stage-3 read above ran in its own
+		// critical section, so an authoritative stage-1/2 write may have
+		// landed while this scan was reading the disk. Writing byID
+		// unconditionally would resurrect the stale interleaving — the cached
+		// value wins instead (same-authority later writes are fine).
 		stateMu.Lock()
+		if cached := sessionTranscripts[sessionID]; cached != "" {
+			stateMu.Unlock()
+			return cached, false
+		}
 		sessionTranscripts[sessionID] = byID
 		stateMu.Unlock()
 		return byID, false
@@ -528,8 +537,14 @@ func handleEvent(payload *HookPayload, event map[string]any) {
 		// stored every trusted (non-guessed) value; this write only matters
 		// for payloads built by hand, and it must never admit a stage-5
 		// guess — that would resurrect the cached-guess shadowing the
-		// stage-4 id scan was meant to fix.
-		sessionTranscripts[sessionID] = payload.TranscriptPath
+		// stage-4 id scan was meant to fix. It must also never overwrite a
+		// *different* cached value: Send() resolves the payload outside this
+		// lock, so a stage-3 cache hit may carry a stale value while an
+		// interleaved authoritative stage-1/2 write already landed. An
+		// existing different value wins; equal or empty may be (re)written.
+		if cached := sessionTranscripts[sessionID]; cached == "" || cached == payload.TranscriptPath {
+			sessionTranscripts[sessionID] = payload.TranscriptPath
+		}
 	}
 	isChild := sessionIsChild(state, payload, event)
 

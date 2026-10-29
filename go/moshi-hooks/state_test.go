@@ -824,6 +824,45 @@ func TestAuthoritativeTranscriptPathOverridesCachedGuess(t *testing.T) {
 	}
 }
 
+// TestStaleCacheReadNeverOverwritesNewerValue is the regression for the
+// stale-read write-back race: handleEvent and stage 4 re-read the cache inside
+// the lock before writing, so a value resolved before an interleaved
+// authoritative stage-1/2 write cannot clobber it.
+func TestStaleCacheReadNeverOverwritesNewerValue(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// Interleave 1 (handleEvent): goroutine A resolved the stale X through a
+	// stage-3 cache hit; before its handleEvent ran, goroutine B landed the
+	// authoritative Y via stage 1/2. The payload carries X flagged as trusted
+	// (not guessed), and the unconditional write used to put X back over Y.
+	staleX := writeSessionFile(t, agentDir, "/stale/cwd", "2026-10-25T00-00-00-000Z_stale.jsonl", `{"type":"session"}`)
+	authY := "/authoritative/session-1.jsonl"
+	sessionTranscripts["session-1"] = authY
+
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = staleX
+	payload.TranscriptPathGuessed = false
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != authY {
+		t.Fatalf("stale payload overwrote newer cache: sessionTranscripts = %q, want %q", got, authY)
+	}
+
+	// Interleave 2 (stage 4): goroutine A read an empty stage-3 cache and
+	// found the on-disk W; meanwhile goroutine B landed Y. The unconditional
+	// stage-4 write used to put W over Y.
+	resolvedW := writeSessionFile(t, agentDir, "/work/moshi", "2026-10-25T01-00-00-000Z_session-4.jsonl", `{"type":"session"}`)
+	sessionTranscripts["session-4"] = authY
+	got, _ := resolveTranscriptPath("", nil, "session-4", "/work/moshi")
+	if got != authY {
+		t.Fatalf("stage-4 scan overwrote newer cache: resolved %q (scan found %q), want cached %q", got, resolvedW, authY)
+	}
+	if got := sessionTranscripts["session-4"]; got != authY {
+		t.Fatalf("sessionTranscripts = %q, want %q", got, authY)
+	}
+}
+
 func TestPromptSequenceForSubmit(t *testing.T) {
 	cases := []struct {
 		state SessionState
