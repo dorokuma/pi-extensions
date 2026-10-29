@@ -20,8 +20,14 @@ import (
 )
 
 const (
-	// agentSource and agentDisplayName are baked in per agent family; this file
-	// is generated for Pi (TS L18-19).
+	// agentSource and agentDisplayName are deliberately reported as "pi", not
+	// "pig": moshi-hook's phone-side Chat View parser only recognizes the
+	// registered agent roster (~20 sources), and "pi" is already registered,
+	// so masquerading as pi reuses the phone app's piFamilyTranscriptEngine
+	// and its Tier B rendering. The display name stays "Pi" for the same
+	// reason — the daemon and app render it verbatim. transcriptPath and the
+	// herdr pane fields still point at this pig session's real state, so Chat
+	// View opens the right transcript (TS pig L20-28 / TS L18-19).
 	agentSource      = "pi"
 	agentDisplayName = "Pi"
 
@@ -46,7 +52,10 @@ func nowSeconds() float64 { return float64(now().UnixNano()) / 1e9 }
 // agent process, so plain maps carry state across events
 // (TS: interface SessionState, L373).
 type SessionState struct {
-	Model                   string
+	Model string
+	// TranscriptPath holds authoritative resolutions only — a stage-5
+	// cwd guess never lands in state because sessionIsChild reads this
+	// field as its last fallback.
 	TranscriptPath          string
 	SessionStartTime        float64
 	FirstPromptPushedAt     float64
@@ -60,11 +69,22 @@ type SessionState struct {
 }
 
 var (
-	// stateMu guards sessions and transcriptChildCache. handleEvent holds it for
-	// the whole normalization so one session's sequence stays consistent.
+	// stateMu guards sessions, transcriptChildCache and sessionTranscripts.
+	// handleEvent holds it for the whole normalization so one session's
+	// sequence stays consistent.
 	stateMu              sync.Mutex
 	sessions             = map[string]*SessionState{}
 	transcriptChildCache = map[string]bool{}
+	// sessionTranscripts caches the transcript path each session resolved
+	// through authoritative sources (stage 1/2 of resolveTranscriptPath) or
+	// a stage-4 session-id match, so a later event that arrives without one
+	// still knows where the session's transcript lives. Stage-5 cwd guesses
+	// are never stored here — they may name another session's file and would
+	// shadow the real one once it appears. resolveTranscriptPath is the only
+	// writer: handleEvent records its verdict in TranscriptPathGuessed
+	// instead of re-caching the value
+	// (TS pig: state.transcriptPath, set inside transcriptPath()).
+	sessionTranscripts = map[string]string{}
 )
 
 // stateFor returns the session's state, creating it on first sight
@@ -84,7 +104,242 @@ func ResetSessionsForTest() {
 	stateMu.Lock()
 	sessions = map[string]*SessionState{}
 	transcriptChildCache = map[string]bool{}
+	sessionTranscripts = map[string]string{}
 	stateMu.Unlock()
+}
+
+// pigSessionsRoot returns the root directory that holds one subdirectory per
+// session cwd: <agentDir>/sessions, the same layout pi uses under
+// ~/.pi/agent/sessions (TS pig: pigSessionsRoot). The agent dir resolves like
+// PiG's node shim (runtime-node/shims/pig-config.mjs):
+//
+//  1. PIG_EXT_HOST_INFO — a JSON object the host hands extensions; its
+//     agentDir field wins. The env is parsed directly (no sdk.AgentDir
+//     global cache) so t.Setenv keeps tests isolated.
+//  2. PIG_CODING_AGENT_DIR, then PI_CODING_AGENT_DIR.
+//  3. PIG_HOME, then XDG_CONFIG_HOME/pig, then ~/.pig — these are config
+//     roots, so "agent/sessions" is appended.
+func pigSessionsRoot() string {
+	if hostInfo := os.Getenv("PIG_EXT_HOST_INFO"); hostInfo != "" {
+		var parsed struct {
+			AgentDir string `json:"agentDir"`
+		}
+		if err := json.Unmarshal([]byte(hostInfo), &parsed); err == nil && parsed.AgentDir != "" {
+			return filepath.Join(parsed.AgentDir, "sessions")
+		}
+	}
+	if envDir := firstString(os.Getenv("PIG_CODING_AGENT_DIR"), os.Getenv("PI_CODING_AGENT_DIR")); envDir != "" {
+		return filepath.Join(envDir, "sessions")
+	}
+	xdg := ""
+	if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
+		xdg = filepath.Join(xdgConfig, "pig")
+	}
+	home := ""
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		home = filepath.Join(homeDir, ".pig")
+	}
+	configRoot := firstString(os.Getenv("PIG_HOME"), xdg, home)
+	if configRoot == "" {
+		return ""
+	}
+	return filepath.Join(configRoot, "agent", "sessions")
+}
+
+// encodeSessionCwd encodes a cwd exactly like PiG's
+// session.DefaultDirForCWD: the leading / or \ goes away, every remaining
+// / \ : becomes -, and the result is wrapped in "--" (TS pig:
+// encodeSessionCwd).
+func encodeSessionCwd(cwd string) string {
+	safe := cwd
+	if len(safe) > 0 && (safe[0] == '/' || safe[0] == '\\') {
+		safe = safe[1:]
+	}
+	var builder strings.Builder
+	for _, r := range safe {
+		if r == '/' || r == '\\' || r == ':' {
+			builder.WriteByte('-')
+		} else {
+			builder.WriteRune(r)
+		}
+	}
+	return "--" + builder.String() + "--"
+}
+
+// pigSessionDirForCwd is the per-cwd session directory; "" when the cwd or
+// the sessions root is unknown (TS pig: pigSessionDirForCwd).
+func pigSessionDirForCwd(cwd string) string {
+	root := pigSessionsRoot()
+	if cwd == "" || root == "" {
+		return ""
+	}
+	return filepath.Join(root, encodeSessionCwd(cwd))
+}
+
+// newestJsonl is the newest *.jsonl in a directory; "" when none exists yet
+// (session_start fires before the first transcript write — the file lands
+// by the time UserPromptSubmit does) (TS pig: newestJsonl).
+func newestJsonl(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	best := ""
+	var bestTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if best == "" || !info.ModTime().Before(bestTime) {
+			bestTime = info.ModTime()
+			best = filepath.Join(dir, entry.Name())
+		}
+	}
+	return best
+}
+
+// findSessionFileByID scans the per-cwd session directories for
+// <timestamp>_<sessionId>.jsonl. Session ids are unique per transcript, so
+// this identifies the session's file even when ctx.cwd and the host's
+// session-dir cwd disagree (a worker launched from a tab root but told to
+// work in a worktree). Only the one-level scan of the sessions root runs;
+// it stays cheap because the root holds one directory per project cwd
+// (TS pig: findSessionFileById).
+func findSessionFileByID(sessionID string) string {
+	if sessionID == "" || sessionID == agentSource {
+		return ""
+	}
+	root := pigSessionsRoot()
+	if root == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	suffix := "_" + sessionID + ".jsonl"
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		names, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, name := range names {
+			if strings.Contains(name.Name(), suffix) {
+				return filepath.Join(dir, name.Name())
+			}
+		}
+	}
+	return ""
+}
+
+// eventTranscriptPath is level 2 of the resolution chain: transcript fields a
+// host may put straight onto the event payload (TS pig reads the same names
+// off the ctx object, which carries them through here).
+func eventTranscriptPath(event map[string]any) string {
+	return firstString(
+		eventString(event, "transcript_path"),
+		eventString(event, "transcriptPath"),
+		eventString(event, "sessionFile"),
+		eventString(event, "session_file"),
+		eventString(event, "sessionPath"),
+	)
+}
+
+// eventString reads a non-empty string off an event map; nil-safe.
+func eventString(event map[string]any, key string) string {
+	if event == nil {
+		return ""
+	}
+	value, _ := event[key].(string)
+	return value
+}
+
+// resolveTranscriptPath is the transcript resolution chain (TS pig:
+// transcriptPath). MOSHI's Chat View tails this file, so it must be the real
+// pig transcript — never a path under ~/.pi.
+//
+// Authoritative sources outrank the cache: a stage-4/5 guess made before the
+// transcript landed on disk (e.g. session_start resolving to the previous
+// session's file under the same cwd) must not shadow the real sessionFile
+// when it arrives. Stages 1-3 are trusted and refresh the cache; stages 4-5
+// are fallible guesses that are never cached.
+//
+//  1. sessionFile — the host sessionManager's getSessionFile(), the
+//     authoritative answer; always wins and refreshes the cache.
+//  2. event fields — transcript_path / transcriptPath / sessionFile /
+//     session_file / sessionPath; also authoritative, refreshes the cache.
+//  3. sessionTranscripts[sessionID] — a path already resolved and cached by
+//     stage 1/2; consulted only when no authoritative value is present this
+//     time.
+//  4. findSessionFileByID(sessionID) — the session-id scan of the sessions
+//     root; a real session match, cached.
+//  5. newestJsonl(pigSessionDirForCwd(cwd)) — the newest transcript in this
+//     cwd's session directory; a guess, returned but never cached.
+//
+// guessed reports whether the result is a fallible stage-5 guess (true) or a
+// trusted stage 1-4 value (false). Callers use it to keep guesses out of both
+// the cache and lineage detection.
+func resolveTranscriptPath(sessionFile string, event map[string]any, sessionID, cwd string) (path string, guessed bool) {
+	// Stage 1: the host session file is authoritative — take it verbatim and
+	// record it so later events without one still resolve.
+	if sessionFile != "" {
+		stateMu.Lock()
+		sessionTranscripts[sessionID] = sessionFile
+		stateMu.Unlock()
+		return sessionFile, false
+	}
+	// Stage 2: event-carried transcript fields are authoritative too — they
+	// replace whatever an earlier guess cached.
+	if fromEvent := eventTranscriptPath(event); fromEvent != "" {
+		stateMu.Lock()
+		sessionTranscripts[sessionID] = fromEvent
+		stateMu.Unlock()
+		return fromEvent, false
+	}
+	// Stage 3: the cache stages 1/2/4 fill. Send() calls us before
+	// handleEvent takes stateMu, so take it here for the read — the critical
+	// section is a single map lookup.
+	stateMu.Lock()
+	cached := sessionTranscripts[sessionID]
+	stateMu.Unlock()
+	if cached != "" {
+		return cached, false
+	}
+	// Stage 4: a filename-bound session id is a real match (a wrongly-guessed
+	// stage-5 file never reaches the cache, so the scan stays reachable once
+	// the session's own transcript exists).
+	if byID := findSessionFileByID(sessionID); byID != "" {
+		// Re-check inside the lock: the stage-3 read above ran in its own
+		// critical section, so an authoritative stage-1/2 write may have
+		// landed while this scan was reading the disk. Writing byID
+		// unconditionally would resurrect the stale interleaving — the cached
+		// value wins instead (same-authority later writes are fine).
+		stateMu.Lock()
+		if cached := sessionTranscripts[sessionID]; cached != "" {
+			stateMu.Unlock()
+			return cached, false
+		}
+		sessionTranscripts[sessionID] = byID
+		stateMu.Unlock()
+		return byID, false
+	}
+	// Stage 5: newest *.jsonl under this cwd is a heuristic only — the file
+	// may belong to a different session that happens to share the cwd. It is
+	// returned flagged as a guess so it is never cached, and a later
+	// authoritative stage-1/2 value or a stage-4 id match can still correct
+	// it.
+	return newestJsonl(pigSessionDirForCwd(cwd)), true
 }
 
 // promptSequenceForSubmit mirrors internal/agentstate.PromptSequenceForSubmit:
@@ -125,15 +380,20 @@ func recordTaskCompletion(state *SessionState, signature string, at float64) boo
 // Extra carries the per-hook fields the caller merges in (`prompt`,
 // `last_assistant_message`), which win over the base fields exactly like the
 // TS object spread `{...base, ...extra}`.
+//
+// TranscriptPathGuessed records resolveTranscriptPath's verdict on
+// TranscriptPath: false for a trusted stage 1-4 value, true for a stage-5 cwd
+// guess. Only handleEvent reads it — the field never leaves the process.
 type HookPayload struct {
-	HookEventName    string
-	SessionID        string
-	TranscriptPath   string
-	Cwd              string
-	Model            string
-	ContextRemaining *float64
-	AgentKind        string
-	Extra            map[string]any
+	HookEventName         string
+	SessionID             string
+	TranscriptPath        string
+	TranscriptPathGuessed bool
+	Cwd                   string
+	Model                 string
+	ContextRemaining      *float64
+	AgentKind             string
+	Extra                 map[string]any
 }
 
 // field reads a payload property by its TS name.
@@ -168,19 +428,17 @@ func (p *HookPayload) str(key string) string { return firstString(p.field(key)) 
 
 // sessionIsChild reports whether the session was created by fork/clone/
 // newSession with lineage, in which case it stays out of the inbox
-// (TS L451).
-//
-// With agentSource "pi" the first two branches are the ones this generated file
-// can reach: the omp branch is keyed on agentSource and the third branch
-// returns early for every other family.
-func sessionIsChild(state *SessionState, payload *HookPayload) bool {
-	if agentSource == "omp" {
-		return payload.str("agent_kind") == "sub"
+// (TS pig: sessionIsChild). This file is generated for Pi, so the omp
+// agent_kind branch the generated TS carries for other families is gone.
+func sessionIsChild(state *SessionState, payload *HookPayload, event map[string]any) bool {
+	filePath := ""
+	if !payload.TranscriptPathGuessed {
+		// A stage-5 cwd guess may name another session's file: reading its
+		// header would suppress this session as a false lineage child. Trusted
+		// resolutions (stage 1-4) still identify the session on their own.
+		filePath = payload.TranscriptPath
 	}
-	if agentSource != "pi" && agentSource != "omo" {
-		return false
-	}
-	filePath := firstString(payload.TranscriptPath, state.TranscriptPath)
+	filePath = firstString(filePath, eventTranscriptPath(event), state.TranscriptPath)
 	if filePath == "" {
 		return false
 	}
@@ -262,8 +520,9 @@ func baseEnvelope(payload *HookPayload, sessionID, eventName string) *Envelope {
 }
 
 // handleEvent normalizes one event and queues at most one envelope
-// (TS: handleEvent, L532).
-func handleEvent(payload *HookPayload) {
+// (TS: handleEvent, L532). event is the raw host event the payload was built
+// from; sessionIsChild consults it as a transcript-field fallback.
+func handleEvent(payload *HookPayload, event map[string]any) {
 	sessionID := payload.SessionID
 	if sessionID == "" {
 		sessionID = newSessionID()
@@ -273,20 +532,34 @@ func handleEvent(payload *HookPayload) {
 	defer stateMu.Unlock()
 
 	state := stateFor(sessionID)
-	isChild := sessionIsChild(state, payload)
+	if payload.TranscriptPath != "" && !payload.TranscriptPathGuessed {
+		// Cache ownership stays with resolveTranscriptPath, which already
+		// stored every trusted (non-guessed) value; this write only matters
+		// for payloads built by hand, and it must never admit a stage-5
+		// guess — that would resurrect the cached-guess shadowing the
+		// stage-4 id scan was meant to fix. It must also never overwrite a
+		// *different* cached value: Send() resolves the payload outside this
+		// lock, so a stage-3 cache hit may carry a stale value while an
+		// interleaved authoritative stage-1/2 write already landed. An
+		// existing different value wins; equal or empty may be (re)written.
+		if cached := sessionTranscripts[sessionID]; cached == "" || cached == payload.TranscriptPath {
+			sessionTranscripts[sessionID] = payload.TranscriptPath
+		}
+	}
+	isChild := sessionIsChild(state, payload, event)
 
 	switch payload.HookEventName {
 	case "SessionStart":
-		// A child session's start would repoint the pane at a session whose
-		// transcript the daemon cannot serve — but only OMP subagents run in the
-		// parent process (agentSource check), and this file is generated for Pi.
-		if isChild && agentSource == "omp" {
-			return
-		}
+		// A lineage child's start still announces itself: the pane takeover is
+		// intended (the TS pig SessionStart branch has no isChild filter).
 		if payload.Model != "" {
 			state.Model = payload.Model
 		}
-		if payload.TranscriptPath != "" {
+		if payload.TranscriptPath != "" && !payload.TranscriptPathGuessed {
+			// state.TranscriptPath stores authoritative values only — a
+			// stage-5 guess never lands here: sessionIsChild falls back to
+			// this field and would read a foreign session's header,
+			// suppressing this session as a false lineage child.
 			state.TranscriptPath = payload.TranscriptPath
 		}
 		state.SessionStartTime = nowSeconds()
@@ -340,7 +613,7 @@ func handleEvent(payload *HookPayload) {
 		// Pi owns the approval prompt and decision; Moshi mirrors the waiting
 		// state so the daemon's TUI bridge can send a remote decision into the
 		// native prompt.
-		if isChild && agentSource == "omp" {
+		if isChild {
 			return
 		}
 		toolName := payload.str("tool_name")
@@ -431,7 +704,7 @@ func handleEvent(payload *HookPayload) {
 		SendEnvelope(envelope)
 
 	case "PermissionResolved":
-		if isChild && agentSource == "omp" {
+		if isChild {
 			return
 		}
 		title := agentDisplayName + " resumed"

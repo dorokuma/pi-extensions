@@ -50,7 +50,8 @@ func safeSessionID(ctx sdk.Context) (value string) {
 }
 
 // safeSessionFile reads sessionManager.getSessionFile(); an in-memory session
-// has none (TS: transcriptPath, L277).
+// has none. It is stage 1 of the transcriptPath chain
+// (TS pig: transcriptPath).
 func safeSessionFile(ctx sdk.Context) (value string) {
 	defer func() { _ = recover() }()
 	file, err := ctx.SessionManager().GetSessionFile()
@@ -108,17 +109,21 @@ func sessionID(event map[string]any, ctx sdk.Context) string {
 func Send(eventName string, event map[string]any, ctx sdk.Context, extra map[string]any) {
 	defer func() { _ = recover() }()
 
+	id := sessionID(event, ctx)
+	cwd := firstString(safeCwd(ctx), processCwd())
+	transcriptPath, guessed := resolveTranscriptPath(safeSessionFile(ctx), event, id, cwd)
 	payload := &HookPayload{
-		HookEventName:    eventName,
-		SessionID:        sessionID(event, ctx),
-		TranscriptPath:   safeSessionFile(ctx),
-		Cwd:              firstString(safeCwd(ctx), processCwd()),
-		Model:            modelLabelForCtx(ctx),
-		ContextRemaining: contextRemainingFrom(ctx),
-		AgentKind:        agentKind(event),
-		Extra:            extra,
+		HookEventName:         eventName,
+		SessionID:             id,
+		TranscriptPath:        transcriptPath,
+		TranscriptPathGuessed: guessed,
+		Cwd:                   cwd,
+		Model:                 modelLabelForCtx(ctx),
+		ContextRemaining:      contextRemainingFrom(ctx),
+		AgentKind:             agentKind(event),
+		Extra:                 extra,
 	}
-	handleEvent(payload)
+	handleEvent(payload, event)
 }
 
 // lastAssistantMessage carries the text agent_end remembered for the

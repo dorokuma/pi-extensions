@@ -4,6 +4,7 @@ package moshihooks
 // per-test reset of the process-level caches the extension keeps.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,11 +18,14 @@ var frozenNow = time.Date(2026, 10, 25, 12, 34, 56, 789000000, time.UTC)
 
 // clearEnvKeys are every variable detection reads. A test starts from "unset"
 // so an ambient tmux / herdr / zellij pane cannot change the expected envelope.
+// The pig session-root variables are cleared too: pigSessionsRoot must resolve
+// only from what the test itself sets.
 var clearEnvKeys = append([]string{
 	"MOSHI_SOCKET_PATH",
 	"TMUX", "TMUX_PANE",
 	"HERDR_ENV", "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_SOCKET_PATH",
 	"ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID",
+	"PIG_EXT_HOST_INFO", "PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_HOME", "XDG_CONFIG_HOME",
 }, MuxEnvKeys...)
 
 // newRecordingSender returns a Sender that records envelopes instead of dialing
@@ -58,6 +62,10 @@ func newHarness(t *testing.T, env map[string]string) *harness {
 	for _, key := range clearEnvKeys {
 		t.Setenv(key, "")
 	}
+	// Isolate pigSessionsRoot from the host's ~/.pig/agent/sessions: the
+	// highest-priority source points at a throwaway agent dir, so
+	// transcript-resolution fallbacks can never touch real session files.
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, t.TempDir()))
 	for key, value := range env {
 		t.Setenv(key, value)
 	}
@@ -91,7 +99,7 @@ func (h *harness) envelopes() []*Envelope {
 func (h *harness) deliver(payload *HookPayload) []*Envelope {
 	h.t.Helper()
 	before := len(h.recorded())
-	handleEvent(payload)
+	handleEvent(payload, nil)
 	all := h.envelopes()
 	if len(all) < before {
 		h.t.Fatalf("recorded envelopes shrank from %d to %d", before, len(all))

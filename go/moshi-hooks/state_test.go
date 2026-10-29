@@ -1,7 +1,9 @@
 package moshihooks
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -531,6 +533,333 @@ func TestRecordTaskCompletionSuppressesOnlyTheSameSignature(t *testing.T) {
 	}
 	if recordTaskCompletion(defaults, "", 301) {
 		t.Fatal("empty signature inside the cooldown must be suppressed")
+	}
+}
+
+// writeSessionFile writes one transcript into <agentDir>/sessions/<cwd-dir>/
+// and returns its path; header is the first jsonl line.
+func writeSessionFile(t *testing.T, agentDir, cwd, name, header string) string {
+	t.Helper()
+	dir := filepath.Join(agentDir, "sessions", encodeSessionCwd(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	file := filepath.Join(dir, name)
+	if err := os.WriteFile(file, []byte(header+"\n{\"type\":\"message\"}\n"), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	return file
+}
+
+func TestEncodeSessionCwd(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/work/moshi", "--work-moshi--"},
+		{"/a/b:c", "--a-b-c--"},
+		{"C:\\Users\\me", "--C--Users-me--"},
+		{"relative/dir", "--relative-dir--"},
+	}
+	for _, test := range cases {
+		if got := encodeSessionCwd(test.in); got != test.want {
+			t.Fatalf("encodeSessionCwd(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+func TestPigSessionsRootPriorityChain(t *testing.T) {
+	// Level by level: each higher-priority source shadows everything below.
+	t.Run("host info wins", func(t *testing.T) {
+		h := newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    fmt.Sprintf(`{"agentDir":%q}`, "/host/agent"),
+			"PIG_CODING_AGENT_DIR": "/env/agent",
+			"PIG_HOME":             "/home/pig",
+		})
+		_ = h
+		if got := pigSessionsRoot(); got != "/host/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q, want /host/agent/sessions", got)
+		}
+	})
+	t.Run("coding agent dir next", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    "",
+			"PIG_CODING_AGENT_DIR": "/env/agent",
+			"PIG_HOME":             "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/env/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("pi agent dir is the pig fallback", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":   "",
+			"PI_CODING_AGENT_DIR": "/pi/agent",
+			"PIG_HOME":            "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/pi/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("pig home appends agent", func(t *testing.T) {
+		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "PIG_HOME": "/home/pig"})
+		if got := pigSessionsRoot(); got != "/home/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("xdg pig config appends agent", func(t *testing.T) {
+		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "XDG_CONFIG_HOME": "/xdg"})
+		if got := pigSessionsRoot(); got != "/xdg/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+	t.Run("host info without agentDir falls through", func(t *testing.T) {
+		newHarness(t, map[string]string{
+			"PIG_EXT_HOST_INFO":    `{"other":true}`,
+			"PIG_CODING_AGENT_DIR": "",
+			"PI_CODING_AGENT_DIR":  "",
+			"PIG_HOME":             "/home/pig",
+		})
+		if got := pigSessionsRoot(); got != "/home/pig/agent/sessions" {
+			t.Fatalf("pigSessionsRoot = %q", got)
+		}
+	})
+}
+
+func TestResolveTranscriptPathStages(t *testing.T) {
+	h := newHarness(t, nil)
+	_ = h
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// Stage 1: an explicit session file wins over everything.
+	if got, _ := resolveTranscriptPath("/mgr/t.jsonl", map[string]any{"transcript_path": "/ev/t.jsonl"}, "sid", "/work"); got != "/mgr/t.jsonl" {
+		t.Fatalf("stage1 = %q, want /mgr/t.jsonl", got)
+	}
+
+	// Stage 2: event transcript fields, in priority order.
+	for _, key := range []string{"transcript_path", "transcriptPath", "sessionFile", "session_file", "sessionPath"} {
+		event := map[string]any{key: "/ev/" + key + ".jsonl"}
+		if got, _ := resolveTranscriptPath("", event, "sid", "/work"); got != "/ev/"+key+".jsonl" {
+			t.Fatalf("stage2 %s = %q", key, got)
+		}
+	}
+
+	// Stage 3: the session-id scan finds the transcript in a different cwd dir.
+	other := writeSessionFile(t, agentDir, "/other/cwd", "2026-10-25T00-00-00-000Z_sid-9.jsonl", `{"type":"session"}`)
+	if got, _ := resolveTranscriptPath("", nil, "sid-9", "/work/moshi"); got != other {
+		t.Fatalf("stage3 = %q, want %q", got, other)
+	}
+	// A sessionID equal to agentSource never scans.
+	if got, _ := resolveTranscriptPath("", nil, agentSource, "/nonexistent"); got != "" {
+		t.Fatalf("agentSource id must not scan, got %q", got)
+	}
+
+	// Stage 4: the newest *.jsonl in this cwd's session directory.
+	cwd := "/work/moshi"
+	older := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_aaa.jsonl", `{"type":"session"}`)
+	newer := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_bbb.jsonl", `{"type":"session"}`)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(older, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if got, guessed := resolveTranscriptPath("", nil, "no-such-id", cwd); got != newer || !guessed {
+		t.Fatalf("stage4 = %q (guessed %v), want %q guessed", got, guessed, newer)
+	}
+	// An unknown cwd yields nothing.
+	if got, _ := resolveTranscriptPath("", nil, "no-such-id", "/no/dir"); got != "" {
+		t.Fatalf("stage4 unknown cwd = %q, want empty", got)
+	}
+}
+
+func TestStage4ChildSessionIsDetected(t *testing.T) {
+	h := newHarness(t, nil)
+	_ = h
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+	path := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_child1.jsonl", `{"type":"session","parentSession":"parent-1"}`)
+
+	// The stage-4 path is also what lineage detection reads: a transcript the
+	// host never handed us still identifies the session as a child. The
+	// session id names the file (findSessionFileByID matches the _child1
+	// suffix), so resolveTranscriptPath returns it as a trusted stage-4 hit —
+	// guessed stays false and the payload needs no explicit flag, exactly like
+	// a payload Send() assembles from this resolution.
+	resolved, guessed := resolveTranscriptPath("", nil, "child1", cwd)
+	if resolved != path || guessed {
+		t.Fatalf("stage4 resolved %q (guessed %v), want %q not guessed", resolved, guessed, path)
+	}
+	payload := payloadFor("UserPromptSubmit")
+	payload.SessionID = "child1"
+	payload.TranscriptPath = resolved
+	h.deliverNothing(payload)
+}
+
+func TestGuessedTranscriptPathStaysOutOfSessionState(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+
+	// session_start fired before this session's transcript hit disk: stage 5
+	// resolves to the newest *.jsonl under the cwd — here a sibling session's
+	// file whose header carries parentSession. The payload flags it as a
+	// guess, so SessionStart must not store it in state.TranscriptPath:
+	// sessionIsChild falls back to that field and would read the foreign
+	// header on the next event, suppressing this session as a false child.
+	own := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_aaa.jsonl", `{"type":"session","id":"session-1"}`)
+	child := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_child1.jsonl", `{"type":"session","parentSession":"parent-1"}`)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(own, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	guess, guessed := resolveTranscriptPath("", nil, "session-1", cwd)
+	if guess != child || !guessed {
+		t.Fatalf("stage5 guess = %q (guessed %v), want %q guessed", guess, guessed, child)
+	}
+
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = guess
+	payload.TranscriptPathGuessed = guessed
+	h.deliverOne(payload)
+	if got := sessions["session-1"].TranscriptPath; got != "" {
+		t.Fatalf("state.TranscriptPath = %q, want empty (guesses never enter state)", got)
+	}
+
+	// The next event resolves the same guess, but neither the payload nor
+	// the stored state may hand it to lineage detection: this session is
+	// not the child the foreign header describes.
+	prompt := payloadFor("UserPromptSubmit")
+	prompt.TranscriptPath = guess
+	prompt.TranscriptPathGuessed = true
+	prompt.Extra = map[string]any{"prompt": "hello"}
+	if envelope := h.deliverOne(prompt); envelope.EventName != "SessionStart" {
+		t.Fatalf("EventName = %q, want SessionStart (foreign transcript must not mark this session a child)", envelope.EventName)
+	}
+}
+
+func TestSessionTranscriptIsCached(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// First event resolves the transcript (here: straight from the payload) and
+	// caches it under the session id.
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = "/cached/t.jsonl"
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != "/cached/t.jsonl" {
+		t.Fatalf("sessionTranscripts = %q, want /cached/t.jsonl", got)
+	}
+
+	// A second event carrying no transcript path of its own reuses the cached
+	// value — even when the disk fallback chain would resolve to a *different*
+	// file. Without the level-0 cache lookup the fallback wins and this fails.
+	// (resolveTranscriptPath is what Send() calls while assembling the next
+	// payload, so it is the seam where the cache must take effect.)
+	other := writeSessionFile(t, agentDir, "/work/moshi", "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
+	got, _ := resolveTranscriptPath("", nil, "session-1", "/work/moshi")
+	if got != "/cached/t.jsonl" {
+		t.Fatalf("cached path not reused: got %q (disk fallback %q), want /cached/t.jsonl", got, other)
+	}
+
+	// A payload carrying a stage-5 guess (flagged by resolveTranscriptPath)
+	// must never enter the cache: caching it would resurrect the shadow that
+	// blocks the stage-4 id scan.
+	guessPayload := payloadFor("SessionStart")
+	guessPayload.SessionID = "session-2"
+	guessPayload.TranscriptPath = other
+	guessPayload.TranscriptPathGuessed = true
+	h.deliverOne(guessPayload)
+	if got := sessionTranscripts["session-2"]; got != "" {
+		t.Fatalf("guessed path entered the cache: sessionTranscripts = %q, want empty", got)
+	}
+}
+
+func TestAuthoritativeTranscriptPathOverridesCachedGuess(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+	cwd := "/work/moshi"
+
+	// session_start fired before this session's transcript hit disk: the
+	// stage-5 cwd fallback resolved to an older session's file. The payload
+	// carries it flagged as a guess, so handleEvent must NOT cache it — a
+	// cached guess would shadow the stage-4 id scan below.
+	stale := writeSessionFile(t, agentDir, cwd, "2026-10-25T00-00-00-000Z_other.jsonl", `{"type":"session"}`)
+	guess, guessed := resolveTranscriptPath("", nil, "session-1", cwd)
+	if guess != stale || !guessed {
+		t.Fatalf("stage5 guess = %q (guessed %v), want %q guessed", guess, guessed, stale)
+	}
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = guess
+	payload.TranscriptPathGuessed = guessed
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != "" {
+		t.Fatalf("cached guess = %q, want empty (guesses are never cached)", got)
+	}
+
+	// The session's own transcript now lands on disk. A later event with no
+	// transcript path at all must reach the stage-4 id scan — if the guess
+	// above had entered sessionTranscripts, stage 3 would return the stale
+	// file forever. This is the defect the guessed flag fixes.
+	authoritative := writeSessionFile(t, agentDir, cwd, "2026-10-25T01-00-00-000Z_session-1.jsonl", `{"type":"session"}`)
+	if got, _ := resolveTranscriptPath("", nil, "session-1", cwd); got != authoritative {
+		t.Fatalf("stage-4 id scan blocked: got %q, want %q", got, authoritative)
+	}
+
+	// An event-carried path still wins over a stale cache entry and upgrades
+	// it — seed one through a non-guessed payload first.
+	stalePayload := payloadFor("SessionStart")
+	stalePayload.SessionID = "session-3"
+	stalePayload.TranscriptPath = stale
+	h.deliverOne(stalePayload)
+	if got := sessionTranscripts["session-3"]; got != stale {
+		t.Fatalf("seeded cache = %q, want %q", got, stale)
+	}
+	event := map[string]any{"transcript_path": authoritative}
+	if got, _ := resolveTranscriptPath("", event, "session-3", cwd); got != authoritative {
+		t.Fatalf("event-carried path lost to cached guess: got %q, want %q", got, authoritative)
+	}
+	if got := sessionTranscripts["session-3"]; got != authoritative {
+		t.Fatalf("cache not upgraded: got %q, want %q", got, authoritative)
+	}
+}
+
+// TestStaleCacheReadNeverOverwritesNewerValue is the regression for the
+// stale-read write-back race: handleEvent and stage 4 re-read the cache inside
+// the lock before writing, so a value resolved before an interleaved
+// authoritative stage-1/2 write cannot clobber it.
+func TestStaleCacheReadNeverOverwritesNewerValue(t *testing.T) {
+	h := newHarness(t, nil)
+	agentDir := t.TempDir()
+	t.Setenv("PIG_EXT_HOST_INFO", fmt.Sprintf(`{"agentDir":%q}`, agentDir))
+
+	// Interleave 1 (handleEvent): goroutine A resolved the stale X through a
+	// stage-3 cache hit; before its handleEvent ran, goroutine B landed the
+	// authoritative Y via stage 1/2. The payload carries X flagged as trusted
+	// (not guessed), and the unconditional write used to put X back over Y.
+	staleX := writeSessionFile(t, agentDir, "/stale/cwd", "2026-10-25T00-00-00-000Z_stale.jsonl", `{"type":"session"}`)
+	authY := "/authoritative/session-1.jsonl"
+	sessionTranscripts["session-1"] = authY
+
+	payload := payloadFor("SessionStart")
+	payload.TranscriptPath = staleX
+	payload.TranscriptPathGuessed = false
+	h.deliverOne(payload)
+	if got := sessionTranscripts["session-1"]; got != authY {
+		t.Fatalf("stale payload overwrote newer cache: sessionTranscripts = %q, want %q", got, authY)
+	}
+
+	// Interleave 2 (stage 4): goroutine A read an empty stage-3 cache and
+	// found the on-disk W; meanwhile goroutine B landed Y. The unconditional
+	// stage-4 write used to put W over Y.
+	resolvedW := writeSessionFile(t, agentDir, "/work/moshi", "2026-10-25T01-00-00-000Z_session-4.jsonl", `{"type":"session"}`)
+	sessionTranscripts["session-4"] = authY
+	got, _ := resolveTranscriptPath("", nil, "session-4", "/work/moshi")
+	if got != authY {
+		t.Fatalf("stage-4 scan overwrote newer cache: resolved %q (scan found %q), want cached %q", got, resolvedW, authY)
+	}
+	if got := sessionTranscripts["session-4"]; got != authY {
+		t.Fatalf("sessionTranscripts = %q, want %q", got, authY)
 	}
 }
 
