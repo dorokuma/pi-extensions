@@ -1,8 +1,8 @@
 {
   "_comment": "联邦式 Pi 扩展注册表：全机 11 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。",
   "schemaVersion": 1,
-  "defaultDestDir": "/root/.pi/agent/extensions",
-  "settingsJson": "/root/.pi/agent/settings.json",
+  "defaultDestDir": "/root/.pig/agent/extensions",
+  "settingsJson": "/root/.pig/agent/settings.json",
   "neverWrite": [
     "herdr-agent-state.ts"
   ],
@@ -12,7 +12,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "auto-continue.ts",
-      "targetPath": "/root/.pi/agent/extensions/auto-continue.ts",
+      "targetPath": "/root/.pig/agent/extensions/auto-continue.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts",
@@ -26,7 +26,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "no-tables.ts",
-      "targetPath": "/root/.pi/agent/extensions/no-tables.ts",
+      "targetPath": "/root/.pig/agent/extensions/no-tables.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts",
@@ -40,9 +40,9 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "herdsman-pi.ts",
-      "targetPath": "/root/.pi/agent/extensions/herdsman-pi.ts",
+      "targetPath": "/root/.pig/agent/extensions/herdsman-pi.ts",
       "doubleLoadGuard": {
-        "settingsFile": "/root/.pi/agent/settings.json",
+        "settingsFile": "/root/.pig/agent/settings.json",
         "packageGlobs": [
           "@dorokuma/herdsman-pi",
           "herdsman-pi"
@@ -62,7 +62,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "ctx-orchestrate.ts",
-      "targetPath": "/root/.pi/agent/extensions/ctx-orchestrate.ts",
+      "targetPath": "/root/.pig/agent/extensions/ctx-orchestrate.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts",
@@ -76,7 +76,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "jev-gate.ts",
-      "targetPath": "/root/.pi/agent/extensions/jev-gate.ts",
+      "targetPath": "/root/.pig/agent/extensions/jev-gate.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts",
@@ -90,7 +90,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "exclude-tools-guard.ts",
-      "targetPath": "/root/.pi/agent/extensions/exclude-tools-guard.ts",
+      "targetPath": "/root/.pig/agent/extensions/exclude-tools-guard.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts",
@@ -104,7 +104,7 @@
       "category": "hosted",
       "managed": "this-repo",
       "destFile": "magpie-image.ts",
-      "targetPath": "/root/.pi/agent/extensions/magpie-image.ts",
+      "targetPath": "/root/.pig/agent/extensions/magpie-image.ts",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts",
@@ -118,7 +118,7 @@
       "category": "federated",
       "managed": "upstream-repo",
       "destFile": "codegraph-go.ts",
-      "targetPath": "/root/.pi/agent/extensions/codegraph-go.ts",
+      "targetPath": "/root/.pig/agent/extensions/codegraph-go.ts",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts",
@@ -132,7 +132,7 @@
       "category": "federated",
       "managed": "upstream-repo",
       "destFile": "ctxmode.ts",
-      "targetPath": "/root/.pi/agent/extensions/ctxmode.ts",
+      "targetPath": "/root/.pig/agent/extensions/ctxmode.ts",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/ctxmode/integrations/pi/ctxmode.ts",
@@ -146,7 +146,7 @@
       "category": "federated",
       "managed": "upstream-repo",
       "destFile": "cache-stats.ts",
-      "targetPath": "/root/.pi/agent/extensions/cache-stats.ts",
+      "targetPath": "/root/.pig/agent/extensions/cache-stats.ts",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/pi-cache-stats/extensions/cache-stats.ts",
@@ -160,7 +160,7 @@
       "category": "external",
       "managed": "herdr-binary",
       "destFile": "herdr-agent-state.ts",
-      "targetPath": "/root/.pi/agent/extensions/herdr-agent-state.ts",
+      "targetPath": "/root/.pig/agent/extensions/herdr-agent-state.ts",
       "authority": {
         "kind": "out-of-band-herdr",
         "sourcePath": null,
