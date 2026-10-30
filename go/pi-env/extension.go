@@ -689,6 +689,42 @@ func ApplyEnv(cwd string) ApplyResult {
 	return ApplyEnvExplicit(globalEnv, projectEnv, os.LookupEnv, os.Setenv, os.Unsetenv)
 }
 
+// sensitiveEnvKey reports whether key looks like a credential-bearing name
+// (contains KEY/TOKEN/SECRET/PASSWORD/PASS/AUTH/CREDENTIAL/CREDS/JWT/SESSION/
+// DSN/PRIVATE/BEARER/URL/URI/PASSCODE, case-insensitive). Such values are
+// masked in the /env report to avoid rendering secrets into the session.
+// URL/URI intentionally catch connection-string keys that may embed
+// user:pass@ credentials (DATABASE_URL, REDIS_URL, MONGO_URI, ...).
+// Substring matching may over-trigger on non-sensitive keys (e.g. AUTHOR,
+// OAUTH_URL, BASE_URL, CALLBACK_URI, PUBLIC_URL); that trades a slightly
+// noisy report for never leaking a credential, which is the safe direction.
+func sensitiveEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+	for _, marker := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "AUTH", "CREDENTIAL", "CREDS", "JWT", "SESSION", "DSN", "PRIVATE", "BEARER", "URL", "URI", "PASSCODE"} {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// maskSecretValue renders a secret for the /env report without exposing enough
+// of it to be enumerable. Values of 16 runes or fewer are fully masked — short
+// passwords/tokens get no reveal at all. Only longer values render as
+// `first4…last4` (e.g. abcd…wxyz) for identification. Empty values render as
+// `(empty)`.
+func maskSecretValue(val string) string {
+	runes := []rune(val)
+	switch {
+	case len(runes) == 0:
+		return "(empty)"
+	case len(runes) <= 16:
+		return "…"
+	default:
+		return string(runes[:4]) + "…" + string(runes[len(runes)-4:])
+	}
+}
+
 // FormatReport styles the environment report for /env command display, preserving key order.
 func FormatReport(theme ThemeRenderer, reports []EnvReport) string {
 	if len(reports) == 0 {
@@ -720,6 +756,9 @@ func FormatReport(theme ThemeRenderer, reports []EnvReport) string {
 		}
 		for _, key := range keys {
 			val := report.Variables[key]
+			if sensitiveEnvKey(key) {
+				val = maskSecretValue(val)
+			}
 			if theme != nil {
 				sb.WriteString(fmt.Sprintf("    %s%s%s\n",
 					theme.Fg("success", key),
