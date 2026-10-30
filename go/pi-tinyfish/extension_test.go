@@ -195,7 +195,7 @@ func TestFormatFetchResponse(t *testing.T) {
 	lang1 := "zh"
 	author1 := "Alice"
 	pubDate1 := "2026-10-23"
-	latency1 := int64(120)
+	latency1 := json.Number("120")
 
 	// Create 55 links to test link preview truncation at 50
 	var manyLinks []string

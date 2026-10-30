@@ -90,18 +90,35 @@ type FetchParams struct {
 
 // FetchPageResult represents a single successfully fetched and extracted page.
 type FetchPageResult struct {
-	URL           string   `json:"url"`
-	FinalURL      *string  `json:"final_url,omitempty"`
-	Title         *string  `json:"title,omitempty"`
-	Description   *string  `json:"description,omitempty"`
-	Language      *string  `json:"language,omitempty"`
-	Author        *string  `json:"author,omitempty"`
-	PublishedDate *string  `json:"published_date,omitempty"`
-	Format        string   `json:"format"`
-	Text          any      `json:"text,omitempty"`
-	Links         []string `json:"links,omitempty"`
-	ImageLinks    []string `json:"image_links,omitempty"`
-	LatencyMs     *int64   `json:"latency_ms,omitempty"`
+	URL           string       `json:"url"`
+	FinalURL      *string      `json:"final_url,omitempty"`
+	Title         *string      `json:"title,omitempty"`
+	Description   *string      `json:"description,omitempty"`
+	Language      *string      `json:"language,omitempty"`
+	Author        *string      `json:"author,omitempty"`
+	PublishedDate *string      `json:"published_date,omitempty"`
+	Format        string       `json:"format"`
+	Text          any          `json:"text,omitempty"`
+	Links         []string     `json:"links,omitempty"`
+	ImageLinks    []string     `json:"image_links,omitempty"`
+	LatencyMs     *json.Number `json:"latency_ms,omitempty"`
+}
+
+// Milliseconds returns the latency in milliseconds as an int64, rounding to
+// the nearest millisecond. It returns 0 when the latency is absent or cannot
+// be parsed as a number.
+func (p *FetchPageResult) Milliseconds() int64 {
+	if p == nil || p.LatencyMs == nil {
+		return 0
+	}
+	if i, err := p.LatencyMs.Int64(); err == nil {
+		return i
+	}
+	f, err := p.LatencyMs.Float64()
+	if err != nil {
+		return 0
+	}
+	return int64(f + 0.5)
 }
 
 // FetchError represents an error encountered while fetching an individual URL.

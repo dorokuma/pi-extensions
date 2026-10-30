@@ -263,7 +263,7 @@ func FormatFetchResponse(res *FetchResponse) string {
 			lines = append(lines, fmt.Sprintf("Published: %s", *page.PublishedDate))
 		}
 		if page.LatencyMs != nil {
-			lines = append(lines, fmt.Sprintf("Latency: %dms", *page.LatencyMs))
+			lines = append(lines, fmt.Sprintf("Latency: %dms", page.Milliseconds()))
 		}
 		lines = append(lines, fmt.Sprintf("Format: %s", page.Format))
 
