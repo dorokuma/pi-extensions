@@ -105,7 +105,7 @@ PiG Go 原生组件：与 Herdr 守护进程进行状态同步与会话上报。
 |---|---|---|---|
 | `pane_id` | 必须 | 必须 | `os.Getenv("HERDR_PANE_ID")` |
 | `source` | 必须 | 必须 | 固定 `"pig"`（**不能**用 `"herdr:pi"`，见 §2.1） |
-| `agent` | 必须 | 必须 | 固定 `"pig"` |
+| `agent` | 必须 | 必须 | 固定 `"pi"`（moshi gateway 的 canonicalAgentName 白名单只认 22 个官方 agent 名，拒收 `"pig"`，见 §2.1） |
 | `seq` | 可选/递增 | 可选/递增 | 单调自增序列号，起始于 `time.Now().UnixMilli()*1000` |
 | `state` | 必须 | - | `"idle"` \| `"working"` \| `"blocked"` |
 | `message` | 可选 | - | 当 blocked 时为阻断原因/标签（如 `data.label`），非 blocked 为 null |
@@ -133,8 +133,11 @@ Herdr 自带内置 `pi` 集成（`herdr integration install pi`，部署物
 | `herdr:pig` / `pig` / `pi` / 任意非内置 id | 是 |
 
 官方文档同样写明：`--source` 要 stable、unique，且 **不要以 `herdr:` 开头**，因为那是
-Herdr 自己集成的命名空间。故本组件取 `source = "pig"`、`agent = "pig"`
-（`herdr pane get` 显示 `agent: pig`）。
+Herdr 自己集成的命名空间。故本组件取 `source = "pig"`（不被 Herdr 内置集成占用的自有
+source）、`agent = "pi"`（上报的 agent 标签，moshi gateway 的 canonicalAgentName 白
+名单只认 22 个官方 agent 名、拒收 `"pig"`）；`herdr pane get` 显示 `agent: pi`。
+注意这三个同名概念别混淆：上报的 `agent` 标签是 `"pi"`，集成 `source` 是 `"pig"`，
+而 `resume_argv` 里的 `"pig"` 是 PiG 二进制进程名。
 
 **Herdr 0.9.5 的 `is_official_agent_source` 过滤（回读侧副作用）**：Herdr 0.9.5 只把
 「官方集成 source」（`is_official_agent_source` 为真，即 Herdr 自带集成登记在册的 source）
@@ -154,7 +157,7 @@ resume 命令，直到 pane 退回空闲 shell 提示符。Go 版在 `session_sh
 |---|---|---|
 | `pane_id` | 必须 | `os.Getenv("HERDR_PANE_ID")` |
 | `source` | 必须 | 固定 `"pig"`（**不能**用 `"herdr:pi"`，见 §2.1） |
-| `agent` | 必须 | 固定 `"pig"` |
+| `agent` | 必须 | 固定 `"pi"`（与状态上报同一 agent 标签，见 §2.1） |
 | `seq` | 可选（推荐） | 单调自增序列号，保证 release 排在同 source 的最后一次状态上报之后 |
 
 ### 2.3 响应信封校验（送达判定）
@@ -315,7 +318,7 @@ socket，退出释放包由 shutdown handler 同步发出。由此留下三个�
 | **启用条件判定** | L18-20 (`enabled()`) | `extension.go: Enabled()` | `HERDR_ENV=="1" && socketPath!="" && paneId!=""`，不满足时完全 no-op |
 | **单次发送尝试** | L22-48 (`sendRequestAttempt`) | `transport.go: Client.SendRequestAttempt()` | 建立 Unix 短连接，写 JSON + `\n`，**按换行帧完整读取**响应（≤ 64KiB；半帧/空帧/超长帧判未送达）后解析并校验 `id`/`result`/`error` 信封判定送达；单次 attempt 硬上限 = 500ms / 1500ms（dial 与 I/O 共享总超时 deadline） |
 | **送达结果回灌** | 未实现（TS 无回执概念） | `transport.go: Client.SendRequest()`, `SendReportAgent()` | **新增**：返回 `bool`（任一 attempt 通过 `validateResponse()` 即为 `true`），供状态机判定「真持窗」（S1）与退出释放时序（S2），见 §2.3 / §2.4 |
-| **source 身份** | L16 `source = "herdr:pi"` | `transport.go: SourcePi = "pig"` | **偏离**：`herdr:pi` 被 Herdr 内置 pi 集成占用，上报被静默丢弃（见 §2.1）；`agent` 亦为 `"pig"` |
+| **source 身份** | L16 `source = "herdr:pi"` | `transport.go: SourcePi = "pig"` / `AgentPi = "pi"` | **偏离**：`herdr:pi` 被 Herdr 内置 pi 集成占用，上报被静默丢弃（见 §2.1）；`agent` 上报 `"pi"`（moshi 白名单拒收 `"pig"`） |
 | **resume 命令** | 未实现 | `transport.go: ResumeCommand()` + `state.go` 持窗门禁 | **新增**：`["pig","--session",<path|id>]`，仅在 Herdr 已接受过一次状态上报（真持窗）后附带（见 §2.4 S1） |
 | **退出释放** | 未实现 | `state.go: HandleSessionShutdown()` | **新增**：`session_shutdown` 时发 `pane.release_agent`（pane_id/source/agent/seq），并先复位状态机、等待在飞排空迭代结束，再把释放包**入队到所有在飞请求之后**（见 §2.4 S2 / S4）；释放包出队时复核世代，被新会话接管时丢弃这份过期释放包（见 §2.4 S3） |
 | **超时与重试** | L50-55 (`sendRequest`) | `transport.go: Client.SendRequest()` | 500ms 首次尝试超时，失败后进行 1500ms 第二次尝试重试；单次 attempt 硬上限 = 500ms / 1500ms，与 TS 一致 |
@@ -341,7 +344,7 @@ socket，退出释放包由 shutdown handler 同步发出。由此留下三个�
 3. **平台支持与 Windows 命名管道 (S2)**：原版 TS 支持 Windows Named Pipe（`\\.\pipe\...`），Go 版本由于标准库 net 不原生支持 Windows 命名管道（需引入外部非标准依赖 `winio`），当前仅支持 Linux/macOS（Unix domain socket），Windows 未支持，【差异说明】。
 4. **会话上报 seq 顺序 (S3)**：TS 在单线程执行栈中先执行 `void reportSession()` 同步分配 seq，再执行 `publishState()` 分配状态 seq。Go 版在 handler 内**同一次加锁**内快照 `sessionRef` 并分配 `seq`，再把请求交给**统一发送生命周期**（单一 dispatcher 逐个写 socket），严格保证 `report_agent_session.seq < 随后 report_agent.seq` 且**上线路序与 seq 序一致**，【已对齐】（见 §2.4 S4）。
 5. **测试可观测性**：Go 实现支持注入超时配置与排空完成通知 channel，使测试可以在真实 Unix Socket 假服务端上在毫秒级快速断言超时重试与排队合并，无需死等真实 2 秒。
-6. **source 身份偏离**：TS 原版固定 `source = "herdr:pi"`，而那正是 Herdr 内置 `pi` 集成占用的 source，上报会被静默丢弃；Go 版取 `source = "pig"`、`agent = "pig"`（见 §2.1）。
+6. **source 身份偏离**：TS 原版固定 `source = "herdr:pi"`，而那正是 Herdr 内置 `pi` 集成占用的 source，上报会被静默丢弃；Go 版取 `source = "pig"`（自有集成 source）、`agent = "pi"`（上报 agent 标签，moshi 白名单只认官方 agent 名）；`resume_argv` 中的 `"pig"` 是恢复进程的 PiG 二进制名（见 §2.1）。
 7. **resume 命令（`resume_argv`）**：TS 原版未实现。Go 版新增 `["pig","--session",<真实 path 或 id>]`（`transport.go: ResumeCommand()`），且仅在 Herdr 已接受过一次状态上报（真持窗）后附带，避免 Herdr 以 `resume_not_accepted` 拒绝（见 §2 表 `resume_argv` 行、§2.4 S1、§3）。
 8. **退出释放（`pane.release_agent`）**：TS 原版未实现。Go 版在 `session_shutdown` 时显式释放持窗，让 Herdr 立即清掉 agent 名、状态与 resume 命令；释放前先复位状态机并等待在飞状态上报结束，保证 release 排在最后一个 report 之后（见 §2.2、§2.4 S2、§3）。
 9. **响应信封校验**：TS 原版「收到任意字节即算送达」，会吞掉 Herdr 的错误信封；Go 版解析并校验 `id` / `result` / `error`，非 JSON、错误信封、`id` 不匹配一律判未送达并触发重试（见 §2.3）。
@@ -410,7 +413,7 @@ go test -count=1 -race -v ./...
   - `TestStateMachine_Transitions`：完整验证 `idle -> working -> blocked -> working -> idle` 状态转移序列，验证去重与 force 逻辑。
   - `TestQueue_CoalescingAndSerialization`：高并发快速推入 3 个状态，验证中间状态被自动合并仅发最新状态，且连接峰值并发严格为 1。
   - `TestLifecycle_AgentSettledGate`：使用真实 Unix Socket 假服务端断言非 rootSession 忽略、isIdle 非 true 时绝对零发送且不置 idle、isIdle=true 成功置 idle 并发送上报。
-  - `TestRelease_AndResumeArgv`：真实 Unix Socket 截获请求，断言状态上报 `pane.report_agent` 携带 `resume_argv = ["pig","--session",<path>]`；假服务端对状态上报延迟 150ms 才回包，使该上报在飞期间触发 `session_shutdown`，断言 handler 复位整个状态机（`rootSession`/`queuedState`/`agentStateReported`/`lastState`/`lastMessage`/`agentActive`/`blockedCount`/`blockedMessage` 全清、在飞排空结束）、`pane.report_agent` **先于** `pane.release_agent` 抵达（释放包不被在飞上报反超），且 `pane.release_agent` 含 `pane_id`/`source`/`agent`/`seq`、身份字段与 `source=pig`、`agent=pig` 一致、`release_agent.seq > report_agent.seq`；同一用例再追加**会话世代隔离**断言：第二次 `session_start` 后让一个 handler 卡在锁外的 `IsIdle()` 查询上，并发触发 `session_shutdown`，断言该滞后的 handler 不会在 `pane.release_agent` **之后**再发出新的 `pane.report_agent`（见 §2.4 S3）。
+  - `TestRelease_AndResumeArgv`：真实 Unix Socket 截获请求，断言状态上报 `pane.report_agent` 携带 `resume_argv = ["pig","--session",<path>]`；假服务端对状态上报延迟 150ms 才回包，使该上报在飞期间触发 `session_shutdown`，断言 handler 复位整个状态机（`rootSession`/`queuedState`/`agentStateReported`/`lastState`/`lastMessage`/`agentActive`/`blockedCount`/`blockedMessage` 全清、在飞排空结束）、`pane.report_agent` **先于** `pane.release_agent` 抵达（释放包不被在飞上报反超），且 `pane.release_agent` 含 `pane_id`/`source`/`agent`/`seq`、身份字段与 `source=pig`、`agent=pi` 一致、`release_agent.seq > report_agent.seq`；同一用例再追加**会话世代隔离**断言：第二次 `session_start` 后让一个 handler 卡在锁外的 `IsIdle()` 查询上，并发触发 `session_shutdown`，断言该滞后的 handler 不会在 `pane.release_agent` **之后**再发出新的 `pane.report_agent`（见 §2.4 S3）。
   - `TestResume_NotOnSessionReportBeforePaneHeld`：真实 Unix Socket 假服务端下断言 source 尚未持窗时首次 `pane.report_agent_session` **不带** `resume_argv`（否则 Herdr 以 `resume_not_accepted` 拒绝）；经一次**被 Herdr 接受的状态上报**后才置位 `agentStateReported`（入队不置位），此后会话上报携带 `["pig","--session",<path>]`。
 - **内存 Dummy / Seam 判定用例**：
   - `TestEventHandlers_Logic`：使用 `dummy.sock` 验证事件总线阻断计数累加与递减逻辑。
@@ -420,7 +423,7 @@ go test -count=1 -race -v ./...
   - `TestLifecycle_BlockedPriorityAndMessages`：使用 `dummy.sock` 验证阻断计数与消息优先级（blocked 优先于 working/idle，最新 label 优先）。
   - `TestExtension_EventWiring`：使用 `dummy.sock` 验证 `Extension()` 启用时各事件正确接线无 panic。
   - `TestPathValidation_IsAbsolutePosixOrWin32`：纯函数路径校验，验证 POSIX、Windows 盘符路径、UNC 路径及相对路径识别。
-  - `TestSource_NotReservedByHerdr`：断言 `agent == "pig"`、`source` 非空且不以 `herdr:` 开头、也不等于 `herdr:pi`（Herdr 为自己的集成保留该命名空间），并断言 session / release 两类上报携带同一个 `source`。
+  - `TestSource_NotReservedByHerdr`：断言 `agent == "pi"`、`source == "pig"` 且不以 `herdr:` 开头、也不等于 `herdr:pi`（Herdr 为自己的集成保留该命名空间），并断言 session / release 两类上报携带同一个 `source`。
 
 ---
 

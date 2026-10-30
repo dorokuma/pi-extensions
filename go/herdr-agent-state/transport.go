@@ -43,7 +43,12 @@ const (
 	// identifies your integration. Keep it stable and unique. Don't start it with
 	// herdr:, because Herdr's own integrations use that prefix."
 	SourcePi = "pig"
-	AgentPi  = "pig"
+	// AgentPi is the agent label reported to Herdr/gateway. It must be "pi"
+	// (the moshi gateway's canonicalAgentName whitelist only recognizes the
+	// 22 official agents including "pi", and rejects "pig"), whereas
+	// SourcePi is the integration source and stays "pig" so Herdr does not
+	// silently drop the report.
+	AgentPi = "pi"
 )
 
 // Sequence generator matching TS: let reportSeq = Date.now() * 1000; reportSeq += 1;
