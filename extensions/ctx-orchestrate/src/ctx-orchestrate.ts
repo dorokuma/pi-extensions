@@ -103,6 +103,35 @@ function oneLine(text: string, cap = EXCERPT_CAP): string {
 
 // ---- 诊断（TUI-safe：默认只写文件，禁 console.*） ---------------------------
 
+/**
+ * Resolve the agent configuration directory, mirroring the Go port's
+ * resolveAgentDir: PIG_EXT_HOST_INFO.agentDir, PI_CODING_AGENT_DIR,
+ * PIG_CODING_AGENT_DIR, $PIG_HOME/agent, ~/.pig/agent — never ~/.pi.
+ * Returns "" only when no home resolves.
+ */
+function resolveAgentDir(): string {
+  try {
+    const raw = process.env.PIG_EXT_HOST_INFO
+    if (raw) {
+      const parsed = JSON.parse(raw) as { agentDir?: string }
+      if (typeof parsed.agentDir === "string" && parsed.agentDir.trim() !== "") {
+        return parsed.agentDir
+      }
+    }
+  } catch {
+    // malformed host info falls through to the env chain
+  }
+  const piDir = process.env.PI_CODING_AGENT_DIR?.trim()
+  if (piDir) return piDir
+  const pigDir = process.env.PIG_CODING_AGENT_DIR?.trim()
+  if (pigDir) return pigDir
+  const pigHome = process.env.PIG_HOME?.trim()
+  if (pigHome) return path.join(pigHome, "agent")
+  const home = os.homedir()
+  if (!home) return ""
+  return path.join(home, ".pig", "agent")
+}
+
 let diagPath: string | null = null
 let diagDegraded = false
 
@@ -111,7 +140,7 @@ function diagLog(msg: string): void {
   if (envFlag("CTX_ORCH_DEBUG", false)) console.error(line)
   try {
     if (!diagPath) {
-      const dir = process.env.CTX_ORCH_DIAG_DIR || path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+      const dir = process.env.CTX_ORCH_DIAG_DIR || path.join(resolveAgentDir() || path.join(os.homedir() || "/tmp", ".pig", "agent"), "logs")
       fs.mkdirSync(dir, { recursive: true })
       diagPath = path.join(dir, "ctx-orchestrate.log")
     }

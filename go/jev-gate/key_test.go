@@ -66,7 +66,7 @@ func lookupFixture(t *testing.T, env map[string]string, files map[string]string)
 func TestResolveAPIKeyOrder(t *testing.T) {
 	local := "http://127.0.0.1:3425/v1"
 	remote := "https://windhub.example/v1"
-	settingsWithKey := `/home/test/.pi/agent/settings.json`
+	settingsWithKey := `/home/test/.pig/agent/settings.json`
 	settings := `{"env":{"MAGPIE_API_KEY":"from-settings"}}`
 
 	if got := ResolveAPIKey(local, lookupFixture(t,

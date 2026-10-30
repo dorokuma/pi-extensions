@@ -602,29 +602,11 @@ func ApplyEnvExplicit(
 }
 
 // ResolveAgentDir discovers the active global agent directory where settings.json resides.
+// It shares the agent-dir resolution every Go extension uses (resolveAgentDir):
+// PIG_EXT_HOST_INFO.agentDir, PI_CODING_AGENT_DIR, PIG_CODING_AGENT_DIR,
+// $PIG_HOME/agent, ~/.pig/agent — never ~/.pi.
 func ResolveAgentDir() string {
-	if v := os.Getenv("PI_CODING_AGENT_DIR"); v != "" {
-		return expandTilde(v)
-	}
-	if v := os.Getenv("PIG_CODING_AGENT_DIR"); v != "" {
-		return expandTilde(v)
-	}
-	if v := os.Getenv("PIG_HOME"); v != "" {
-		return filepath.Join(expandTilde(v), "agent")
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		piAgent := filepath.Join(home, ".pi", "agent")
-		if _, err := os.Stat(piAgent); err == nil {
-			return piAgent
-		}
-		pigAgent := filepath.Join(home, ".pig", "agent")
-		if _, err := os.Stat(pigAgent); err == nil {
-			return pigAgent
-		}
-		return piAgent
-	}
-	return ""
+	return resolveAgentDir()
 }
 
 func readSettingsFile(filePath string) map[string]any {

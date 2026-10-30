@@ -577,8 +577,36 @@ type PersistShape = {
   delayMs: number;
 };
 
+/**
+ * Resolve the agent configuration directory this extension writes into,
+ * mirroring the Go port's resolveAgentDir: PIG_EXT_HOST_INFO.agentDir,
+ * PI_CODING_AGENT_DIR, PIG_CODING_AGENT_DIR, $PIG_HOME/agent, ~/.pig/agent —
+ * never ~/.pi so a redirected or isolated PiG run cannot recreate the retired
+ * Pi home.
+ */
+function resolveAgentDir(): string {
+  try {
+    const raw = process.env.PIG_EXT_HOST_INFO;
+    if (raw) {
+      const parsed = JSON.parse(raw) as { agentDir?: string };
+      if (typeof parsed.agentDir === "string" && parsed.agentDir.trim() !== "") {
+        return parsed.agentDir;
+      }
+    }
+  } catch {
+    // malformed host info falls through to the env chain
+  }
+  const piDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (piDir) return piDir;
+  const pigDir = process.env.PIG_CODING_AGENT_DIR?.trim();
+  if (pigDir) return pigDir;
+  const pigHome = process.env.PIG_HOME?.trim();
+  if (pigHome) return join(pigHome, "agent");
+  return join(homedir(), ".pig", "agent");
+}
+
 function settingsPath(): string {
-  return join(homedir(), ".pi", "agent", "auto-continue.json");
+  return join(resolveAgentDir(), "auto-continue.json");
 }
 
 function clampInt(n: number, min: number, max: number, fallback: number): number {

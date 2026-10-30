@@ -15,12 +15,11 @@ import (
 //
 //	CTX_ORCH_DEBUG=1     also write to stderr
 //	CTX_ORCH_DIAG_DIR    directory of the log file (wins over everything below)
-//	PIG_HOME             when set, the default directory is $PIG_HOME/agent/logs
+//	agent dir            resolveAgentDir(): PIG_EXT_HOST_INFO.agentDir,
+//	                     PI_/PIG_CODING_AGENT_DIR, $PIG_HOME/agent, ~/.pig/agent
 //
-// The default without PIG_HOME is the TS location, <home>/.pi/agent/logs, so a
-// plain run keeps parity. A PiG run started with PIG_HOME set (any redirected
-// or isolated home) must not write into the production ~/.pi, so its own home
-// takes over the default.
+// Without an override the log lands in <agent dir>/logs under ~/.pig — never
+// ~/.pi, so no run can recreate the retired Pi home.
 
 // diagState is the process-wide diagnostics sink: the log path is resolved once,
 // and a failure to write degrades diagnostics instead of failing the extension.
@@ -70,7 +69,7 @@ func diagFile() (string, error) {
 		return diagState.path, nil
 	}
 	home, _ := os.UserHomeDir()
-	dir := resolveDiagDir(os.Getenv("CTX_ORCH_DIAG_DIR"), os.Getenv("PIG_HOME"), home)
+	dir := resolveDiagDir(os.Getenv("CTX_ORCH_DIAG_DIR"), home)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -79,18 +78,20 @@ func diagFile() (string, error) {
 }
 
 // resolveDiagDir picks the diagnostics directory: an explicit CTX_ORCH_DIAG_DIR
-// wins; otherwise a non-empty PIG_HOME keeps the log inside the isolated PiG home
-// ($PIG_HOME/agent/logs); otherwise the TS default <home>/.pi/agent/logs, with
-// /tmp standing in for a home that cannot be resolved.
-func resolveDiagDir(diagDir, pigHome, home string) string {
+// wins; otherwise <agent dir>/logs where the agent dir resolves like every Go
+// extension (PIG_EXT_HOST_INFO.agentDir, PI_/PIG_CODING_AGENT_DIR,
+// $PIG_HOME/agent, ~/.pig/agent — never ~/.pi). The env reads are the process's
+// own; the home argument is what ~/.pig and the /tmp stand-in resolve from, so
+// tests control it.
+func resolveDiagDir(diagDir, home string) string {
 	if dir := strings.TrimSpace(diagDir); dir != "" {
 		return dir
 	}
-	if root := strings.TrimSpace(pigHome); root != "" {
-		return filepath.Join(root, "agent", "logs")
+	if dir := resolveAgentDirWithHome(home); dir != "" {
+		return filepath.Join(dir, "logs")
 	}
 	if home = strings.TrimSpace(home); home == "" {
 		home = "/tmp"
 	}
-	return filepath.Join(home, ".pi", "agent", "logs")
+	return filepath.Join(home, ".pig", "agent", "logs")
 }

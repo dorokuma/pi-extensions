@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 // Ports src/core/settings.ts.
@@ -86,43 +84,17 @@ func SettingsPath() string {
 	return filepath.Join(AgentDir(), "pi-vcc-config.json")
 }
 
-// AgentDir is pi's getAgentDir() for this host.
-// Resolution: PIG_EXT_HOST_INFO.agentDir (via sdk.AgentDir; what PiG actually
-// injects into extension subprocesses), then $PI_CODING_AGENT_DIR,
-// $PIG_CODING_AGENT_DIR, $PIG_HOME/agent, else ~/.pi/agent.
+// AgentDir is pi's getAgentDir() for this host. It resolves through
+// resolveAgentDir: PIG_EXT_HOST_INFO.agentDir (via sdk.AgentDir; what PiG
+// actually injects into extension subprocesses), then $PI_CODING_AGENT_DIR,
+// $PIG_CODING_AGENT_DIR, $PIG_HOME/agent, else ~/.pig/agent — never ~/.pi.
 func AgentDir() string {
-	if dir, err := sdk.AgentDir(); err == nil {
-		if dir = strings.TrimSpace(dir); dir != "" {
-			return expandHome(dir)
-		}
-	}
-	if dir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")); dir != "" {
-		return expandHome(dir)
-	}
-	if dir := strings.TrimSpace(os.Getenv("PIG_CODING_AGENT_DIR")); dir != "" {
-		return expandHome(dir)
-	}
-	if home := strings.TrimSpace(os.Getenv("PIG_HOME")); home != "" {
-		return filepath.Join(expandHome(home), "agent")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".pi", "agent")
-	}
-	return ""
+	return resolveAgentDir()
 }
 
 // expandHome expands a leading "~" the way a shell would.
 func expandHome(path string) string {
-	if path == "~" || strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil && home != "" {
-			if path == "~" {
-				return home
-			}
-			return filepath.Join(home, path[2:])
-		}
-	}
-	return path
+	return expandAgentDirHome(path)
 }
 
 // readJSONObject is settings.ts readJson(): a parsed object, or nil when the

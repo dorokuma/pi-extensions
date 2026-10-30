@@ -190,7 +190,7 @@ func TestClientDisconnectReconnectOnce(t *testing.T) {
 	if err != nil || !strings.Contains(got, "max=70") || count.Load() != 2 {
 		t.Fatal(got, err, count.Load())
 	}
-	b, err := os.ReadFile(filepath.Join(homeDir(), ".pi", "agent", "logs", "codegraph-go.log"))
+	b, err := os.ReadFile(filepath.Join(homeDir(), ".pig", "agent", "logs", "codegraph-go.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestStderrRingAndDiagnostics(t *testing.T) {
 	}
 	c.dumpStderrBufferLocked(p, true)
 	c.mu.Unlock()
-	log := filepath.Join(h, ".pi", "agent", "logs", "codegraph-go.log")
+	log := filepath.Join(h, ".pig", "agent", "logs", "codegraph-go.log")
 	b, err := os.ReadFile(log)
 	if err != nil {
 		t.Fatal(err)
@@ -317,10 +317,10 @@ func TestStderrRingAndDiagnostics(t *testing.T) {
 	t.Setenv("HOME", filepath.Join(h, "blocked"))
 	diagLog("unwritable directory")
 	// P2-4: os.homedir() || "/tmp" — an unresolvable HOME falls back to
-	// /tmp/.pi/agent/logs/codegraph-go.log. The fixture cleans up only what it
+	// /tmp/.pig/agent/logs/codegraph-go.log. The fixture cleans up only what it
 	// created itself.
 	t.Setenv("HOME", "")
-	fallback := filepath.Join("/tmp", ".pi", "agent", "logs", "codegraph-go.log")
+	fallback := filepath.Join("/tmp", ".pig", "agent", "logs", "codegraph-go.log")
 	_, statErr := os.Stat(fallback)
 	diagLog("home fallback")
 	b, err = os.ReadFile(fallback)
@@ -331,7 +331,7 @@ func TestStderrRingAndDiagnostics(t *testing.T) {
 		t.Cleanup(func() {
 			os.Remove(fallback)
 			dir := filepath.Dir(fallback)
-			for range 3 { // logs, agent, .pi — only empty dirs are removed
+			for range 3 { // logs, agent, .pig — only empty dirs are removed
 				os.Remove(dir)
 				dir = filepath.Dir(dir)
 			}

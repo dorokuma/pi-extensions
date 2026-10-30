@@ -23,16 +23,19 @@ func TestDefaultPersist(t *testing.T) {
 	}
 }
 
-// TestSettingsPathIsolation pins the resolution order documented as difference
-// D1: PIG_HOME wins (so an isolated PiG run never touches ~/.pi), otherwise the
-// TS path.
+// TestSettingsPathIsolation pins the resolution order: the agent dir is
+// PIG_EXT_HOST_INFO/PI_/PIG_CODING_AGENT_DIR first, then PIG_HOME, then
+// ~/.pig — never ~/.pi.
 func TestSettingsPathIsolation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("PIG_EXT_HOST_INFO", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
 	t.Setenv("PIG_HOME", "")
 
-	if got, want := SettingsPath(), filepath.Join(home, ".pi", "agent", "auto-continue.json"); got != want {
-		t.Fatalf("SettingsPath() without PIG_HOME = %q, want %q", got, want)
+	if got, want := SettingsPath(), filepath.Join(home, ".pig", "agent", "auto-continue.json"); got != want {
+		t.Fatalf("SettingsPath() without overrides = %q, want %q", got, want)
 	}
 
 	isolated := t.TempDir()

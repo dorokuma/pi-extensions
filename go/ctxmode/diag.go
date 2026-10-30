@@ -36,11 +36,17 @@ func DiagLog(msg string) {
 	if os.Getenv("CTXMODE_DIAG_STDERR") == "1" {
 		fmt.Fprintln(os.Stderr, line)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		home = "/tmp"
+	defaultDir := ""
+	if dir := resolveAgentDir(); dir != "" {
+		defaultDir = filepath.Join(dir, "logs")
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = "/tmp"
+		}
+		defaultDir = filepath.Join(home, ".pig", "agent", "logs")
 	}
-	dir := envString("CTXMODE_DIAG_DIR", filepath.Join(home, ".pi", "agent", "logs"))
+	dir := envString("CTXMODE_DIAG_DIR", defaultDir)
 	if diagnostics.dir != dir {
 		diagnostics.path = ""
 		diagnostics.dir = dir
