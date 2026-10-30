@@ -3,6 +3,7 @@ package pitinyfish
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -212,6 +213,64 @@ func TestFetchSuccess(t *testing.T) {
 	}
 	if res.Errors[0].Error != "404 Not Found" {
 		t.Errorf("unexpected error message: %s", res.Errors[0].Error)
+	}
+}
+
+func TestFetchLatencyMsIntAndFloat(t *testing.T) {
+	testCases := []struct {
+		name       string
+		rawLatency string
+		expected   float64
+	}{
+		{"float", "1234.5", 1234.5},
+		{"int", "1200", 1200},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"results":[{"url":"https://example.com","format":"markdown","text":"x","latency_ms":%s}],"errors":[]}`, tc.rawLatency)
+			}))
+			defer ts.Close()
+
+			client, err := NewClient(
+				WithBaseURL(ts.URL),
+				WithAPIKey("test-dummy-key"),
+			)
+			if err != nil {
+				t.Fatalf("NewClient failed: %v", err)
+			}
+
+			res, err := client.Fetch(context.Background(), FetchParams{
+				URLs: []string{"https://example.com"},
+			})
+			if err != nil {
+				t.Fatalf("Fetch failed: %v", err)
+			}
+			if len(res.Results) != 1 {
+				t.Fatalf("expected 1 result, got %d", len(res.Results))
+			}
+			lat := res.Results[0].LatencyMs
+			if lat == nil {
+				t.Fatal("expected non-nil LatencyMs")
+			}
+			f, err := lat.Float64()
+			if err != nil {
+				t.Fatalf("LatencyMs %q not a valid float: %v", string(*lat), err)
+			}
+			if f != tc.expected {
+				t.Fatalf("expected LatencyMs %v, got %v", tc.expected, f)
+			}
+			expectedMs := int64(tc.expected + 0.5)
+			if formatted := FormatFetchResponse(res); !strings.Contains(formatted, fmt.Sprintf("Latency: %dms", expectedMs)) {
+				t.Fatalf("expected 'Latency: %dms' in formatted output:\n%s", expectedMs, formatted)
+			}
+		})
 	}
 }
 
