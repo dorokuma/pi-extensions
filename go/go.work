@@ -13,6 +13,7 @@ use (
 	./herdr-agent-state
 	./herdsman-pi
 	./jev-gate
+	./jev-gate/cmd/jev-mcp
 	./moshi-hooks
 	./no-tables
 	./pi-context-pruning
