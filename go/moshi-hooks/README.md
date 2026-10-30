@@ -16,7 +16,7 @@ PiG 的 moshi-hook 生命周期钩子扩展。它把 Pi 的会话事件归一化
 
 | 契约 | 实现 |
 |---|---|
-| Socket 路径：`MOSHI_SOCKET_PATH` 非空直返 → darwin `~/Library/Application Support/Moshi/moshi-hook.sock` → windows `\\.\pipe\moshi-hook` → `XDG_RUNTIME_DIR/moshi-hook.sock` → `/tmp/moshi-hook.sock` | `ResolveSocketPath`（socket.go:40） |
+| Socket 路径：`MOSHI_SOCKET_PATH` 非空直返 → darwin `~/Library/Application Support/Moshi/moshi-hook.sock` → windows `\\.\pipe\moshi-hook` → `XDG_RUNTIME_DIR/moshi-hook.sock` → 探测 `/run/user/<uid>/moshi-hook.sock` 存在则用之 → `/tmp/moshi-hook.sock` | `ResolveSocketPath`（socket.go:40） |
 | 单连接一消息：dial → 写紧凑单行 JSON + `\n` → `CloseWrite` 半关闭 → 读干守护进程 ack 到 EOF → `Close` | `deliverEnvelope`（socket.go:70） |
 | 单次发送上限 250ms（连接超时 + `SetDeadline`） | `SendTimeout`（socket.go:23） |
 | 所有连接/读写错误静默吞掉 | `deliverEnvelope` 无错误返回 |
@@ -42,7 +42,7 @@ JSON 名逐字照抄 TS 属性名（`herdrWorkspaceId`、`herdrTabId`、`toolUse
 |---|---|---|
 | L15-16 | `helperBinary`（仅调试/手工重放用，从不 spawn） | extension.go:24 |
 | L18-19 | `agentSource="pi"` / `agentDisplayName="Pi"` | state.go:22 |
-| L21-37 | `resolveSocketPath` | socket.go:40 |
+| L21-37 | `resolveSocketPath`（含 pig 新增的 `/run/user/<uid>` 探测） | socket.go:40 |
 | L39-53 | 保序队列说明 + `inFlightSends`/`sendTimeoutMs`/`sendQueue` | socket.go:23、socket.go:120 |
 | L55-60 | `sendEnvelope` | socket.go:166、socket.go:228 |
 | L62-91 | `deliverEnvelope` | socket.go:70 |
@@ -180,9 +180,14 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
    TS 用模块级 `const`/`Map`；Go 用互斥保护的包级状态（事件可能并发到达），并额外提供
    `ResetSessionsForTest`/`SetSenderForTest`/`ResetSenderForTest`/`ResetTerminalContextForTest`
    供测试重置。这些是 TS 没有的测试面，不改变线上行为。
-9. **测试专用注入缝**：`resolveTerminalContext(getenv, run)` 与 `newSender(sockPath, deliver, timeout)`
+9. **`/run/user/<uid>` 探测**（socket.go:63）
+   TS 在 `XDG_RUNTIME_DIR` 为空时直接落 `/tmp`；Go 版在中间多探一步
+   `/run/user/<uid>/moshi-hook.sock`（systemd-user 默认位置），文件存在才用——herdr
+   pane 里拉起的 hook 子进程常拿不到 `XDG_RUNTIME_DIR`，缺这一步会让 envelope 静默丢失。
+   文件不存在时行为与 TS 完全一致（落 `/tmp`）。
+10. **测试专用注入缝**：`resolveTerminalContext(getenv, run)` 与 `newSender(sockPath, deliver, timeout)`
    把进程/环境/网络依赖注入化，便于无 socket 单测（TS 无对应物）。
-10. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
+11. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
 
 ## 4. 文件布局
 
