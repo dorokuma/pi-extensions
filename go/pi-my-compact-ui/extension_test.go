@@ -1197,8 +1197,12 @@ func TestConcurrentTurnRace(t *testing.T) {
 				}
 				// The two modals read the same live entries and tools the events
 				// write, so they render from value snapshots (see snapshotEntry).
+				// The selector may arm its poll loop on a live entry; it is
+				// disposed inside the iteration because a deferred dispose would
+				// pile one goroutine per loop on top of the race run.
 				selector := r.newInspectSelectorModal()
 				_ = selector.Render(80)
+				selector.dispose()
 				_ = (&detailModalComponent{tui: r, entry: groupEntry{kind: "tool", tool: newTestTool("r", "read", map[string]any{"path": "/p"})}}).Render(80)
 				_ = chat.Render(80)
 				_ = tui.renderCount()

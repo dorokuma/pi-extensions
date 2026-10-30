@@ -86,7 +86,15 @@ type runtimeState struct {
 	// a second Custom session.
 	activeCustomRoot *customRootComponent
 	capturedTui      tuiHandle
-	animTimer        *animTimer
+	// customInvalidate is the frame requester the SDK overlay installs through
+	// sdkComponentAdapter.SetInvalidate while a ctx.ui.Custom component is
+	// mounted (remoteOverlay.requestRender). On the Custom branch capturedTui
+	// stays nil, so requestFrame falls back to this hook to repaint the focused
+	// overlay; customInvalidateOwner is the adapter that installed it, so a
+	// stale overlay's SetInvalidate(nil) cannot detach its successor's hook.
+	customInvalidate      func()
+	customInvalidateOwner *sdkComponentAdapter
+	animTimer             *animTimer
 	// animTicks holds the completion channel of every animation tick that has
 	// already fired and is still executing. arming r.animTimer alone is not
 	// enough for stopAnimation to wait: the tick clears r.animTimer as soon as it

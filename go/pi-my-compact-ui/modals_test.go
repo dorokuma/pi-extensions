@@ -3,6 +3,7 @@ package compactui
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -445,6 +446,86 @@ func TestInspectSelectorLifecycle(t *testing.T) {
 	}
 	// A second close is safe.
 	r.closeInspectSelectorModal()
+}
+
+// Test the selector polls while a listed entry is live. The Ctrl+I window
+// showed a frozen spinner until a key event forced a repaint: without a poll
+// loop of its own (the detail modal has startPollingIfNeeded, the selector
+// did not), renderCount would stay flat while a tool still runs. It also
+// covers the re-arm half of the lifecycle: a tool that starts *after* the
+// selector opened must restart polling through refreshEntries, and a drained
+// list must stop the loop without a goroutine leaking past dispose.
+func TestInspectSelectorPollsWhileLive(t *testing.T) {
+	r, tui := selectorRuntime(t)
+	// Add a live (pending) tool to a fresh group, so the selector lists a
+	// running entry whose icon should tick.
+	tool := newTestTool("live", "read", nil).pending()
+	group := r.newToolGroup(0)
+	group.entries = []groupEntry{{kind: "tool", tool: tool}}
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.mu.Unlock()
+
+	r.openInspectSelectorModal()
+	defer r.closeInspectSelectorModal()
+	r.mu.Lock()
+	modal := r.activeSelectorComp
+	r.mu.Unlock()
+	if modal == nil {
+		t.Fatal("selector did not open")
+	}
+
+	waitRenders := func(before int, what string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if tui.renderCount() > before {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("no timer-driven repaint in 2s (%s): renderCount stayed %d", what, before)
+	}
+	waitRenders(tui.renderCount(), "live entry at open")
+
+	// Finish the tool (under mu, the way an event handler writes it) and let
+	// the poll loop observe the drained list: polling must stop on its own.
+	r.mu.Lock()
+	tool.succeeded("ok")
+	r.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		modal.mu.Lock()
+		polling := modal.polling
+		modal.mu.Unlock()
+		if !polling {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	modal.mu.Lock()
+	polling := modal.polling
+	modal.mu.Unlock()
+	if polling {
+		t.Error("poll loop kept running after the last live entry finished")
+	}
+
+	// A tool that starts while the selector is already open: the event-driven
+	// refreshEntries must re-arm the loop and the repaints must resume.
+	tool2 := newTestTool("live2", "bash", nil).pending()
+	group2 := r.newToolGroup(0)
+	group2.entries = []groupEntry{{kind: "tool", tool: tool2}}
+	r.mu.Lock()
+	r.addGroupLocked(group2)
+	r.mu.Unlock()
+	modal.refreshEntries(false) // the call handleToolExecutionStart makes
+	modal.mu.Lock()
+	polling = modal.polling
+	modal.mu.Unlock()
+	if !polling {
+		t.Fatal("a live entry added after open did not restart the poll loop")
+	}
+	waitRenders(tui.renderCount(), "live entry added after open")
 }
 
 // Test opening the selector closes an open detail modal (TS L2072-2075).
@@ -937,4 +1018,165 @@ func TestConfigCommandZeroContextSafe(t *testing.T) {
 		}
 	}()
 	r.handleConfigCommand(sdkZeroContext())
+}
+
+// ── Custom-branch invalidator plumbing (review round-3 consider 1) ──────────
+
+// Test adapterFor binds the adapter to the runtime its component renders
+// through, and SetInvalidate installs the overlay's frame requester as the
+// runtime's requestFrame fallback: the poll loop's tick reaches the overlay
+// even though capturedTui stays nil on the ctx.ui.Custom branch. The run
+// drives the polling live-selector of TestInspectSelectorPollsWhileLive
+// against the no-TUI branch, with the invalidator standing in for the SDK's
+// remoteOverlay.requestRender.
+func TestAdapterForInstallsCustomInvalidate(t *testing.T) {
+	r, _ := selectorRuntimeWithCustomUI(t)
+	// A live entry arms the selector's poll loop the way the fake-TUI run does.
+	tool := newTestTool("live", "read", nil).pending()
+	group := r.newToolGroup(0)
+	group.entries = []groupEntry{{kind: "tool", tool: tool}}
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.mu.Unlock()
+
+	r.openInspectSelectorModal()
+	defer r.closeInspectSelectorModal()
+	r.mu.Lock()
+	root := r.activeCustomRoot
+	modal := r.activeSelectorComp
+	r.mu.Unlock()
+	if root == nil || modal == nil {
+		t.Fatal("the selector did not open through the Custom root")
+	}
+	modal.mu.Lock()
+	if !modal.polling {
+		modal.mu.Unlock()
+		t.Fatal("a live entry did not arm the selector's poll loop")
+	}
+	modal.mu.Unlock()
+
+	adapter := adapterFor(root)
+	if adapter.rt != r {
+		t.Fatal("adapterFor did not bind the root's runtime")
+	}
+	var invalidated atomic.Int32
+	adapter.SetInvalidate(func() { invalidated.Add(1) })
+	r.mu.Lock()
+	owner := r.customInvalidateOwner
+	r.mu.Unlock()
+	if owner != adapter {
+		t.Fatal("SetInvalidate did not register the adapter as the owner")
+	}
+
+	// The poll loop's requestFrame reaches the overlay's invalidator.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if invalidated.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if invalidated.Load() == 0 {
+		t.Fatal("no timer-driven invalidate in 2s: the Custom branch never repaints")
+	}
+	// SetInvalidate(nil) detaches: the runtime drops the hook and the owner.
+	adapter.SetInvalidate(nil)
+	r.mu.Lock()
+	cleared := r.customInvalidate == nil && r.customInvalidateOwner == nil
+	r.mu.Unlock()
+	if !cleared {
+		t.Error("SetInvalidate(nil) did not detach the invalidator")
+	}
+}
+
+// Test a stale overlay's SetInvalidate(nil) cannot detach the hook a newer
+// adapter installed: remoteOverlay.stop clears the callback of the adapter it
+// mounted, and without the owner check it would erase its successor's hook.
+func TestSetInvalidateNilKeepsNewOwner(t *testing.T) {
+	r, _ := selectorRuntimeWithCustomUI(t)
+	r.openInspectSelectorModal()
+	defer r.closeInspectSelectorModal()
+	r.mu.Lock()
+	root := r.activeCustomRoot
+	r.mu.Unlock()
+	if root == nil {
+		t.Fatal("the selector did not open through the Custom root")
+	}
+	oldAdapter := adapterFor(root)
+	oldAdapter.SetInvalidate(func() {})
+	newAdapter := adapterFor(root)
+	newAdapter.SetInvalidate(func() {})
+
+	oldAdapter.SetInvalidate(nil)
+	r.mu.Lock()
+	owner := r.customInvalidateOwner
+	hook := r.customInvalidate
+	r.mu.Unlock()
+	if owner != newAdapter || hook == nil {
+		t.Error("a stale SetInvalidate(nil) detached the new owner's hook")
+	}
+	newAdapter.SetInvalidate(nil)
+	r.mu.Lock()
+	cleared := r.customInvalidate == nil && r.customInvalidateOwner == nil
+	r.mu.Unlock()
+	if !cleared {
+		t.Error("the owner's own SetInvalidate(nil) should detach it")
+	}
+}
+
+// Test root.dispose stops both modals of the shared Custom session: the
+// selector keeps ticking after the overlay is gone when the root was torn
+// down from the detail view, because disposing only the current view leaves
+// the selector's poll timer armed.
+func TestCustomRootDisposeStopsBothPolls(t *testing.T) {
+	r, _ := selectorRuntimeWithCustomUI(t)
+	tool := newTestTool("live", "read", nil).pending()
+	group := r.newToolGroup(0)
+	group.entries = []groupEntry{{kind: "tool", tool: tool}}
+	r.mu.Lock()
+	r.addGroupLocked(group)
+	r.mu.Unlock()
+
+	r.openInspectSelectorModal()
+	r.mu.Lock()
+	root := r.activeCustomRoot
+	selector := r.activeSelectorComp
+	r.mu.Unlock()
+	if root == nil || selector == nil {
+		t.Fatal("the selector did not open through the Custom root")
+	}
+	selector.mu.Lock()
+	if !selector.polling {
+		selector.mu.Unlock()
+		t.Fatal("a live selector entry did not arm the poll loop")
+	}
+	selector.mu.Unlock()
+
+	// Enter mounts the detail view on top of the selector (the detail's own
+	// entry is the live tool, so its poll loop arms too).
+	r.openDetailModal(groupEntry{kind: "tool", tool: tool})
+	r.mu.Lock()
+	detail := r.activeModalComponent
+	r.mu.Unlock()
+	if detail == nil {
+		t.Fatal("the detail modal did not open")
+	}
+	detail.mu.Lock()
+	if !detail.polling {
+		detail.mu.Unlock()
+		t.Fatal("a live detail entry did not arm the poll loop")
+	}
+	detail.mu.Unlock()
+
+	// Tearing the root down from the detail view must stop both loops.
+	root.dispose()
+	selector.mu.Lock()
+	selectorPolling := selector.polling
+	selector.mu.Unlock()
+	detail.mu.Lock()
+	detailPolling := detail.polling
+	detail.mu.Unlock()
+	if selectorPolling || detailPolling {
+		t.Errorf("dispose left polls armed: selector=%v detail=%v", selectorPolling, detailPolling)
+	}
 }
