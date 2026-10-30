@@ -1,0 +1,3 @@
+# Local build artifact: `go build ./...` drops the jev-mcp binary next to main.go.
+# It is a compiled artifact, never committed (same convention as /bin/*).
+jev-mcp
