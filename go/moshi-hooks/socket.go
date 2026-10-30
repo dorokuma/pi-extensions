@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,6 +38,11 @@ const (
 // ResolveSocketPath mirrors internal/config.SocketPath: the MOSHI_SOCKET_PATH
 // override wins over the per-platform default so tests and dev daemons can
 // point us at a throwaway socket (TS: resolveSocketPath, L24).
+//
+// On Linux the daemon listens under XDG_RUNTIME_DIR, but hook subprocesses can
+// run without that variable (e.g. inside a herdr pane). When it is empty we
+// probe /run/user/<uid>/moshi-hook.sock — the systemd-user default — before
+// falling back to /tmp, so the envelope does not get silently dropped.
 func ResolveSocketPath() string {
 	if override := os.Getenv("MOSHI_SOCKET_PATH"); override != "" {
 		return override
@@ -54,7 +60,25 @@ func ResolveSocketPath() string {
 	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
 		return filepath.Join(runtimeDir, "moshi-hook.sock")
 	}
+	if path := runUserSocketPath(); path != "" {
+		return path
+	}
 	return "/tmp/moshi-hook.sock"
+}
+
+// runUserSocketDir is the parent of the per-uid runtime directories probed
+// when XDG_RUNTIME_DIR is empty. It is a variable so tests can point the
+// probe at a temp directory instead of the real /run/user.
+var runUserSocketDir = "/run/user"
+
+// runUserSocketPath returns /run/user/<uid>/moshi-hook.sock when that file
+// exists, else "".
+func runUserSocketPath() string {
+	path := filepath.Join(runUserSocketDir, strconv.Itoa(os.Getuid()), "moshi-hook.sock")
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	return path
 }
 
 // deliverEnvelope performs one send attempt (TS: deliverEnvelope, L62).

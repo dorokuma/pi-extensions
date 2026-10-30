@@ -1,7 +1,10 @@
 package moshihooks
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,7 +35,42 @@ func TestResolveSocketPathDefault(t *testing.T) {
 	}
 	t.Setenv("MOSHI_SOCKET_PATH", "")
 	t.Setenv("XDG_RUNTIME_DIR", "")
+	stubRunUserDir(t) // no socket under it
 	if got, want := ResolveSocketPath(), "/tmp/moshi-hook.sock"; got != want {
+		t.Fatalf("ResolveSocketPath = %q, want %q", got, want)
+	}
+}
+
+// stubRunUserDir points the /run/user probe at a fresh temp dir for the
+// duration of the test and returns it, so tests never touch the real
+// /run/user.
+func stubRunUserDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	previous := runUserSocketDir
+	runUserSocketDir = dir
+	t.Cleanup(func() { runUserSocketDir = previous })
+	return dir
+}
+
+func TestResolveSocketPathRunUserFallback(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skipf("platform default applies on %s", runtime.GOOS)
+	}
+	t.Setenv("MOSHI_SOCKET_PATH", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	base := stubRunUserDir(t)
+
+	uidDir := filepath.Join(base, strconv.Itoa(os.Getuid()))
+	if err := os.MkdirAll(uidDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(uidDir, "moshi-hook.sock")
+	if err := os.WriteFile(want, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ResolveSocketPath(); got != want {
 		t.Fatalf("ResolveSocketPath = %q, want %q", got, want)
 	}
 }
