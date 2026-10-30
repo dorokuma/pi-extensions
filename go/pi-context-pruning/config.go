@@ -196,11 +196,13 @@ func readJSONSafe(path string) map[string]any {
 	return res
 }
 
-// resolveGlobalSettingsPath resolves the path to the global settings file,
-// considering PIG_HOME when set, and falling back to ~/.pi/agent/settings.json.
+// resolveGlobalSettingsPath resolves the path to the global settings file.
+// Under an explicit PIG_HOME the two historical probes keep their order
+// (agent/settings.json, then a pre-agent-dir settings.json); otherwise the
+// agent directory resolves through resolveAgentDir (PIG_EXT_HOST_INFO →
+// PI_/PIG_CODING_AGENT_DIR → $PIG_HOME/agent → ~/.pig/agent — never ~/.pi).
 func resolveGlobalSettingsPath() string {
-	pigHome := os.Getenv("PIG_HOME")
-	if pigHome != "" {
+	if pigHome := os.Getenv("PIG_HOME"); pigHome != "" {
 		p1 := filepath.Join(pigHome, "agent", "settings.json")
 		if _, err := os.Stat(p1); err == nil {
 			return p1
@@ -210,10 +212,8 @@ func resolveGlobalSettingsPath() string {
 			return p2
 		}
 	}
-
-	homeDir, err := os.UserHomeDir()
-	if err == nil && homeDir != "" {
-		return filepath.Join(homeDir, ".pi", "agent", "settings.json")
+	if dir := resolveAgentDir(); dir != "" {
+		return filepath.Join(dir, "settings.json")
 	}
 	return ""
 }

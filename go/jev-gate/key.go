@@ -5,10 +5,9 @@ package jevgate
 //
 // Order (first non-blank wins):
 //  1. the process environment MAGPIE_API_KEY / WINDHUB_API_KEY;
-//  2. the `env` block of ${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json —
-//     pi's settings.env is not injected into the pi process environment, so the
-//     extension reads the file itself and the key can stay in a 0600 file that
-//     is not version controlled;
+//  2. the `env` block of <agent dir>/settings.json — pi's settings.env is not
+//     injected into the pi process environment, so the extension reads the file
+//     itself and the key can stay in a 0600 file that is not version controlled;
 //  3. the literal local-gateway token "magpie", but only when the base URL
 //     points at a loopback gateway.
 //
@@ -161,13 +160,9 @@ func ResolveAPIKey(baseURL string, lookup KeyLookup) KeyResolution {
 		}
 	}
 
-	directory := lookup.Getenv("PI_CODING_AGENT_DIR")
+	directory := resolveAgentDirFor(lookup.Getenv, lookup.HomeDir)
 	if directory == "" {
-		home, err := lookup.HomeDir()
-		if err != nil {
-			home = ""
-		}
-		directory = filepath.Join(home, ".pi", "agent")
+		directory = filepath.Join(".pig", "agent")
 	}
 	file := filepath.Join(directory, "settings.json")
 	data, err := lookup.ReadFile(file)

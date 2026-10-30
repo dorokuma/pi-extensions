@@ -133,19 +133,50 @@ export function isLocalGatewayUrl(rawUrl: string): boolean {
 /**
  * 解析凭据。按序取第一个非空值：
  *   ① 进程环境 `MAGPIE_API_KEY` / `WINDHUB_API_KEY`；
- *   ② `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json` 的 `env` 块（`MAGPIE_API_KEY` / `WINDHUB_API_KEY`）；
+ *   ② `<agentDir>/settings.json` 的 `env` 块（`MAGPIE_API_KEY` / `WINDHUB_API_KEY`），其中
+ *      agentDir 按统一链解析：PIG_EXT_HOST_INFO.agentDir → PI_CODING_AGENT_DIR →
+ *      PIG_CODING_AGENT_DIR → $PIG_HOME/agent → ~/.pig/agent（绝不回退 ~/.pi）；
  *   ③ 当 `BASE_URL` 指向本机回环网关（127.0.0.0/8 / localhost / localhost. / ::1 / ::ffff:(0:)127.0.0.0/104）时，
  *      回落到本地网关令牌 `"magpie"`（与 `models.json` 及 `magpie-image.ts` 一致，开箱即用）。
  * 指向远端网关且未配置任何凭据时返回 undefined，由调用方 fail-closed 报错。
  */
 let keyLookupError: string | null = null
 
+/**
+ * Resolve the agent configuration directory the same way every Go extension
+ * does: PIG_EXT_HOST_INFO.agentDir → PI_CODING_AGENT_DIR →
+ * PIG_CODING_AGENT_DIR → $PIG_HOME/agent → ~/.pig/agent — never ~/.pi.
+ * Returns "" only when no home resolves.
+ */
+function resolveAgentDir(): string {
+  try {
+    const raw = process.env.PIG_EXT_HOST_INFO
+    if (raw) {
+      const parsed = JSON.parse(raw) as { agentDir?: string }
+      if (typeof parsed.agentDir === "string" && parsed.agentDir.trim() !== "") {
+        return parsed.agentDir
+      }
+    }
+  } catch {
+    // malformed host info falls through to the env chain
+  }
+  const piDir = process.env.PI_CODING_AGENT_DIR?.trim()
+  if (piDir) return piDir
+  const pigDir = process.env.PIG_CODING_AGENT_DIR?.trim()
+  if (pigDir) return pigDir
+  const pigHome = process.env.PIG_HOME?.trim()
+  if (pigHome) return path.join(pigHome, "agent")
+  const home = os.homedir()
+  if (!home) return ""
+  return path.join(home, ".pig", "agent")
+}
+
 function resolveApiKey(): string | undefined {
   for (const envName of KEY_ENV_NAMES) {
     const fromEnv = process.env[envName]
     if (fromEnv && fromEnv.trim()) return fromEnv.trim()
   }
-  const dir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent")
+  const dir = resolveAgentDir() || path.join(os.homedir(), ".pig", "agent")
   const file = path.join(dir, "settings.json")
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { env?: Record<string, unknown> }

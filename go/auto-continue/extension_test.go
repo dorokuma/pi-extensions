@@ -2,6 +2,7 @@ package autocontinue
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -9,7 +10,7 @@ import (
 // tag (TS LOG / STATUS_KEY, auto-continue.ts:98-99).
 func TestExtensionIdentity(t *testing.T) {
 	// NewState resolves and loads the preference file while the factory builds;
-	// PIG_HOME keeps that read inside a temporary home instead of ~/.pi.
+	// PIG_HOME keeps that read inside a temporary home instead of ~/.pig.
 	t.Setenv("PIG_HOME", t.TempDir())
 	extension := Extension()
 	if extension == nil {
@@ -21,17 +22,25 @@ func TestExtensionIdentity(t *testing.T) {
 }
 
 // TestExtensionFactoryIsolated makes sure building the extension does not touch
-// the production preference file: PIG_HOME redirects it and the file is created
+// the real agent directory: PIG_HOME redirects it and the file is created
 // inside that temporary home.
 func TestExtensionFactoryIsolated(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("PIG_HOME", home)
+	// Point HOME at a directory that must stay empty so any write outside
+	// PIG_HOME (e.g. a leftover ~/.pig default) would fail the stat below and
+	// leave visible evidence.
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "unused-home"))
+	t.Setenv("PIG_EXT_HOST_INFO", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
 
 	if extension := Extension(); extension == nil {
 		t.Fatal("Extension() returned nil")
 	}
 	// The factory loads the persisted preferences, which writes the defaults on
-	// first sight. That file must live under PIG_HOME, never under ~/.pi.
+	// first sight. That file must live under PIG_HOME, never under the real
+	// ~/.pig/agent.
 	if _, err := os.Stat(home + "/agent/auto-continue.json"); err != nil {
 		t.Fatalf("expected the isolated preference file: %v", err)
 	}

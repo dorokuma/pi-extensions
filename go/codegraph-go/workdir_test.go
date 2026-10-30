@@ -22,6 +22,12 @@ func isolated(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	// Clear every agent-dir override the resolver reads so the HOME default is
+	// what the assertions see regardless of the environment tests run in.
+	t.Setenv("PIG_EXT_HOST_INFO", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_HOME", "")
 	t.Setenv("CODEGRAPH_CONFIG", "")
 	t.Setenv("CODEGRAPH_GO_WORKDIR", "")
 	t.Setenv("CODEGRAPH_GO_ALLOW_BROAD", "")

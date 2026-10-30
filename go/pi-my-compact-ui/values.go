@@ -531,22 +531,15 @@ type compactConfig struct {
 // defaultConfig is DEFAULT_CONFIG.
 func defaultConfig() compactConfig { return compactConfig{MaxGroupEntries: defaultMaxGroupEntries} }
 
-// configPathFor is configPath (L789) with the PIG_HOME red line: a non-empty
-// PIG_HOME isolates the config under $PIG_HOME/agent, otherwise the path is
-// ~/.pi/agent/compact-ui.json.
+// configPathFor is configPath (L789) with the agent-dir resolution every Go
+// extension shares (PIG_EXT_HOST_INFO → PI_/PIG_CODING_AGENT_DIR →
+// $PIG_HOME/agent → ~/.pig/agent — never ~/.pi). The env/home function
+// parameters keep the same injection points tests use.
 func configPathFor(env func(string) string, home func() (string, error)) string {
-	if env != nil {
-		if pigHome := env("PIG_HOME"); pigHome != "" {
-			return filepath.Join(pigHome, "agent", "compact-ui.json")
-		}
+	if dir := resolveAgentDirFor(env, home); dir != "" {
+		return filepath.Join(dir, "compact-ui.json")
 	}
-	userHome := ""
-	if home != nil {
-		if resolved, err := home(); err == nil {
-			userHome = resolved
-		}
-	}
-	return filepath.Join(userHome, ".pi", "agent", "compact-ui.json")
+	return filepath.Join(".pig", "agent", "compact-ui.json")
 }
 
 // loadConfig is loadConfig (L797-807): decode the file, falling back to the

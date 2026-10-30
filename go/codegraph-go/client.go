@@ -28,11 +28,14 @@ func diagLog(msg string) {
 		fmt.Fprintln(os.Stderr, line)
 		return
 	}
-	h := homeDir()
-	if h == "" {
-		h = "/tmp"
+	// resolveAgentDir already covers host-info/env overrides and ~/.pig/agent;
+	// it returns "" only when no home directory resolves, where /tmp stands in
+	// (the TS `os.homedir() || "/tmp"` shape).
+	base := resolveAgentDir()
+	if base == "" {
+		base = filepath.Join("/tmp", ".pig", "agent")
 	}
-	dir := filepath.Join(h, ".pi", "agent", "logs")
+	dir := filepath.Join(base, "logs")
 	if os.MkdirAll(dir, 0755) != nil {
 		return
 	}

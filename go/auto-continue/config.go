@@ -24,20 +24,14 @@ func DefaultPersist() Persist {
 // SettingsPath resolves the preference file.
 //
 // TS settingsPath (auto-continue.ts:564-566) is
-// `join(homedir(), ".pi", "agent", "auto-continue.json")`. This port keeps that
-// as the production answer and adds one isolation rule: when PIG_HOME is set,
-// the file lives under PIG_HOME/agent/ instead. Go extensions run under PiG,
-// which sets PIG_HOME to its own home when overridden; ./bin/pig-test clears
-// overrides so the default ~/.pig is used. Resolving under PIG_HOME keeps a
-// redirected PiG run from reading or creating /root/.pi/agent/auto-continue.json,
-// which the migration's hard rule forbids touching. Same resolution strategy as
-// pi-context-pruning's resolveGlobalSettingsPath. See README "与 TS 差异" D1.
+// `join(homedir(), ".pi", "agent", "auto-continue.json")`. This port resolves
+// the same file under the agent directory resolveAgentDir returns:
+// PIG_EXT_HOST_INFO.agentDir, then PI_/PIG_CODING_AGENT_DIR, then
+// $PIG_HOME/agent, else ~/.pig/agent — never ~/.pi, so a production or
+// isolated PiG run can no longer create /root/.pi/agent/auto-continue.json.
 func SettingsPath() string {
-	if home := strings.TrimSpace(os.Getenv("PIG_HOME")); home != "" {
-		return filepath.Join(home, "agent", "auto-continue.json")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".pi", "agent", "auto-continue.json")
+	if dir := resolveAgentDir(); dir != "" {
+		return filepath.Join(dir, "auto-continue.json")
 	}
 	return ""
 }

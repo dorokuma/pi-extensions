@@ -604,9 +604,9 @@ func TestPigSessionsRootPriorityChain(t *testing.T) {
 			t.Fatalf("pigSessionsRoot = %q", got)
 		}
 	})
-	t.Run("xdg pig config appends agent", func(t *testing.T) {
-		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "XDG_CONFIG_HOME": "/xdg"})
-		if got := pigSessionsRoot(); got != "/xdg/pig/agent/sessions" {
+	t.Run("default home is the pig tree", func(t *testing.T) {
+		newHarness(t, map[string]string{"PIG_EXT_HOST_INFO": "", "HOME": "/home/user"})
+		if got := pigSessionsRoot(); got != "/home/user/.pig/agent/sessions" {
 			t.Fatalf("pigSessionsRoot = %q", got)
 		}
 	})

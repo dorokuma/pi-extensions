@@ -111,39 +111,14 @@ func ResetSessionsForTest() {
 // pigSessionsRoot returns the root directory that holds one subdirectory per
 // session cwd: <agentDir>/sessions, the same layout pi uses under
 // ~/.pi/agent/sessions (TS pig: pigSessionsRoot). The agent dir resolves like
-// PiG's node shim (runtime-node/shims/pig-config.mjs):
-//
-//  1. PIG_EXT_HOST_INFO — a JSON object the host hands extensions; its
-//     agentDir field wins. The env is parsed directly (no sdk.AgentDir
-//     global cache) so t.Setenv keeps tests isolated.
-//  2. PIG_CODING_AGENT_DIR, then PI_CODING_AGENT_DIR.
-//  3. PIG_HOME, then XDG_CONFIG_HOME/pig, then ~/.pig — these are config
-//     roots, so "agent/sessions" is appended.
+// every Go extension (resolveAgentDir): PIG_EXT_HOST_INFO.agentDir, then
+// PI_CODING_AGENT_DIR, PIG_CODING_AGENT_DIR, $PIG_HOME/agent, else
+// ~/.pig/agent — never a path under ~/.pi.
 func pigSessionsRoot() string {
-	if hostInfo := os.Getenv("PIG_EXT_HOST_INFO"); hostInfo != "" {
-		var parsed struct {
-			AgentDir string `json:"agentDir"`
-		}
-		if err := json.Unmarshal([]byte(hostInfo), &parsed); err == nil && parsed.AgentDir != "" {
-			return filepath.Join(parsed.AgentDir, "sessions")
-		}
+	if dir := resolveAgentDir(); dir != "" {
+		return filepath.Join(dir, "sessions")
 	}
-	if envDir := firstString(os.Getenv("PIG_CODING_AGENT_DIR"), os.Getenv("PI_CODING_AGENT_DIR")); envDir != "" {
-		return filepath.Join(envDir, "sessions")
-	}
-	xdg := ""
-	if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
-		xdg = filepath.Join(xdgConfig, "pig")
-	}
-	home := ""
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		home = filepath.Join(homeDir, ".pig")
-	}
-	configRoot := firstString(os.Getenv("PIG_HOME"), xdg, home)
-	if configRoot == "" {
-		return ""
-	}
-	return filepath.Join(configRoot, "agent", "sessions")
+	return ""
 }
 
 // encodeSessionCwd encodes a cwd exactly like PiG's

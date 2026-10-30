@@ -493,30 +493,28 @@ func TestIsCtrlI(t *testing.T) {
 	}
 }
 
-// Test configPathFor: the PIG_HOME isolation red line (task §2.3).
+// Test configPathFor: agent-dir resolution (PIG_EXT_HOST_INFO → PI_/PIG_
+// CODING_AGENT_DIR → PIG_HOME/agent → ~/.pig/agent — never ~/.pi).
 func TestConfigPathFor(t *testing.T) {
 	home := func() (string, error) { return "/home/user", nil }
 	cases := []struct {
 		name string
-		pig  string
+		env  map[string]string
 		want string
 	}{
-		{"PIG_HOME set", "/root/.pig-test", "/root/.pig-test/agent/compact-ui.json"},
-		{"PIG_HOME empty falls back to ~/.pi", "", "/home/user/.pi/agent/compact-ui.json"},
+		{"PIG_HOME set", map[string]string{"PIG_HOME": "/root/.pig-test"}, "/root/.pig-test/agent/compact-ui.json"},
+		{"PI_CODING_AGENT_DIR wins", map[string]string{"PI_CODING_AGENT_DIR": "/opt/agent", "PIG_HOME": "/pig"}, "/opt/agent/compact-ui.json"},
+		{"host info wins over env", map[string]string{"PIG_EXT_HOST_INFO": `{"agentDir":"/host/agent"}`, "PI_CODING_AGENT_DIR": "/env/agent"}, "/host/agent/compact-ui.json"},
+		{"no overrides falls back to ~/.pig", map[string]string{}, "/home/user/.pig/agent/compact-ui.json"},
 	}
 	for _, tc := range cases {
-		env := func(key string) string {
-			if key == "PIG_HOME" {
-				return tc.pig
-			}
-			return ""
-		}
+		env := func(key string) string { return tc.env[key] }
 		if got := configPathFor(env, home); got != tc.want {
 			t.Errorf("%s: configPathFor = %q, want %q", tc.name, got, tc.want)
 		}
 	}
-	// A missing home directory still yields the conventional path.
-	if got := configPathFor(func(string) string { return "" }, func() (string, error) { return "", errors.New("no home") }); got != filepath.Join("", ".pi", "agent", "compact-ui.json") {
+	// A missing home directory still yields the conventional relative path.
+	if got := configPathFor(func(string) string { return "" }, func() (string, error) { return "", errors.New("no home") }); got != filepath.Join(".pig", "agent", "compact-ui.json") {
 		t.Errorf("erroring home = %q", got)
 	}
 }

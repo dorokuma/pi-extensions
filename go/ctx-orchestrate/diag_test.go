@@ -23,10 +23,15 @@ func resetDiagPath(t *testing.T) {
 	})
 }
 
-// TestResolveDiagDir pins the precedence: an explicit CTX_ORCH_DIAG_DIR wins, a
-// set PIG_HOME keeps the log inside the isolated PiG home, and only then does the
-// TS default <home>/.pi/agent/logs apply (/tmp standing in for an unknown home).
+// TestResolveDiagDir pins the precedence: an explicit CTX_ORCH_DIAG_DIR wins,
+// then the resolved agent dir (PIG_EXT_HOST_INFO/agent-envs/PIG_HOME/ ~/.pig),
+// and /tmp stands in when no home resolves.
 func TestResolveDiagDir(t *testing.T) {
+	// Clear every override the resolver reads so assertions don't depend on the
+	// environment the test happens to run in.
+	t.Setenv("PIG_EXT_HOST_INFO", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
 	for _, tc := range []struct {
 		name    string
 		diagDir string
@@ -35,14 +40,15 @@ func TestResolveDiagDir(t *testing.T) {
 		want    string
 	}{
 		{"explicit dir wins over PIG_HOME", "/var/log/ctx", "/pig", "/home/u", "/var/log/ctx"},
-		{"blank explicit dir is unset", "   ", "/pig", "/home/u", "/pig/agent/logs"},
+		{"blank explicit dir falls through", "   ", "/pig", "/home/u", "/pig/agent/logs"},
 		{"PIG_HOME is trimmed and cleaned", "", " /pig/ ", "/home/u", "/pig/agent/logs"},
-		{"home fallback without PIG_HOME", "", "", "/home/u", "/home/u/.pi/agent/logs"},
-		{"unknown home falls back to /tmp", "", "", "", "/tmp/.pi/agent/logs"},
+		{"home falls back to ~/.pig", "", "", "/home/u", "/home/u/.pig/agent/logs"},
+		{"unknown home falls back to /tmp", "", "", "", "/tmp/.pig/agent/logs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveDiagDir(tc.diagDir, tc.pigHome, tc.home); got != tc.want {
-				t.Fatalf("resolveDiagDir(%q, %q, %q) = %q, want %q", tc.diagDir, tc.pigHome, tc.home, got, tc.want)
+			t.Setenv("PIG_HOME", tc.pigHome)
+			if got := resolveDiagDir(tc.diagDir, tc.home); got != tc.want {
+				t.Fatalf("resolveDiagDir(%q, %q) = %q, want %q", tc.diagDir, tc.home, got, tc.want)
 			}
 		})
 	}
@@ -50,13 +56,15 @@ func TestResolveDiagDir(t *testing.T) {
 
 // TestDiagDefaultsToPigHome is the isolation regression: with CTX_ORCH_DIAG_DIR
 // unset and PIG_HOME set, one diagnostics line must land in $PIG_HOME/agent/logs
-// and nothing may be created under the real home. Before the fix the PIG_HOME
-// branch did not exist, so the run wrote
-// into $HOME/.pi/agent/logs.
+// and nothing may be created under the real home. Before the agent-dir
+// resolution unified on ~/.pig the run wrote into $HOME/.pi/agent/logs.
 func TestDiagDefaultsToPigHome(t *testing.T) {
 	pigHome := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("CTX_ORCH_DIAG_DIR", "")
+	t.Setenv("PIG_EXT_HOST_INFO", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PIG_CODING_AGENT_DIR", "")
 	t.Setenv("PIG_HOME", pigHome)
 	t.Setenv("HOME", home)
 	resetDiagPath(t)
