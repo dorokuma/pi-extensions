@@ -362,11 +362,150 @@ func TestFormatReport(t *testing.T) {
 	expectedLines := []string{
 		"[accent][env][/accent]",
 		"[muted]  global[/muted]",
-		"    [success]A_KEY[/success][dim]=[/dim][muted]100[/muted]",
+		// A_KEY matches the sensitive-key heuristic; value "100" is short so fully masked.
+		"    [success]A_KEY[/success][dim]=[/dim][muted]…[/muted]",
 	}
 	wantRep := strings.Join(expectedLines, "\n")
 	if repStr != wantRep {
 		t.Errorf("repStr = %q, want %q", repStr, wantRep)
+	}
+}
+
+// 8b. FormatReport masks values of sensitive keys (KEY/TOKEN/SECRET/...), not others
+func TestFormatReport_SecretMasking(t *testing.T) {
+	// fake: 19-char fixture built at runtime so no realistic credential literal
+	// appears in the source (exercises the first4…last4 branch, len>16).
+	fake := "s" + strings.Repeat("e", 17) + "c"
+	report := EnvReport{
+		Source: "global",
+		Keys:   []string{"TINYFISH_API_KEY", "FOO", "MY_TOKEN", "EMPTY_SECRET"},
+		Variables: map[string]string{
+			"TINYFISH_API_KEY": fake,
+			"FOO":              "bar",
+			"MY_TOKEN":         "short",
+			"EMPTY_SECRET":     "",
+		},
+	}
+
+	out := FormatReport(nil, []EnvReport{report})
+
+	lines := strings.Split(out, "\n")
+	findLine := func(prefix string) string {
+		for _, l := range lines {
+			if strings.Contains(l, prefix) {
+				return l
+			}
+		}
+		return ""
+	}
+
+	full := report.Variables["TINYFISH_API_KEY"]
+	wantMasked := full[:4] + "…" + full[len(full)-4:]
+
+	if got := findLine("TINYFISH_API_KEY"); !strings.Contains(got, wantMasked) {
+		t.Errorf("expected masked value %q in TINYFISH_API_KEY line, got %q\nfull report:\n%s", wantMasked, got, out)
+	}
+	if strings.Contains(out, full) {
+		t.Errorf("full secret value leaked in report:\n%s", out)
+	}
+	if got := findLine("FOO"); !strings.Contains(got, "bar") {
+		t.Errorf("non-sensitive FOO should render verbatim, got %q\nfull report:\n%s", got, out)
+	}
+	// Short sensitive value (<=16 chars) fully masked, no partial reveal.
+	if got := findLine("MY_TOKEN"); strings.Contains(got, "short") || !strings.Contains(got, "…") {
+		t.Errorf("short sensitive value should be fully masked, got %q\nfull report:\n%s", got, out)
+	}
+	if got := findLine("EMPTY_SECRET"); !strings.Contains(got, "(empty)") {
+		t.Errorf("empty sensitive value should render '(empty)', got %q\nfull report:\n%s", got, out)
+	}
+}
+
+// 8c. maskSecretValue boundary rules: 0 -> (empty); <=16 runes fully masked;
+// >16 runes reveal only first4…last4 (never more than 8 chars of the value).
+func TestMaskSecretValue_Boundaries(t *testing.T) {
+	if got := maskSecretValue(""); got != "(empty)" {
+		t.Errorf("empty value = %q, want '(empty)'", got)
+	}
+
+	fullyMasked := map[string]int{
+		"9-char boundary":  9,
+		"16-char boundary": 16,
+		"short value":      8,
+		"1 char":           1,
+	}
+	for name, n := range fullyMasked {
+		val := strings.Repeat("p", n)
+		if got := maskSecretValue(val); got != "…" {
+			t.Errorf("%s: maskSecretValue(%d chars) = %q, want fully masked '…'", name, n, got)
+		}
+	}
+
+	// 17-char boundary: first4…last4 reveal.
+	val17 := "0123456789ABCDEFG"
+	if got, want := maskSecretValue(val17), "0123…DEFG"; got != want {
+		t.Errorf("17-char value = %q, want %q", got, want)
+	}
+
+	// Long token: first4…last4, and never more than 8 chars of the value visible.
+	long := "s" + strings.Repeat("e", 17) + "c" // 19 chars
+	masked := maskSecretValue(long)
+	if want := "seee…eeec"; masked != want {
+		t.Errorf("19-char value = %q, want %q", masked, want)
+	}
+	for n := 9; n <= len(long); n++ {
+		for i := 0; i+n <= len(long); i++ {
+			if strings.Contains(masked, long[i:i+n]) {
+				t.Fatalf("masked %q leaks %d consecutive chars %q of secret", masked, n, long[i:i+n])
+			}
+		}
+	}
+}
+
+// 8d. sensitiveEnvKey coverage: URL/URI/PASSCODE/CREDS markers (and existing
+// PASS via PGPASS) mask values in the /env report; plainly non-sensitive keys
+// render verbatim. Values are runtime-built fixtures, not real credentials.
+func TestSensitiveEnvKey_Coverage(t *testing.T) {
+	// 20-char fixture -> first4…last4 branch; never a real credential.
+	fake := "x" + strings.Repeat("y", 18) + "z"
+	wantMasked := fake[:4] + "…" + fake[len(fake)-4:]
+
+	sensitive := []string{"DATABASE_URL", "PGPASS", "MY_PASSCODE", "AWS_CREDS"}
+	nonSensitive := []string{"FOO", "EDITOR"}
+
+	var keys []string
+	vars := make(map[string]string)
+	for _, k := range append(append([]string{}, sensitive...), nonSensitive...) {
+		keys = append(keys, k)
+		vars[k] = fake
+	}
+	out := FormatReport(nil, []EnvReport{{Source: "global", Keys: keys, Variables: vars}})
+
+	lineOf := func(key string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), key+"=") {
+				return l
+			}
+		}
+		return ""
+	}
+
+	for _, k := range sensitive {
+		got := lineOf(k)
+		if got == "" {
+			t.Fatalf("missing report line for %s\nfull report:\n%s", k, out)
+		}
+		if !strings.Contains(got, wantMasked) {
+			t.Errorf("%s should be masked as %q, got %q\nfull report:\n%s", k, wantMasked, got, out)
+		}
+	}
+	for _, k := range nonSensitive {
+		got := lineOf(k)
+		if got == "" {
+			t.Fatalf("missing report line for %s\nfull report:\n%s", k, out)
+		}
+		if !strings.Contains(got, "="+fake) {
+			t.Errorf("non-sensitive %s should render verbatim, got %q\nfull report:\n%s", k, got, out)
+		}
 	}
 }
 
