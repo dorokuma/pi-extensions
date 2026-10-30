@@ -59,11 +59,21 @@ func (t *ticker) stop() {
 	close(t.stopC)
 }
 
-// requestFrame asks the captured TUI for a frame. Callers must not hold mu.
+// requestFrame asks for a frame. Callers must not hold mu. Two repaints can
+// apply: the captured TUI's requestRender (the addOverlay branch), and the
+// Custom overlay's own invalidator the SDK installs through SetInvalidate
+// (the ctx.ui.Custom branch, where capturedTui stays nil). Both run because a
+// host may expose a captured TUI and a Custom overlay at once: the invalidator
+// is what actually repaints the remote overlay, requestRender repaints the
+// chat behind it.
 func (r *runtimeState) requestFrame() {
 	r.mu.Lock()
 	tui := r.capturedTui
+	invalidate := r.customInvalidate
 	r.mu.Unlock()
+	if invalidate != nil {
+		invalidate()
+	}
 	requestRender(tui)
 }
 
@@ -230,9 +240,12 @@ func (r *runtimeState) openDetailModal(entry groupEntry) {
 	r.mu.Unlock()
 	if root != nil {
 		// The selector opened a single ctx.ui.Custom root; Enter switches that
-		// root's view instead of stacking a second Custom session.
+		// root's view instead of stacking a second Custom session. On this
+		// branch capturedTui is nil, so the repaint goes through requestFrame:
+		// the Custom overlay's own invalidator (installed by the adapter's
+		// SetInvalidate) is what repaints the remote frame.
 		root.show(modal)
-		requestRender(tui)
+		r.requestFrame()
 		return
 	}
 	if tui != nil {
@@ -272,8 +285,10 @@ func (r *runtimeState) closeDetailModal() {
 	}
 	if root != nil {
 		// Closing the detail falls back to the selector that owns the root.
+		// Same repaint path as above: capturedTui is nil on the Custom
+		// branch, so requestFrame reaches the overlay's invalidator.
 		root.showSelector()
-		requestRender(tui)
+		r.requestFrame()
 		return
 	}
 	if done != nil {
@@ -492,15 +507,30 @@ func (c *customRootComponent) HandleInput(data string) (bool, any) {
 	return false, value
 }
 
-// dispose releases the root's views.
+// dispose releases the root's views. The root owns both modals of the shared
+// Custom session: the selector (its permanent view) and whichever detail is
+// mounted on top. Disposing only the current view would leak the other
+// modal's poll timer -- the selector keeps ticking after the overlay is gone
+// when the root was torn down from the detail view, and vice versa. Both
+// disposes are idempotent (a modal dispose is flag-setting plus a
+// sync.Once-guarded timer stop), so a view already released through
+// closeDetailModal / closeInspectSelectorModal is disposed harmlessly twice.
 func (c *customRootComponent) dispose() {
 	c.mu.Lock()
 	view := c.view
+	selector := c.selector
 	c.view = nil
 	c.depth = 0
 	c.mu.Unlock()
-	if disposer, ok := view.(interface{ dispose() }); ok {
-		disposer.dispose()
+	disposed := map[remoteComponent]bool{}
+	for _, comp := range []remoteComponent{view, selector} {
+		if comp == nil || disposed[comp] {
+			continue
+		}
+		disposed[comp] = true
+		if disposer, ok := comp.(interface{ dispose() }); ok {
+			disposer.dispose()
+		}
 	}
 }
 

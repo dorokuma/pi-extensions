@@ -803,6 +803,9 @@ func TestPreparingToolRendersAndOpensWithoutPanic(t *testing.T) {
 	// Both modals render and open without panicking while the call is still
 	// provisional: this is where a nil entry.tool used to crash.
 	selector := r.newInspectSelectorModal()
+	// The provisional call is still live, so the selector armed its poll loop;
+	// release it instead of leaking the goroutine past the test.
+	defer selector.dispose()
 	if len(selector.entries) == 0 {
 		t.Fatal("the selector has no entries for the streamed tool call")
 	}

@@ -501,36 +501,119 @@ type inspectSelectorModal struct {
 	selectedIdx int
 	scrollTop   int
 	visibleHgt  int
+	pollTimer   *animTimer
+	polling     bool
+	disposed    bool
 }
 
-// newInspectSelectorModal is `new InspectSelectorModal()` (L1821-1823).
+// newInspectSelectorModal is `new InspectSelectorModal()` (L1821-1823). The
+// initial refresh is also what arms the poll loop when the list already
+// holds a live entry.
 func (r *runtimeState) newInspectSelectorModal() *inspectSelectorModal {
 	modal := &inspectSelectorModal{tui: r, visibleHgt: 10}
 	modal.refreshEntries(true)
 	return modal
 }
 
-// refreshEntries is refreshEntries (L1824-1841): re-read the visible entries,
-// keeping the selection in place or trailing the newest.
-func (m *inspectSelectorModal) refreshEntries(isInitial bool) {
+// hasLiveEntriesLocked reports whether any selector entry still streams or
+// runs: the same predicate isModalEntryActive applies to a detail modal's
+// single entry, lifted to the selector's whole list. The caller holds m.mu.
+func (m *inspectSelectorModal) hasLiveEntriesLocked() bool {
+	if m.tui == nil {
+		return false
+	}
+	for _, entry := range m.entries {
+		if m.tui.isModalEntryActive(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+// startPollingIfNeeded is the selector's counterpart of the detail modal's
+// startPollingIfNeeded (L1583-1592): while any listed entry is live, re-render
+// every spinner interval so the row icons animate without waiting for a key
+// event, and stop once every entry finished.
+func (m *inspectSelectorModal) startPollingIfNeeded() {
 	m.mu.Lock()
-	wasAtEnd := isInitial || m.selectedIdx >= len(m.entries)-1
+	if m.disposed || m.polling || !m.hasLiveEntriesLocked() {
+		m.mu.Unlock()
+		return
+	}
+	timer := &animTimer{stop: make(chan struct{}), done: make(chan struct{})}
+	m.pollTimer = timer
+	m.polling = true
 	m.mu.Unlock()
+	go func() {
+		<-timer.stop
+		close(timer.done)
+	}()
+	go m.pollLoop(timer)
+}
+
+// pollLoop is the setInterval body: it re-requests the frame and re-reads the
+// entry list each tick, so a tool that starts *after* the selector opened is
+// picked up and a drained list stops the loop.
+func (m *inspectSelectorModal) pollLoop(timer *animTimer) {
+	ticker := newTicker(spinnerMs)
+	defer ticker.stop()
+	for {
+		select {
+		case <-timer.stop:
+			return
+		case <-ticker.c:
+			// refreshEntries commits the new list and requests the frame, so a
+			// single call drives both halves of the tick.
+			m.refreshEntries(false)
+			m.mu.Lock()
+			live := !m.disposed && m.hasLiveEntriesLocked()
+			if !live && m.pollTimer == timer {
+				m.pollTimer = nil
+				m.polling = false
+			}
+			m.mu.Unlock()
+			if !live {
+				timer.stopTimer()
+				return
+			}
+		}
+	}
+}
+
+// refreshEntries is refreshEntries (L1824-1841): re-read the visible entries,
+// keeping the selection in place or trailing the newest. The follow-tail
+// decision is made on the current selection at commit time, inside the same
+// critical section that writes it, so a key press that arrived while the new
+// list was being gathered cannot be overridden by a stale wasAtEnd.
+func (m *inspectSelectorModal) refreshEntries(isInitial bool) {
 	entries := m.tui.allInspectableEntries()
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	wasAtEnd := isInitial || len(m.entries) == 0 || m.selectedIdx >= len(m.entries)-1
 	m.entries = entries
 	if len(m.entries) == 0 {
 		m.selectedIdx = 0
 		m.scrollTop = 0
-		return
-	}
-	if wasAtEnd {
-		m.selectedIdx = len(m.entries) - 1
 	} else {
-		m.selectedIdx = maxInt(0, minInt(m.selectedIdx, len(m.entries)-1))
+		if wasAtEnd {
+			m.selectedIdx = len(m.entries) - 1
+		} else {
+			m.selectedIdx = maxInt(0, minInt(m.selectedIdx, len(m.entries)-1))
+		}
+		m.adjustScrollLocked()
 	}
-	m.adjustScrollLocked()
+	m.mu.Unlock()
+	// An event handler reaching refreshEntries on the Custom branch has no
+	// captured TUI (its trailing requestRender no-ops), and a refresh that
+	// leaves no live entry arms no poll loop to repaint either, so the entry
+	// change must be pushed here. requestFrame covers both repaint paths:
+	// the overlay invalidator the adapter installed through SetInvalidate,
+	// and the captured TUI's requestRender.
+	m.tui.requestFrame()
+	// A refresh that leaves a live entry must (re)arm the poll loop: a tool
+	// that starts while the selector is already open has to tick its spinner
+	// too. This is a no-op while a loop is already armed or the modal is
+	// disposed.
+	m.startPollingIfNeeded()
 }
 
 // adjustScrollLocked is adjustScroll (L1842-1855).
@@ -764,8 +847,17 @@ func highlightRow(th theme, row string) string {
 	return th.inverse(row)
 }
 
-// dispose is dispose (L2061-2062).
-func (m *inspectSelectorModal) dispose() {}
+// dispose is dispose (L2061-2062): drop the poll timer the way the detail
+// modal's dispose does, so the goroutine cannot outlive the overlay.
+func (m *inspectSelectorModal) dispose() {
+	m.mu.Lock()
+	timer := m.pollTimer
+	m.pollTimer = nil
+	m.polling = false
+	m.disposed = true
+	m.mu.Unlock()
+	timer.stopTimer()
+}
 
 // invalidate is invalidate (L2063-2064).
 func (m *inspectSelectorModal) invalidate() {}

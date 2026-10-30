@@ -1,6 +1,8 @@
 package compactui
 
 import (
+	"sync"
+
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
@@ -85,7 +87,7 @@ func (u sdkUI) custom(factory remoteComponentFactory, options any) (result any, 
 			}
 		}
 	}
-	return u.ctx.Custom(remoteComponentOf(comp), sdkOptions)
+	return u.ctx.Custom(adapterFor(comp), sdkOptions)
 }
 
 // sdkOverlayCloser adapts the SDK's overlay handle to overlayCloser.
@@ -98,14 +100,76 @@ func (c sdkOverlayCloser) hide() {
 	}
 }
 
-// remoteComponentOf wraps a ported component as the SDK's RemoteComponent.
-func remoteComponentOf(comp remoteComponent) sdk.RemoteComponent {
-	return &sdkComponentAdapter{built: comp}
-}
-
 // sdkComponentAdapter renders a ported component through the SDK.
 type sdkComponentAdapter struct {
 	built remoteComponent
+
+	// The SDK never invokes the port's factory with a real TUI (Custom takes
+	// the component itself), so on the ctx.ui.Custom branch capturedTui stays
+	// nil and runtime.requestFrame is a no-op. The SDK-side equivalent is
+	// RemoteComponentInvalidator: while the overlay is mounted it installs its
+	// own requestRender through SetInvalidate, and clears it with nil before
+	// disposal. The adapter forwards that callback into the runtime's
+	// requestFrame path so a modal's poll tick produces a real repaint on this
+	// branch too.
+	rt *runtimeState
+
+	mu         sync.Mutex
+	invalidate func()
+}
+
+// adapterFor wraps comp and binds it to the runtime it renders through, so a
+// later SetInvalidate can register the frame requester on the right runtime.
+func adapterFor(comp remoteComponent) *sdkComponentAdapter {
+	adapter := &sdkComponentAdapter{built: comp}
+	switch c := comp.(type) {
+	case *customRootComponent:
+		adapter.rt = c.tui
+	case *inspectSelectorModal:
+		adapter.rt = c.tui
+	case *detailModalComponent:
+		adapter.rt = c.tui
+	}
+	return adapter
+}
+
+// SetInvalidate implements sdk.RemoteComponentInvalidator. The SDK installs
+// its overlay requestRender while the component is mounted (extension.go
+// remoteOverlay.start) and clears it with nil on stop; implementations must
+// replace the callback and treat nil as detach. The callback is registered on
+// the runtime as the requestFrame fallback for the no-capturedTui branch, so
+// the detail/selector poll loops repaint through the overlay's own invalidator
+// instead of a full requestRender they cannot reach.
+func (a *sdkComponentAdapter) SetInvalidate(fn func()) {
+	a.mu.Lock()
+	a.invalidate = fn
+	a.mu.Unlock()
+	rt := a.rt
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	if fn != nil {
+		rt.customInvalidate = a.invalidateNow
+		rt.customInvalidateOwner = a
+	} else if rt.customInvalidateOwner == a {
+		rt.customInvalidate = nil
+		rt.customInvalidateOwner = nil
+	}
+	rt.mu.Unlock()
+}
+
+// invalidateNow is the callback the runtime's requestFrame reaches on the
+// Custom branch: it nudges the SDK overlay's requestRender, which is what
+// repaints the remote frame. It is a no-op before the overlay mounts and after
+// it stops (the SDK clears the callback with SetInvalidate(nil)).
+func (a *sdkComponentAdapter) invalidateNow() {
+	a.mu.Lock()
+	fn := a.invalidate
+	a.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // Render implements sdk.RemoteComponent.
