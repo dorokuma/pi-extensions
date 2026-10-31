@@ -540,8 +540,47 @@ func CompleteCommand(prefix string) []map[string]string {
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-// HandleSessionStart mirrors the `session_start` handler.
-func (e *HerdsmanExtension) HandleSessionStart(ctx Context) {
+// shouldSkipDaemonClient mirrors the TS `shouldSkipDaemonClient`: whether
+// this `session_start` must not open a daemon connection at all.
+//
+// Two shapes qualify, and both are one-shot or session-less runs where a
+// daemon client can only ever be a liability:
+//   - no session file (`--no-session`): there is no path to register presence
+//     against, and `agent.orchestrator.register` rejects, so the client would
+//     spend the rest of the run in a reconnect loop;
+//   - a non-interactive `print`/`json` run: the process is about to exit and
+//     nothing will ever read the stream, so the connection outlives the run
+//     and holds the event loop open.
+//
+// HasUI is only honoured as an explicit false (Pi's own signal for a
+// non-interactive mode); an absent field means "unknown" and keeps the old
+// behaviour. The mode is read from the event first and the context second
+// because Pi reports it on both. The SDK pins "no reported mode" to "print",
+// so a nil-mode context here is one the host never described — unknown, like
+// the absent TS field, not non-interactive.
+func shouldSkipDaemonClient(ctx Context, eventMode *string, sessionRef *AgentSessionRef) bool {
+	if sessionRef == nil || sessionRef.Value == "" {
+		return true
+	}
+	if hasUI, known := ctx.HasUI(); known && !hasUI {
+		return true
+	}
+	mode := ""
+	modeKnown := false
+	if eventMode != nil && *eventMode != "" {
+		mode = *eventMode
+		modeKnown = true
+	}
+	if !modeKnown {
+		mode, modeKnown = ctx.Mode()
+	}
+	return modeKnown && (mode == "print" || mode == "json")
+}
+
+// HandleSessionStart mirrors the `session_start` handler. `eventMode` is the
+// mode the event itself reported (the SDK hands the whole `data` map); nil
+// means the event did not carry one and the context is asked instead.
+func (e *HerdsmanExtension) HandleSessionStart(ctx Context, eventMode *string) {
 	e.mu.Lock()
 	// A new session is a new connection and a new scope identity: every guard
 	// captured before it is stale, and a registration left in flight belongs to
@@ -561,6 +600,21 @@ func (e *HerdsmanExtension) HandleSessionStart(ctx Context) {
 	}
 	e.launchIdentity = herdrLaunchIdentity(e.env)
 	if e.launchIdentity == nil {
+		e.connected = false
+		e.loseRole(ctx, loseRoleOptions{})
+		e.mu.Unlock()
+		return
+	}
+	if shouldSkipDaemonClient(ctx, eventMode, e.sessionRef) {
+		// Nothing to register against: an ephemeral `--no-session` run has no
+		// session file to report, and a `print`/`json` run is a one-shot
+		// non-interactive process whose only remaining work is to exit. Building
+		// a client here is what kept `pi --print` hanging on `herdsman.sock`.
+		e.stopKeepalive()
+		if e.client != nil {
+			e.client.Close()
+		}
+		e.client = nil
 		e.connected = false
 		e.loseRole(ctx, loseRoleOptions{})
 		e.mu.Unlock()

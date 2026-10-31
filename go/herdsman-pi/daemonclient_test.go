@@ -69,6 +69,9 @@ func (d *fakeDaemon) accept() {
 }
 
 func (d *fakeDaemon) serve(conn net.Conn, onConnect func(net.Conn), onMessage func(net.Conn, rpcClientMsg)) {
+	// Whatever ends the read loop (client close, supersede, protocol error)
+	// un-registers the conn so LiveConnections reports what is still open.
+	defer d.removeLive(conn)
 	decoder, err := NewJsonLineDecoder(DefaultMaxFrameBytes)
 	if err != nil {
 		return
@@ -112,6 +115,26 @@ func stringOr(value any) string {
 func mapOr(value any) map[string]any {
 	record, _ := value.(map[string]any)
 	return record
+}
+
+// removeLive drops a conn the serve loop is done with.
+func (d *fakeDaemon) removeLive(conn net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i, live := range d.live {
+		if live == conn {
+			d.live = append(d.live[:i], d.live[i+1:]...)
+			return
+		}
+	}
+}
+
+// LiveConnections reports how many accepted connections are still open on the
+// server side — the orphan count the socket-cleanup regressions assert on.
+func (d *fakeDaemon) LiveConnections() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.live)
 }
 
 func (d *fakeDaemon) Write(conn net.Conn, payload string) {
@@ -574,4 +597,102 @@ func TestClientRejectsUnansweredRequestAndIgnoresLateResponse(t *testing.T) {
 	if record, ok := result.(map[string]any); !ok || record["ok"] != true {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+}
+
+// ── upstream 7558d7f: superseded sockets are closed, reconnect timers are
+// dropped, and a session reset releases what the client still holds ──────────
+
+// TestClientResetForSessionLeavesNoOrphanConnection pins the orphan-ESTAB fix:
+// a session reset (or any new connection) must release what the client already
+// holds. The constructor queues its first dial on a goroutine, so a reset
+// issued immediately races it — whichever attempt wins, the loser must be
+// superseded and its socket destroyed, not left ESTABLISHED on herdsman.sock
+// with nobody holding a reference to close it.
+func TestClientResetForSessionLeavesNoOrphanConnection(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.SetOnMessage(func(conn net.Conn, message rpcClientMsg) {
+		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
+	})
+	connected := make(chan struct{}, 4)
+	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
+	t.Cleanup(client.Close)
+	client.SetOnConnected(func() error { connected <- struct{}{}; return nil })
+	// The race the extension hits: this runs before (or while) the queued
+	// constructor dial is still in flight.
+	client.ResetForSession()
+
+	awaitCondition(t, "one live connection and one onConnected", func() bool {
+		return daemon.Connections() == 1 && daemon.LiveConnections() == 1 && len(connected) == 1
+	})
+	// Give the losing attempt time to land: it must have destroyed itself, not
+	// dialled a second socket or left the first one open.
+	time.Sleep(80 * time.Millisecond)
+	if got := daemon.Connections(); got != 1 {
+		t.Fatalf("a superseded attempt dialled a second socket: %d connection(s)", got)
+	}
+	if got := daemon.LiveConnections(); got != 1 {
+		t.Fatalf("an orphan socket is still open on the daemon: %d live connection(s)", got)
+	}
+	if _, err := client.Request("agent.list", map[string]any{}); err != nil {
+		t.Fatalf("the surviving connection does not serve: %v", err)
+	}
+
+	client.Close()
+	awaitCondition(t, "close released the last socket", func() bool {
+		return daemon.LiveConnections() == 0
+	})
+}
+
+// TestClientCloseAfterFailedDialLeavesNoOrphan pins the timer-drop half of the
+// fix: a reconnect backoff the previous cycle scheduled must not dial into the
+// replacement — after Close, no connection may appear at all.
+func TestClientCloseAfterFailedDialLeavesNoOrphan(t *testing.T) {
+	dir := t.TempDir()
+	client := NewReconnectingDaemonClient(dir+"/absent.sock", []int64{30})
+	// The first dial fails and the backoff is armed. A close must cancel it
+	// instead of letting it fire against a client that no longer exists.
+	awaitCondition(t, "backoff armed after the failed dial", func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.state == stateIdle && client.reconnectTimer != nil
+	})
+	client.Close()
+	client.mu.Lock()
+	timer := client.reconnectTimer
+	client.mu.Unlock()
+	if timer != nil {
+		t.Fatal("Close left the reconnect timer armed")
+	}
+	time.Sleep(80 * time.Millisecond)
+	client.mu.Lock()
+	state := client.state
+	client.mu.Unlock()
+	if state != stateClosed {
+		t.Fatalf("the dropped timer revived the client: state=%v", state)
+	}
+}
+
+// TestClientSupersededDialIsClosedNotAdopted pins the stale-generation backstop:
+// a dial that lands after a newer attempt took over (or after Close) is not
+// the live connection — it is closed immediately instead of lingering.
+func TestClientSupersededDialIsClosedNotAdopted(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.SetOnMessage(func(conn net.Conn, message rpcClientMsg) {
+		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
+	})
+	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
+	t.Cleanup(client.Close)
+	awaitCondition(t, "first connection", func() bool { return daemon.Connections() == 1 })
+
+	// Simulate a stale attempt whose dial lands after the client closed: the
+	// socket must be destroyed, not adopted. dialGeneration is the unlocked
+	// half every dial runs through, so driving it with a dead generation is the
+	// same check the socket's "connect" backstop performs upstream.
+	stale := client.generation - 1
+	client.Close()
+	awaitCondition(t, "live socket closed", func() bool { return daemon.LiveConnections() == 0 })
+	client.dialGeneration(stale, daemon.socket, nil)
+	awaitCondition(t, "the stale socket was adopted then destroyed", func() bool {
+		return daemon.Connections() >= 2 && daemon.LiveConnections() == 0
+	})
 }

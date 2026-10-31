@@ -66,6 +66,14 @@ type Context interface {
 	IsIdle() (idle bool, known bool)
 	SessionFile() string
 	SessionID() string
+	// HasUI reports whether a dialog-capable UI is attached to this run. The
+	// bool says whether the host reported one at all (`hasUI?: boolean` in the
+	// TS): false,false means "unknown" and must keep the old behaviour.
+	HasUI() (hasUI bool, known bool)
+	// Mode reports the run mode (`"tui" | "rpc" | "json" | "print"`). The bool
+	// says whether the host named one: "" means unknown, like an absent TS
+	// field, so a context that never reports a mode stays interactive.
+	Mode() (mode string, known bool)
 	UI() ContextUI
 }
 

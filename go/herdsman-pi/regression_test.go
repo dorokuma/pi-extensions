@@ -206,7 +206,7 @@ func newBlockingFixture(t *testing.T, client *blockingClient) *fixture {
 func startBlocking(t *testing.T, f *fixture, client *blockingClient) {
 	t.Helper()
 	client.arm()
-	go func() { f.core.HandleSessionStart(f.ctx) }()
+	go func() { f.core.HandleSessionStart(f.ctx, nil) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if client.issued("agent.orchestrator.register") > 0 {
@@ -306,7 +306,7 @@ func TestRegression_CoreNeverHoldsItsLockDuringADaemonRequest(t *testing.T) {
 		client := newBlockingClient(func(method string, params any) any { return ownerResponse() })
 		f := newBlockingFixture(t, client)
 		holdAndRelease(t, f.core, client, "agent.orchestrator.register", "registerPresence", func() {
-			f.core.HandleSessionStart(f.ctx)
+			f.core.HandleSessionStart(f.ctx, nil)
 		})
 		awaitRegistration(t, f.core)
 		if !coreConnected(f.core) {
@@ -328,7 +328,7 @@ func TestRegression_CoreNeverHoldsItsLockDuringADaemonRequest(t *testing.T) {
 		f := newBlockingFixture(t, client)
 		client.arm()
 		client.failOn("agent.orchestrator.register", errors.New("register failed"))
-		go func() { f.core.HandleSessionStart(f.ctx) }()
+		go func() { f.core.HandleSessionStart(f.ctx, nil) }()
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) && client.issued("agent.orchestrator.register") == 0 {
 			time.Sleep(2 * time.Millisecond)
@@ -1313,7 +1313,7 @@ func TestRegression_EarlyRegistrationExitDoesNotStickTheInFlightMarker(t *testin
 		f := newBlockingFixture(t, client)
 		// Bring the identity up without dialling: the fake client's
 		// ResetForSession only fires a callback that is not installed yet.
-		f.core.HandleSessionStart(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 
 		// Count the registrations the live cycle already issued, so the check
 		// below cannot be satisfied by a client that started from zero.

@@ -362,6 +362,14 @@ type fakeContext struct {
 	Aborts        int
 	sessionFile   string
 	sessionID     string
+	// hasUI mirrors ctx.hasUI: nil is "the host never reported one" (unknown),
+	// a pointer is the reported value. The SDK always knows it; the tests keep
+	// the TS "absent means unknown" surface.
+	hasUI *bool
+	// mode mirrors ctx.mode: "" is "the host never named one". The SDK pins an
+	// unreported mode to "print", so tests that model an interactive run pass
+	// it explicitly.
+	mode string
 }
 
 type notification struct {
@@ -405,7 +413,23 @@ func (c *fakeContext) SetIdle(idle bool) {
 
 func (c *fakeContext) SessionFile() string { return c.sessionFile }
 func (c *fakeContext) SessionID() string   { return c.sessionID }
-func (c *fakeContext) UI() ContextUI       { return fakeUI{owner: c} }
+func (c *fakeContext) HasUI() (bool, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hasUI == nil {
+		return false, false
+	}
+	return *c.hasUI, true
+}
+func (c *fakeContext) Mode() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode == "" {
+		return "", false
+	}
+	return c.mode, true
+}
+func (c *fakeContext) UI() ContextUI { return fakeUI{owner: c} }
 
 type fakeUI struct{ owner *fakeContext }
 
@@ -785,7 +809,7 @@ func newFixture(t *testing.T, options ExtensionOptions, idle bool, identity *her
 
 // start performs session_start + connect + registration, like the TS helper.
 func (f *fixture) start() {
-	f.core.HandleSessionStart(f.ctx)
+	f.core.HandleSessionStart(f.ctx, nil)
 	f.client.ConnectNow()
 	awaitRegistration(f.t, f.core)
 }

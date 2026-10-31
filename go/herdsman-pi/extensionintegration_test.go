@@ -179,7 +179,7 @@ func runWithWatchdog(t *testing.T, what string, fn func()) {
 func TestExtensionSessionStartWithRealClientConnectsAndRegisters(t *testing.T) {
 	f, _ := newRealClientFixture(t)
 	runWithWatchdog(t, "HandleSessionStart", func() {
-		f.core.HandleSessionStart(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 	})
 	awaitMethod(t, f, "agent.orchestrator.register")
 	awaitAnswered(t, f, "agent.orchestrator.register")
@@ -201,7 +201,7 @@ func TestExtensionSessionStartWithRealClientConnectsAndRegisters(t *testing.T) {
 func TestExtensionAgentStartAfterRealConnect(t *testing.T) {
 	f, _ := newRealClientFixture(t)
 	runWithWatchdog(t, "HandleSessionStart", func() {
-		f.core.HandleSessionStart(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 	})
 	awaitMethod(t, f, "agent.orchestrator.register")
 	runWithWatchdog(t, "HandleAgentStart", func() {
@@ -229,7 +229,7 @@ func TestExtensionHandlesOrchestratorStreamWithRealClient(t *testing.T) {
 	})
 
 	runWithWatchdog(t, "HandleSessionStart", func() {
-		f.core.HandleSessionStart(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 	})
 	awaitMethod(t, f, "agent.orchestrator.register")
 	// The registration has to be applied before the role change is pushed: e.mu

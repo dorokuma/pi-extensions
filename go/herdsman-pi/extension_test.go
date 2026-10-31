@@ -183,7 +183,7 @@ func TestExtensionDoesNotConnectOutsideCompleteHerdrEnvironment(t *testing.T) {
 			return newFakeClient()
 		},
 	}, true, nil) // no Herdr identity
-	f.core.HandleSessionStart(f.ctx)
+	f.core.HandleSessionStart(f.ctx, nil)
 	if created != 0 {
 		t.Fatalf("client created outside a Herdr environment (%d)", created)
 	}
@@ -214,7 +214,7 @@ func TestExtensionDoesNotConnectOutsideCompleteHerdrEnvironment(t *testing.T) {
 		},
 		Env: partialEnv,
 	}, true, nil)
-	partial.core.HandleSessionStart(partial.ctx)
+	partial.core.HandleSessionStart(partial.ctx, nil)
 	if incomplete != 0 {
 		t.Fatalf("client created without a pane id (%d)", incomplete)
 	}
@@ -237,7 +237,7 @@ func TestExtensionSessionStartSurvivesSynchronousDialCallback(t *testing.T) {
 	// own goroutine and the test fails on a timeout instead of hanging.
 	done := make(chan struct{})
 	go func() {
-		f.core.HandleSessionStart(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 		close(done)
 	}()
 	select {
@@ -410,6 +410,110 @@ func TestContextFilterStillDropsHerdsmansOwnMessages(t *testing.T) {
 	if kept := core.HandleContext([]any{mention}); len(kept) != 1 {
 		t.Fatalf("kept %d messages, want the assistant mention: %#v", len(kept), kept)
 	}
+}
+
+// TestExtensionSkipsDaemonClientOnOneShotRuns is the regression guard for the
+// upstream fix that kept `pi --print` hanging on `herdsman.sock`: a session
+// start in a non-interactive (`print`/`json`) or session-less (`--no-session`)
+// run must not build a daemon client at all. The mode arrives on the context
+// and on the event; `hasUI` is honoured only as an explicit false.
+func TestExtensionSkipsDaemonClientOnOneShotRuns(t *testing.T) {
+	t.Run("print mode reported on the context", func(t *testing.T) {
+		created := 0
+		f := newFixture(t, ExtensionOptions{
+			ClientFactory: func() HerdsmanDaemonClient {
+				created++
+				return newFakeClient()
+			},
+		}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		mode := "print"
+		f.ctx.mode = mode
+		noUI := false
+		f.ctx.hasUI = &noUI
+		f.core.HandleSessionStart(f.ctx, nil)
+		if created != 0 {
+			t.Fatalf("client created in print mode (%d)", created)
+		}
+		if f.core.client != nil {
+			t.Fatal("the core kept a client for a one-shot session")
+		}
+	})
+
+	t.Run("json mode reported on the context", func(t *testing.T) {
+		created := 0
+		f := newFixture(t, ExtensionOptions{
+			ClientFactory: func() HerdsmanDaemonClient {
+				created++
+				return newFakeClient()
+			},
+		}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		f.ctx.mode = "json"
+		f.core.HandleSessionStart(f.ctx, nil)
+		if created != 0 {
+			t.Fatalf("client created in json mode (%d)", created)
+		}
+	})
+
+	t.Run("hasUI false alone skips", func(t *testing.T) {
+		created := 0
+		f := newFixture(t, ExtensionOptions{
+			ClientFactory: func() HerdsmanDaemonClient {
+				created++
+				return newFakeClient()
+			},
+		}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		noUI := false
+		f.ctx.hasUI = &noUI
+		f.core.HandleSessionStart(f.ctx, nil)
+		if created != 0 {
+			t.Fatalf("client created without a UI (%d)", created)
+		}
+	})
+
+	t.Run("event mode wins over an unknown context mode", func(t *testing.T) {
+		created := 0
+		f := newFixture(t, ExtensionOptions{
+			ClientFactory: func() HerdsmanDaemonClient {
+				created++
+				return newFakeClient()
+			},
+		}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		eventMode := "print"
+		f.core.HandleSessionStart(f.ctx, &eventMode)
+		if created != 0 {
+			t.Fatalf("client created from the event's mode (%d)", created)
+		}
+	})
+
+	t.Run("no session file skips and closes the previous client", func(t *testing.T) {
+		first := newFakeClient()
+		f := newFixture(t, ExtensionOptions{}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		f.start()
+		if first.Closed() {
+			t.Fatal("the interactive session already closed its client")
+		}
+		// A `--no-session` restart arrives: no path to register against, so the
+		// old client dies with the session and no new one is built.
+		f.ctx.sessionFile = ""
+		f.core.HandleSessionStart(f.ctx, nil)
+		if !f.client.Closed() {
+			t.Fatal("a session-less restart left the previous client open")
+		}
+		if f.core.client != nil {
+			t.Fatal("the core kept a client for a session-less run")
+		}
+	})
+
+	t.Run("an interactive session with no reported mode still connects", func(t *testing.T) {
+		// Backward compatibility: contexts that set neither hasUI nor mode keep
+		// the old behaviour — an absent field means "unknown", not "print".
+		f := newFixture(t, ExtensionOptions{}, true, &herdsmanEnv{paneID: "wB:p1", workspaceID: "wB"})
+		f.start()
+		registers := f.client.CallsFor("agent.orchestrator.register")
+		if len(registers) != 1 {
+			t.Fatalf("expected one registration, got %d", len(registers))
+		}
+	})
 }
 
 var _ = time.Second

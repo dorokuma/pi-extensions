@@ -208,6 +208,28 @@ func (c sdkContext) SessionID() string {
 	return id
 }
 
+// HasUI maps ctx.hasUI: the SDK reports it in the ready/state snapshot, so it
+// is always known once a context exists. The second return value keeps the TS
+// "absent means unknown" contract for the fake contexts the tests drive.
+func (c sdkContext) HasUI() (bool, bool) {
+	if c.ctx == nil {
+		return false, false
+	}
+	return c.ctx.HasUI(), true
+}
+
+// Mode maps ctx.mode: the SDK carries the host's run mode from the ready
+// message. An empty string would be "the host never said", but the SDK pins
+// the same contract the TS reads: a host that names no mode is a non-UI run,
+// so Mode() reports "print" for it — exactly the session this extension must
+// not dial a daemon for.
+func (c sdkContext) Mode() (string, bool) {
+	if c.ctx == nil {
+		return "", false
+	}
+	return c.ctx.Mode(), true
+}
+
 func (c sdkContext) UI() ContextUI { return sdkContextUI{ctx: c.ctx} }
 
 // sdkContextUI adapts the context's UI calls. A context the core holds can
@@ -327,7 +349,13 @@ func NewSDKExtension(options ExtensionOptions) *sdk.Extension {
 
 	e.OnEvent(sdk.EventSessionStart, func(ctx sdk.Context, data map[string]any) (any, error) {
 		instance, hosted := holder.begin(ctx, true)
-		instance.HandleSessionStart(hosted)
+		// Pi reports the run mode on the event as well as the context; the event
+		// wins when it carries one, exactly like the TS `event.mode ?? ctx.mode`.
+		var eventMode *string
+		if mode, ok := data["mode"].(string); ok && mode != "" {
+			eventMode = &mode
+		}
+		instance.HandleSessionStart(hosted, eventMode)
 		return nil, nil
 	})
 	e.OnEvent(sdk.EventSessionShutdown, func(ctx sdk.Context, data map[string]any) (any, error) {
