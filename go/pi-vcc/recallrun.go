@@ -15,6 +15,11 @@ const (
 	// PairedResultChars is recall-run.ts PAIRED_RESULT_CHARS: the clip for a tool
 	// result shown alongside an expanded call.
 	PairedResultChars = 4000
+	// RecallOutputChars is recall-run.ts RECALL_OUTPUT_CHARS: the ceiling for one
+	// recall result, the 50 KB of Pi's read tool — one long entry (a base64
+	// image on one line) must not flood the context. A character is a UTF-16
+	// code unit, as String.prototype.length counts them.
+	RecallOutputChars = 50 * 1024
 )
 
 // offPathNote is recall-run.ts OFF_PATH_NOTE.
@@ -165,7 +170,27 @@ func IgnoredNote(request RecallRequest) string {
 
 // RunRecall is recall-run.ts runRecall().
 func RunRecall(request RecallRequest, view *RecallView, hints RecallPagingHints) string {
-	return IgnoredNote(request) + runAction(request, view, hints)
+	return capOutput(IgnoredNote(request) + runAction(request, view, hints))
+}
+
+// capOutput is recall-run.ts capOutput(): clip a recall result to
+// RecallOutputChars UTF-16 code units, moving the cut point one unit earlier
+// when it would split a surrogate pair, and saying so at both ends.
+func capOutput(text string) string {
+	if jsLen(text) <= RecallOutputChars {
+		return text
+	}
+	units := jsUnits(text)
+	end := RecallOutputChars
+	// Never split a surrogate pair.
+	if units[end-1] >= 0xD800 && units[end-1] <= 0xDBFF {
+		end--
+	}
+	return "Warning: output clipped at " + jsNumberString(float64(end)) + " of " +
+		jsNumberString(float64(len(units))) + " chars (one recall result is capped at 50 KB). " +
+		"Ask for less at once: fewer expand indices, a narrower query, or a line range for file content " +
+		"('#N:path:offset:limit').\n\n" +
+		jsFromUnits(units[:end]) + "\n...[clipped at 50 KB]"
 }
 
 func runAction(request RecallRequest, view *RecallView, hints RecallPagingHints) string {

@@ -44,7 +44,7 @@ const RecallToolDescription = "Recall earlier parts of this session, including a
 	"Pick one per call:\n" +
 	"- query: keyword search (regex works), 5 results per page.\n" +
 	"- range: [from, to]: entries #from..#to in order, 20 per page.\n" +
-	"- expand: [N, ...]: full untruncated text of those entries.\n" +
+	"- expand: [N, ...]: full text of those entries.\n" +
 	"- mode: 'touched': files worked on, with entry indices.\n" +
 	"- query '#N:path': file content from entry N ('#N:path:full' for all lines).\n" +
 	"\n" +
@@ -54,7 +54,7 @@ const RecallToolDescription = "Recall earlier parts of this session, including a
 	"  reads edited or retried branches.\n" +
 	"\n" +
 	"#N is the number shown in summary refs like (#12) and in recall results.\n" +
-	"Only the current session is searchable."
+	"Only the current session is searchable. One result is capped at 50 KB."
 
 // RecallToolPromptSnippet is tools/recall.ts's promptSnippet.
 const RecallToolPromptSnippet = "Recall earlier parts of this session before saying the context is gone. " +
@@ -90,7 +90,7 @@ func RecallToolSchema() sdk.Schema {
 			"expand": map[string]any{
 				"type":        "array",
 				"items":       map[string]any{"type": "number"},
-				"description": "#N indices to return full untruncated content for (from summary refs like (#12) or recall results).",
+				"description": "#N indices to return full content for (from summary refs like (#12) or recall results).",
 			},
 			"page": map[string]any{
 				"type":        "number",

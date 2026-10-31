@@ -318,6 +318,175 @@ func TestSearchEntries_RelativeFloor(t *testing.T) {
 	}
 }
 
+// ── the snippet line window (search-entries.ts clipLine, 0.11.2) ──────────
+
+func TestClipLine(t *testing.T) {
+	// A line at or under the limit passes through unchanged.
+	if got := clipLine(strings.Repeat("a", snippetLineChars-1), 0); jsLen(got) != snippetLineChars-1 {
+		t.Fatalf("a short line was clipped: %d units", jsLen(got))
+	}
+	exact := strings.Repeat("a", snippetLineChars)
+	if got := clipLine(exact, 0); got != exact {
+		t.Fatal("a 300-char line was clipped")
+	}
+	// A 301-char line loses one char and gains the trailing ellipsis.
+	long := strings.Repeat("a", snippetLineChars+1)
+	got := clipLine(long, 0)
+	if jsLen(got) != snippetLineChars+1 || !strings.HasSuffix(got, "…") || strings.HasPrefix(got, "…") {
+		t.Fatalf("a 301-char line clipped wrong: %q...", got[:40])
+	}
+	// `at` past the middle keeps the window on the match's surroundings.
+	mid := clipLine(strings.Repeat("a", 200)+"NEEDLE"+strings.Repeat("b", 200), 203)
+	if mid != "…"+strings.Repeat("a", 147)+"NEEDLE"+strings.Repeat("b", 147)+"…" {
+		t.Fatalf("the window does not surround the match: %q", mid)
+	}
+	// `at` near the end clamps the window to the line's last 300 chars.
+	tail := clipLine(strings.Repeat("c", 600)+"END", 600)
+	if tail != "…"+strings.Repeat("c", 297)+"END" {
+		t.Fatalf("the tail window is wrong: %q", tail)
+	}
+	// Multi-byte runes count by UTF-16 code units, like String.prototype.length.
+	mbLine := strings.Repeat("é", snippetLineChars) + "Z"
+	mbGot := clipLine(mbLine, snippetLineChars)
+	if jsLen(mbGot) != snippetLineChars+1 || !strings.HasPrefix(mbGot, "…") {
+		t.Fatalf("a multi-byte line clipped by bytes: %q", mbGot[:20])
+	}
+	// A supplementary-plane rune is two code units; when the window's end lands
+	// inside the pair, the lone surrogate surfaces as U+FFFD, like a JS slice.
+	// Here the pair straddles unit 350 of the window.
+	splitLine := strings.Repeat("x", 349) + "\U0001D54F" + strings.Repeat("z", 400)
+	splitGot := clipLine(splitLine, 200)
+	if jsLen(splitGot) != snippetLineChars+2 || !strings.HasSuffix(splitGot, "�…") {
+		t.Fatalf("a straddled surrogate pair clipped wrong: %q", splitGot[len(splitGot)-12:])
+	}
+}
+
+func TestLineSnippet_ClipsContextLinesAt300(t *testing.T) {
+	longCtx := strings.Repeat("x", 2000)
+	text := "intro\n" + longCtx + "\nmore " + longCtx + " needle tail"
+	snip, ok := lineSnippet(text, compileIgnoreCase("needle"), 2)
+	if !ok {
+		t.Fatal("no snippet")
+	}
+	lines := jsSplitLines(snip)
+	// The context line keeps only its first 300 chars plus the ellipsis.
+	if got := lines[1]; got != strings.Repeat("x", snippetLineChars)+"…" {
+		t.Fatalf("the context line is not head-clipped: %q...", got[:40])
+	}
+	// The matched line is windowed on the match, not on its start.
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "needle tail") || !strings.HasPrefix(last, "…") {
+		t.Fatalf("the matched line lost its match window: %q", last[:80])
+	}
+}
+
+// ── the base64 search filter (search-entries.ts searchableText, 0.11.2) ────
+
+// encodedRun builds a base64-looking run of n chars with the random-data
+// mix looksEncoded expects: ~25% digits and the rest split across cases.
+func encodedRun(n int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	var b strings.Builder
+	b.Grow(n)
+	for i := 0; i < n; i++ {
+		b.WriteByte(alphabet[(i*31+7)%len(alphabet)])
+	}
+	return b.String()
+}
+
+func TestLooksEncoded(t *testing.T) {
+	if !looksEncoded(encodedRun(1200)) {
+		t.Fatal("a random-looking base64 run was not recognised")
+	}
+	for name, run := range map[string]string{
+		"pure hex":       strings.Repeat("deadbeef42", 100),
+		"equals signs":   strings.Repeat("=", 1000),
+		"long camelCase": strings.Repeat("theVeryLongIdentifierName", 40),
+		"upper only":     strings.Repeat("ABCDEFGHIJ", 100),
+	} {
+		if looksEncoded(run) {
+			t.Fatalf("%s was mistaken for encoded data", name)
+		}
+	}
+	// Digits at 4 percent — under the 5 percent digit threshold even with both
+	// cases heavy.
+	mixed := strings.Repeat("aBcDeFgH", 125) // 1000 letters, upper+lower ~50% each
+	borderline := mixed[:len(mixed)-40] + strings.Repeat("7", 40)
+	if looksEncoded(borderline) {
+		t.Fatal("a 4-percent-digit run crossed the digit threshold")
+	}
+}
+
+func TestSearchableText(t *testing.T) {
+	run := encodedRun(1500)
+	entry := RenderedEntry{Summary: "before " + run + " after"}
+	got := searchableText(nil, entry)
+	if got != "before … after" {
+		t.Fatalf("searchableText = %q", got)
+	}
+	// A run under 1000 chars is kept verbatim.
+	short := RenderedEntry{Summary: "k " + encodedRun(999) + " k"}
+	if got := searchableText(nil, short); got != short.Summary {
+		t.Fatal("a sub-threshold run was rewritten")
+	}
+	// The same filter applies to message text, not only to summaries.
+	msg := map[string]any{"role": "user", "content": "data " + run}
+	if got := searchableText(msg, RenderedEntry{}); got != "data …" {
+		t.Fatalf("message text was not filtered: %q", got)
+	}
+}
+
+func TestSearchEntries_Base64RunCannotDominateBM25(t *testing.T) {
+	// Issue #63: a one-line base64 blob counts as ~1 word, so its doc length
+	// collapses and any short term landing in it scores off the chart. With
+	// searchableText the run is "…", so the genuine match ranks first.
+	run := encodedRun(2 * 1024 * 1024)
+	entries := []RenderedEntry{
+		{Index: 0, Role: "tool_result", Summary: "[bash] " + run[:200]},
+		{Index: 1, Role: "user", Summary: "the max retries and min timeout settings"},
+	}
+	messages := []map[string]any{
+		{"role": "toolResult", "toolName": "bash", "content": "image data " + run},
+		{"role": "user", "content": "the max retries and min timeout settings"},
+	}
+	hits := SearchEntries(entries, messages, "max min")
+	if len(hits) == 0 {
+		t.Fatal("no hits")
+	}
+	if hits[0].Index != 1 {
+		t.Fatalf("the base64 blob ranked first: hits[0].Index = %d", hits[0].Index)
+	}
+	// The filtered run never reaches a snippet.
+	for _, hit := range hits {
+		if hit.HasSnippet && strings.Contains(hit.Snippet, run[:80]) {
+			t.Fatalf("the base64 run leaked into a snippet: %q", hit.Snippet[:120])
+		}
+	}
+}
+
+func TestSearchEntries_Base64RunFilteredOnRegexPath(t *testing.T) {
+	run := encodedRun(1500)
+	entries := []RenderedEntry{
+		{Index: 0, Role: "user", Summary: "x"},
+		{Index: 1, Role: "user", Summary: "plain needle here"},
+	}
+	messages := []map[string]any{
+		{"role": "user", "content": "data " + run + " done"},
+		{"role": "user", "content": "plain needle here"},
+	}
+	// A regex term that occurs only inside the blob must not match it.
+	needle := run[700:705]
+	hits := SearchEntries(entries, messages, needle+"+")
+	if len(hits) != 0 {
+		t.Fatalf("a term inside the filtered run matched: %#v", hits[0])
+	}
+	// A genuine term still matches, and its snippet carries no base64.
+	hits = SearchEntries(entries, messages, "needle")
+	if len(hits) != 1 || hits[0].Index != 1 {
+		t.Fatalf("hits = %#v", hits)
+	}
+}
+
 // ── format recall ───────────────────────────────────────────────────────────
 
 func TestShortPath(t *testing.T) {

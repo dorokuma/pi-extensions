@@ -393,6 +393,94 @@ func TestRunRecall_DrillDownOffPathNote(t *testing.T) {
 	}
 }
 
+// ── the 50 KB output cap (recall-run.ts capOutput, 0.11.2) ───────────────
+
+func TestCapOutput_UnderAndAtLimitUnchanged(t *testing.T) {
+	under := strings.Repeat("a", RecallOutputChars-1)
+	if got := capOutput(under); got != under {
+		t.Fatal("a result under 50 KB was clipped")
+	}
+	exact := strings.Repeat("a", RecallOutputChars)
+	if got := capOutput(exact); got != exact {
+		t.Fatal("a result of exactly 50 KB was clipped")
+	}
+}
+
+func TestCapOutput_ClipsOverLimit(t *testing.T) {
+	over := strings.Repeat("a", RecallOutputChars+1)
+	got := capOutput(over)
+	if !strings.HasPrefix(got, "Warning: output clipped at "+jsNumberString(float64(RecallOutputChars))+
+		" of "+jsNumberString(float64(RecallOutputChars+1))+" chars") {
+		t.Fatalf("the clip warning is missing:\n%.200s", got)
+	}
+	if !strings.HasSuffix(got, "\n...[clipped at 50 KB]") {
+		t.Fatalf("the tail marker is missing:\n%s", got[len(got)-120:])
+	}
+	// The body is the first RecallOutputChars units; the warning and marker
+	// add a bounded overhead on top, as upstream does.
+	if jsLen(got) > RecallOutputChars+300 {
+		t.Fatalf("the clipped body was not bounded: %d units", jsLen(got))
+	}
+}
+
+func TestCapOutput_NeverSplitsASurrogatePair(t *testing.T) {
+	// The pair straddles the cap: unit RecallOutputChars-1 is its high
+	// surrogate, so the cut moves one unit earlier and drops the pair whole.
+	straddle := strings.Repeat("a", RecallOutputChars-1) + "\U0001D54F" + "tail"
+	got := capOutput(straddle)
+	if !strings.Contains(got, "clipped at "+jsNumberString(float64(RecallOutputChars-1))+" of ") {
+		t.Fatalf("the cut was not moved before the pair:\n%.200s", got)
+	}
+	if strings.Contains(got, "\U0001D54F") {
+		t.Fatal("the surrogate pair leaked past the cut")
+	}
+	// A pair that ends exactly at the cap fits whole and is kept.
+	fits := strings.Repeat("a", RecallOutputChars-2) + "\U0001D54F" + "tail"
+	got = capOutput(fits)
+	if !strings.Contains(got, "\U0001D54F") {
+		t.Fatal("a surrogate pair that fits was split")
+	}
+}
+
+func TestRunRecall_ExpandCapsAt50KB(t *testing.T) {
+	big := strings.Repeat("context line ", 2000) // 26000 chars per message
+	sessionFile, entries := writeSessionFile(t,
+		`{"type":"message","id":"e1","parentId":"","message":{"role":"user","content":`+strconvQuote(big)+`}}`,
+		`{"type":"message","id":"e2","parentId":"e1","message":{"role":"user","content":`+strconvQuote(big)+`}}`,
+		`{"type":"message","id":"e3","parentId":"e2","message":{"role":"user","content":`+strconvQuote(big)+`}}`,
+	)
+	view := OpenRecallView(sessionFile, ScopeAll, fakeManager{branch: entries})
+	out := RunRecall(RecallRequest{
+		Action: RecallAction{Kind: ActionExpand, Indices: []int{0, 1, 2}},
+	}, view, recallHints)
+	if !strings.HasPrefix(out, "Warning: output clipped at ") {
+		t.Fatalf("an expand over 50 KB was not clipped:\n%.200s", out)
+	}
+	if !strings.HasSuffix(out, "\n...[clipped at 50 KB]") {
+		t.Fatalf("the tail marker is missing:\n%s", out[len(out)-120:])
+	}
+	// The warning and marker add a bounded amount around the capped body.
+	if jsLen(out) > RecallOutputChars+512 {
+		t.Fatalf("the capped output is still %d units", jsLen(out))
+	}
+	// The clipped body still starts with the first expanded entry.
+	if !strings.Contains(out, "#0 [user]") {
+		t.Fatalf("the first entry was lost:\n%.400s", out)
+	}
+}
+
+func TestRunRecall_IgnoredNoteSurvivesTheCap(t *testing.T) {
+	sessionFile, entries := recallFixtureFile(t)
+	view := OpenRecallView(sessionFile, ScopeAll, fakeManager{branch: entries})
+	out := RunRecall(RecallRequest{
+		Action:  RecallAction{Kind: ActionSearch, Query: "token refresh", Page: 1},
+		Dropped: []string{"expand"},
+	}, view, recallHints)
+	if !strings.HasPrefix(out, "Ignored: expand.") {
+		t.Fatalf("the note is missing under the cap:\n%.200s", out)
+	}
+}
+
 // ── helpers the port shares with the harness ────────────────────────────────
 
 func TestInvalidExpandIndices(t *testing.T) {

@@ -219,6 +219,52 @@ func wordCount(doc string) int {
 	return len(jsSplitWhitespace(doc))
 }
 
+// base64RunRe is search-entries.ts BASE64_RUN: a run of base64 characters this
+// long can be encoded data (an image, a file). Shorter ones (keys, tokens)
+// rarely hold a chance match: a 3-letter term hits about once per 32k random
+// chars. JSON, code and paths break a run with punctuation.
+var base64RunRe = mustCompile(`[A-Za-z0-9+/=]{1000,}`)
+
+// looksEncoded is search-entries.ts looksEncoded(): encoded data mixes digits
+// and both cases (random base64: ~16% / 40% / 40%). Joined identifiers, hex
+// and `=====` runs do not, and stay searchable. The run is all ASCII, so a
+// byte walk counts the same characters TS's charCodeAt loop does.
+func looksEncoded(run string) bool {
+	digits, upper, lower := 0, 0, 0
+	for i := 0; i < len(run); i++ {
+		c := run[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+		case c >= 'A' && c <= 'Z':
+			upper++
+		case c >= 'a' && c <= 'z':
+			lower++
+		}
+	}
+	n := float64(len(run))
+	return float64(digits) >= n*0.05 && float64(upper) >= n*0.15 && float64(lower) >= n*0.15
+}
+
+// searchableText is search-entries.ts searchableText(): an entry's text as
+// search sees it, with encoded data dropped as search engines drop overlong
+// tokens. Terms match as substrings, so a short term would hit inside it
+// hundreds of times, and it would count as one word of length. Only the
+// search/score/snippet corpus is rewritten; storage and expand keep the
+// original text.
+func searchableText(msg map[string]any, entry RenderedEntry) string {
+	text := entry.Summary
+	if msg != nil {
+		text = fullText(msg)
+	}
+	return jsReplaceRegexp(text, base64RunRe, func(run string, _ []string) string {
+		if looksEncoded(run) {
+			return "\u2026"
+		}
+		return run
+	})
+}
+
 // bm25Context is search-entries.ts BM25Context.
 type bm25Context struct {
 	n       int
@@ -269,14 +315,50 @@ func bm25Score(doc string, dl int, terms []term, ctx *bm25Context) float64 {
 	return score
 }
 
+// snippetLineChars is search-entries.ts SNIPPET_LINE_CHARS: the longest
+// snippet line; a longer one is cut to a window around the match, or to its
+// start. A character is a UTF-16 code unit, as String.prototype.length counts
+// them.
+const snippetLineChars = 300
+
+// clipLine is search-entries.ts clipLine(): a 300-unit window of a line,
+// centered on `at` (a UTF-16 code-unit index) when possible, with an ellipsis
+// on each cut side.
+func clipLine(line string, at int) string {
+	units := jsUnits(line)
+	if len(units) <= snippetLineChars {
+		return line
+	}
+	start := at - snippetLineChars/2
+	if limit := len(units) - snippetLineChars; start > limit {
+		start = limit
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + snippetLineChars
+	out := jsFromUnits(units[start:end])
+	if start > 0 {
+		out = "\u2026" + out
+	}
+	if end < len(units) {
+		out += "\u2026"
+	}
+	return out
+}
+
 // lineSnippet is search-entries.ts lineSnippet(): ±contextLines around the first
-// matching line.
+// matching line, each line windowed by clipLine.
 func lineSnippet(text string, re *regexp.Regexp, contextLines int) (string, bool) {
 	lines := jsSplitLines(text)
 	matchIdx := -1
+	matchAt := 0
 	for i, line := range lines {
-		if re.MatchString(line) {
+		if loc := re.FindStringIndex(line); loc != nil {
 			matchIdx = i
+			// `at` is the match start as a UTF-16 code-unit index, like the
+			// index String.prototype.search reports.
+			matchAt = jsLen(line[:loc[0]])
 			break
 		}
 	}
@@ -295,7 +377,13 @@ func lineSnippet(text string, re *regexp.Regexp, contextLines int) (string, bool
 	if start > 0 {
 		parts = append(parts, "...("+jsNumberString(float64(start))+" lines above)")
 	}
-	parts = append(parts, lines[start:end]...)
+	for i := start; i < end; i++ {
+		at := 0
+		if i == matchIdx {
+			at = matchAt
+		}
+		parts = append(parts, clipLine(lines[i], at))
+	}
 	if end < len(lines) {
 		parts = append(parts, "...("+jsNumberString(float64(len(lines)-end))+" lines below)")
 	}
@@ -472,10 +560,11 @@ func SearchEntriesDetailed(entries []RenderedEntry, messages []map[string]any, q
 			if err := checkBudget(); err != nil {
 				return SearchResult{}, err
 			}
-			text := entry.Summary
-			if i < len(messages) && messages[i] != nil {
-				text = fullText(messages[i])
+			var msg map[string]any
+			if i < len(messages) {
+				msg = messages[i]
 			}
+			text := searchableText(msg, entry)
 			filePart := strings.Join(entry.Files, " ")
 			hay := entry.Role + " " + text + " " + filePart
 			if re.MatchString(hay) {
@@ -498,10 +587,11 @@ func SearchEntriesDetailed(entries []RenderedEntry, messages []map[string]any, q
 
 	docs := make([]string, 0, len(entries))
 	for i, entry := range entries {
-		text := entry.Summary
-		if i < len(messages) && messages[i] != nil {
-			text = fullText(messages[i])
+		var msg map[string]any
+		if i < len(messages) {
+			msg = messages[i]
 		}
+		text := searchableText(msg, entry)
 		filePart := strings.Join(entry.Files, " ")
 		docs = append(docs, entry.Role+" "+text+" "+filePart)
 	}
@@ -526,10 +616,11 @@ func SearchEntriesDetailed(entries []RenderedEntry, messages []map[string]any, q
 			continue
 		}
 		score := bm25Score(docs[i], docLens[i], here, ctx)
-		text := entry.Summary
-		if i < len(messages) && messages[i] != nil {
-			text = fullText(messages[i])
+		var msg map[string]any
+		if i < len(messages) {
+			msg = messages[i]
 		}
+		text := searchableText(msg, entry)
 		hit := SearchHit{RenderedEntry: entry, MatchCount: len(here)}
 		if snip, ok := lineSnippet(text, snipRe, 2); ok {
 			hit.Snippet = snip
