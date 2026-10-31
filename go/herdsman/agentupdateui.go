@@ -5,7 +5,8 @@ import (
 	"strings"
 )
 
-// Port of packages/herdsman-pi/src/agent-update-ui.ts.
+// Port of the archived TS herdsman's agent-update-ui module
+// (archive/herdsman-bridge-ts).
 //
 // The TS module builds a pi-tui `Box`/`Text` component pair and hands it to the
 // host. PiG has no equivalent host component tree for the subprocess SDK: the

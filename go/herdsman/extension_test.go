@@ -1,6 +1,7 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-extension.test.ts — part 1: acknowledgement
+// Port of the archived TS herdsman's extension unit tests — part 1:
+// acknowledgement
 // failure classification, self-contained loading, socket default, hidden
 // update formatting, the Herdr environment gate and presence registration.
 //
@@ -284,7 +285,7 @@ func TestExtensionRegistersPresenceAndAdoptsDaemonLocation(t *testing.T) {
 		t.Fatalf("sessionRef: %#v", params["sessionRef"])
 	}
 	if sessionRef["agent"] != "pig" || sessionRef["kind"] != "path" ||
-		sessionRef["source"] != "herdr:pig" || sessionRef["value"] != "/tmp/pi-session.jsonl" {
+		sessionRef["source"] != "herdr:pig" || sessionRef["value"] != f.ctx.SessionFile() {
 		t.Fatalf("unexpected sessionRef: %#v", sessionRef)
 	}
 	status := f.ctx.Status("herdsman")

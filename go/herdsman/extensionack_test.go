@@ -1,6 +1,7 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-extension.test.ts — part 2: acknowledgement
+// Port of the archived TS herdsman's extension unit tests — part 2:
+// acknowledgement
 // ordering and gating, footer refresh, role loss, non-owner behaviour and the
 // `/herdsman` command.
 

@@ -1,6 +1,6 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-extension.test.ts — part 3: wake injection,
+// Port of the archived TS herdsman's extension unit tests — part 3: wake injection,
 // the busy deferral ladder, dead-letter write-off, the retry budget, silent
 // upstream-error acknowledgement and the keepalive.
 //
@@ -9,6 +9,7 @@ package herdsman
 // due callback synchronously.
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -61,6 +62,9 @@ func streamEvent(f *fixture, event AgentEventWireRecord) {
 type serverPageState struct {
 	mu     sync.Mutex
 	events map[int]AgentEventWireRecord
+	// ackedIDs is the daemon-side evidence of which eventIds the socket-level
+	// suites saw acknowledged.
+	ackedIDs []int
 }
 
 func (p *serverPageState) put(event AgentEventWireRecord) {
@@ -81,6 +85,22 @@ func (p *serverPageState) snapshot() []AgentEventWireRecord {
 	}
 	sort.Slice(list, func(left, right int) bool { return list[left].ID < list[right].ID })
 	return list
+}
+
+// validateAck checks an `agent.notifications.ack` the way a scope-owning
+// daemon would: the id must be one it actually listed (or one its watermark
+// already covered), and it is recorded for the socket-level ack assertions.
+func (p *serverPageState) validateAck(eventID int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if eventID <= 0 {
+		return fmt.Errorf("ack carries no usable eventId: %d", eventID)
+	}
+	if _, listed := p.events[eventID]; !listed {
+		return fmt.Errorf("ack for event %d that was never on the pending page", eventID)
+	}
+	p.ackedIDs = append(p.ackedIDs, eventID)
+	return nil
 }
 
 func detailsOf(t *testing.T, message sentMessage) (eventIDs []int, presented []int) {

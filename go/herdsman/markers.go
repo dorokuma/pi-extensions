@@ -3,7 +3,7 @@ package herdsman
 // agentContextMarker is the literal marker the TS extension filters out of the
 // incoming context list. It is assembled at compile time from two halves so
 // this repository can be read, grepped and diffed inside a Pi session that is
-// itself running the TS herdsman-pi extension: that extension's `context` hook
+// itself running the archived TS herdsman extension: that extension's `context` hook
 // drops any message whose content contains the marker, and a tool result
 // echoing it verbatim would be filtered away before the model could see it.
 //
