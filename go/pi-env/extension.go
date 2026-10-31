@@ -673,21 +673,35 @@ func ApplyEnv(cwd string) ApplyResult {
 
 // sensitiveEnvKey reports whether key looks like a credential-bearing name
 // (contains KEY/TOKEN/SECRET/PASSWORD/PASS/AUTH/CREDENTIAL/CREDS/JWT/SESSION/
-// DSN/PRIVATE/BEARER/URL/URI/PASSCODE, case-insensitive). Such values are
-// masked in the /env report to avoid rendering secrets into the session.
+// DSN/PRIVATE/BEARER/URL/URI/PASSCODE/PROXY/SALT/SIG/CERT, case-insensitive).
+// Such values are masked in the /env report to avoid rendering secrets into
+// the session.
 // URL/URI intentionally catch connection-string keys that may embed
-// user:pass@ credentials (DATABASE_URL, REDIS_URL, MONGO_URI, ...).
-// Substring matching may over-trigger on non-sensitive keys (e.g. AUTHOR,
-// OAUTH_URL, BASE_URL, CALLBACK_URI, PUBLIC_URL); that trades a slightly
-// noisy report for never leaking a credential, which is the safe direction.
+// user:pass@ credentials (DATABASE_URL, REDIS_URL, MONGO_URI, ...); PROXY
+// catches HTTP_PROXY-style keys whose values routinely embed a proxy
+// credential. Substring matching may over-trigger on non-sensitive keys
+// (e.g. AUTHOR, OAUTH_URL, BASE_URL, CALLBACK_URI, PUBLIC_URL, DESIGN,
+// CERTIFICATE_DIR); that trades a slightly noisy report for never leaking a
+// credential, which is the safe direction.
 func sensitiveEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
-	for _, marker := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "AUTH", "CREDENTIAL", "CREDS", "JWT", "SESSION", "DSN", "PRIVATE", "BEARER", "URL", "URI", "PASSCODE"} {
+	for _, marker := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "AUTH", "CREDENTIAL", "CREDS", "JWT", "SESSION", "DSN", "PRIVATE", "BEARER", "URL", "URI", "PASSCODE", "PROXY", "SALT", "SIG", "CERT"} {
 		if strings.Contains(upper, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// userinfoCredentialPattern matches a `scheme://...:pass...` authority that
+// embeds a userinfo credential: a value carrying userinfo is masked no matter
+// what its key is named (e.g. an HTTP_PROXY value under a non-sensitive key).
+var userinfoCredentialPattern = regexp.MustCompile(`://[^/@\s]*:[^/@\s]*@`)
+
+// sensitiveEnvValue reports whether the value itself carries a credential: a
+// URL/URI authority with `user:pass@` userinfo.
+func sensitiveEnvValue(val string) bool {
+	return userinfoCredentialPattern.MatchString(val)
 }
 
 // maskSecretValue renders a secret for the /env report without exposing enough
@@ -738,7 +752,7 @@ func FormatReport(theme ThemeRenderer, reports []EnvReport) string {
 		}
 		for _, key := range keys {
 			val := report.Variables[key]
-			if sensitiveEnvKey(key) {
+			if sensitiveEnvKey(key) || sensitiveEnvValue(val) {
 				val = maskSecretValue(val)
 			}
 			if theme != nil {

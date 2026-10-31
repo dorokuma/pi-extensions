@@ -509,6 +509,66 @@ func TestSensitiveEnvKey_Coverage(t *testing.T) {
 	}
 }
 
+// 8e. H9 regression: proxy-style keys (HTTP_PROXY/HTTPS_PROXY/NO_PROXY/...)
+// and any value carrying a URL userinfo credential (`scheme://user:pass@host`)
+// must be masked in the /env report even when the key name carries no
+// KEY/TOKEN/SECRET marker.
+func TestFormatReport_ProxyAndUserinfoMasking(t *testing.T) {
+	proxy := "http://user:s3cret-passw0rd@proxy.internal:8080"
+
+	// Value-bearing userinfo is masked on ANY key name, sensitive markers or not.
+	report := EnvReport{
+		Source: "global",
+		Keys:   []string{"HTTP_PROXY", "INNOCENT_LOOKUP"},
+		Variables: map[string]string{
+			"HTTP_PROXY":      proxy,
+			"INNOCENT_LOOKUP": proxy,
+		},
+	}
+	out := FormatReport(nil, []EnvReport{report})
+	if strings.Contains(out, "s3cret-passw0rd") || strings.Contains(out, proxy) {
+		t.Fatalf("proxy credential leaked into report:\n%s", out)
+	}
+	lineOf := func(key, report string) string {
+		for _, l := range strings.Split(report, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), key+"=") {
+				return l
+			}
+		}
+		return ""
+	}
+	for _, key := range []string{"HTTP_PROXY", "INNOCENT_LOOKUP"} {
+		line := lineOf(key, out)
+		if line == "" || !strings.Contains(line, "\u2026") {
+			t.Fatalf("%s line not masked: %q\nfull report:\n%s", key, line, out)
+		}
+	}
+
+	// PROXY/SALT/SIG/CERT key names are sensitive on their own.
+	for _, key := range []string{"HTTPS_PROXY", "NO_PROXY", "PASSWORD_SALT", "SIGNING_SEED", "TLS_CERT", "CA_BUNDLE_SIG"} {
+		if !sensitiveEnvKey(key) {
+			t.Errorf("sensitiveEnvKey(%q) = false, want true", key)
+		}
+	}
+
+	// A PROXY key with no credential in the value is still masked by name;
+	// a non-sensitive key with a credential-free value stays verbatim.
+	plain := EnvReport{
+		Source:    "global",
+		Keys:      []string{"HTTP_PROXY", "DOWNLOAD_DIR"},
+		Variables: map[string]string{"HTTP_PROXY": "http://proxy.internal:8080", "DOWNLOAD_DIR": "/tmp/dl"},
+	}
+	out = FormatReport(nil, []EnvReport{plain})
+	proxyLine := lineOf("HTTP_PROXY", out)
+	if !strings.Contains(proxyLine, "\u2026") {
+		t.Fatalf("HTTP_PROXY line not masked: %q\nfull report:\n%s", proxyLine, out)
+	}
+	dirLine := lineOf("DOWNLOAD_DIR", out)
+	if !strings.Contains(dirLine, "/tmp/dl") {
+		t.Fatalf("credential-free non-sensitive value should render verbatim: %q\nfull report:\n%s", dirLine, out)
+	}
+}
+
 // 9. BuildSessionStartWarnings tests
 func TestBuildSessionStartWarnings(t *testing.T) {
 	theme := mockTheme{}
