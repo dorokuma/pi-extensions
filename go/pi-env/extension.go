@@ -699,10 +699,17 @@ func sensitiveEnvKey(key string) bool {
 var userinfoCredentialPattern = regexp.MustCompile(`://[^/@\s]*:[^/@\s]*@`)
 
 // sensitiveEnvValue reports whether the value itself carries a credential: a
-// URL/URI authority with `user:pass@` userinfo.
+// URL/URI authority with `user:pass@` userinfo. Values that hit this are
+// masked whole: a first4…last4 mask would still leak credential fragments (the
+// last4 window can sit inside a short password, e.g. the `s@h:` tail of
+// `http://user:s@h:8080`-style values).
 func sensitiveEnvValue(val string) bool {
 	return userinfoCredentialPattern.MatchString(val)
 }
+
+// redactedEnvValue is how a credential-bearing value renders in the /env
+// report: nothing of the original string survives.
+const redactedEnvValue = "(redacted)"
 
 // maskSecretValue renders a secret for the /env report without exposing enough
 // of it to be enumerable. Values of 16 runes or fewer are fully masked — short
@@ -752,7 +759,9 @@ func FormatReport(theme ThemeRenderer, reports []EnvReport) string {
 		}
 		for _, key := range keys {
 			val := report.Variables[key]
-			if sensitiveEnvKey(key) || sensitiveEnvValue(val) {
+			if sensitiveEnvValue(val) {
+				val = redactedEnvValue
+			} else if sensitiveEnvKey(key) {
 				val = maskSecretValue(val)
 			}
 			if theme != nil {

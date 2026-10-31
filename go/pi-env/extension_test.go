@@ -516,7 +516,8 @@ func TestSensitiveEnvKey_Coverage(t *testing.T) {
 func TestFormatReport_ProxyAndUserinfoMasking(t *testing.T) {
 	proxy := "http://user:s3cret-passw0rd@proxy.internal:8080"
 
-	// Value-bearing userinfo is masked on ANY key name, sensitive markers or not.
+	// Value-bearing userinfo is masked whole on ANY key name, sensitive
+	// markers or not: no first4/last4 reveal.
 	report := EnvReport{
 		Source: "global",
 		Keys:   []string{"HTTP_PROXY", "INNOCENT_LOOKUP"},
@@ -539,8 +540,14 @@ func TestFormatReport_ProxyAndUserinfoMasking(t *testing.T) {
 	}
 	for _, key := range []string{"HTTP_PROXY", "INNOCENT_LOOKUP"} {
 		line := lineOf(key, out)
-		if line == "" || !strings.Contains(line, "\u2026") {
-			t.Fatalf("%s line not masked: %q\nfull report:\n%s", key, line, out)
+		if line == "" || !strings.Contains(line, redactedEnvValue) {
+			t.Fatalf("%s line not fully redacted: %q\nfull report:\n%s", key, line, out)
+		}
+		// The whole value, including its scheme/authority fragments, is gone.
+		for _, frag := range []string{"http", "user", "proxy.internal", "8080"} {
+			if strings.Contains(line, frag) {
+				t.Fatalf("%s line leaks fragment %q: %q", key, frag, line)
+			}
 		}
 	}
 
@@ -566,6 +573,33 @@ func TestFormatReport_ProxyAndUserinfoMasking(t *testing.T) {
 	dirLine := lineOf("DOWNLOAD_DIR", out)
 	if !strings.Contains(dirLine, "/tmp/dl") {
 		t.Fatalf("credential-free non-sensitive value should render verbatim: %q\nfull report:\n%s", dirLine, out)
+	}
+}
+
+// 8f. H9 rework: a >16-rune value carrying a credential must be masked whole.
+// first4…last4 would leave credential fragments visible (a 5-char password
+// ends inside the last4 window).
+func TestFormatReport_UserinfoValueFullyRedacted(t *testing.T) {
+	// 33 runes, 5-char password -> old mask rendered `…s@h:`.
+	long := "http://user:dh2ka@h:8080"
+	short := "x://a:b@c" // <=16 runes is already fully masked
+	report := EnvReport{
+		Source:    "global",
+		Keys:      []string{"SERVICE_URL", "MISC"},
+		Variables: map[string]string{"SERVICE_URL": long, "MISC": short},
+	}
+	out := FormatReport(nil, []EnvReport{report})
+	for _, frag := range []string{"dh2ka", "s@h:", "user", "8080", long, short} {
+		if strings.Contains(out, frag) {
+			t.Fatalf("credential value leaked fragment %q into report:\n%s", frag, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "SERVICE_URL=") || strings.Contains(line, "MISC=") {
+			if !strings.Contains(line, redactedEnvValue) {
+				t.Fatalf("credential-bearing value not fully redacted: %q", line)
+			}
+		}
 	}
 }
 
