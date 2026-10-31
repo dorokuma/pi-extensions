@@ -12,7 +12,7 @@
 | 自写扩展 12 个（9338 行） | TS | Go（PiG Go SDK / piglet） |
 | npm 包 5 个（pi-tinyfish、pi-env、rpiv-ask-user-question、pi-vcc+2 补丁、pi-my-compact-ui） | TS | 按需求重写为 Go，自己维护 |
 | pi-context-pruning（git 包，218 行） | TS | Go |
-| herdsman-pi（扩展壳 14 行 + 源码 3889 行） | TS | Go |
+| herdsman（pi 扩展侧，扩展壳 14 行 + 源码 3889 行） | TS | Go |
 | herdsman 守护进程 + CLI（15286 行） | TS，Node 22 | Go |
 | codegraph-go、moshi-hook | Go | 不动 |
 | herdr | Rust | 不动 |
@@ -57,7 +57,7 @@ cache-stats(2110，`isProxy`/`isUntrustedProxy` 10 处，D83 风险，Go 里改�
 
 ## 5. 第 4 批：大件（约 15600 行）
 
-pi-vcc(5529，两个本地补丁 `pi-vcc-0.10.0-recall-note`、`pi-vcc-0.9.0-ctx-run` 直接合进 Go 版)、rpiv-ask-user-question(6212)、herdsman-pi(3889，这批只做扩展侧，通过现有 RPC 和 TS 守护进程通信，协议不变)。
+pi-vcc(5529，两个本地补丁 `pi-vcc-0.10.0-recall-note`、`pi-vcc-0.9.0-ctx-run` 直接合进 Go 版)、rpiv-ask-user-question(6212)、herdsman 扩展侧(3889，这批只做扩展侧，通过现有 RPC 和 TS 守护进程通信，协议不变)。
 
 ## 6. 第 5 批：herdsman 守护进程 + CLI Go 化（15286 行）
 
@@ -67,7 +67,7 @@ pi-vcc(5529，两个本地补丁 `pi-vcc-0.10.0-recall-note`、`pi-vcc-0.9.0-ctx
   - WakeWaiter 由 Node 自我重启改为 Go 二进制 exec 自己，环境变量 `HERDSMAN_AGY_SESSION_ID / HERDSMAN_AGY_STATE_DIR / HERDSMAN_AGY_WAITER_EPOCH` 保持。
   - agy 会话库 `~/.gemini/antigravity-cli/conversations/<id>.db`（SQLite + protobuf）只读解析，对照 `antigravity-proto.ts` / `antigravity-reader.ts` 及其单测；额外 home `AGY_EXTRA_HOMES`（默认 `/root/.agy-pro-home`）保留。
 - 数据库：现在用 drizzle（见 `drizzle/` 迁移），Go 版沿用同一个库文件和表结构，不做迁移；用纯 Go SQLite 驱动（modernc.org/sqlite），不引 cgo。
-- RPC：observability RPC 的方法名和消息格式不变，Go 版守护进程要能被 TS 版 herdsman-pi 和 Go 版 herdsman-pi 同时连。
+- RPC：observability RPC 的方法名和消息格式不变，Go 版守护进程要能被 TS 版和 Go 版 herdsman 扩展同时连。
 - test/integration 下的用例尽量翻；翻不了的写进报告。
 - 切换方式：`/root/.local/bin/herdsman` 包装脚本加开关 `HERDSMAN_IMPL=go|ts`，默认仍 ts；切换和回滚都只改这一处。**切换要爸爸点头。**
 

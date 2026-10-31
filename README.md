@@ -2,7 +2,7 @@
 
 本仓是全机 Pi 扩展的**唯一权威源 / 分发中枢**，架构为**联邦式**：
 
-- **hosted（内生，7 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
+- **hosted（内生，6 个）**：本仓是其唯一权威源，逐字节同步到部署目录。
 - **federated（外生，3 个）**：源**留在各自宿主仓**，本仓仅以子进程级联调用它们各自的
   `install.sh`；改动回宿主仓走既有流程。
 - **external（外部，1 个）**：`herdr-agent-state.ts` 由 **herdr 二进制托管**，本仓只读
@@ -10,14 +10,13 @@
 
 数据源唯一：`federated/registry.json`。请先读 `AGENTS.md` 的 6 条铁律。
 
-## 全机 11 扩展矩阵
+## 全机 10 扩展矩阵
 
 | 名称 | 类别 | 权威源（绝对路径） | 目标安装路径 |
 |---|---|---|---|
 | auto-continue | hosted | `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts` | `/root/.pi/agent/extensions/auto-continue.ts` |
 | no-tables | hosted | `/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts` | `/root/.pi/agent/extensions/no-tables.ts` |
 | ctx-orchestrate | hosted | `/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts` | `/root/.pi/agent/extensions/ctx-orchestrate.ts` |
-| herdsman-bridge | hosted | `/root/workspace/pi-extensions/extensions/herdsman-bridge/src/herdsman-bridge.ts`（运行时再导出 `/root/workspace/herdsman/packages/herdsman-pi/src/index.ts`） | `/root/.pi/agent/extensions/herdsman-pi.ts` |
 | jev-gate | hosted | `/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts` | `/root/.pi/agent/extensions/jev-gate.ts` |
 | exclude-tools-guard | hosted | `/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts` | `/root/.pi/agent/extensions/exclude-tools-guard.ts` |
 | magpie-image | hosted | `/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts` | `/root/.pi/agent/extensions/magpie-image.ts` |
@@ -26,9 +25,6 @@
 | pi-cache-stats | federated | `/root/workspace/pi-cache-stats/extensions/cache-stats.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/cache-stats.ts` |
 | herdr-agent-state | external | herdr 二进制托管（带外，无本仓/宿主仓权威源） | `/root/.pi/agent/extensions/herdr-agent-state.ts`（只读，绝不写） |
 
-> herdsman-bridge 仓内文件名是 `herdsman-bridge.ts`，安装后部署文件名是 `herdsman-pi.ts`，
-> 内容逐字一致。
-
 ## 命令用法
 
 ```bash
@@ -36,8 +32,8 @@
 pnpm setup                 # = pnpm install --ignore-workspace
 pnpm check                 # = tsc --noEmit
 
-bash install.sh --list     # 列出 11 扩展：名称/类别/权威源/目标/当前状态
-bash install.sh --audit    # 只读巡检 11 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警
+bash install.sh --list     # 列出 10 扩展：名称/类别/权威源/目标/当前状态
+bash install.sh --audit    # 只读巡检 10 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警
 bash install.sh --dry-run <name...>   # 只演练，不写任何文件
 bash install.sh <name...>  # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all      # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -49,15 +45,14 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 | 变量 | 作用 | 优先级 / 备注 |
 |---|---|---|
 | `PI_EXT_DEST_DIR` | 目标部署目录 | CLI `--dest-dir` > `$PI_EXT_DEST_DIR` > `~/.pi/agent/extensions`；须为绝对路径 |
-| `PI_EXT_SETTINGS_JSON` | herdsman 双加载防护读取的 `settings.json` 覆盖点（**测试/演练用**） | 高于 registry `doubleLoadGuard.settingsFile`，高于 `dirname($DEST_DIR)/settings.json` 回落；正常安装**无需设置**（留空即走 registry 配置的真实 `/root/.pi/agent/settings.json`）。登记于此以消除「隐藏后门 + 死代码」——它不是后门，是已登记的显式覆盖点 |
 
-两条均可通过 `bash install.sh --help` 的 `Env:` 段自查。
+可通过 `bash install.sh --help` 的 `Env:` 段自查。
 
 `install.sh` 契约与 `/root/workspace/codegraph-go/integrations/pi/install.sh` 对齐：
 `set -euo pipefail`、`md5sum` 预检、md5 幂等（同则 `unchanged`、不动 mtime）、源缺失即失败、
 目标父目录 `mkdir -p` + `install -m 644`、DEST 非绝对/为目录显式 `FAILED` 非零退出、实质改动
 后提示 `/reload` 或新会话生效、外生脚本缺失/失败容忍并在最后一行重打 `WARN` 汇总。
-`--audit` 保持严格只读，在巡检完 11 项已登记扩展后，额外对目标目录（`DEST_DIR`）执行顶层差集比对与子目录递归扫描（`find -P -mindepth 2` 无限深度，不跟随符号链接、不进入符号链接目录）：
+`--audit` 保持严格只读，在巡检完 10 项已登记扩展后，额外对目标目录（`DEST_DIR`）执行顶层差集比对与子目录递归扫描（`find -P -mindepth 2` 无限深度，不跟随符号链接、不进入符号链接目录）：
 顶层条目与 `federated/registry.json` 的 `.extensions[].destFile` 做差集，子目录**大小写不敏感**递归收集 `.ts` 文件（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`；非 `.ts` 嵌套文件不逐条列，仅在汇总行计入 `nested non-.ts not listed`），
 在明细表中按 8 类 `KIND` 标注（`other *.ts` 顶层独立或残留 `.ts`［大小写不敏感］、`nested *.ts` 非 `__tests__/` 子目录内未登记 `.ts`［大小写不敏感］、`__tests__ file` 任意层级 `__tests__/` 目录内［匹配 `__tests__/*` 或 `*/__tests__/*`］的合法冻结测试文件、`historical backup` 冻结历史备份［含 `*.bak-*` 与 `*.bak`，大小写敏感］、`__tests__ dir` / `dir` 目录、`other-file` / `other`），
 对非普通文件（fifo / socket / device / 目录 / 符号链接）一律**跳过 `md5sum` 内容校验**（`DEST_MD5` 显示 `----` 并在 `AUDIT` 列注明 `content check skipped`）以防 fifo 阻塞挂死，
@@ -69,8 +64,8 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 ## 已知事项（如实披露）
 
 - **`install.sh --audit` 的 dest 目录差集告警、子目录扫描与退出码语义**：`--audit` 除巡检 `federated/registry.json`
-  已登记的 11 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容 `herdsman-bridge` →
-  `herdsman-pi.ts`、`pi-cache-stats` → `cache-stats.ts` 的异名映射）列出全部未登记顶层条目，同时以
+  已登记的 10 项外，会枚举 `DEST_DIR` 顶层条目并按 `.extensions[].destFile` 口径（兼容
+  `pi-cache-stats` → `cache-stats.ts` 的异名映射）列出全部未登记顶层条目，同时以
   `find -P -mindepth 2`（无限深度，不跟随符号链接、不进入符号链接目录）递归收集子目录内的 `.ts` 文件：
   - **`.ts` 后缀大小写不敏感**：顶层 `other *.ts` 与子目录递归收集均先取小写副本再匹配 `*.ts`（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`），明细表与专项点名保留原始文件名大小写；`historical backup`（`*.bak-*` / `*.bak`）与 `__tests__` 目录名保持大小写敏感，不改变其它类别语义。
   - **任意层级 `__tests__/` 归类契约**：子目录 `.ts` 只要位于任意层级的 `__tests__/` 目录内（相对路径匹配 `__tests__/*` 或 `*/__tests__/*`，如 `__tests__/no-tables.test.ts`、`__tests__/nested/z.ts`、`x/__tests__/y.ts`），均归为 `__tests__ file`（进明细表披露，**不进**专项 `WARN` 点名）；其余子目录 `.ts` 归为 `nested *.ts`（进明细表且与顶层 `other *.ts` 一并进 `install.sh WARN: unregistered *.ts in dest-dir: ...` 专项点名）。
@@ -98,13 +93,6 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
   令 `pnpm install --ignore-workspace` 整体 exit 1。此时依赖**已装全**（`Already up to date`），
   `pnpm check` / `tsc --noEmit` 实测可用（exit 0）；需要时再 `pnpm approve-builds` 显式挑选用
   哪些依赖的构建脚本。这不是离线退化，也不影响本仓类型检查结论。
-- **herdsman 双加载防护的实际保护范围**：仅在默认部署目录下读**真实**
-  `/root/.pi/agent/settings.json`（registry `doubleLoadGuard.settingsFile`，实测该文件
-  `packages` 无 `herdsman-pi` npm 包）；显式 `--dest-dir <DIR>` 时回落到
-  `dirname(<DIR>)/settings.json`，演练场景下该文件通常**不存在** → 打印 note 后放行
-  （理由：没有 settings 文件，就不可能装同名 npm 包）。`settings.json` **存在**但非法 JSON 或
-  `packages` 非数组时 **fail-closed**：显式 `FAILED`、exit 1，宁可拦住也不放行。读取路径可用
-  `PI_EXT_SETTINGS_JSON` 覆盖（见环境变量表；测试/演练用）。
 - **`--dest-dir` 对 federated 只是尽力传递、不构成隔离保证**：本仓只按各宿主仓约定的 dest
   环境变量（`PI_EXT_DEST` / `PI_CTXMODE_EXT`）把目标路径传给他们各自的 `install.sh`；宿主脚本
   内部逻辑不透明，理论上可忽略该变量写到别处，本仓**不校验**其写后落点。冷目录演练实测
@@ -113,9 +101,9 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 ## 目录布局
 
 ```
-extensions/<name>/src/<file>.ts     # 7 个内生扩展源码（唯一权威副本）
+extensions/<name>/src/<file>.ts     # 6 个内生扩展源码（唯一权威副本）
 extensions/<name>/README.md          # 各扩展：权威源/目标/来源/出处/一致性记录
-federated/registry.json              # 11 扩展的类别与绝对权威路径（install.sh 数据源）
+federated/registry.json              # 10 扩展的类别与绝对权威路径（install.sh 数据源）
 install.sh                           # 统一安装/巡检入口
 .agents/notes/                       # 重大变更与踩坑笔记
 .agents/history/no-tables/           # no-tables 两份历史备份的只读副本（三段式还原输入源）
@@ -138,10 +126,7 @@ install.sh                           # 统一安装/巡检入口
   （该扩展的 image 相关类型来自此包）→ 依授权补声明
   `devDependencies.@earendil-works/pi-ai: ^1.0.0`（本就是 `pi-coding-agent` 的传递依赖，
   锁文件里已有 1.0.0，未新增任何其它依赖）。补后 exit 0。
-- `herdsman-bridge` 是一个跨仓再导出壳，目标源码在 `/root/workspace/herdsman`（铁律禁改，
-  由其自身 tsconfig + `typecheck` 脚本负责）；bundler 解析下会触发它的 `.ts` 绝对导入
-  `TS5097` 并拖入 herdsman 自身源码的既有告警，故**不纳入**本仓 tsc 图（见 tsconfig
-  `include`/`exclude` 与该扩展 README）。
+- 原 `herdsman` TS 桥已归档至 `archive/`（不再纳入本仓 tsc 图与安装面）。
 - 退化方案与其局限详见初始笔记；未伪造任何「检查通过」。
 
 ## 状态
@@ -150,11 +135,10 @@ install.sh                           # 统一安装/巡检入口
   `50ee528`），当时 `origin/main` 与 `main` 同指 `50ee528`、工作分支 `chore/catchup-magpie-image`
   自 `50ee528` 开出且改动尚未提交；**后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`**（当前 `main` 与 `origin/main` 同指 `77885dd`，共 **10 个 commit**）。阶段 0（工程底座）+ 阶段 1（hosted 逐字纳管）+ 阶段 2
   （`install.sh` + `registry.json`）均已完成并通过双审（reviewer / oracle），3 条 should-fix 已在
-  首次入库前的修复轮落地（install.sh herdsman 防护 fail-closed + settings 解析优先级、
-  installable_names 死代码修正、no-tables 三段式还原输入源与部署目录解耦），详见初始笔记。
-- **计数现状**：hosted **7 个**（auto-continue / no-tables / ctx-orchestrate /
-  herdsman-bridge / jev-gate / exclude-tools-guard / magpie-image），全机 **11 个**
-  （7 hosted + 3 federated + 1 external）。
+  首次入库前的修复轮落地（installable_names 死代码修正、no-tables 三段式还原输入源与部署目录解耦），详见初始笔记。
+- **计数现状**：hosted **6 个**（auto-continue / no-tables / ctx-orchestrate /
+  jev-gate / exclude-tools-guard / magpie-image），全机 **10 个**
+  （6 hosted + 3 federated + 1 external）。
 - **本轮收尾内容**（历史快照：截至 `50ee528` 时为分支 `chore/catchup-magpie-image` 未提交改动；后续已由 `ab50f9d` 入库同步并经 `77885dd` 合入 `main`）：三处「部署比仓内新」的漂移整文件
   回仓（jev-gate / exclude-tools-guard / no-tables 的 rule F 修复）；当时第 8 个 hosted 扩展
   `magpie-image` 纳管（2026-10-16 移除已归档扩展后现为 7 个 hosted）；no-tables rule F 回归测试收入本仓；计数同步（`registry.json` /

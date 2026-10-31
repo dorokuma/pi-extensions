@@ -15,7 +15,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 - 第 1 批：小件扩展移植（herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish、pi-context-pruning；gemini-safety 已弃用并删除）
 - 第 2 批：中件扩展移植（moshi-hooks、ctxmode、jev-gate、ctx-orchestrate、auto-continue、codegraph-go）
 - 第 3 批：界面类扩展移植（cache-stats、pi-my-compact-ui）
-- 第 4 批：大件扩展移植（pi-vcc、rpiv-ask-user-question、herdsman-pi 扩展侧）
+- 第 4 批：大件扩展移植（pi-vcc、rpiv-ask-user-question、herdsman 扩展侧）
 - 第 5 批：herdsman 守护进程与 CLI Go 化（位于 herdsman 仓库 `go-port` 分支 `go/`）
 - 第 6 批：切换与卸载 Node（需人工确认）
 
