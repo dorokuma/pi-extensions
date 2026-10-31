@@ -56,7 +56,7 @@ type pendingRequest struct {
 	method  string
 	reject  func(error)
 	resolve func(any)
-	timer   *time.Timer
+	timer   Timer
 }
 
 // ReconnectingDaemonClient mirrors the TS class of the same name: a
@@ -99,8 +99,10 @@ type ReconnectingDaemonClient struct {
 
 	// writeLine is the socket write, replaceable in tests.
 	writeLine func(line string) error
-	// now is the clock used by the request timeouts, replaceable in tests.
-	now func() time.Time
+	// timers schedules the request timeouts. Production uses the real clock;
+	// tests install a manual clock so a scheduler stall cannot fire a request
+	// timeout the daemon actually answered in time (the wall-clock flake).
+	timers Timers
 }
 
 // NewReconnectingDaemonClient mirrors `new ReconnectingDaemonClient(options)`:
@@ -125,7 +127,7 @@ func NewReconnectingDaemonClient(socketPath string, reconnectDelaysMS []int64) *
 		nextID:          1,
 		state:           stateIdle,
 		pending:         map[string]*pendingRequest{},
-		now:             time.Now,
+		timers:          realTimers{},
 	}
 	// queueMicrotask(() => this.#connect())
 	go func() { client.connect() }()
@@ -277,7 +279,11 @@ func (c *ReconnectingDaemonClient) Request(method string, params any) (any, erro
 	result := make(chan outcome, 1)
 
 	c.mu.Lock()
-	timer := time.AfterFunc(requestTimeoutMS*time.Millisecond, func() {
+	timers := c.timers
+	if timers == nil {
+		timers = realTimers{}
+	}
+	timer := timers.SetTimeout(requestTimeoutMS*time.Millisecond, func() {
 		c.mu.Lock()
 		_, tracked := c.pending[id]
 		if tracked {

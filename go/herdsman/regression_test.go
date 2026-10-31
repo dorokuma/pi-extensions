@@ -942,7 +942,6 @@ func TestRegression_ResetForSessionStopsTheScheduledReconnect(t *testing.T) {
 		reconnectDelays: []int64{50},
 		nextID:          1,
 		pending:         map[string]*pendingRequest{},
-		now:             time.Now,
 		state:           stateIdle,
 	}
 	// A backoff the previous session scheduled and never got to run.
@@ -1311,31 +1310,23 @@ func TestRegression_EarlyRegistrationExitDoesNotStickTheInFlightMarker(t *testin
 	t.Run("closed before the goroutine runs", func(t *testing.T) {
 		client := newBlockingClient(func(method string, params any) any { return ownerResponse() })
 		f := newBlockingFixture(t, client)
-		// Bring the identity up without dialling: the fake client's
-		// ResetForSession only fires a callback that is not installed yet.
-		f.core.HandleSessionStart(f.ctx, nil)
 
-		// Count the registrations the live cycle already issued, so the check
-		// below cannot be satisfied by a client that started from zero.
-		before := client.issued("agent.orchestrator.register")
-
-		// The registration goroutine will find the extension closed before it can
-		// issue anything: exactly the early-exit branch.
+		// The extension must already be closed when the registration goroutine
+		// runs: closed is set before session_start, so every schedule lands the
+		// goroutine's entry check in the early-exit branch. Setting it *after*
+		// HandleSessionStart (as this case first did) only wins while the
+		// goroutine stays descheduled — under CPU oversubscription the register
+		// request and `connected = true` can land before the test locks, which
+		// fails the connected assertion on a schedule, not on the code path.
 		f.core.mu.Lock()
 		f.core.closed = true
 		f.core.mu.Unlock()
-		f.core.registerPresence(f.ctx)
+		f.core.HandleSessionStart(f.ctx, nil)
 
-		deadline := time.Now().Add(watchdog)
-		for time.Now().Before(deadline) {
-			f.core.mu.Lock()
-			inFlight := f.core.registrationInFlight
-			f.core.mu.Unlock()
-			if inFlight == nil {
-				break
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
+		// The goroutine spawned by the session-start connect is the early-exit
+		// registration itself: awaitRegistration settles on its done channel, and
+		// the entry check must have dropped it before any daemon request.
+		awaitRegistration(t, f.core)
 		f.core.mu.Lock()
 		inFlight := f.core.registrationInFlight
 		f.core.mu.Unlock()
@@ -1347,8 +1338,8 @@ func TestRegression_EarlyRegistrationExitDoesNotStickTheInFlightMarker(t *testin
 		// closed extension that issued agent.orchestrator.register (and then
 		// applied the reply) reached the daemon for a cycle that was already
 		// gone. The pre-fix implementation had no guard before the request.
-		if got := client.issued("agent.orchestrator.register"); got != before {
-			t.Fatalf("a closed extension issued agent.orchestrator.register: %d -> %d", before, got)
+		if got := client.issued("agent.orchestrator.register"); got != 0 {
+			t.Fatalf("a closed extension issued agent.orchestrator.register: %d call(s)", got)
 		}
 		if coreConnected(f.core) {
 			t.Fatal("a closed extension marked itself connected")
