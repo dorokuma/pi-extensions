@@ -142,6 +142,11 @@ type overlayCloser interface {
 // ctx.ui PT uses. It is an interface so a test can drive the modal lifecycle
 // without a live SDK connection, and so no host callback is stored as an
 // sdk.Context whose zero value would hide a nil dereference.
+//
+// setHiddenThinkingLabel stays the sdkUI primitive it is; when a new host UI
+// primitive for the native thinking seam arrives (the upstream #384 hook),
+// route it through the native_thinking.go adapter layer rather than sprinkling
+// it across call sites, and add the primitive here and on sdkUI as a pair.
 type uiContext interface {
 	setHiddenThinkingLabel(label string)
 	onTerminalInput(handler func(data string) terminalInputVerdict) func()

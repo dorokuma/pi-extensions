@@ -96,13 +96,21 @@ removeChild / clear`（`installGrouping`）、`AssistantMessageComponent.prototy
    `installNativeThinkingSuppression`（bundle L256-334）对含 thinking 的消息**无条件**
    过滤掉所有 thinking 块（`content.filter(item => item?.type !== "thinking")`）；本移植
    沿用同一口径，只是改用宿主真正暴露的那道缝：factory 注册 `e.MarkdownTransformer`
-   （`extension.go:53`）→ `transformMarkdown`（`assistant.go:189`）对
+   （`extension.go:53`）→ `transformMarkdown`（`native_thinking.go:92`）对
    `MessageType == "assistant-thinking"` 返回空串，宿主 `tui/markdown.go` 对变换后
    `JSTrim(content) == ""` 的文本（`markdown.go:314`；异步分支 `markdown.go:295-303`）
    返回 **0 行**。这与本移植前的行为不同（移植前原生 thinking 正文照常显示）；异步代理
    带来的两条代价见下文「能力边界声明」。宿主侧原有的「识别并跳过原生 thinking widget」
    （`grouping.go:839` `isNativeThinkingWidget`）只作用于本移植自己的树，与这条宿主路径
    互不依赖。
+   - **上游挂接点收敛在 `native_thinking.go`**：「原生 thinking 行的宿主缝」全部收在该文件
+     的适配层后——`applyNativeThinkingSuppression`（`native_thinking.go:38`，当前本体即
+     `ui.setHiddenThinkingLabel("")`）、`transformMarkdown` 及本地镜像
+     `installNativeThinkingSuppression` / `ensureAssistantThinkingPatched`。上游 PiG 0.6.0
+     正式钩子（issue #384，扩展接管隐藏 thinking 行的 0 行折叠）公布并落地后，只需改
+     `applyNativeThinkingSuppression` 的实现（及 transformer 取舍），调用点
+     `handleSessionStart` 与 factory 注册处不动；钩子形状未知，适配层只收敛调用点、
+     不预测接口。
 6. **符号键改用显式字段**：TS 用 `Symbol.for(...)` 的 `PARENT_KEY` / `PATCH_KEY` 等
    把补丁状态挂在宿主组件上；Go 侧无此机制，改为结构体字段与 `map`（如
    `toolComponent.owner`、`runtimeState.groups`），语义等价且可被 race detector 覆盖。
@@ -120,8 +128,8 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
 | 宿主面 | 本移植的落地 |
 |---|---|
 | `ctx.SetWidgetRenderer("compact-anim", ...)` | `extension.go:560` `renderWidget`（widget 行） |
-| `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart`（`extension.go:580`）里设置，原生 thinking 标签留空 |
-| `ext.MarkdownTransformer(...)` | `extension.go:53` 注册 `transformMarkdown`（`assistant.go:189`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
+| `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart` 经适配层 `applyNativeThinkingSuppression`（`native_thinking.go:38`）设置，原生 thinking 标签留空 |
+| `ext.MarkdownTransformer(...)` | `extension.go:53` 注册 `transformMarkdown`（`native_thinking.go:92`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
 | `ctx.OnTerminalInput` | `extension.go:525` `handleTerminalInput`，`Ctrl+I` 开检查器 |
 | `ctx.Custom` / `AddOverlay` | `runtime_glue.go:195` / `runtime_glue.go:259` 两个 overlay |
 | `ext.ToolRenderer(...)` | `extension.go:412` `installToolRenderer`：Call/Result 都返回 `toolRowLocked` 的紧凑单行 + 结果文本 |
@@ -227,7 +235,7 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
    - **与原版一致**：原版 `installNativeThinkingSuppression`（bundle L256-334）对含
      thinking 的消息**无条件**过滤掉所有 thinking 块
      （`content.filter(item => item?.type !== "thinking")`），与本移植的
-     `transformMarkdown`（`assistant.go:189`）对 `assistant-thinking` 返回空串等价。所以
+     `transformMarkdown`（`native_thinking.go:92`）对 `assistant-thinking` 返回空串等价。所以
      `hideThinkingBlock: false` 时宿主原生 thinking **正文不出现**：宿主
      `tui/markdown.go` 对变换后 `JSTrim(content) == ""` 的文本返回 0 行
      （`markdown.go:314`；异步分支 `markdown.go:295-303`）。旧结论「不可抑制」已被证伪，
@@ -316,8 +324,8 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L196 | `thinkingAlreadyShown` | `assistant.go:22` | `thinkingAlreadyShown` |
 | L210 | `stageHistoricalThinking` | `assistant.go:50` | `stageHistoricalThinking` |
 | L235 | `ensureHistoricalThinkingAnchors` | `assistant.go:110` | `ensureHistoricalThinkingAnchors` |
-| L256 | `installNativeThinkingSuppression` | `assistant.go:148` | `installNativeThinkingSuppression` |
-| L319 | `ensureAssistantThinkingPatched` | `assistant.go:156` | `ensureAssistantThinkingPatched` |
+| L256 | `installNativeThinkingSuppression` | `native_thinking.go:50` | `installNativeThinkingSuppression` |
+| L319 | `ensureAssistantThinkingPatched` | `native_thinking.go:107` | `ensureAssistantThinkingPatched` |
 | L327 | `getAssistantContentState` | `state.go:174` | `assistantContentState` |
 | L327 | `getAssistantContentState` | `grouping.go:856` | `getAssistantContentStateLocked` |
 | L335 | `removeGroupFromContainer` | `grouping.go:604` | `removeGroupFromContainer` |
