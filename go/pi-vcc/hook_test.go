@@ -310,6 +310,21 @@ func TestHook_CompactionEntryIsPiVcc(t *testing.T) {
 	}
 }
 
+// TestHook_GlobalIndexForRecoversHostPanic pins H1: globalIndexFor's recover
+// must cover the host calls themselves, not an inner function that has already
+// returned. A Context with no host attached panics inside GetEntries; the
+// lookup must degrade to nil instead of letting that panic kill the handler.
+func TestHook_GlobalIndexForRecoversHostPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("globalIndexFor let a host panic escape: %v", r)
+		}
+	}()
+	if index := globalIndexFor(sdk.Context{}); index != nil {
+		t.Fatalf("globalIndexFor = %v, want nil after a host panic", index)
+	}
+}
+
 // TestHook_DebugSnapshotWrittenWhenEnabled pins dbg(): the snapshot is written
 // only when the setting is on, and it describes a real compaction.
 func TestHook_DebugSnapshotWrittenWhenEnabled(t *testing.T) {

@@ -371,9 +371,14 @@ func stringSliceField(object map[string]any, parent, child string) []string {
 
 // globalIndexFor is the `#N` map: the in-memory tree first, then the session
 // file, else nil (fail-closed: no refs rather than window-relative ones).
-func globalIndexFor(ctx sdk.Context) map[string]int {
-	func() {
-		defer func() { _ = recover() }()
+func globalIndexFor(ctx sdk.Context) (index map[string]int) {
+	// A host/SDK failure here must not take down the whole handler: degrade to
+	// no refs, the fail-closed outcome this function already returns when the
+	// calls merely error.
+	defer func() {
+		if recover() != nil {
+			index = nil
+		}
 	}()
 	if entries, err := ctx.GetEntries(); err == nil && len(entries) > 0 {
 		decoded := make([]map[string]any, 0, len(entries))
