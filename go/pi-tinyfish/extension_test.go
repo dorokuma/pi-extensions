@@ -291,6 +291,42 @@ func TestTruncationAndFormatting(t *testing.T) {
 	}
 }
 
+// TestExecuteSearchMarksFailuresIsError pins H2: an execution failure must
+// surface to the protocol layer as IsError, not as a plain text result the
+// host and the model cannot tell apart from a successful answer.
+func TestExecuteSearchMarksFailuresIsError(t *testing.T) {
+	restore := setClientFactory(func(opts ...ClientOption) (*Client, error) {
+		return nil, fmt.Errorf("Missing API key")
+	})
+	defer restore()
+
+	resRaw, err := ExecuteSearch(sdk.Context{}, map[string]any{"query": "go"})
+	if err != nil {
+		t.Fatalf("Execute returned unexpected err: %v", err)
+	}
+	res := resRaw.(sdk.ToolResult)
+	if !res.IsError {
+		t.Fatalf("client-failure result IsError = false, want true: %+v", res)
+	}
+}
+
+// TestExecuteFetchMarksFailuresIsError is the fetch half of H2.
+func TestExecuteFetchMarksFailuresIsError(t *testing.T) {
+	restore := setClientFactory(func(opts ...ClientOption) (*Client, error) {
+		return nil, fmt.Errorf("Missing API key")
+	})
+	defer restore()
+
+	resRaw, err := ExecuteFetch(sdk.Context{}, map[string]any{"url": "https://example.com"})
+	if err != nil {
+		t.Fatalf("Execute returned unexpected err: %v", err)
+	}
+	res := resRaw.(sdk.ToolResult)
+	if !res.IsError {
+		t.Fatalf("client-failure result IsError = false, want true: %+v", res)
+	}
+}
+
 func TestExecuteSearchWithFakeServer(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := SearchResponse{

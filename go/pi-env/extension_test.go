@@ -509,6 +509,100 @@ func TestSensitiveEnvKey_Coverage(t *testing.T) {
 	}
 }
 
+// 8e. H9 regression: proxy-style keys (HTTP_PROXY/HTTPS_PROXY/NO_PROXY/...)
+// and any value carrying a URL userinfo credential (`scheme://user:pass@host`)
+// must be masked in the /env report even when the key name carries no
+// KEY/TOKEN/SECRET marker.
+func TestFormatReport_ProxyAndUserinfoMasking(t *testing.T) {
+	proxy := "http://user:s3cret-passw0rd@proxy.internal:8080"
+
+	// Value-bearing userinfo is masked whole on ANY key name, sensitive
+	// markers or not: no first4/last4 reveal.
+	report := EnvReport{
+		Source: "global",
+		Keys:   []string{"HTTP_PROXY", "INNOCENT_LOOKUP"},
+		Variables: map[string]string{
+			"HTTP_PROXY":      proxy,
+			"INNOCENT_LOOKUP": proxy,
+		},
+	}
+	out := FormatReport(nil, []EnvReport{report})
+	if strings.Contains(out, "s3cret-passw0rd") || strings.Contains(out, proxy) {
+		t.Fatalf("proxy credential leaked into report:\n%s", out)
+	}
+	lineOf := func(key, report string) string {
+		for _, l := range strings.Split(report, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), key+"=") {
+				return l
+			}
+		}
+		return ""
+	}
+	for _, key := range []string{"HTTP_PROXY", "INNOCENT_LOOKUP"} {
+		line := lineOf(key, out)
+		if line == "" || !strings.Contains(line, redactedEnvValue) {
+			t.Fatalf("%s line not fully redacted: %q\nfull report:\n%s", key, line, out)
+		}
+		// The whole value, including its scheme/authority fragments, is gone.
+		for _, frag := range []string{"http", "user", "proxy.internal", "8080"} {
+			if strings.Contains(line, frag) {
+				t.Fatalf("%s line leaks fragment %q: %q", key, frag, line)
+			}
+		}
+	}
+
+	// PROXY/SALT/SIG/CERT key names are sensitive on their own.
+	for _, key := range []string{"HTTPS_PROXY", "NO_PROXY", "PASSWORD_SALT", "SIGNING_SEED", "TLS_CERT", "CA_BUNDLE_SIG"} {
+		if !sensitiveEnvKey(key) {
+			t.Errorf("sensitiveEnvKey(%q) = false, want true", key)
+		}
+	}
+
+	// A PROXY key with no credential in the value is still masked by name;
+	// a non-sensitive key with a credential-free value stays verbatim.
+	plain := EnvReport{
+		Source:    "global",
+		Keys:      []string{"HTTP_PROXY", "DOWNLOAD_DIR"},
+		Variables: map[string]string{"HTTP_PROXY": "http://proxy.internal:8080", "DOWNLOAD_DIR": "/tmp/dl"},
+	}
+	out = FormatReport(nil, []EnvReport{plain})
+	proxyLine := lineOf("HTTP_PROXY", out)
+	if !strings.Contains(proxyLine, "\u2026") {
+		t.Fatalf("HTTP_PROXY line not masked: %q\nfull report:\n%s", proxyLine, out)
+	}
+	dirLine := lineOf("DOWNLOAD_DIR", out)
+	if !strings.Contains(dirLine, "/tmp/dl") {
+		t.Fatalf("credential-free non-sensitive value should render verbatim: %q\nfull report:\n%s", dirLine, out)
+	}
+}
+
+// 8f. H9 rework: a >16-rune value carrying a credential must be masked whole.
+// first4…last4 would leave credential fragments visible (a 5-char password
+// ends inside the last4 window).
+func TestFormatReport_UserinfoValueFullyRedacted(t *testing.T) {
+	// 33 runes, 5-char password -> old mask rendered `…s@h:`.
+	long := "http://user:dh2ka@h:8080"
+	short := "x://a:b@c" // <=16 runes is already fully masked
+	report := EnvReport{
+		Source:    "global",
+		Keys:      []string{"SERVICE_URL", "MISC"},
+		Variables: map[string]string{"SERVICE_URL": long, "MISC": short},
+	}
+	out := FormatReport(nil, []EnvReport{report})
+	for _, frag := range []string{"dh2ka", "s@h:", "user", "8080", long, short} {
+		if strings.Contains(out, frag) {
+			t.Fatalf("credential value leaked fragment %q into report:\n%s", frag, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "SERVICE_URL=") || strings.Contains(line, "MISC=") {
+			if !strings.Contains(line, redactedEnvValue) {
+				t.Fatalf("credential-bearing value not fully redacted: %q", line)
+			}
+		}
+	}
+}
+
 // 9. BuildSessionStartWarnings tests
 func TestBuildSessionStartWarnings(t *testing.T) {
 	theme := mockTheme{}

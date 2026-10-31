@@ -156,7 +156,11 @@ func (w *WrappingSelect) Render(width int) []string {
 		lines = append(lines, w.renderItem(w.items[i], i, isActive, width, numberWidth)...)
 	}
 	if start > 0 || end < len(w.items) {
-		lines = append(lines, w.theme.ScrollInfo("  ("+itoa(w.selectedIndex+1)+"/"+itoa(len(w.items))+")"))
+		info := "  (" + itoa(w.selectedIndex+1) + "/" + itoa(len(w.items)) + ")"
+		if w.theme.ScrollInfo != nil {
+			info = w.theme.ScrollInfo(info)
+		}
+		lines = append(lines, info)
 	}
 	return lines
 }
@@ -272,7 +276,7 @@ func (w *WrappingSelect) renderLabelBlock(
 			prefix = rowPrefix
 		}
 		line := prefix + segment
-		if applySelectedStyle {
+		if applySelectedStyle && w.theme.SelectedText != nil {
 			line = w.theme.SelectedText(line)
 		}
 		lines = append(lines, line)
@@ -288,9 +292,19 @@ func (w *WrappingSelect) renderDescriptionBlock(description, continuationPrefix 
 	wrapped := wrapTextWithAnsi(description, contentWidth)
 	lines := make([]string, 0, len(wrapped))
 	for _, segment := range wrapped {
-		lines = append(lines, continuationPrefix+w.theme.Description(segment))
+		lines = append(lines, continuationPrefix+describeSegment(w.theme, segment))
 	}
 	return lines
+}
+
+// describeSegment renders one description segment through the theme hook,
+// falling back to the raw text when the hook is nil ("A nil hook renders the
+// text unstyled").
+func describeSegment(theme WrappingSelectTheme, segment string) string {
+	if theme.Description == nil {
+		return segment
+	}
+	return theme.Description(segment)
 }
 
 // clampIndex mirrors `Math.max(0, Math.min(index, length - 1))`.

@@ -278,6 +278,45 @@ func TestTextEditorMultibyteDeletion(t *testing.T) {
 	}
 }
 
+// TestTextEditorMultibyteCursorSteps pins H15: Left/Right step one rune, not
+// one byte, so the cursor never rests on a UTF-8 continuation byte and a
+// following edit cannot split a rune. Byte cols in "aé中": a=0, é=1..2, 中=3..5.
+func TestTextEditorMultibyteCursorSteps(t *testing.T) {
+	step := func(text string, col int, keys ...string) Cursor {
+		editor := newEditor(text)
+		editor.cursor = Cursor{Line: 0, Col: col}
+		for _, k := range keys {
+			editor.HandleInput(k)
+		}
+		return editor.GetCursor()
+	}
+	const text = "aé中"
+	if got := step(text, 0, "\x1b[C"); got != (Cursor{Line: 0, Col: 1}) {
+		t.Fatalf("right over 'a' = %#v, want col 1", got)
+	}
+	if got := step(text, 0, "\x1b[C", "\x1b[C"); got != (Cursor{Line: 0, Col: 3}) {
+		t.Fatalf("right over 'é' = %#v, want col 3 (next rune start)", got)
+	}
+	if got := step(text, 0, "\x1b[C", "\x1b[C", "\x1b[C"); got != (Cursor{Line: 0, Col: 6}) {
+		t.Fatalf("right over '中' = %#v, want col 6", got)
+	}
+	if got := step(text, len(text), "\x1b[D"); got != (Cursor{Line: 0, Col: 3}) {
+		t.Fatalf("left over '中' = %#v, want col 3", got)
+	}
+	if got := step(text, len(text), "\x1b[D", "\x1b[D"); got != (Cursor{Line: 0, Col: 1}) {
+		t.Fatalf("left over 'é' = %#v, want col 1", got)
+	}
+	// Backspace after rune-stepping removes 'é' whole, keeping valid UTF-8.
+	editor := newEditor(text)
+	editor.cursor = Cursor{Line: 0, Col: 0}
+	editor.HandleInput("\x1b[C")
+	editor.HandleInput("\x1b[C")
+	editor.HandleInput("\x7f")
+	if got := editor.GetText(); got != "a中" {
+		t.Fatalf("text after rune-aligned backspace = %q", got)
+	}
+}
+
 func TestTextEditorOnChangeFires(t *testing.T) {
 	editor := NewTextEditor()
 	count := 0
