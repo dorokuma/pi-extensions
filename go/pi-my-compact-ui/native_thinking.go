@@ -7,15 +7,15 @@ import (
 // This file is the adapter layer for the "native thinking row" host seam: every
 // way this extension suppresses or hides the host's own thinking render lives
 // here, so the upstream PiG 0.6.0 hook (issue #384: the extension takes over
-// rendering the hidden-thinking row, collapsing it to zero lines) has exactly
-// one file to land in.
+// rendering the hidden-thinking row, collapsing it to zero lines) lands here.
 //
-// The hook's shape is not known yet -- it may be a bool flag, an RPC, or an SDK
-// method -- so this file converges the *call sites*, not the interface. When
-// the hook ships, the single place to change is applyNativeThinkingSuppression
-// (call the new hook, or negotiate with it), plus possibly the keep/drop
-// decision on transformMarkdown below. handleSessionStart and every other
-// caller must not need to know which primitive is underneath.
+// What converges today is the call sites: applyNativeThinkingSuppression is
+// the sole caller of the setHiddenThinkingLabel primitive and transformMarkdown
+// is the sole registered assistant-thinking seam. An unknown hook is not
+// promised to fit this shape: if it needs a new primitive or registration,
+// uiContext/sdkUI and NewExtension gain the pair per the accessors.go
+// contract, so "one place to change" means the adapter layer plus its pair --
+// not a literal single file or function. handleSessionStart stays agnostic.
 //
 // Two different seams are folded into this one file because they implement the
 // same suppression semantics:
@@ -26,15 +26,15 @@ import (
 // local mirror of that semantics (component flags + the installed record); they
 // belong to the same boundary even though they never touch the host.
 
-// applyNativeThinkingSuppression makes the host's native thinking render
-// invisible / zero-footprint for us. Its body today is the one primitive the
-// host exposes -- setHiddenThinkingLabel("") blanks the hidden-state label so
-// the hidden thinking row draws one empty stub line -- but the semantic is the
-// suppression, not the label.
+// applyNativeThinkingSuppression blanks the host's native hidden-thinking
+// label: its body today is the one primitive the host exposes,
+// setHiddenThinkingLabel(""), so the hidden row still draws one empty stub
+// line (plus the host spacer). The zero-line collapse is what the upstream
+// #384 hook is for; today this only blanks the label.
 //
-// When the upstream #384 hook lands in PiG 0.6.0, this method body is the only
-// place that changes: call the new hook (or negotiate with it) here, and the
-// caller handleSessionStart stays untouched.
+// When the #384 hook lands in PiG 0.6.0, the change converges on this method
+// body (call the new hook, or negotiate with it); handleSessionStart stays
+// untouched unless the hook needs a new primitive -- see the file head.
 func (r *runtimeState) applyNativeThinkingSuppression(ui uiContext) {
 	ui.setHiddenThinkingLabel("")
 }

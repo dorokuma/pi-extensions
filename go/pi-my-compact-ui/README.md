@@ -85,7 +85,7 @@ removeChild / clear`（`installGrouping`）、`AssistantMessageComponent.prototy
    `clearPatched`（`grouping.go:567`）在本容器上复刻。
 2. **助手思考补丁改为渲染层重写**：TS 直接 patch `AssistantMessageComponent` 让它在
    历史消息里重排 thinking 块；Go 侧改为在渲染 assistant 消息时由
-   `applyAssistantThinkingPatch`（`assistant.go:221`）产出等价内容，并由
+   `applyAssistantThinkingPatch`（`assistant.go:147`）产出等价内容，并由
    `stripAssistantPhantomPadding`（`grouping.go:787`）清掉原实现留下的空行。
 3. **压缩摘要标题改为自带组件**：TS patch `updateDisplay`；Go 侧自带
    `compactionHeaderComponent`（`component.go:301`），由
@@ -96,7 +96,7 @@ removeChild / clear`（`installGrouping`）、`AssistantMessageComponent.prototy
    `installNativeThinkingSuppression`（bundle L256-334）对含 thinking 的消息**无条件**
    过滤掉所有 thinking 块（`content.filter(item => item?.type !== "thinking")`）；本移植
    沿用同一口径，只是改用宿主真正暴露的那道缝：factory 注册 `e.MarkdownTransformer`
-   （`extension.go:53`）→ `transformMarkdown`（`native_thinking.go:92`）对
+   （`extension.go:54`）→ `transformMarkdown`（`native_thinking.go:92`）对
    `MessageType == "assistant-thinking"` 返回空串，宿主 `tui/markdown.go` 对变换后
    `JSTrim(content) == ""` 的文本（`markdown.go:314`；异步分支 `markdown.go:295-303`）
    返回 **0 行**。这与本移植前的行为不同（移植前原生 thinking 正文照常显示）；异步代理
@@ -129,7 +129,7 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
 |---|---|
 | `ctx.SetWidgetRenderer("compact-anim", ...)` | `extension.go:560` `renderWidget`（widget 行） |
 | `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart` 经适配层 `applyNativeThinkingSuppression`（`native_thinking.go:38`）设置，原生 thinking 标签留空 |
-| `ext.MarkdownTransformer(...)` | `extension.go:53` 注册 `transformMarkdown`（`native_thinking.go:92`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
+| `ext.MarkdownTransformer(...)` | `extension.go:54` 注册 `transformMarkdown`（`native_thinking.go:92`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
 | `ctx.OnTerminalInput` | `extension.go:525` `handleTerminalInput`，`Ctrl+I` 开检查器 |
 | `ctx.Custom` / `AddOverlay` | `runtime_glue.go:195` / `runtime_glue.go:259` 两个 overlay |
 | `ext.ToolRenderer(...)` | `extension.go:412` `installToolRenderer`：Call/Result 都返回 `toolRowLocked` 的紧凑单行 + 结果文本 |
@@ -276,7 +276,7 @@ TS 侧行段取自 bundle 里的 `// src/x.ts` 模块注释，逐条实测：
 | L8–L49 | `src/state.ts` | state.go / accessors.go |
 | L50–L69 | `src/constants.ts` | values.go |
 | L70–L192 | `src/helpers.ts` | values.go |
-| L193–L521 | `src/assistant-patches.ts` | assistant.go / grouping.go |
+| L193–L521 | `src/assistant-patches.ts` | assistant.go / grouping.go / native_thinking.go |
 | L522–L754 | `src/streaming-tools.ts` | streaming.go |
 | L755–L785 | `src/animation.ts` | runtime_glue.go |
 | L786–L807 | `src/config.ts` | values.go |
