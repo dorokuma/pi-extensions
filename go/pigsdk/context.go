@@ -1758,8 +1758,14 @@ func (c Context) GetTheme(name string) (Theme, error) {
 // SetTheme switches the current theme by name.
 func (c Context) SetTheme(name string) (bool, string) {
 	result, err := c.callHost("ui.setTheme", map[string]string{"theme": name})
-	if err != nil || result == nil {
+	if err != nil {
 		return false, err.Error()
+	}
+	if result == nil {
+		// callHost answers nil,nil when the host leaves a call unsettled past
+		// the connection's end; the old single-check form dereferenced the nil
+		// err and panicked here.
+		return false, "host returned no result"
 	}
 	var resp struct {
 		Success bool   `json:"success"`
