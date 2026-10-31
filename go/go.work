@@ -23,4 +23,5 @@ use (
 	./pi-vcc
 	./pigsdk
 	./rpiv-ask-user-question
+	./sandbox
 )
