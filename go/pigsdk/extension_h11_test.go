@@ -1,41 +1,71 @@
 package sdk
 
-// Regression test for H11: a before_agent_start event dispatched with a nil
-// decoded data map must not panic on the `data["systemPrompt"] = ...` write
-// (assignment to entry in nil map). The dispatch is driven over a real
-// net.Pipe conn so the recover boundary and respond path are the real ones.
+// Defensive-depth regression tests for H10/H11. The nil-data shape behind H11
+// is not reachable through ordinary host payloads — a non-map args body fails
+// preparePromptOptions before dispatch, and a stream payload that decodes to a
+// non-map is normalized to an empty map by event_stream.go — so the nil-map
+// write guard in extension.go is belt-and-braces. The H10 SetTheme nil-result
+// branch is likewise unreachable over the wire today (a host frame with no
+// call_result body is the synthetic shape used below). These tests pin
+// "no panic" regressions driven over a real net.Pipe conn; they do not claim
+// a reproduced panic from a reachable host input.
 
 import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
 )
 
-// h11Host reads frames off one end of a net.Pipe and captures the response the
-// extension writes for the event request.
+// h11Host is the host end of a net.Pipe: it reads the frames the extension
+// writes and answers them. Every read/write carries a deadline so a missing
+// frame fails fast instead of hanging the test.
 type h11Host struct {
 	t    *testing.T
 	conn net.Conn
 }
 
-func newH11Host(t *testing.T) (*h11Host, net.Conn) {
+// handshake pipes the extension, serves register→ready, and returns a stop
+// that shuts the extension down. t.Cleanup closes the host end.
+func handshake(t *testing.T, ext *Extension) (host *h11Host, stop func()) {
 	t.Helper()
 	hostEnd, extEnd := net.Pipe()
-	return &h11Host{t: t, conn: hostEnd}, extEnd
+	host = &h11Host{t: t, conn: hostEnd}
+	t.Cleanup(func() { hostEnd.Close() })
+	done := make(chan error, 1)
+	go func() { done <- ext.runWithConn(extEnd, nil, "") }()
+	if reg := host.readFrame(); reg["register"] == nil {
+		t.Fatalf("first frame is not a register frame: %#v", reg)
+	}
+	host.sendFrame(map[string]any{"type": "ready",
+		"ready": map[string]any{"cwd": t.TempDir(), "mode": "rpc", "width": 80}})
+	return host, func() {
+		host.sendFrame(map[string]any{"type": "shutdown"})
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("extension exited with error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("extension did not stop on shutdown")
+		}
+	}
 }
 
 func (h *h11Host) readFrame() map[string]any {
 	h.t.Helper()
 	var header [4]byte
-	if _, err := readFullH11(h.conn, header[:]); err != nil {
+	h.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.conn, header[:]); err != nil {
 		h.t.Fatalf("read frame header: %v", err)
 	}
 	data := make([]byte, binary.BigEndian.Uint32(header[:]))
-	if _, err := readFullH11(h.conn, data); err != nil {
+	h.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.conn, data); err != nil {
 		h.t.Fatalf("read frame body: %v", err)
 	}
 	var msg map[string]any
@@ -45,165 +75,6 @@ func (h *h11Host) readFrame() map[string]any {
 	return msg
 }
 
-func readFullH11(conn net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := conn.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-// TestBeforeAgentStartNilDataNoPanic sends a before_agent_start event request
-// whose args decode to a nil map. The SDK must answer with an error response
-// (its preparePromptOptions guard), not a "handler panicked" panic recovery.
-func TestBeforeAgentStartNilDataNoPanic(t *testing.T) {
-	host, extEnd := newH11Host(t)
-	defer host.conn.Close()
-
-	ext := New("h11-nil-data")
-	var handlerID int
-	ext.OnEvent("before_agent_start", func(ctx Context, data map[string]any) (any, error) {
-		return nil, nil
-	})
-	// The registered handler id the host will dispatch on.
-	handlerID = ext.eventNextID
-
-	done := make(chan error, 1)
-	go func() { done <- ext.runWithConn(extEnd, nil, "") }()
-
-	// Read the register frame.
-	reg := host.readFrame()
-	if _, ok := reg["register"]; !ok {
-		t.Fatalf("first frame is not a register frame: %#v", reg)
-	}
-	// Ready so the extension leaves its wait.
-	host.sendFrame(map[string]any{"type": "ready", "ready": map[string]any{"cwd": t.TempDir(), "mode": "rpc", "width": 80}})
-
-	// Fire the event with args that decode to nil ("null").
-	host.sendFrame(map[string]any{
-		"type": "request",
-		"id":   "req-1",
-		"request": map[string]any{
-			"method":     "event",
-			"event":      "before_agent_start",
-			"handler_id": handlerID,
-			"args":       json.RawMessage(`null`),
-		},
-	})
-
-	// Expect a response frame for req-1 that is an error, not a panic.
-	deadline := time.Now().Add(5 * time.Second)
-	var resp map[string]any
-	for time.Now().Before(deadline) {
-		msg := host.readFrame()
-		if msg["type"] == "response" && msg["id"] == "req-1" {
-			resp = msg
-			break
-		}
-	}
-	if resp == nil {
-		t.Fatal("no response frame for the before_agent_start request")
-	}
-	respObj, _ := resp["response"].(map[string]any)
-	if respObj == nil {
-		t.Fatalf("response frame missing response object: %#v", resp)
-	}
-	errInfo, _ := respObj["error"].(map[string]any)
-	if errInfo == nil {
-		t.Fatalf("expected an error response, got: %#v", respObj)
-	}
-	msg, _ := errInfo["message"].(string)
-	if strings.Contains(msg, "handler panicked") || strings.Contains(msg, "nil map") {
-		t.Fatalf("before_agent_start with nil data panicked: %q", msg)
-	}
-
-	// Shutdown so runWithConn returns.
-	host.sendFrame(map[string]any{"type": "shutdown"})
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("extension exited with error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("extension did not stop on shutdown")
-	}
-}
-
-// TestBeforeAgentStartStreamNilDataNoPanic exercises the stream-decoded path of
-// H11: a before_agent_start event delivered as an event stream whose decoded
-// payload is not a map leaves req.streamData nil, and the dispatch must not
-// panic writing data["systemPrompt"].
-func TestBeforeAgentStartStreamNilDataNoPanic(t *testing.T) {
-	host, extEnd := newH11Host(t)
-	defer host.conn.Close()
-
-	ext := New("h11-nil-stream")
-	ext.OnEvent("before_agent_start", func(ctx Context, data map[string]any) (any, error) {
-		return nil, nil
-	})
-	handlerID := ext.eventNextID
-
-	done := make(chan error, 1)
-	go func() { done <- ext.runWithConn(extEnd, nil, "") }()
-
-	reg := host.readFrame()
-	if _, ok := reg["register"]; !ok {
-		t.Fatalf("first frame is not a register frame: %#v", reg)
-	}
-	host.sendFrame(map[string]any{"type": "ready", "ready": map[string]any{"cwd": t.TempDir(), "mode": "rpc", "width": 80}})
-
-	// Stream keyframe whose args decode to a JSON array — cloneStreamValue does
-	// not produce a map, so streamData stays nil (the H11 nil-map shape).
-	host.sendFrame(map[string]any{
-		"type": "request",
-		"id":   "req-stream",
-		"request": map[string]any{
-			"method":     "event",
-			"event":      "before_agent_start",
-			"handler_id": handlerID,
-			"args":       json.RawMessage(`["not","a","map"]`),
-			"stream":     map[string]any{"seq": 1, "key": "k"},
-		},
-	})
-
-	deadline := time.Now().Add(5 * time.Second)
-	var resp map[string]any
-	for time.Now().Before(deadline) {
-		msg := host.readFrame()
-		if msg["type"] == "response" && msg["id"] == "req-stream" {
-			resp = msg
-			break
-		}
-	}
-	if resp == nil {
-		t.Fatal("no response frame for the streamed before_agent_start request")
-	}
-	respObj, _ := resp["response"].(map[string]any)
-	if respObj == nil {
-		t.Fatalf("response frame missing response object: %#v", resp)
-	}
-	if errInfo, _ := respObj["error"].(map[string]any); errInfo != nil {
-		msg, _ := errInfo["message"].(string)
-		if strings.Contains(msg, "handler panicked") || strings.Contains(msg, "nil map") {
-			t.Fatalf("streamed before_agent_start panicked on nil data: %q", msg)
-		}
-	}
-
-	host.sendFrame(map[string]any{"type": "shutdown"})
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("extension exited with error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("extension did not stop on shutdown")
-	}
-}
-
 func (h *h11Host) sendFrame(msg map[string]any) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -211,8 +82,85 @@ func (h *h11Host) sendFrame(msg map[string]any) {
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
+	h.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := h.conn.Write(append(header[:], data...)); err != nil {
 		h.t.Fatalf("write frame: %v", err)
+	}
+}
+
+// readResponse returns the response frame for id (other frames are skipped; a
+// missing one fails on the read deadline).
+func (h *h11Host) readResponse(id string) map[string]any {
+	h.t.Helper()
+	for {
+		msg := h.readFrame()
+		if msg["type"] == "response" && msg["id"] == id {
+			return msg
+		}
+	}
+}
+
+// frameError returns the response's error message, "" when the frame is not an
+// error response.
+func frameError(t *testing.T, resp map[string]any) string {
+	t.Helper()
+	respObj, _ := resp["response"].(map[string]any)
+	if respObj == nil {
+		t.Fatalf("response frame missing response object: %#v", resp)
+	}
+	if errInfo, _ := respObj["error"].(map[string]any); errInfo != nil {
+		msg, _ := errInfo["message"].(string)
+		return msg
+	}
+	return ""
+}
+
+// TestBeforeAgentStartNilDataNoPanic pins that a before_agent_start dispatch
+// whose data map decoded to nil cannot reach the `data["systemPrompt"]` write:
+// the SDK answers preparePromptOptions' error, not a panic recovery.
+func TestBeforeAgentStartNilDataNoPanic(t *testing.T) {
+	ext := New("h11-nil-data")
+	ext.OnEvent("before_agent_start", func(ctx Context, data map[string]any) (any, error) {
+		return nil, nil
+	})
+	host, stop := handshake(t, ext)
+	defer stop()
+
+	// args "null" decodes data to a nil map; preparePromptOptions rejects it
+	// before the write the H11 guard covers.
+	host.sendFrame(map[string]any{"type": "request", "id": "req-1",
+		"request": map[string]any{
+			"method":     "event",
+			"event":      "before_agent_start",
+			"handler_id": ext.eventNextID,
+			"args":       json.RawMessage(`null`),
+		}})
+	if msg := frameError(t, host.readResponse("req-1")); strings.Contains(msg, "handler panicked") || strings.Contains(msg, "nil map") {
+		t.Fatalf("before_agent_start with nil data panicked: %q", msg)
+	}
+}
+
+// TestBeforeAgentStartStreamNilDataNoPanic exercises the stream-decoded shape:
+// a keyframe payload that is not a map is normalized to an empty map by
+// event_stream.go, so the dispatch never sees nil data. noPanic regression.
+func TestBeforeAgentStartStreamNilDataNoPanic(t *testing.T) {
+	ext := New("h11-nil-stream")
+	ext.OnEvent("before_agent_start", func(ctx Context, data map[string]any) (any, error) {
+		return nil, nil
+	})
+	host, stop := handshake(t, ext)
+	defer stop()
+
+	host.sendFrame(map[string]any{"type": "request", "id": "req-stream",
+		"request": map[string]any{
+			"method":     "event",
+			"event":      "before_agent_start",
+			"handler_id": ext.eventNextID,
+			"args":       json.RawMessage(`["not","a","map"]`),
+			"stream":     map[string]any{"seq": 1, "key": "k"},
+		}})
+	if msg := frameError(t, host.readResponse("req-stream")); strings.Contains(msg, "handler panicked") || strings.Contains(msg, "nil map") {
+		t.Fatalf("streamed before_agent_start panicked on nil data: %q", msg)
 	}
 }
 
@@ -220,44 +168,26 @@ func (h *h11Host) sendFrame(msg map[string]any) {
 // frame that carries no call_result body (result == nil, err == nil), SetTheme
 // must report a failure string instead of dereferencing the nil error.
 func TestSetThemeNilResultNoPanic(t *testing.T) {
-	host, extEnd := newH11Host(t)
-	defer host.conn.Close()
-
 	ext := New("h10-nil-result")
-	done := make(chan error, 1)
-	go func() { done <- ext.runWithConn(extEnd, nil, "") }()
+	host, stop := handshake(t, ext)
+	defer stop()
 
-	reg := host.readFrame()
-	if _, ok := reg["register"]; !ok {
-		t.Fatalf("first frame is not a register frame: %#v", reg)
-	}
-	host.sendFrame(map[string]any{"type": "ready", "ready": map[string]any{"cwd": t.TempDir(), "mode": "rpc", "width": 80}})
-
-	ctx := Context{ext: ext}
 	resultCh := make(chan string, 1)
 	go func() {
-		ok, msg := ctx.SetTheme("dark")
+		ok, msg := (Context{ext: ext}).SetTheme("dark")
 		resultCh <- fmt.Sprintf("ok=%v msg=%q", ok, msg)
 	}()
 
-	// Read the ui.setTheme call and answer it with a frame that has NO
-	// call_result payload at all: waitCall receives nil,nil.
+	// Read the ui.setTheme call and answer it with no call_result body at all:
+	// waitCall receives nil,nil.
 	var callID string
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		msg := host.readFrame()
-		if msg["type"] == "call" {
-			call := msg["call"].(map[string]any)
-			if call["method"] == "ui.setTheme" {
-				callID, _ = msg["id"].(string)
-				break
-			}
+		if call, _ := msg["call"].(map[string]any); call != nil && call["method"] == "ui.setTheme" {
+			callID, _ = msg["id"].(string)
+			break
 		}
 	}
-	if callID == "" {
-		t.Fatal("extension never issued the ui.setTheme call")
-	}
-	// call_result envelope with an absent CallResult body.
 	host.sendFrame(map[string]any{"type": "call_result", "id": callID})
 
 	select {
@@ -267,15 +197,5 @@ func TestSetThemeNilResultNoPanic(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("SetTheme did not return (possible panic or deadlock)")
-	}
-
-	host.sendFrame(map[string]any{"type": "shutdown"})
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("extension exited with error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("extension did not stop on shutdown")
 	}
 }

@@ -1543,8 +1543,11 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 				_ = e.conn.respond(id, nil, err)
 				return
 			}
-			// A request whose payload decoded to a nil map must not panic on the
-			// write below (assignment to entry in nil map): give it a real map.
+			// Defense in depth: a nil data map cannot arrive here in practice
+			// (a non-map args payload fails preparePromptOptions above; a
+			// non-map stream payload is normalized to an empty map by
+			// event_stream.go), but if one ever did, writing to it would
+			// panic — hand the handler a real map instead.
 			if data == nil {
 				data = make(map[string]any)
 			}
