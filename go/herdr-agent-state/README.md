@@ -144,7 +144,7 @@ source）、`agent = "pi"`（上报的 agent 标签，moshi gateway 的 canonica
 的会话信息回读给 `herdr pane get`。本组件的 `source = "pig"` 不在该名单内，因此即便
 `pane.report_agent` 被正常接受（Herdr 回 ok，见上表对照实验），`herdr pane get` 的
 `agent_session` 仍为 `null`。这是**回读侧的过滤**，不是上报被拒，也不影响 §2.3 的送达判定。
-会话历史不依赖该回读：由 `herdsman-pi` 扩展配合 herdsman 的 `~/.pig/agent/sessions`
+会话历史不依赖该回读：由 `herdsman` 扩展配合 herdsman 的 `~/.pig/agent/sessions`
 白名单闭环。
 
 ### 2.2 `pane.release_agent`（退出释放）

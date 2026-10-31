@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — 联邦式 Pi 扩展分发中枢的统一安装/巡检入口。
 #
-# 数据源：federated/registry.json（11 个扩展的类别与绝对权威路径）。本仓是 7 个
+# 数据源：federated/registry.json（10 个扩展的类别与绝对权威路径）。本仓是 6 个
 # 「hosted」内生扩展的唯一权威源，逐字节同步到部署目录；对 3 个「federated」外生
 # 扩展只以子进程级联调用其宿主仓的 install.sh（源留在宿主仓，改动回宿主仓走既有
 # 流程）；对 1 个「external」项 herdr-agent-state.ts 只读巡检、本仓绝不写它。
@@ -14,8 +14,8 @@
 #   - 实质改动后提示 Pi 需 /reload 或新会话才生效。
 #
 # 用法：
-#   install.sh --list                 # 列出 11 个扩展：名称/类别/权威源/目标/当前状态
-#   install.sh --audit                # 只读巡检全机 11 个：md5/权限/外生脚本/herdr 只读态 + dest 差集告警
+#   install.sh --list                 # 列出 10 个扩展：名称/类别/权威源/目标/当前状态
+#   install.sh --audit                # 只读巡检全机 10 个：md5/权限/外生脚本/herdr 只读态 + dest 差集告警
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -24,9 +24,6 @@
 # 铁律相关（详见 AGENTS.md）：
 #   - --all / 位置参数都绝不可能写 herdr-agent-state.ts：external 类别剔除 + NEVERWRITE 硬白名单
 #     （安装枚举层按 destFile 口径过滤）+ refuse_if_neverwrite 写入层兜底，三重防护。
-#   - 写 herdsman-bridge 前读 settings.json 的 packages，若已含同名 npm 包则显式报错退出（防双实例）；
-#     settings.json 存在但非法 JSON / packages 非数组时 fail-closed（显式 FAILED、exit 1，宁可拦住
-#     也不放行）；缺失则 note + 放行。读取路径可用 $PI_EXT_SETTINGS_JSON 覆盖（测试/演练用，README 已登记）。
 set -euo pipefail
 
 PROG="install.sh"
@@ -49,8 +46,8 @@ usage() {
 install.sh — 联邦式 Pi 扩展统一安装/巡检入口
 
 Usage:
-  install.sh --list                list 11 extensions (name/category/authority/target/status)
-  install.sh --audit               read-only inspect all 11 (md5/perms/upstream scripts/herdr) + warn on unregistered dest-dir entries
+  install.sh --list                list 10 extensions (name/category/authority/target/status)
+  install.sh --audit               read-only inspect all 10 (md5/perms/upstream scripts/herdr) + warn on unregistered dest-dir entries
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)
@@ -59,8 +56,6 @@ Usage:
 
 Env:
   PI_EXT_DEST_DIR        default target dir (CLI --dest-dir wins over it)
-  PI_EXT_SETTINGS_JSON   test/rehearsal-only override for the herdsman double-load guard's
-                         settings.json (documented in README; normally leave unset)
 
 Data source: federated/registry.json. This repo NEVER writes herdr-agent-state.ts.
 EOF
@@ -180,41 +175,6 @@ validate_target_file() { # $1 = full file path
   return 0
 }
 
-# ---- herdsman 双加载防护（fail-closed）----
-# settings 解析优先级（显式覆盖优先，均为「测试/演练用覆盖点」语义，见 README 环境变量表）：
-#   1) $PI_EXT_SETTINGS_JSON    —— 显式环境变量覆盖（演练/测试指哪读哪）
-#   2) registry .doubleLoadGuard.settingsFile —— 默认即真实 /root/.pi/agent/settings.json
-#   3) dirname($DEST_DIR)/settings.json     —— 最后回落（registry 未配 settingsFile 时）
-# 实际保护范围（如实披露，见 README）：仅当读到真实 /root/.pi/agent/settings.json 时才对
-# 真实 npm 双装载生效；显式 --dest-dir 的演练场景回落到该目录旁的 settings.json，通常不存在。
-# 判定口径（fail-closed，宁可拦住也不放行）：
-#   - settings.json 缺失      → note + 放行（无 npm 包可装，维持既有行为）
-#   - 存在但非法 JSON        → 显式 FAILED、exit 1（无法证明没有 herdsman-pi npm 包）
-#   - .packages 非数组       → 显式 FAILED、exit 1（同上，含 {} / 字符串 / 数字等类型）
-#   - .packages 缺失或 null  → 等价于 []，放行
-guard_herdsman_doubleload() { # $1 = name
-  local name="$1" settings packages_json
-  settings="${PI_EXT_SETTINGS_JSON:-}"
-  if [ -z "$settings" ]; then settings="$(regq "$name" '.doubleLoadGuard.settingsFile // ""')"; fi
-  if [ -z "$settings" ]; then settings="$(dirname "$DEST_DIR")/settings.json"; fi
-  if [ ! -f "$settings" ]; then
-    echo "$PROG note: double-load guard settings.json not found at $settings — skipping (no npm package can be present)"
-    return 0
-  fi
-  # fail-closed ①：文件存在但 jq 解析失败（旧写法把它吞成 '[]' 静默放行）→ 显式失败。
-  if ! packages_json="$(jq -c '.packages // []' "$settings" 2>/dev/null)"; then
-    fail "double-load guard: settings.json exists but is NOT valid JSON: $settings — cannot verify absence of the herdsman-pi npm package. Refusing to install herdsman-bridge (fail-closed). Fix the file, or point PI_EXT_SETTINGS_JSON at a valid settings file (run 'jq . \"$settings\"' to see the parse error)"
-  fi
-  # fail-closed ②：.packages 必须是数组（旧写法让对象/字符串等非数组类型穿透检测）。
-  if ! printf '%s' "$packages_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    fail "double-load guard: $settings '.packages' is NOT an array (got: $packages_json) — cannot verify absence of the herdsman-pi npm package. Refusing to install herdsman-bridge (fail-closed). Fix the file, or point PI_EXT_SETTINGS_JSON at a valid settings file"
-  fi
-  if printf '%s' "$packages_json" | jq -e 'type=="array" and (any(.[]; type=="string" and test("herdsman-pi"; "i")))' >/dev/null 2>&1; then
-    fail "herdsman double-load guard: $settings 'packages' already loads a herdsman-pi npm package — installing the bridge too would create TWO instances (double daemon client / duplicate registrations). Remove the npm package first (packages=$packages_json)"
-  fi
-  echo "$PROG note: double-load guard passed (no herdsman-pi npm package in $settings.packages)"
-}
-
 # ---- 状态判定（list/audit 共用，只读）----
 # 打印：<status>\t<src_md5>\t<dest_md5>\t<dest_perms>
 status_of() { # $1=name  $2=dest_dir
@@ -263,9 +223,8 @@ status_of() { # $1=name  $2=dest_dir
 }
 
 # ---- dest 目录差集巡检（audit 专用，严格只读）----
-# 1) 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（注意 herdsman-bridge
-#    的 destFile 为 herdsman-pi.ts、pi-cache-stats 为 cache-stats.ts，必须比对 .destFile
-#    而非 .name）。
+# 1) 枚举 dest_dir 顶层条目，与 registry .extensions[].destFile 做差集（必须比对 .destFile
+#    而非 .name，以兼容 name 与 destFile 异名的条目，如 pi-cache-stats → cache-stats.ts）。
 # 2) 递归扫描 dest_dir 子目录（find -P -mindepth 2，无限深度，不跟随符号链接、不进入符号链接目录）：
 #    大小写不敏感收集子目录内未登记 .ts 文件（覆盖 .ts / .TS / .Ts / .tS）；非 .ts 的嵌套文件不逐条列，
 #    仅在汇总行给计数。显式捕获 find/sort 退出码与 stderr，失败时绝不静默（打印 INCOMPLETE WARN 说明可能少报）。
@@ -498,7 +457,6 @@ install_hosted() { # $1=name
   validate_target_file "$dest"
   refuse_if_neverwrite "$(regq "$name" '.destFile')"
   smd5="$(md5_of "$src")" || fail "md5sum failed for source: $src"
-  if [ "$name" = "herdsman-bridge" ]; then guard_herdsman_doubleload "$name"; fi
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] $name (hosted): would install -m 644 $src -> $dest (source md5 $smd5)"
     return 0
