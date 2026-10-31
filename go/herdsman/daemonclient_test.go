@@ -214,6 +214,18 @@ func awaitCondition(t *testing.T, what string, predicate func() bool) {
 	t.Fatalf("condition was not met: %s", what)
 }
 
+// clientIsConnected reports the client's own state, the same field Request
+// checks. The fake daemon's Connections() counter is a *server-side* accept
+// count: under load it can reach 1 while the client's dialGeneration is still
+// waiting for c.mu to flip state to stateConnected, and a Request issued in
+// that window fails with ErrClientNotConnected. Gating on the client state
+// removes that readiness race.
+func clientIsConnected(client *ReconnectingDaemonClient) bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.state == stateConnected && client.socket != nil
+}
+
 // TestClientServesRequestsFromInsideAStreamHandler is the regression guard
 // for the second deadlock shape: a handler that runs on the notification path
 // and issues a request of its own. The read loop must stay free to read that
@@ -222,6 +234,10 @@ func TestClientServesRequestsFromInsideAStreamHandler(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 
 	pushed := false
 	daemon.SetOnMessage(func(conn net.Conn, message rpcClientMsg) {
@@ -263,7 +279,7 @@ func TestClientServesRequestsFromInsideAStreamHandler(t *testing.T) {
 		handled <- method
 	})
 
-	awaitCondition(t, "connection", func() bool { return daemon.Connections() == 1 })
+	awaitCondition(t, "connection", func() bool { return clientIsConnected(client) })
 	if _, err := client.Request("agent.list", map[string]any{}); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
@@ -283,6 +299,10 @@ func TestClientDeliversNotificationsInOrderWithoutDropping(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 
 	const total = 25
 	delivered := make(chan int, total)
@@ -301,7 +321,7 @@ func TestClientDeliversNotificationsInOrderWithoutDropping(t *testing.T) {
 		}
 	})
 
-	awaitCondition(t, "connection", func() bool { return daemon.Connections() == 1 })
+	awaitCondition(t, "connection", func() bool { return clientIsConnected(client) })
 	if _, err := client.Request("agent.list", map[string]any{}); err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -325,6 +345,13 @@ func TestClientConnectsHandlesResponsesAndStreams(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	// The request timeout runs on a manual clock: a heavily loaded box can stall
+	// the whole process past the 15s wall-clock timeout even though the daemon
+	// answered in microseconds, which is exactly the flake this guards.
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	connected := make(chan struct{}, 8)
 	streams := make(chan DaemonStreamMessage, 8)
 	client.SetOnConnected(func() error { connected <- struct{}{}; return nil })
@@ -364,6 +391,10 @@ func TestClientDecodesContextChangeStreams(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	streams := make(chan DaemonStreamMessage, 4)
 	client.SetOnStreamMessage(func(message DaemonStreamMessage) { streams <- message })
 
@@ -384,7 +415,7 @@ func TestClientDecodesContextChangeStreams(t *testing.T) {
 		})
 	})
 
-	awaitCondition(t, "connection", func() bool { return clientConnected(client) })
+	awaitCondition(t, "connection", func() bool { return clientIsConnected(client) })
 	result, err := client.Request("agent.list", map[string]any{})
 	if err != nil {
 		t.Fatalf("request: %v", err)
@@ -402,16 +433,17 @@ func TestClientDecodesContextChangeStreams(t *testing.T) {
 	}
 }
 
-// clientConnected reports the private state through the exported API surface.
-func clientConnected(client *ReconnectingDaemonClient) bool {
-	_, err := client.Request("__probe__", map[string]any{})
-	return err == nil || !errors.Is(err, ErrClientNotConnected)
-}
-
 func TestClientRejectsInFlightWorkReconnectsAndServesLaterRequests(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	// Manual request-timeout clock: the in-flight "hold" rejection comes from the
+	// read loop seeing the dropped socket, which under load can be descheduled
+	// past the wall-clock 15s timeout and report ErrRequestTimeout instead.
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	disconnects := make(chan error, 4)
 	client.SetOnDisconnected(func(err error) { disconnects <- err })
 
@@ -422,13 +454,17 @@ func TestClientRejectsInFlightWorkReconnectsAndServesLaterRequests(t *testing.T)
 		}
 		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
 	})
-	awaitCondition(t, "first connection", func() bool { return daemon.Connections() == 1 })
+	awaitCondition(t, "first connection", func() bool { return clientIsConnected(client) })
 
 	_, err := client.Request("hold", map[string]any{})
 	if err == nil || !strings.Contains(err.Error(), "socket closed") {
 		t.Fatalf("expected a socket-closed rejection, got %v", err)
 	}
-	awaitCondition(t, "reconnect", func() bool { return daemon.Connections() == 2 })
+	// The second accept count is the reconnect being asserted; the client-side
+	// state is what lets the following request run instead of racing the dial.
+	awaitCondition(t, "reconnect", func() bool {
+		return daemon.Connections() == 2 && clientIsConnected(client)
+	})
 	select {
 	case <-disconnects:
 	case <-time.After(2 * time.Second):
@@ -447,6 +483,10 @@ func TestClientSurvivesMalformedJSONAndReconnects(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	daemon.SetOnConnect(func(conn net.Conn) {
 		if daemon.Connections() == 1 {
 			daemon.Write(conn, "{not-json}")
@@ -455,7 +495,11 @@ func TestClientSurvivesMalformedJSONAndReconnects(t *testing.T) {
 	daemon.SetOnMessage(func(conn net.Conn, message rpcClientMsg) {
 		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
 	})
-	awaitCondition(t, "second connection", func() bool { return daemon.Connections() >= 2 })
+	// The reconnect lands a second accept; the client-side connected state is
+	// what lets the request run instead of racing the second dial.
+	awaitCondition(t, "second connection", func() bool {
+		return daemon.Connections() >= 2 && clientIsConnected(client)
+	})
 	result, err := client.Request("healthy", map[string]any{})
 	if err != nil {
 		t.Fatalf("request after reconnect: %v", err)
@@ -485,6 +529,10 @@ func optionalMethodCase(t *testing.T, optional string, params map[string]any) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	disconnected := make(chan error, 4)
 	client.SetOnDisconnected(func(err error) { disconnected <- err })
 
@@ -498,7 +546,7 @@ func optionalMethodCase(t *testing.T, optional string, params map[string]any) {
 		}
 		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
 	})
-	awaitCondition(t, "connection", func() bool { return daemon.Connections() == 1 })
+	awaitCondition(t, "connection", func() bool { return clientIsConnected(client) })
 
 	_, err := client.Request(optional, params)
 	if err == nil || !strings.Contains(err.Error(), "Unknown method: "+optional) {
@@ -530,6 +578,13 @@ func TestClientMarksDaemonIncompatibleOnUnknownRequiredMethod(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	// Manual request-timeout clock: under load the daemon's error response can be
+	// read long after it was written, and a wall-clock 15s timeout would fire on
+	// starvation rather than on a genuine daemon stall.
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	disconnected := make(chan error, 4)
 	client.SetOnDisconnected(func(err error) { disconnected <- err })
 
@@ -539,7 +594,7 @@ func TestClientMarksDaemonIncompatibleOnUnknownRequiredMethod(t *testing.T) {
 			"id":    message.ID,
 		})
 	})
-	awaitCondition(t, "connection", func() bool { return daemon.Connections() == 1 })
+	awaitCondition(t, "connection", func() bool { return clientIsConnected(client) })
 
 	_, err := client.Request("agent.orchestrator.get", map[string]any{})
 	if err == nil || err.Error() != "Unknown method: agent.orchestrator.get" {
@@ -620,6 +675,10 @@ func TestClientResetForSessionLeavesNoOrphanConnection(t *testing.T) {
 	connected := make(chan struct{}, 4)
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	client.SetOnConnected(func() error { connected <- struct{}{}; return nil })
 	// The race the extension hits: this runs before (or while) the queued
 	// constructor dial is still in flight.
@@ -686,6 +745,10 @@ func TestClientSupersededDialIsClosedNotAdopted(t *testing.T) {
 	})
 	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
 	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
 	awaitCondition(t, "first connection", func() bool { return daemon.Connections() == 1 })
 
 	// Wait for the generation the constructor dial produced to be usable before

@@ -942,7 +942,6 @@ func TestRegression_ResetForSessionStopsTheScheduledReconnect(t *testing.T) {
 		reconnectDelays: []int64{50},
 		nextID:          1,
 		pending:         map[string]*pendingRequest{},
-		now:             time.Now,
 		state:           stateIdle,
 	}
 	// A backoff the previous session scheduled and never got to run.
