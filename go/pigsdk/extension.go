@@ -1543,6 +1543,11 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 				_ = e.conn.respond(id, nil, err)
 				return
 			}
+			// A request whose payload decoded to a nil map must not panic on the
+			// write below (assignment to entry in nil map): give it a real map.
+			if data == nil {
+				data = make(map[string]any)
+			}
 			data["systemPrompt"] = ctx.systemPrompt
 		}
 		snapshot := snapshotContextMessages(req.Event, data)
