@@ -122,6 +122,39 @@ func TestWrappingSelectEmpty(t *testing.T) {
 	}
 }
 
+// TestWrappingSelectNilThemeHooks pins H14: a zero-value WrappingSelectTheme
+// (all hooks nil) must render the text unstyled, as the theme's contract
+// promises ("A nil hook renders the text unstyled"), instead of panicking on
+// the nil ScrollInfo/SelectedText/Description calls.
+func TestWrappingSelectNilThemeHooks(t *testing.T) {
+	items := BuildItemsForQuestion(twoOptions("H", "Q?"))
+	selectView := NewWrappingSelect(items, 2, WrappingSelectTheme{}, WrappingSelectOptions{})
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("zero-value theme panicked: %v", r)
+		}
+	}()
+
+	lines := selectView.Render(40)
+	text := renderStrings(lines)
+	if !strings.Contains(text, "1. A") {
+		t.Fatalf("unstyled render missing the option label:\n%s", text)
+	}
+	// With maxVisible 2 of 3 items there is a scroll-info row, rendered
+	// unstyled rather than through a nil hook.
+	if !strings.Contains(text, "/3") {
+		t.Fatalf("scroll info row missing or panicked:\n%s", text)
+	}
+	// The description block also rides a nil Description hook.
+	itemsWithDesc := []WrappingSelectItem{{Kind: RowKindOption, Label: "A", Description: "desc A"}}
+	descView := NewWrappingSelect(itemsWithDesc, 5, WrappingSelectTheme{}, WrappingSelectOptions{})
+	descText := renderStrings(descView.Render(40))
+	if !strings.Contains(descText, "desc A") {
+		t.Fatalf("description row missing:\n%s", descText)
+	}
+}
+
 func TestWrappingSelectSelectionClamps(t *testing.T) {
 	items := BuildItemsForQuestion(twoOptions("H", "Q?"))
 	selectView := NewWrappingSelect(items, 10, plainTheme, WrappingSelectOptions{})
