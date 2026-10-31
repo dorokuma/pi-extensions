@@ -61,14 +61,13 @@ func (d *fakeDaemon) accept() {
 		d.mu.Lock()
 		d.conns++
 		d.live = append(d.live, conn)
-		onMessage := d.onMessage
 		onConnect := d.onConnect
 		d.mu.Unlock()
-		go d.serve(conn, onConnect, onMessage)
+		go d.serve(conn, onConnect)
 	}
 }
 
-func (d *fakeDaemon) serve(conn net.Conn, onConnect func(net.Conn), onMessage func(net.Conn, rpcClientMsg)) {
+func (d *fakeDaemon) serve(conn net.Conn, onConnect func(net.Conn)) {
 	// Whatever ends the read loop (client close, supersede, protocol error)
 	// un-registers the conn so LiveConnections reports what is still open.
 	defer d.removeLive(conn)
@@ -95,8 +94,14 @@ func (d *fakeDaemon) serve(conn net.Conn, onConnect func(net.Conn), onMessage fu
 				}
 				message := rpcClientMsg{Method: stringOr(record["method"]), Params: mapOr(record["params"])}
 				message.ID = record["id"]
-				if onMessage != nil {
-					onMessage(conn, message)
+				// The handler is read per message, not snapshotted at accept: a
+				// client that dials before the test installs SetOnMessage still gets
+				// answers, so the install order in a test cannot drop the handler.
+				d.mu.Lock()
+				handler := d.onMessage
+				d.mu.Unlock()
+				if handler != nil {
+					handler(conn, message)
 				}
 			}
 		}
@@ -481,12 +486,11 @@ func TestClientRejectsInFlightWorkReconnectsAndServesLaterRequests(t *testing.T)
 
 func TestClientSurvivesMalformedJSONAndReconnects(t *testing.T) {
 	daemon := newFakeDaemon(t)
-	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
-	t.Cleanup(client.Close)
-	manual := newManualTimers()
-	client.mu.Lock()
-	client.timers = manual
-	client.mu.Unlock()
+	// Handlers go on before the client is created: the constructor starts its
+	// first dial on a goroutine, and OnConnect/OnMessage must already be in
+	// place when the accept lands or the malformed first frame is never
+	// written. This is the same ordering the extension's own session_start
+	// guarantees.
 	daemon.SetOnConnect(func(conn net.Conn) {
 		if daemon.Connections() == 1 {
 			daemon.Write(conn, "{not-json}")
@@ -495,17 +499,48 @@ func TestClientSurvivesMalformedJSONAndReconnects(t *testing.T) {
 	daemon.SetOnMessage(func(conn net.Conn, message rpcClientMsg) {
 		daemon.WriteJSON(conn, map[string]any{"id": message.ID, "result": map[string]any{"ok": true}})
 	})
-	// The reconnect lands a second accept; the client-side connected state is
-	// what lets the request run instead of racing the second dial.
-	awaitCondition(t, "second connection", func() bool {
-		return daemon.Connections() >= 2 && clientIsConnected(client)
-	})
+	client := NewReconnectingDaemonClient(daemon.socket, []int64{5})
+	t.Cleanup(client.Close)
+	manual := newManualTimers()
+	client.mu.Lock()
+	client.timers = manual
+	client.mu.Unlock()
+	// The reconnect chain is delivered through the client's own onConnected
+	// callbacks, not a wall-clock poll: each dial that wins the generation
+	// produces exactly one event (SetOnConnected replays a connect that
+	// finished before it was installed), so the second entry is the
+	// deterministic signal that the malformed frame was survived and the
+	// backoff re-dial landed. Polling a 2s deadline for the ~10-hop serial
+	// chain (dial/accept/decode-error/backoff/re-dial/accept) was the flake
+	// under CPU oversubscription: the chain is correct, it just has more
+	// scheduler handoffs than the budget allowed. The watchdogs are hang
+	// ceilings for the regression shape, not a performance budget.
+	connects := make(chan struct{}, 4)
+	client.SetOnConnected(func() error { connects <- struct{}{}; return nil })
+	// First connect (replayed if it landed before the callback was installed),
+	// then the backoff reconnect after the malformed frame kills the socket.
+	select {
+	case <-connects:
+	case <-time.After(watchdog):
+		t.Fatal("the first connection never reported")
+	}
+	select {
+	case <-connects:
+	case <-time.After(watchdog):
+		t.Fatal("the client never reconnected after the malformed frame")
+	}
 	result, err := client.Request("healthy", map[string]any{})
 	if err != nil {
 		t.Fatalf("request after reconnect: %v", err)
 	}
 	if record, ok := result.(map[string]any); !ok || record["ok"] != true {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	// The answered request proves the daemon accepted a second connection:
+	// its serve loop ran before it could reply (the accept count itself can
+	// lag the client-side connect by a scheduler hop if checked earlier).
+	if daemon.Connections() < 2 {
+		t.Fatalf("the reconnect never reached the daemon: %d accept(s)", daemon.Connections())
 	}
 }
 
