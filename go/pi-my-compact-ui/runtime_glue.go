@@ -16,15 +16,12 @@ import (
 type ticker struct {
 	c     chan struct{}
 	stopC chan struct{}
-	once  *onceCloser
+	once  sync.Once
 }
-
-// onceCloser closes a channel exactly once.
-type onceCloser struct{ ch chan struct{} }
 
 // newTicker starts an interval of intervalMs.
 func newTicker(intervalMs int) *ticker {
-	t := &ticker{c: make(chan struct{}), stopC: make(chan struct{}), once: &onceCloser{ch: make(chan struct{})}}
+	t := &ticker{c: make(chan struct{}), stopC: make(chan struct{})}
 	go func() {
 		timer := time.NewTimer(time.Duration(intervalMs) * time.Millisecond)
 		defer timer.Stop()
@@ -45,18 +42,13 @@ func newTicker(intervalMs int) *ticker {
 	return t
 }
 
-// stop ends the interval.
+// stop ends the interval. It is idempotent: the sync.Once makes concurrent
+// calls safe, so a caller racing another stop cannot close stopC twice.
 func (t *ticker) stop() {
 	if t == nil {
 		return
 	}
-	select {
-	case <-t.once.ch:
-		return
-	default:
-	}
-	close(t.once.ch)
-	close(t.stopC)
+	t.once.Do(func() { close(t.stopC) })
 }
 
 // requestFrame asks for a frame. Callers must not hold mu. Two repaints can
