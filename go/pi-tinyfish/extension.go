@@ -308,6 +308,14 @@ func textResult(text string, details map[string]any) sdk.ToolResult {
 	}
 }
 
+// errorResult is textResult with IsError set, so execution failures reach the
+// protocol layer as errors instead of being disguised as normal text results.
+func errorResult(text string, details map[string]any) sdk.ToolResult {
+	result := textResult(text, details)
+	result.IsError = true
+	return result
+}
+
 // clientFactory is an internal seam to allow injecting mock clients in tests.
 var clientFactory = NewClient
 
@@ -364,7 +372,7 @@ func executeSearch(ctx sdk.Context, params map[string]any) (any, error) {
 	client, err := clientFactory(WithTimeout(time.Duration(timeoutMs) * time.Millisecond))
 	if err != nil {
 		msg := err.Error()
-		return textResult(fmt.Sprintf("Error: %s", msg), map[string]any{
+		return errorResult(fmt.Sprintf("Error: %s", msg), map[string]any{
 			"provider": "tinyfish",
 			"kind":     "search",
 			"query":    query,
@@ -385,7 +393,7 @@ func executeSearch(ctx sdk.Context, params map[string]any) (any, error) {
 	resp, err := client.Search(reqCtx, searchParams)
 	if err != nil {
 		msg := err.Error()
-		return textResult(fmt.Sprintf("Error: %s", msg), map[string]any{
+		return errorResult(fmt.Sprintf("Error: %s", msg), map[string]any{
 			"provider": "tinyfish",
 			"kind":     "search",
 			"query":    query,
@@ -445,7 +453,7 @@ func executeFetch(ctx sdk.Context, params map[string]any) (any, error) {
 	client, err := clientFactory(WithTimeout(time.Duration(timeoutMs) * time.Millisecond))
 	if err != nil {
 		msg := err.Error()
-		return textResult(fmt.Sprintf("Error: %s", msg), map[string]any{
+		return errorResult(fmt.Sprintf("Error: %s", msg), map[string]any{
 			"provider": "tinyfish",
 			"kind":     "fetch",
 			"urls":     urls,
@@ -466,7 +474,7 @@ func executeFetch(ctx sdk.Context, params map[string]any) (any, error) {
 	resp, err := client.Fetch(reqCtx, fetchParams)
 	if err != nil {
 		msg := err.Error()
-		return textResult(fmt.Sprintf("Error: %s", msg), map[string]any{
+		return errorResult(fmt.Sprintf("Error: %s", msg), map[string]any{
 			"provider": "tinyfish",
 			"kind":     "fetch",
 			"urls":     urls,
