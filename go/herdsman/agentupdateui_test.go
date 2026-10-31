@@ -1,6 +1,6 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-agent-update-ui.test.ts (11 cases).
+// Port of the archived TS herdsman's agent-update-ui unit tests (11 cases).
 //
 // The TS renders into a pi-tui Box and asserts on `render(100)`; the Go port
 // renders to lines with the identity theme (the TS `theme`) and a semantic

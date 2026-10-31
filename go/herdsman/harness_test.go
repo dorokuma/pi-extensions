@@ -8,6 +8,7 @@ package herdsman
 
 import (
 	"errors"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -377,7 +378,7 @@ type notification struct {
 	level   NotifyLevel
 }
 
-func newFakeContext(idle *bool) *fakeContext {
+func newFakeContext(t *testing.T, idle *bool) *fakeContext {
 	if idle == nil {
 		on := true
 		idle = &on
@@ -385,7 +386,7 @@ func newFakeContext(idle *bool) *fakeContext {
 	return &fakeContext{
 		Statuses:    map[string]*string{},
 		idle:        idle,
-		sessionFile: "/tmp/pi-session.jsonl",
+		sessionFile: filepath.Join(t.TempDir(), "pi-session.jsonl"),
 		sessionID:   "pi-session",
 	}
 }
@@ -779,7 +780,14 @@ func newFixture(t *testing.T, options ExtensionOptions, idle bool, identity *her
 	if options.ClientFactory == nil {
 		options.ClientFactory = func() HerdsmanDaemonClient { return client }
 	}
-	timers := newManualTimers()
+	timers := options.Timers
+	var manual *manualTimers
+	if timers == nil {
+		manual = newManualTimers()
+		timers = manual
+	} else {
+		manual, _ = timers.(*manualTimers)
+	}
 	options.Timers = timers
 	if options.Env == nil {
 		options.Env = envFunc(identity)
@@ -801,8 +809,8 @@ func newFixture(t *testing.T, options ExtensionOptions, idle bool, identity *her
 		}
 	}
 	pi := &fakePi{}
-	fixture := &fixture{t: t, client: client, pi: pi, timers: timers, signal: signals}
-	fixture.ctx = newFakeContext(&idle)
+	fixture := &fixture{t: t, client: client, pi: pi, timers: manual, signal: signals}
+	fixture.ctx = newFakeContext(t, &idle)
 	fixture.core = NewExtension(pi, options)
 	return fixture
 }

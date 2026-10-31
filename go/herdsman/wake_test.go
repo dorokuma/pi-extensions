@@ -1,6 +1,6 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-wake.test.ts (projection, formatting and
+// Port of the archived TS herdsman's wake unit tests (projection, formatting and
 // dead-letter accounting). The TS `event()` builder is `wakeEvent` here; the
 // `publishedOutcomeKind` fixture (a verbatim snapshot of the released 0.15.0
 // outcomeKind) is ported next to it so the backward-compatibility assertions
@@ -54,9 +54,9 @@ func wakeEvent(id int, kind string, payload map[string]any, options *eventOption
 	return event
 }
 
-// publishedOutcomeKind is the verbatim `outcomeKind` of the published
-// @dorokuma/herdsman-pi@0.15.0 (test/fixtures/herdsman-pi-0.15.0-outcome-kind.ts,
-// package/src/wake.ts sha256 3d63716723cd05920ef080de481fbcab894e93801d8fb0d1a0a036d7ee4059a3).
+// publishedOutcomeKind is the verbatim `outcomeKind` of the last released TS
+// herdsman (0.15.0; wake.ts sha256
+// 3d63716723cd05920ef080de481fbcab894e93801d8fb0d1a0a036d7ee4059a3).
 // It keeps the backward-compatibility assertions honest: a released client
 // does not know `stalled` and still wakes on `failed`.
 func publishedOutcomeKind(event AgentEventWireRecord) string {

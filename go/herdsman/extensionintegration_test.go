@@ -68,6 +68,14 @@ type recordingClient struct {
 
 	mu       sync.Mutex
 	answered []string
+
+	// handler is the extension's stream handler once it is installed (or the
+	// wrapped no-op before that). Every call ends in a handled entry, so the
+	// queue depth is an observable "the push was fully processed" signal: it
+	// flips only after the handler returned, which — unlike an RPC response —
+	// is strictly ordered after whatever the handler scheduled.
+	handler func(DaemonStreamMessage)
+	handled []DaemonStreamMessage
 }
 
 func (c *recordingClient) Request(method string, params any) (any, error) {
@@ -77,6 +85,41 @@ func (c *recordingClient) Request(method string, params any) (any, error) {
 	c.answered = append(c.answered, method)
 	c.mu.Unlock()
 	return result, err
+}
+
+// SetOnStreamMessage installs the extension's handler behind the recorder:
+// the wrapped handler delegates first and only then records the message, so
+// handledCount reaching the pushed count proves the handler ran to
+// completion — the barrier the RPC-response path cannot provide (RPC answers
+// are resolved on the read loop, stream messages on the streamLoop goroutine,
+// and the two carry no ordering between them).
+func (c *recordingClient) SetOnStreamMessage(handler func(DaemonStreamMessage)) {
+	c.mu.Lock()
+	c.handler = handler
+	c.mu.Unlock()
+	c.HerdsmanDaemonClient.SetOnStreamMessage(c.observe)
+}
+
+// observe is the wrapper the real client actually invokes.
+func (c *recordingClient) observe(message DaemonStreamMessage) {
+	c.mu.Lock()
+	handler := c.handler
+	c.mu.Unlock()
+	if handler != nil {
+		handler(message)
+	}
+	c.mu.Lock()
+	c.handled = append(c.handled, message)
+	c.mu.Unlock()
+}
+
+// handledCount is the number of stream messages whose handler already
+// returned (pushes delivered before the extension installed its handler count
+// too — they were fully processed the moment the no-op delegate returned).
+func (c *recordingClient) handledCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.handled)
 }
 
 func (c *recordingClient) answeredCount(method string) int {

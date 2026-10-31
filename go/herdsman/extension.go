@@ -1,6 +1,7 @@
 package herdsman
 
-// Port of packages/herdsman-pi/src/index.ts (the extension body).
+// Port of the archived TS herdsman's extension body
+// (archive/herdsman-bridge-ts: index.ts).
 //
 // The TS file is one closure per extension instance: `createHerdsmanPiExtension`
 // registers a command and eleven event handlers, and everything else is a local

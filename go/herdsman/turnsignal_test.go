@@ -1,6 +1,6 @@
 package herdsman
 
-// Port of test/unit/herdsman-pi-turn-signal.test.ts (8 cases).
+// Port of the archived TS herdsman's turn-signal unit tests (8 cases).
 //
 // The TS injects a `SessionWriteProbe` to avoid touching a real session file;
 // the Go probe is the same interface. The TS probe's async `sleep` is a plain

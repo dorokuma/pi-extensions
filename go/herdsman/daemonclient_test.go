@@ -1,6 +1,6 @@
 package herdsman
 
-// Port of test/integration/herdsman-pi-daemon-client.test.ts (9 cases).
+// Port of the archived TS herdsman's daemon-client integration tests (9 cases).
 //
 // Every case runs against an isolated fake daemon bound to a Unix socket under
 // a private temp dir; nothing touches the production herdsman daemon. The
@@ -191,6 +191,10 @@ func (d *fakeDaemon) Close() {
 	}
 	close(d.closed)
 	_ = d.listener.Close()
+	// Dropping the accepted connections lets the serve goroutines (and the
+	// read loop of any client still holding the other end) exit instead of
+	// leaking past the test.
+	d.DropLive()
 	if err := os.Remove(d.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		// A missing socket file only means the listener never got that far.
 		_ = err
@@ -684,11 +688,22 @@ func TestClientSupersededDialIsClosedNotAdopted(t *testing.T) {
 	t.Cleanup(client.Close)
 	awaitCondition(t, "first connection", func() bool { return daemon.Connections() == 1 })
 
+	// Wait for the generation the constructor dial produced to be usable before
+	// deriving the stale one: reading `generation` unlocked would race the
+	// queued dial's own locked increment. A Request round trip only completes
+	// once that dial is fully applied.
+	awaitCondition(t, "first connection serves a request", func() bool {
+		_, err := client.Request("agent.list", map[string]any{})
+		return err == nil
+	})
+	client.mu.Lock()
+	stale := client.generation - 1
+	client.mu.Unlock()
+
 	// Simulate a stale attempt whose dial lands after the client closed: the
 	// socket must be destroyed, not adopted. dialGeneration is the unlocked
 	// half every dial runs through, so driving it with a dead generation is the
 	// same check the socket's "connect" backstop performs upstream.
-	stale := client.generation - 1
 	client.Close()
 	awaitCondition(t, "live socket closed", func() bool { return daemon.LiveConnections() == 0 })
 	client.dialGeneration(stale, daemon.socket, nil)
