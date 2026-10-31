@@ -1,0 +1,167 @@
+// Package sandbox 提供基于 Linux Landlock LSM 的无特权进程沙盒封装。
+package sandbox
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+var (
+	// ErrUnsupported 表示当前内核不支持或未启用 Landlock LSM。
+	ErrUnsupported = errors.New("sandbox: landlock is not supported by the running kernel")
+	// ErrNetUnsupported 表示当前内核 Landlock ABI 版本低于 4，不支持 TCP 网络隔离。
+	ErrNetUnsupported = errors.New("sandbox: Landlock network restriction requires ABI >= 4")
+	// ErrInvalidPolicy 表示策略配置存在非法路径或参数。
+	ErrInvalidPolicy = errors.New("sandbox: invalid policy")
+	// ErrEmptyPolicy 表示策略既未指定任何文件路径，也未启用网络隔离。
+	ErrEmptyPolicy = errors.New("sandbox: policy specifies no filesystem rules and DenyNet is false")
+	// ErrForbiddenExec 表示 Exec 白名单中包含被禁止的嵌套执行器。
+	ErrForbiddenExec = errors.New("sandbox: executable is in forbidden list")
+)
+
+// Policy 定义 Landlock 沙盒的访问控制策略。
+//
+// 当 ReadOnly、ReadWrite 或 Exec 中任意一项非空时，文件系统进入白名单模式：
+// 除显式声明的路径外，其余所有受 Landlock 管控的文件系统访问均被拒绝。
+// ReadWrite 默认仅授予读写、创建、删除、截断等权限，不授予执行权限（遵循 W^X 原则）；
+// 若某路径同时出现在 ReadWrite 与 Exec（如只读审查员预设中的私有 GOTMPDIR），则兼具读写与执行权限。
+type Policy struct {
+	// ReadOnly 允许只读访问的目录或文件路径列表。
+	ReadOnly []string
+	// ReadWrite 允许读写访问的目录或文件路径列表（默认不含执行权限）。
+	ReadWrite []string
+	// Exec 允许执行（execve）的二进制文件或目录路径白名单。
+	Exec []string
+	// DenyNet 为 true 时禁止所有 TCP 端口的 bind 与 connect 操作（需 Landlock ABI >= 4）。
+	DenyNet bool
+
+	// Env 需要在沙盒生效时注入当前进程及子进程的环境变量列表（格式为 "KEY=VALUE"）。
+	// 例如 ReadOnlyReviewer 会在此设置指向私有可写目录的 TMPDIR、GOTMPDIR、GOCACHE。
+	Env []string
+
+	// BestEffort 为 true 时，若内核不支持 Landlock，或 ABI < 4 不支持 DenyNet，
+	// 或部分路径不存在，将输出告警并降级执行而非返回错误。
+	BestEffort bool
+
+	// WarnWriter 指定 BestEffort 模式下的告警输出目标；为 nil 时默认输出到 os.Stderr。
+	WarnWriter io.Writer
+}
+
+// WithBestEffort 返回开启或关闭 BestEffort 降级模式的 Policy 副本。
+func (p Policy) WithBestEffort(enabled bool) Policy {
+	p.BestEffort = enabled
+	return p
+}
+
+// NormalizePath 校验并将路径规范化为干净的绝对路径。
+func NormalizePath(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("%w: empty path", ErrInvalidPolicy)
+	}
+	if strings.ContainsRune(raw, 0) {
+		return "", fmt.Errorf("%w: path contains NUL byte", ErrInvalidPolicy)
+	}
+	cleaned := filepath.Clean(raw)
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolve abs path %q: %v", ErrInvalidPolicy, raw, err)
+	}
+	return abs, nil
+}
+
+// NormalizePaths 批量校验、规范化路径并按首次出现顺序去重。
+func NormalizePaths(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, raw := range paths {
+		norm, err := NormalizePath(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[norm]; !ok {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+	}
+	return out, nil
+}
+
+// Validate 校验 Policy 的合法性，包括非空检查、路径规范化、禁止执行的二进制拦截以及环境变量格式校验。
+func (p Policy) Validate() error {
+	if len(p.ReadOnly) == 0 && len(p.ReadWrite) == 0 && len(p.Exec) == 0 && !p.DenyNet {
+		return ErrEmptyPolicy
+	}
+	if _, err := NormalizePaths(p.ReadOnly); err != nil {
+		return fmt.Errorf("ReadOnly: %w", err)
+	}
+	if _, err := NormalizePaths(p.ReadWrite); err != nil {
+		return fmt.Errorf("ReadWrite: %w", err)
+	}
+	execPaths, err := NormalizePaths(p.Exec)
+	if err != nil {
+		return fmt.Errorf("Exec: %w", err)
+	}
+	for _, ep := range execPaths {
+		if IsForbiddenExec(ep) {
+			return fmt.Errorf("%w: %s", ErrForbiddenExec, ep)
+		}
+	}
+	for _, kv := range p.Env {
+		if err := validateEnvEntry(kv); err != nil {
+			return fmt.Errorf("Env: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateEnvEntry(kv string) error {
+	if strings.ContainsRune(kv, 0) {
+		return fmt.Errorf("%w: env entry contains NUL byte", ErrInvalidPolicy)
+	}
+	k, _, ok := strings.Cut(kv, "=")
+	if !ok || strings.TrimSpace(k) == "" || strings.ContainsRune(k, '=') {
+		return fmt.Errorf("%w: invalid env entry %q (expected KEY=VALUE)", ErrInvalidPolicy, kv)
+	}
+	return nil
+}
+
+func applyEnv(env []string) error {
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return fmt.Errorf("%w: invalid env entry %q", ErrInvalidPolicy, kv)
+		}
+		if err := os.Setenv(k, v); err != nil {
+			return fmt.Errorf("sandbox: setenv %q: %w", k, err)
+		}
+	}
+	return nil
+}
+
+func (p Policy) warnf(format string, args ...any) {
+	w := p.WarnWriter
+	if w == nil {
+		w = os.Stderr
+	}
+	_, _ = fmt.Fprintf(w, format+"\n", args...)
+}
+
+// Supported 检测当前内核是否支持并启用了 Landlock。
+// 若支持，返回最高支持的 ABI 版本号（>= 1）和 true；否则返回 (0, false)。
+func Supported() (abi int, ok bool) {
+	return supported()
+}
+
+// Apply 将给定的沙盒策略应用到当前进程（及其之后 fork/exec 的所有子进程），
+// 并将 Policy.Env 中声明的环境变量写入当前进程环境。
+// 该操作一旦成功即不可撤销，后续只能继续叠加更严格的规则。
+func Apply(p Policy) error {
+	return applyPolicy(p)
+}
