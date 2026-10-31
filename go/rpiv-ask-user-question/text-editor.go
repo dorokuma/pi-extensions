@@ -223,7 +223,7 @@ func (e *TextEditor) insertNewline() {
 // moveLeft moves the cursor one column left, wrapping to the previous line end.
 func (e *TextEditor) moveLeft() {
 	if e.cursor.Col > 0 {
-		e.cursor.Col--
+		e.cursor.Col = prevRuneStart(e.lines[e.cursor.Line], e.cursor.Col)
 		return
 	}
 	if e.cursor.Line > 0 {
@@ -235,7 +235,7 @@ func (e *TextEditor) moveLeft() {
 // moveRight moves the cursor one column right, wrapping to the next line start.
 func (e *TextEditor) moveRight() {
 	if e.cursor.Col < len(e.lines[e.cursor.Line]) {
-		e.cursor.Col++
+		e.cursor.Col = nextRuneEnd(e.lines[e.cursor.Line], e.cursor.Col)
 		return
 	}
 	if e.cursor.Line < len(e.lines)-1 {
