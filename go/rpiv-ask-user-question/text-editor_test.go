@@ -278,47 +278,40 @@ func TestTextEditorMultibyteDeletion(t *testing.T) {
 	}
 }
 
-// TestTextEditorMultibyteCursorSteps pins H15: Left/Right move the cursor one
-// whole rune, not one byte, so a cursor never stops on a UTF-8 continuation
-// byte and later edits cannot split a multi-byte character.
+// TestTextEditorMultibyteCursorSteps pins H15: Left/Right step one rune, not
+// one byte, so the cursor never rests on a UTF-8 continuation byte and a
+// following edit cannot split a rune. Byte cols in "aé中": a=0, é=1..2, 中=3..5.
 func TestTextEditorMultibyteCursorSteps(t *testing.T) {
-	// "aé中": byte cols 0,1(a) 3(é) 6(中) 9(end).
-	text := "aé中"
-
-	// Right from 0 must land on the start of the next rune, not inside one.
-	editor := newEditor(text)
-	editor.cursor = Cursor{Line: 0, Col: 0}
-	editor.HandleInput("\x1b[C") // Right over 'a'
-	if got := editor.GetCursor(); got != (Cursor{Line: 0, Col: 1}) {
+	step := func(text string, col int, keys ...string) Cursor {
+		editor := newEditor(text)
+		editor.cursor = Cursor{Line: 0, Col: col}
+		for _, k := range keys {
+			editor.HandleInput(k)
+		}
+		return editor.GetCursor()
+	}
+	const text = "aé中"
+	if got := step(text, 0, "\x1b[C"); got != (Cursor{Line: 0, Col: 1}) {
 		t.Fatalf("right over 'a' = %#v, want col 1", got)
 	}
-	editor.HandleInput("\x1b[C") // Right over 'é' (2 bytes)
-	if got := editor.GetCursor(); got != (Cursor{Line: 0, Col: 3}) {
-		t.Fatalf("right over 'é' = %#v, want col 3 (next rune start), not a byte inside it", got)
+	if got := step(text, 0, "\x1b[C", "\x1b[C"); got != (Cursor{Line: 0, Col: 3}) {
+		t.Fatalf("right over 'é' = %#v, want col 3 (next rune start)", got)
 	}
-	editor.HandleInput("\x1b[C") // Right over '中' (3 bytes)
-	if got := editor.GetCursor(); got != (Cursor{Line: 0, Col: 6}) {
+	if got := step(text, 0, "\x1b[C", "\x1b[C", "\x1b[C"); got != (Cursor{Line: 0, Col: 6}) {
 		t.Fatalf("right over '中' = %#v, want col 6", got)
 	}
-
-	// Left from the end must land on the previous rune's start.
-	editor = newEditor(text)
-	editor.cursor = Cursor{Line: 0, Col: len(text)}
-	editor.HandleInput("\x1b[D") // Left over '中'
-	if got := editor.GetCursor(); got != (Cursor{Line: 0, Col: 3}) {
+	if got := step(text, len(text), "\x1b[D"); got != (Cursor{Line: 0, Col: 3}) {
 		t.Fatalf("left over '中' = %#v, want col 3", got)
 	}
-	editor.HandleInput("\x1b[D") // Left over 'é'
-	if got := editor.GetCursor(); got != (Cursor{Line: 0, Col: 1}) {
+	if got := step(text, len(text), "\x1b[D", "\x1b[D"); got != (Cursor{Line: 0, Col: 1}) {
 		t.Fatalf("left over 'é' = %#v, want col 1", got)
 	}
-
-	// A delete after rune-stepping removes a whole rune, keeping valid UTF-8.
-	editor = newEditor(text)
+	// Backspace after rune-stepping removes 'é' whole, keeping valid UTF-8.
+	editor := newEditor(text)
 	editor.cursor = Cursor{Line: 0, Col: 0}
-	editor.HandleInput("\x1b[C") // to col 1
-	editor.HandleInput("\x1b[C") // to col 3 (past 'é')
-	editor.HandleInput("\x7f")  // backspace removes 'é' whole
+	editor.HandleInput("\x1b[C")
+	editor.HandleInput("\x1b[C")
+	editor.HandleInput("\x7f")
 	if got := editor.GetText(); got != "a中" {
 		t.Fatalf("text after rune-aligned backspace = %q", got)
 	}
