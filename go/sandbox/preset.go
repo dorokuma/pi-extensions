@@ -443,6 +443,109 @@ func IsEntryAgentPath(entryAgents []string, pathOrName string) bool {
 	return false
 }
 
+// agyHookBinaryNames 是 agy 生命周期钩子（SessionStart/PreInvocation/PreToolUse/PostToolUse/
+// PreCompress/Stop）会 exec 的钩子二进制名。来源：/root/.gemini/config/hooks.json、
+// /root/.agy-pro-home/.gemini/config/hooks.json 及插件 hooks.json（agy-recall）。
+// herdsman 是 bash 包装脚本，exec 到 $HOME/.local/lib/herdsman-go/herdsman（ELF 本体）。
+// 严禁整目录放行 ~/.local/bin（含 herdr、dispatch-agent），按名字逐个点名。
+var agyHookBinaryNames = []string{
+	"herdsman",
+	"agy-rules-hook",
+	"moshi-hook",
+	"agy-recover-400",
+	"agy-recall",
+}
+
+// agyHookLookupDirs 是在 standardBinDirs/agentLookupDirs 之外为 agy 钩子二进制
+// 追加搜索的宿主目录，覆盖 homeDir() 与硬编码 /root 两种 HOME 形态。
+func agyHookLookupDirs() []string {
+	seen := make(map[string]struct{}, 2)
+	var out []string
+	add := func(d string) {
+		d = filepath.Clean(strings.TrimSpace(d))
+		if d == "" || d == "." {
+			return
+		}
+		if _, ok := seen[d]; ok {
+			return
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	add(filepath.Join(homeDir(), ".local", "bin"))
+	add("/root/.local/bin")
+	return out
+}
+
+// ResolveAgyHookPaths 解析 agy 生命周期钩子可执行路径：逐个在 PATH、standardBinDirs、
+// agentLookupDirs、agyHookLookupDirs() 下查找 agyHookBinaryNames，校验存在、非目录、可执行，
+// 并自动 EvalSymlinks 把符号链接与真实目标一并纳入（如 agy-recall → plugins/agy-recall/bin/agy-recall）。
+// 对 herdsman 额外纳入其 bash exec 目标 ~/.local/lib/herdsman-go/herdsman 及 HERDSMAN_GO_BIN 覆盖值。
+// 不放行整个 ~/.local/bin，避免 herdr/dispatch-agent 被连带放行。
+func ResolveAgyHookPaths() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		norm, err := NormalizePath(candidate)
+		if err != nil {
+			return
+		}
+		info, err := os.Stat(norm)
+		if err != nil || info.IsDir() {
+			return
+		}
+		if info.Mode()&0o111 == 0 {
+			return
+		}
+		if _, ok := seen[norm]; !ok {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+			if rn, err := NormalizePath(resolved); err == nil {
+				if st, err := os.Stat(rn); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+					if _, ok := seen[rn]; !ok {
+						seen[rn] = struct{}{}
+						out = append(out, rn)
+					}
+				}
+			}
+		}
+	}
+
+	for _, name := range agyHookBinaryNames {
+		if lp, err := exec.LookPath(name); err == nil {
+			add(lp)
+		}
+		for _, dir := range standardBinDirs {
+			add(filepath.Join(dir, name))
+		}
+		for _, dir := range agentLookupDirs {
+			add(filepath.Join(dir, name))
+		}
+		for _, dir := range agyHookLookupDirs() {
+			add(filepath.Join(dir, name))
+		}
+	}
+
+	// herdsman 包装脚本 exec 到 herdsman-go 真实二进制；HERDSMAN_GO_BIN 优先于默认路径。
+	// 覆盖 homeDir() 与 /root 两种 HOME，确保 HOME=/root/.agy-pro-home 下同样解析到本体。
+	addHerdsmanGoBin := func(root string) {
+		add(filepath.Join(root, ".local", "lib", "herdsman-go", "herdsman"))
+	}
+	if envBin := strings.TrimSpace(os.Getenv("HERDSMAN_GO_BIN")); envBin != "" {
+		add(envBin)
+	}
+	addHerdsmanGoBin(homeDir())
+	addHerdsmanGoBin("/root")
+
+	return out
+}
+
 // ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi 及其符号链接目标，供 ReviewerAgent 顶层启动。
 // 不把 dispatch-agent / grok 纳入；嵌套禁止无法靠 Landlock 一次性放行实现，见 ReviewerAgent 注释。
 func ResolveEntryAgentPaths() []string {
@@ -575,12 +678,19 @@ func appendAgyStateReadWrite(p *Policy) {
 //
 // 额外能力：
 //   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
+//     agy 生命周期钩子二进制（herdsman 及其 herdsman-go ELF 本体、agy-rules-hook、moshi-hook、
+//     agy-recover-400、agy-recall，含软链目标），否则 SessionStart/PreInvocation/PreToolUse/
+//     PostToolUse/PreCompress/Stop 钩子在沙盒内被 Landlock 拦截，只读子代理无法向 Herdsman
+//     注册会话/上报 agent.turn.completed；
 //   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
 //     与 /root/.agy-pro-home/.gemini/antigravity-cli 下数据子目录 + 根目录已有状态文件
 //     （不含 bin/，避免对可执行文件 W^X 写穿）；以及 /dev/tty（dispatch-agent-go 对 agy 使用
 //     --prompt-interactive / -i，bubbletea 需要打开控制终端）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
+//
+// 注意：herdsman 访问 /root/.herdsman（runtime.json/herdsman.sock）保持只读；
+// /root/.herdsman 绝不加入 ReadWrite，HOME=/root/.agy-pro-home 时经软链指向同一目录亦然。
 //
 // 嵌套限制（如实）：Landlock 按路径授予 EXECUTE，顶层放行后子进程通常也能再 exec 同一路径；
 // 当前实现没有 execve 计数 / 一次性 ticket。沙盒内再起 agy/pig 在 OS 层仍可能成功。
@@ -591,9 +701,11 @@ func ReviewerAgent(workdir string) Policy {
 
 	extraTools := BuildExecWhitelist([]string{"mkdir", "cp", "touch"})
 	agents := ResolveEntryAgentPaths()
+	hooks := ResolveAgyHookPaths()
 	p.EntryAgents = agents
 	p.Exec = append(p.Exec, extraTools...)
 	p.Exec = append(p.Exec, agents...)
+	p.Exec = append(p.Exec, hooks...)
 
 	sessionRoot := "/tmp/herdr-role-sessions"
 	_ = os.MkdirAll(sessionRoot, 0o700)

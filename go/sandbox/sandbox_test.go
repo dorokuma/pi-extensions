@@ -1048,3 +1048,109 @@ func TestIsEntryAgentPath(t *testing.T) {
 		t.Fatal("dispatch-agent must not match")
 	}
 }
+
+// TestReviewerAgentAgyHooks 回归：ReviewerAgent 必须以最小权限放行 agy 生命周期钩子
+// （herdsman/herdsman-go 本体 + agy-rules-hook/moshi-hook/agy-recover-400/agy-recall，
+// 含符号链接目标），且不放宽 ReadOnlyReviewer、不把 /root/.herdsman 加入 ReadWrite、
+// 保持 W^X（Exec 与 ReadWrite 无父子目录交叠）。
+func TestReviewerAgentAgyHooks(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("ReviewerAgent Validate failed: %v", err)
+	}
+
+	// Exec 集合：规范化 + 符号链接解析两份都进 set，模拟 Landlock 按路径授予时对软链与目标的放行。
+	execSet := make(map[string]struct{}, len(policy.Exec)*2)
+	for _, ep := range policy.Exec {
+		execSet[ep] = struct{}{}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			execSet[r] = struct{}{}
+		}
+	}
+
+	// 宿主机真实存在的钩子二进制必须能解析进 Exec；不存在的直接 fail（防 silently skip）。
+	hookBins := []string{
+		"/root/.local/bin/herdsman",
+		"/root/.local/bin/agy-rules-hook",
+		"/root/.local/bin/moshi-hook",
+		"/root/.local/bin/agy-recover-400",
+		"/root/.local/bin/agy-recall",
+	}
+	for _, hb := range hookBins {
+		if _, err := os.Stat(hb); err != nil {
+			t.Fatalf("host hook binary %s missing: %v", hb, err)
+		}
+		if _, ok := execSet[hb]; !ok {
+			t.Fatalf("hook %s not in ReviewerAgent Exec", hb)
+		}
+	}
+	// herdsman 包装脚本 exec 的 ELF 本体也必须在 Exec 中。
+	herdsmanGo := "/root/.local/lib/herdsman-go/herdsman"
+	if _, err := os.Stat(herdsmanGo); err != nil {
+		t.Fatalf("herdsman-go ELF %s missing: %v", herdsmanGo, err)
+	}
+	if _, ok := execSet[herdsmanGo]; !ok {
+		t.Fatalf("herdsman-go ELF %s not in ReviewerAgent Exec", herdsmanGo)
+	}
+
+	// 不得把 /root/.local/bin 整个目录放进 Exec（会连带放行 herdr/dispatch-agent）。
+	for _, ep := range policy.Exec {
+		if ep == "/root/.local/bin" || ep == "/root/.local/bin/" {
+			t.Fatal("ReviewerAgent must not Exec-allow whole /root/.local/bin")
+		}
+		base := filepath.Base(ep)
+		if base == "herdr" || base == "dispatch-agent" || base == "grok" {
+			t.Fatalf("ReviewerAgent Exec unexpectedly contains %s", ep)
+		}
+	}
+
+	// /root/.herdsman 保持只读，绝不进 ReadWrite（W^X + 最小权限）。
+	for _, rw := range policy.ReadWrite {
+		if strings.Contains(rw, "/.herdsman") {
+			t.Fatalf("ReviewerAgent must not grant ReadWrite to %s", rw)
+		}
+	}
+
+	// W^X：任何 ReadWrite 路径不得与 Exec 路径相同或互为父子目录。
+	for _, rw := range policy.ReadWrite {
+		normRW, err := sandbox.NormalizePath(rw)
+		if err != nil {
+			t.Fatalf("NormalizePath rw %q: %v", rw, err)
+		}
+		for ep := range execSet {
+			normEP, err := sandbox.NormalizePath(ep)
+			if err != nil {
+				continue
+			}
+			if normRW == normEP ||
+				strings.HasPrefix(normEP, normRW+string(filepath.Separator)) ||
+				strings.HasPrefix(normRW, normEP+string(filepath.Separator)) {
+				t.Fatalf("W^X violation: ReadWrite %q overlaps Exec %q", normRW, normEP)
+			}
+		}
+	}
+
+	// ReadOnlyReviewer 行为不变：不新增钩子、无 agy-pro-home/herdsman Exec。
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	roSet := make(map[string]struct{}, len(ro.Exec))
+	for _, ep := range ro.Exec {
+		roSet[ep] = struct{}{}
+	}
+	for _, hb := range hookBins {
+		if _, ok := roSet[hb]; ok {
+			t.Fatalf("ReadOnlyReviewer Exec unexpectedly contains hook %s", hb)
+		}
+	}
+	if _, ok := roSet[herdsmanGo]; ok {
+		t.Fatal("ReadOnlyReviewer Exec unexpectedly contains herdsman-go ELF")
+	}
+}
