@@ -21,6 +21,8 @@ var (
 	ErrEmptyPolicy = errors.New("sandbox: policy specifies no filesystem rules and DenyNet is false")
 	// ErrForbiddenExec 表示 Exec 白名单中包含被禁止的嵌套执行器或动态链接器。
 	ErrForbiddenExec = errors.New("sandbox: executable is in forbidden list")
+	// ErrSeccomp 表示安装或初始化 seccomp PROT_EXEC 内存映射守卫失败。
+	ErrSeccomp = errors.New("sandbox: failed to install seccomp exec guard")
 )
 
 // Policy 定义 Landlock 沙盒的访问控制策略。
@@ -45,7 +47,7 @@ type Policy struct {
 	Env []string
 
 	// BestEffort 为 true 时，若内核不支持 Landlock，或 ABI < 4 不支持 DenyNet，
-	// 或部分路径不存在，将输出告警并降级执行而非返回错误。
+	// 或 seccomp 守卫无法安装，或部分路径不存在，将输出告警并降级执行而非返回错误。
 	BestEffort bool
 
 	// WarnWriter 指定 BestEffort 模式下的告警输出目标；为 nil 时默认输出到 os.Stderr。

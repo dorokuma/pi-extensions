@@ -1,3 +1,5 @@
+//go:build linux
+
 package sandbox
 
 import (
@@ -287,13 +289,30 @@ func applyPolicy(p Policy) error {
 	goExecDir := lookupEnvValue(p.Env, envGoExecDirKey)
 	realGoBin := lookupEnvValue(p.Env, envRealGoBinKey)
 
-	// 1. 在当前进程收紧 Landlock 规则集之前，先启动受控辅助进程（负责 Go 工具链构建代理与 seccomp 监听）。
-	// 此时辅助进程尚未被剥夺对 goExecDir/work 与 goExecDir/cache 的写权限，且不会受 seccomp 启动拦截影响。
-	var ctrlFD int = -1
+	// 1. 当配置了 Exec 白名单时，在收紧当前进程 Landlock 规则集之前先启动受控辅助进程并安装 seccomp PROT_EXEC 守卫。
+	// 非 BestEffort 模式下，若辅助进程或 seccomp 安装失败，直接返回错误、不继续执行；
+	// BestEffort 模式下输出告警并降级继续施加 Landlock 规则。
 	if len(p.Exec) > 0 {
-		if fd, err := startHelperProcess(p, goExecDir, realGoBin); err == nil {
-			ctrlFD = fd
+		if err := setupHelperAndSeccomp(p, goExecDir, realGoBin); err != nil {
+			if !p.BestEffort {
+				return fmt.Errorf("%w: %v", ErrSeccomp, err)
+			}
+			p.warnf("sandbox: seccomp PROT_EXEC guard unavailable (%v); degrading without ld-linux mmap restriction", err)
 		}
+	}
+
+	// 2. 将当前进程（含全部线程）永久锁入目标 Landlock 规则集（此时当前进程对 goExecDir 仅具只读+执行权）。
+	if err := enforceRuleset(rulesetFD); err != nil {
+		return err
+	}
+
+	return applyEnv(p.Env)
+}
+
+func setupHelperAndSeccomp(p Policy, goExecDir, realGoBin string) error {
+	ctrlFD, lifeWFD, err := startHelperProcess(p, goExecDir, realGoBin)
+	if err != nil {
+		return fmt.Errorf("start helper process: %w", err)
 	}
 	defer func() {
 		if ctrlFD >= 0 {
@@ -301,25 +320,24 @@ func applyPolicy(p Policy) error {
 		}
 	}()
 
-	// 2. 将当前进程（含全部线程）永久锁入目标 Landlock 规则集（此时当前进程对 goExecDir 仅具只读+执行权）。
-	if err := enforceRuleset(rulesetFD); err != nil {
-		return err
-	}
-
-	// 3. 当配置了 Exec 白名单时，为当前进程安装 seccomp PROT_EXEC 守卫并将 notifyFD 移交辅助进程监听。
-	if len(p.Exec) > 0 {
-		notifyFD, secErr := installSeccompExecGuard()
-		if secErr == nil && notifyFD >= 0 {
-			if ctrlFD >= 0 && sendNotifyFDToHelper(ctrlFD, notifyFD) == nil {
-				_ = unix.Close(notifyFD)
-			} else {
-				nonExecRW := computeNonExecRWDirs(p)
-				go serveSeccompNotifications(notifyFD, nonExecRW)
-			}
+	notifyFD, secErr := installSeccompExecGuard()
+	if secErr != nil {
+		// 若非 BestEffort（或未启用 Go 构建代理），立即关闭存活管道让辅助进程退出
+		if (!p.BestEffort || goExecDir == "") && lifeWFD >= 0 {
+			_ = unix.Close(lifeWFD)
 		}
+		return fmt.Errorf("install seccomp filter: %w", secErr)
 	}
 
-	return applyEnv(p.Env)
+	if err := sendNotifyFDToHelper(ctrlFD, notifyFD); err != nil {
+		_ = unix.Close(notifyFD)
+		if (!p.BestEffort || goExecDir == "") && lifeWFD >= 0 {
+			_ = unix.Close(lifeWFD)
+		}
+		return fmt.Errorf("transfer seccomp notify fd to helper: %w", err)
+	}
+	_ = unix.Close(notifyFD)
+	return nil
 }
 
 func createAndPopulateRuleset(p Policy, abi int, hasFS, enforceNet bool) (int, error) {
@@ -552,8 +570,27 @@ func enforceRuleset(rulesetFD int) error {
 // installSeccompExecGuard 安装针对 SYS_MMAP / SYS_MPROTECT (带 PROT_EXEC) 的 seccomp-unotify 过滤器。
 // 当任何受控进程或子进程尝试执行可执行内存映射时：
 // 1. 若该进程的 /proc/<pid>/exe 指向动态链接器（如直接调用 `/lib64/ld-linux-x86-64.so.2 /root/.local/bin/agy`），立即拒绝并返回 EACCES；
-// 2. 若映射的目标文件属于 ForbiddenExecNames 或位于不可执行的 ReadWrite 目录内（如 LD_PRELOAD 注入），立即拒绝并返回 EACCES。
+// 2. 若映射的目标文件属于 ForbiddenExecNames 或位于不可执行的 ReadWrite 目录内（如从可写临时目录 LD_PRELOAD 注入），立即拒绝并返回 EACCES。
 func installSeccompExecGuard() (int, error) {
+	// seccomp(SECCOMP_SET_MODE_FILTER) 要求调用线程（及 TSYNC 同步的所有同组线程）已设置 PR_SET_NO_NEW_PRIVS。
+	lockedThread := false
+	_, _, nnpErrno := syscall.AllThreadsSyscall6(
+		unix.SYS_PRCTL,
+		unix.PR_SET_NO_NEW_PRIVS,
+		1, 0, 0, 0, 0,
+	)
+	if nnpErrno != 0 {
+		if nnpErrno != syscall.ENOTSUP && nnpErrno != unix.EOPNOTSUPP {
+			return -1, fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", nnpErrno)
+		}
+		runtime.LockOSThread()
+		lockedThread = true
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			runtime.UnlockOSThread()
+			return -1, fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", err)
+		}
+	}
+
 	filter := []unix.SockFilter{
 		// 0: 加载 seccomp_data.nr (偏移 0)
 		{Code: bpfLD | bpfW | bpfABS, K: 0},
@@ -583,7 +620,7 @@ func installSeccompExecGuard() (int, error) {
 		uintptr(unsafe.Pointer(&prog)),
 	)
 	if errno != 0 {
-		// 降级尝试不带 TSYNC_ESRCH 的单线程/当前线程监听器注册
+		// 降级尝试不带 TSYNC_ESRCH 的当前线程监听器注册（如 cgo / -race 场景）
 		r1, _, errno = unix.Syscall(
 			unix.SYS_SECCOMP,
 			seccompSetModeFilter,
@@ -594,6 +631,9 @@ func installSeccompExecGuard() (int, error) {
 	runtime.KeepAlive(&filter)
 	runtime.KeepAlive(&prog)
 	if errno != 0 {
+		if lockedThread {
+			runtime.UnlockOSThread()
+		}
 		return -1, errno
 	}
 	return int(r1), nil
@@ -713,10 +753,10 @@ type helperConfig struct {
 	HasBroker     bool     `json:"has_broker"`
 }
 
-func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
+func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error) {
 	selfExe, err := os.Executable()
 	if err != nil || selfExe == "" {
-		return -1, fmt.Errorf("resolve executable: %w", err)
+		return -1, -1, fmt.Errorf("resolve executable: %w", err)
 	}
 	if resolved, err := filepath.EvalSymlinks(selfExe); err == nil && resolved != "" {
 		selfExe = resolved
@@ -724,7 +764,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
 
 	var pipeFDs [2]int
 	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
-		return -1, err
+		return -1, -1, err
 	}
 	lifeR := os.NewFile(uintptr(pipeFDs[0]), "life-r")
 	lifeWFD := pipeFDs[1]
@@ -733,7 +773,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
 	if err != nil {
 		_ = lifeR.Close()
 		_ = unix.Close(lifeWFD)
-		return -1, err
+		return -1, -1, err
 	}
 	ctrlParentFD := sp[0]
 	ctrlChildFile := os.NewFile(uintptr(sp[1]), "ctrl-sock")
@@ -779,7 +819,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
 		if brokerSockFile != nil {
 			_ = brokerSockFile.Close()
 		}
-		return -1, err
+		return -1, -1, err
 	}
 
 	cmd := exec.Command(selfExe)
@@ -800,7 +840,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
 		if brokerSockFile != nil {
 			_ = brokerSockFile.Close()
 		}
-		return -1, err
+		return -1, -1, err
 	}
 
 	// 子进程启动后再清除父进程所持 lifeWFD 的 FD_CLOEXEC，
@@ -821,9 +861,10 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, error) {
 	var ack [1]byte
 	if _, err := unix.Read(ctrlParentFD, ack[:]); err != nil {
 		_ = unix.Close(ctrlParentFD)
-		return -1, err
+		_ = unix.Close(lifeWFD)
+		return -1, -1, err
 	}
-	return ctrlParentFD, nil
+	return ctrlParentFD, lifeWFD, nil
 }
 
 func sendNotifyFDToHelper(ctrlFD int, notifyFD int) error {

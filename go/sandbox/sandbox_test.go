@@ -9,7 +9,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/dorokuma/pi-extensions/go/sandbox"
 )
@@ -29,6 +33,9 @@ func TestMain(m *testing.M) {
 		return
 	case "reviewer_go_toolchain":
 		subprocReviewerGoToolchain()
+		return
+	case "seccomp_failure":
+		subprocSeccompFailure()
 		return
 	}
 	os.Exit(m.Run())
@@ -379,6 +386,154 @@ func subprocExecWhitelist() {
 				os.Exit(1)
 			}
 		}
+	}
+
+	os.Exit(0)
+}
+
+func TestLandlockSeccompGuardFailureHandling(t *testing.T) {
+	requireLandlock(t)
+
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("skipping: 'true' binary not found in PATH: %v", err)
+	}
+	trueBin, err = filepath.EvalSymlinks(trueBin)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(true): %v", err)
+	}
+
+	tmp := t.TempDir()
+	roDir := filepath.Join(tmp, "ro")
+	rwDir := filepath.Join(tmp, "rw")
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatalf("mkdir ro: %v", err)
+	}
+	if err := os.MkdirAll(rwDir, 0o755); err != nil {
+		t.Fatalf("mkdir rw: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		testSubprocEnv+"=seccomp_failure",
+		"TEST_RO_DIR="+roDir,
+		"TEST_RW_DIR="+rwDir,
+		"TEST_ALLOWED_BIN="+trueBin,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seccomp_failure subprocess failed: %v\noutput:\n%s", err, string(out))
+	}
+}
+
+func occupySeccompListenerSlot() (int, error) {
+	const (
+		seccompSetModeFilter         uintptr = 1
+		seccompFilterFlagTSync       uintptr = 1 << 0
+		seccompFilterFlagNewListener uintptr = 1 << 3
+		seccompFilterFlagTSyncESRCH  uintptr = 1 << 4
+		seccompRetAllow              uint32  = 0x7fff0000
+		bpfRET                       uint16  = 0x06
+		bpfK                         uint16  = 0x00
+	)
+
+	runtime.LockOSThread()
+	_, _, errno := syscall.AllThreadsSyscall6(
+		unix.SYS_PRCTL,
+		unix.PR_SET_NO_NEW_PRIVS,
+		1, 0, 0, 0, 0,
+	)
+	if errno != 0 {
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			return -1, err
+		}
+	}
+
+	filter := []unix.SockFilter{
+		{Code: bpfRET | bpfK, K: seccompRetAllow},
+	}
+	prog := unix.SockFprog{
+		Len:    uint16(len(filter)),
+		Filter: &filter[0],
+	}
+
+	flags := seccompFilterFlagNewListener | seccompFilterFlagTSync | seccompFilterFlagTSyncESRCH
+	r1, _, sysErrno := unix.Syscall(
+		unix.SYS_SECCOMP,
+		seccompSetModeFilter,
+		flags,
+		uintptr(unsafe.Pointer(&prog)),
+	)
+	if sysErrno != 0 {
+		r1, _, sysErrno = unix.Syscall(
+			unix.SYS_SECCOMP,
+			seccompSetModeFilter,
+			seccompFilterFlagNewListener,
+			uintptr(unsafe.Pointer(&prog)),
+		)
+	}
+	runtime.KeepAlive(&filter)
+	runtime.KeepAlive(&prog)
+	if sysErrno != 0 {
+		return -1, sysErrno
+	}
+	return int(r1), nil
+}
+
+func subprocSeccompFailure() {
+	roDir := os.Getenv("TEST_RO_DIR")
+	rwDir := os.Getenv("TEST_RW_DIR")
+	allowedBin := os.Getenv("TEST_ALLOWED_BIN")
+
+	// 预先占用当前线程/进程的唯一 SECCOMP_FILTER_FLAG_NEW_LISTENER 槽位，
+	// 使后续 sandbox.Apply 安装 seccomp 守卫时必定触发内核 EBUSY 错误。
+	dummyListenerFD, err := occupySeccompListenerSlot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "occupySeccompListenerSlot failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer unix.Close(dummyListenerFD)
+
+	// 1. 非 BestEffort 模式下，seccomp 安装失败必须直接返回错误（包装 ErrSeccomp），且不应用环境变量
+	strictPolicy := sandbox.Policy{
+		ReadOnly:   []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", roDir},
+		ReadWrite:  []string{rwDir},
+		Exec:       []string{allowedBin},
+		Env:        []string{"PI_SECCOMP_STRICT_SHOULD_NOT_APPLY=1"},
+		BestEffort: false,
+	}
+	if err := sandbox.Apply(strictPolicy); err == nil {
+		fmt.Fprintln(os.Stderr, "expected sandbox.Apply to fail when seccomp installation fails in non-BestEffort mode, got nil")
+		os.Exit(1)
+	} else if !errors.Is(err, sandbox.ErrSeccomp) {
+		fmt.Fprintf(os.Stderr, "expected error wrapping ErrSeccomp, got: %v\n", err)
+		os.Exit(1)
+	}
+	if os.Getenv("PI_SECCOMP_STRICT_SHOULD_NOT_APPLY") != "" {
+		fmt.Fprintln(os.Stderr, "expected strictPolicy.Env not to be applied when Apply returns error")
+		os.Exit(1)
+	}
+
+	// 2. BestEffort 模式下，seccomp 安装失败应输出告警并降级继续执行 Landlock 限制
+	var warnBuf bytes.Buffer
+	bestEffortPolicy := strictPolicy.WithBestEffort(true)
+	bestEffortPolicy.WarnWriter = &warnBuf
+	bestEffortPolicy.Env = []string{"PI_SECCOMP_BEST_EFFORT_APPLIED=1"}
+
+	if err := sandbox.Apply(bestEffortPolicy); err != nil {
+		fmt.Fprintf(os.Stderr, "expected BestEffort sandbox.Apply to degrade and succeed on seccomp failure, got: %v\n", err)
+		os.Exit(1)
+	}
+	if !strings.Contains(warnBuf.String(), "seccomp") {
+		fmt.Fprintf(os.Stderr, "expected BestEffort warning to mention seccomp, got: %q\n", warnBuf.String())
+	}
+	if os.Getenv("PI_SECCOMP_BEST_EFFORT_APPLIED") != "1" {
+		fmt.Fprintln(os.Stderr, "expected BestEffort Env to be applied")
+		os.Exit(1)
+	}
+	// 验证 Landlock 文件系统只读规则已生效
+	if err := os.WriteFile(filepath.Join(roDir, "blocked.txt"), []byte("x"), 0o644); err == nil {
+		fmt.Fprintln(os.Stderr, "expected write to roDir to be blocked after BestEffort degradation")
+		os.Exit(1)
 	}
 
 	os.Exit(0)
