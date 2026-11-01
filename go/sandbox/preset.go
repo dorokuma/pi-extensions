@@ -380,3 +380,166 @@ func ReadOnlyReviewer(workdir string) Policy {
 		Env:       envList,
 	}
 }
+
+// ReviewerAgentTools 在 DefaultReviewerTools 基础上补充代理运行期常用的文件辅助命令。
+var ReviewerAgentTools = append(append([]string{}, DefaultReviewerTools...),
+	"mkdir", "cp", "touch",
+)
+
+// agentLookupDirs 是解析 agy/pig/pi 时除 PATH 与 standardBinDirs 外额外搜索的目录。
+var agentLookupDirs = []string{
+	"/root/.local/bin",
+	"/root/.pig/bin",
+}
+
+// entryAgentPathSet 将 EntryAgents 路径规范化（含符号链接目标）为集合，供 Validate / seccomp 使用。
+func entryAgentPathSet(paths []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(paths)*2)
+	for _, raw := range paths {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		norm, err := NormalizePath(raw)
+		if err != nil {
+			continue
+		}
+		out[norm] = struct{}{}
+		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+			if rn, err := NormalizePath(resolved); err == nil {
+				out[rn] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// IsEntryAgentPath 判断 pathOrName 是否属于给定的 EntryAgents 列表（含符号链接解析与 basename 匹配）。
+func IsEntryAgentPath(entryAgents []string, pathOrName string) bool {
+	trimmed := strings.TrimSpace(pathOrName)
+	if trimmed == "" || len(entryAgents) == 0 {
+		return false
+	}
+	set := entryAgentPathSet(entryAgents)
+	if norm, err := NormalizePath(trimmed); err == nil {
+		if _, ok := set[norm]; ok {
+			return true
+		}
+		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+			if rn, err := NormalizePath(resolved); err == nil {
+				if _, ok := set[rn]; ok {
+					return true
+				}
+			}
+		}
+	}
+	if !strings.ContainsRune(trimmed, filepath.Separator) {
+		for p := range set {
+			if filepath.Base(p) == trimmed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi 及其符号链接目标，供 ReviewerAgent 顶层启动。
+// 不把 dispatch-agent / grok 纳入；嵌套禁止无法靠 Landlock 一次性放行实现，见 ReviewerAgent 注释。
+func ResolveEntryAgentPaths() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		norm, err := NormalizePath(candidate)
+		if err != nil {
+			return
+		}
+		info, err := os.Stat(norm)
+		if err != nil || info.IsDir() {
+			return
+		}
+		if info.Mode()&0o111 == 0 {
+			return
+		}
+		if _, ok := seen[norm]; !ok {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+			if rn, err := NormalizePath(resolved); err == nil {
+				if st, err := os.Stat(rn); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+					if _, ok := seen[rn]; !ok {
+						seen[rn] = struct{}{}
+						out = append(out, rn)
+					}
+				}
+			}
+		}
+	}
+
+	names := []string{"agy", "pig", "pi"}
+	for _, name := range names {
+		if lp, err := exec.LookPath(name); err == nil {
+			add(lp)
+		}
+		for _, dir := range standardBinDirs {
+			add(filepath.Join(dir, name))
+		}
+		for _, dir := range agentLookupDirs {
+			add(filepath.Join(dir, name))
+		}
+	}
+	if matches, err := filepath.Glob("/root/.local/opt/pig/*/pig"); err == nil {
+		for _, m := range matches {
+			add(m)
+		}
+	}
+	return out
+}
+
+func homeDir() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	return "/root"
+}
+
+// ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig，
+// 并开放代理会话状态目录写权限。
+//
+// 额外能力：
+//   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
+//   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）与 ~/.gemini/antigravity-cli（agy 状态，
+//     含根目录下 settings/history 等文件，以目录为最小可写单元）；
+//   - DenyNet 仍为 false（LLM 走本机 Magpie）；
+//   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
+//
+// 嵌套限制（如实）：Landlock 按路径授予 EXECUTE，顶层放行后子进程通常也能再 exec 同一路径；
+// 当前实现没有 execve 计数 / 一次性 ticket。沙盒内再起 agy/pig 在 OS 层仍可能成功。
+// 兜底：只读角色本身无 bash/run_command，工具层难以再派发；dispatch-agent/grok 仍不在白名单。
+// 原 ReadOnlyReviewer / --preset reviewer 行为不变。
+func ReviewerAgent(workdir string) Policy {
+	p := ReadOnlyReviewer(workdir)
+
+	extraTools := BuildExecWhitelist([]string{"mkdir", "cp", "touch"})
+	agents := ResolveEntryAgentPaths()
+	p.EntryAgents = agents
+	p.Exec = append(p.Exec, extraTools...)
+	p.Exec = append(p.Exec, agents...)
+
+	sessionRoot := "/tmp/herdr-role-sessions"
+	_ = os.MkdirAll(sessionRoot, 0o700)
+	p.ReadWrite = append(p.ReadWrite, sessionRoot)
+
+	agyStateDir := filepath.Join(homeDir(), ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(agyStateDir, 0o755)
+	p.ReadWrite = append(p.ReadWrite, agyStateDir)
+
+	return p
+}

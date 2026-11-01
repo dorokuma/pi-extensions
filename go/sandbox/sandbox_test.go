@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 	case "seccomp_failure":
 		subprocSeccompFailure()
 		return
+	case "reviewer_agent_entry":
+		subprocReviewerAgentEntry()
+		return
 	}
 	os.Exit(m.Run())
 }
@@ -840,5 +843,158 @@ func cleanupReviewerTempDirs(p sandbox.Policy) {
 	}
 	if execDir := envMap["PI_SANDBOX_GO_EXEC_DIR"]; strings.HasPrefix(execDir, "/tmp/pi-reviewer-exec-") {
 		_ = os.RemoveAll(execDir)
+	}
+}
+
+func TestReviewerAgentPreset(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() {
+		cleanupReviewerTempDirs(policy)
+	})
+
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("ReviewerAgent Validate failed: %v", err)
+	}
+	if len(policy.EntryAgents) == 0 {
+		t.Fatal("expected EntryAgents to be populated when agy/pig exist on host")
+	}
+
+	// 原 reviewer 不含的辅助工具应在 Exec 中
+	foundMkdir := false
+	for _, ep := range policy.Exec {
+		base := filepath.Base(ep)
+		if base == "mkdir" || base == "cp" || base == "touch" {
+			foundMkdir = true
+			break
+		}
+	}
+	if !foundMkdir {
+		t.Fatalf("expected mkdir/cp/touch in ReviewerAgent Exec, got %v", policy.Exec)
+	}
+
+	foundSession := false
+	for _, rw := range policy.ReadWrite {
+		if rw == "/tmp/herdr-role-sessions" {
+			foundSession = true
+		}
+	}
+	if !foundSession {
+		t.Fatal("expected /tmp/herdr-role-sessions in ReadWrite")
+	}
+
+	// 对照：原 ReadOnlyReviewer 仍拒绝把 ForbiddenExec 放进 Exec，且无 EntryAgents
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	if len(ro.EntryAgents) != 0 {
+		t.Fatalf("ReadOnlyReviewer must keep EntryAgents empty, got %v", ro.EntryAgents)
+	}
+	for _, ep := range ro.Exec {
+		if sandbox.IsForbiddenExec(ep) {
+			t.Fatalf("ReadOnlyReviewer Exec unexpectedly contains forbidden %s", ep)
+		}
+	}
+	if err := ro.Validate(); err != nil {
+		t.Fatalf("ReadOnlyReviewer Validate failed: %v", err)
+	}
+
+	// EntryAgents 路径允许通过 Validate；dispatch-agent 仍拒绝
+	bad := sandbox.Policy{
+		ReadOnly:    []string{"/"},
+		Exec:        []string{"/usr/local/bin/dispatch-agent"},
+		EntryAgents: policy.EntryAgents,
+	}
+	if err := bad.Validate(); !errors.Is(err, sandbox.ErrForbiddenExec) {
+		t.Fatalf("expected ErrForbiddenExec for dispatch-agent even with EntryAgents, got %v", err)
+	}
+}
+
+func TestReviewerAgentEntryExecIntegration(t *testing.T) {
+	requireLandlock(t)
+
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("skipping: true not found: %v", err)
+	}
+	trueData, err := os.ReadFile(trueBin)
+	if err != nil {
+		t.Fatalf("read true: %v", err)
+	}
+
+	tmp := t.TempDir()
+	fakeAgy := filepath.Join(tmp, "agy")
+	if err := os.WriteFile(fakeAgy, trueData, 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	denied := filepath.Join(tmp, "dispatch-agent")
+	if err := os.WriteFile(denied, trueData, 0o755); err != nil {
+		t.Fatalf("write fake dispatch-agent: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		testSubprocEnv+"=reviewer_agent_entry",
+		"TEST_BIN_DIR="+tmp,
+		"TEST_FAKE_AGY="+fakeAgy,
+		"TEST_FAKE_DISPATCH="+denied,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("reviewer_agent_entry subprocess failed: %v\noutput:\n%s", err, string(out))
+	}
+}
+
+func subprocReviewerAgentEntry() {
+	binDir := os.Getenv("TEST_BIN_DIR")
+	fakeAgy := os.Getenv("TEST_FAKE_AGY")
+	fakeDispatch := os.Getenv("TEST_FAKE_DISPATCH")
+
+	p := sandbox.Policy{
+		ReadOnly:    []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", binDir},
+		Exec:        []string{fakeAgy},
+		EntryAgents: []string{fakeAgy},
+	}
+	if err := sandbox.Apply(p); err != nil {
+		fmt.Fprintf(os.Stderr, "Apply failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := exec.Command(fakeAgy).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "expected EntryAgent agy to run, got: %v\n", err)
+		os.Exit(1)
+	}
+	if err := exec.Command(fakeDispatch).Run(); err == nil {
+		fmt.Fprintln(os.Stderr, "expected dispatch-agent to be denied, but it succeeded")
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestIsEntryAgentPath(t *testing.T) {
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, "real-agy")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(tmp, "agy")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	agents := []string{link}
+	if !sandbox.IsEntryAgentPath(agents, link) {
+		t.Fatal("expected link path to match EntryAgents")
+	}
+	if !sandbox.IsEntryAgentPath(agents, real) {
+		t.Fatal("expected resolved real path to match EntryAgents")
+	}
+	if !sandbox.IsEntryAgentPath(agents, "agy") {
+		t.Fatal("expected basename agy to match EntryAgents")
+	}
+	if sandbox.IsEntryAgentPath(agents, "dispatch-agent") {
+		t.Fatal("dispatch-agent must not match")
 	}
 }

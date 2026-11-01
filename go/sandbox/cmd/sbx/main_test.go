@@ -211,3 +211,55 @@ func TestVersionDefaultDev(t *testing.T) {
 		t.Fatal("version must be non-empty (default \"dev\" or ldflags-injected)")
 	}
 }
+
+func TestParseArgsReviewerAgent(t *testing.T) {
+	workDir := t.TempDir()
+	cfg, err := parseArgs([]string{
+		"--preset", "reviewer-agent",
+		"--workdir", workDir,
+		"--",
+		"/root/.local/bin/agy", "--help",
+	})
+	if err != nil {
+		t.Fatalf("parseArgs(--preset reviewer-agent) failed: %v", err)
+	}
+	if cfg.Preset != "reviewer-agent" {
+		t.Fatalf("Preset = %q, want reviewer-agent", cfg.Preset)
+	}
+	if cfg.WorkDir != workDir {
+		t.Fatalf("WorkDir = %q, want %q", cfg.WorkDir, workDir)
+	}
+
+	pol, err := buildPolicy(cfg)
+	if err != nil {
+		t.Fatalf("buildPolicy(reviewer-agent) failed: %v", err)
+	}
+	defer cleanupPolicyTempDirs(pol)
+
+	if err := pol.Validate(); err != nil {
+		t.Fatalf("ReviewerAgent Validate failed: %v", err)
+	}
+	if len(pol.EntryAgents) == 0 {
+		t.Fatal("expected non-empty EntryAgents for reviewer-agent preset")
+	}
+
+	foundSession := false
+	foundAgyState := false
+	for _, rw := range pol.ReadWrite {
+		if rw == "/tmp/herdr-role-sessions" {
+			foundSession = true
+		}
+		if strings.HasSuffix(rw, "/.gemini/antigravity-cli") || strings.Contains(rw, "/.gemini/antigravity-cli") {
+			foundAgyState = true
+		}
+	}
+	if !foundSession {
+		t.Fatalf("expected /tmp/herdr-role-sessions in ReadWrite, got %v", pol.ReadWrite)
+	}
+	if !foundAgyState {
+		t.Fatalf("expected antigravity-cli state dir in ReadWrite, got %v", pol.ReadWrite)
+	}
+	if pol.DenyNet {
+		t.Fatal("reviewer-agent must keep DenyNet=false for Magpie")
+	}
+}

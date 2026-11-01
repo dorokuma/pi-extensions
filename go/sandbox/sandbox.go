@@ -50,6 +50,12 @@ type Policy struct {
 	// 或 seccomp 守卫无法安装，或部分路径不存在，将输出告警并降级执行而非返回错误。
 	BestEffort bool
 
+	// EntryAgents 列出允许出现在 Exec 白名单中的代理二进制绝对路径（agy/pig/pi 及其
+	// 符号链接解析目标）。这些路径的 basename 通常命中 ForbiddenExecNames，但
+	// ReviewerAgent 预设需要顶层启动它们。Landlock 按路径放行，无法做到「只允许
+	// 第一次 exec」；嵌套再起同名代理仍会被 Landlock 允许，需靠角色工具白名单兜底。
+	EntryAgents []string
+
 	// WarnWriter 指定 BestEffort 模式下的告警输出目标；为 nil 时默认输出到 os.Stderr。
 	WarnWriter io.Writer
 }
@@ -111,9 +117,15 @@ func (p Policy) Validate() error {
 	if err != nil {
 		return fmt.Errorf("Exec: %w", err)
 	}
+	entrySet := entryAgentPathSet(p.EntryAgents)
 	for _, ep := range execPaths {
-		if IsForbiddenExec(ep) || IsELFInterpreter(ep) {
+		if IsELFInterpreter(ep) {
 			return fmt.Errorf("%w: %s", ErrForbiddenExec, ep)
+		}
+		if IsForbiddenExec(ep) {
+			if _, ok := entrySet[ep]; !ok {
+				return fmt.Errorf("%w: %s", ErrForbiddenExec, ep)
+			}
 		}
 	}
 	for _, kv := range p.Env {

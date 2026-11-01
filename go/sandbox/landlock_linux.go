@@ -657,7 +657,7 @@ func computeNonExecRWDirs(p Policy) []string {
 	return out
 }
 
-func serveSeccompNotifications(notifyFD int, nonExecRWDirs []string) {
+func serveSeccompNotifications(notifyFD int, nonExecRWDirs []string, entryAgents []string) {
 	defer unix.Close(notifyFD)
 	var req seccompNotif
 	var resp seccompNotifResp
@@ -677,7 +677,7 @@ func serveSeccompNotifications(notifyFD int, nonExecRWDirs []string) {
 			return
 		}
 
-		deny := shouldDenyExecMmap(&req, nonExecRWDirs)
+		deny := shouldDenyExecMmap(&req, nonExecRWDirs, entryAgents)
 		// 验证通知 ID 仍然有效，防止极端情况下的 PID 复用
 		_, _, validErrno := unix.Syscall(
 			unix.SYS_IOCTL,
@@ -706,7 +706,7 @@ func serveSeccompNotifications(notifyFD int, nonExecRWDirs []string) {
 	}
 }
 
-func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string) bool {
+func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string, entryAgents []string) bool {
 	pid := int(req.Pid)
 	if pid <= 0 {
 		return true
@@ -715,9 +715,14 @@ func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string) bool {
 	// 1. 检查发起可执行映射的进程主程序是否为 ld-linux 等动态链接器或禁止执行的二进制。
 	// 当通过内核 PT_INTERP 正常启动白名单程序时，/proc/<pid>/exe 指向该白名单程序本身；
 	// 当用户直接执行 `/lib64/ld-linux-x86-64.so.2 <target>` 时，/proc/<pid>/exe 指向 ld-linux，在此直接拒绝。
+	// ReviewerAgent 顶层放行的 EntryAgents（agy/pig/pi）作为 exe 时不得一律拒绝 PROT_EXEC，
+	// 否则代理进程自身的合法内存映射会被误杀。
 	if exeTarget, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeTarget != "" {
 		exeTarget = strings.TrimSuffix(exeTarget, " (deleted)")
-		if IsELFInterpreter(exeTarget) || IsForbiddenExec(exeTarget) {
+		if IsELFInterpreter(exeTarget) {
+			return true
+		}
+		if IsForbiddenExec(exeTarget) && !IsEntryAgentPath(entryAgents, exeTarget) {
 			return true
 		}
 	}
@@ -750,6 +755,7 @@ type helperConfig struct {
 	GoExecDir     string   `json:"go_exec_dir"`
 	RealGoBin     string   `json:"real_go_bin"`
 	NonExecRWDirs []string `json:"non_exec_rw"`
+	EntryAgents   []string `json:"entry_agents"`
 	HasBroker     bool     `json:"has_broker"`
 }
 
@@ -808,6 +814,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error)
 		GoExecDir:     goExecDir,
 		RealGoBin:     realGoBin,
 		NonExecRWDirs: computeNonExecRWDirs(p),
+		EntryAgents:   append([]string(nil), p.EntryAgents...),
 		HasBroker:     hasBroker,
 	}
 	cfgBytes, err := json.Marshal(cfg)
@@ -929,7 +936,7 @@ func runHelperProcess() {
 	// 2. 辅助进程为自身派生的子进程（如 go test）安装 seccomp PROT_EXEC 守卫。
 	if selfNotifyFD, err := installSeccompExecGuard(); err == nil && selfNotifyFD >= 0 {
 		unix.CloseOnExec(selfNotifyFD)
-		go serveSeccompNotifications(selfNotifyFD, cfg.NonExecRWDirs)
+		go serveSeccompNotifications(selfNotifyFD, cfg.NonExecRWDirs, cfg.EntryAgents)
 	}
 
 	if brokerLn != nil {
@@ -957,7 +964,7 @@ func runHelperProcess() {
 			if err == nil {
 				for _, fd := range fds {
 					unix.CloseOnExec(fd)
-					go serveSeccompNotifications(fd, cfg.NonExecRWDirs)
+					go serveSeccompNotifications(fd, cfg.NonExecRWDirs, cfg.EntryAgents)
 				}
 			}
 		}

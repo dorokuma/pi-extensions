@@ -49,7 +49,7 @@ type cliConfig struct {
 	Command     []string
 }
 
-const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] -- COMMAND [ARGS...]"
+const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] -- COMMAND [ARGS...]"
 
 // parseArgs 解析命令行参数（不含 os.Args[0]），支持 `--reviewer WORKDIR` 作为 `--preset reviewer --workdir DIR` 的兼容别名。
 func parseArgs(args []string) (cliConfig, error) {
@@ -113,8 +113,10 @@ func parseArgs(args []string) (cliConfig, error) {
 		switch strings.ToLower(strings.TrimSpace(presetName)) {
 		case "reviewer", "read-only-reviewer":
 			presetName = "reviewer"
+		case "reviewer-agent":
+			presetName = "reviewer-agent"
 		default:
-			return cliConfig{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer)", presetName)
+			return cliConfig{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer, reviewer-agent)", presetName)
 		}
 		if strings.TrimSpace(workDir) == "" {
 			workDir = "."
@@ -152,8 +154,14 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 				wd = "."
 			}
 			policy = sandbox.ReadOnlyReviewer(wd)
+		case "reviewer-agent":
+			wd := cfg.WorkDir
+			if strings.TrimSpace(wd) == "" {
+				wd = "."
+			}
+			policy = sandbox.ReviewerAgent(wd)
 		default:
-			return sandbox.Policy{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer)", cfg.Preset)
+			return sandbox.Policy{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer, reviewer-agent)", cfg.Preset)
 		}
 	}
 
@@ -257,8 +265,13 @@ func main() {
 	}
 
 	// 当启用了 Exec 白名单时，在应用沙盒前双重校验目标命令是否属于被禁用的代理或动态链接器。
+	// reviewer-agent 预设允许顶层 EntryAgents（agy/pig/pi）；其余 ForbiddenExec 仍拒绝。
 	if len(policy.Exec) > 0 {
-		if sandbox.IsForbiddenExec(cfg.Command[0]) || sandbox.IsELFInterpreter(cfg.Command[0]) {
+		if sandbox.IsELFInterpreter(cfg.Command[0]) {
+			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
+			os.Exit(126)
+		}
+		if sandbox.IsForbiddenExec(cfg.Command[0]) && !sandbox.IsEntryAgentPath(policy.EntryAgents, cfg.Command[0]) {
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
 			os.Exit(126)
 		}
@@ -272,7 +285,11 @@ func main() {
 	}
 
 	if len(policy.Exec) > 0 {
-		if sandbox.IsForbiddenExec(bin) || sandbox.IsELFInterpreter(bin) {
+		if sandbox.IsELFInterpreter(bin) {
+			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
+			os.Exit(126)
+		}
+		if sandbox.IsForbiddenExec(bin) && !sandbox.IsEntryAgentPath(policy.EntryAgents, bin) {
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
 			os.Exit(126)
 		}

@@ -40,6 +40,9 @@ go run ./cmd/sbx --check
 go run ./cmd/sbx --reviewer /path/to/repo -- go test ./...
 # 或等价写法：
 go run ./cmd/sbx --preset reviewer --workdir /path/to/repo -- go test ./...
+
+# 只读审查员代理（允许顶层 agy/pig，扩展会话 RW；嵌套再起同名代理 OS 层仍可能成功，见 CHANGELOG）
+go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo -- /root/.local/bin/agy --help
 ```
 
 ## 安全机制与本轮封堵的绕过路径
