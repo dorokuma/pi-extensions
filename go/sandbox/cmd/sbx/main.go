@@ -15,6 +15,9 @@ import (
 	"github.com/dorokuma/pi-extensions/go/sandbox"
 )
 
+// version 由构建时 -ldflags "-X main.version=X.Y.Z" 注入；未注入时为 "dev"。
+var version = "dev"
+
 type stringSlice []string
 
 func (s *stringSlice) String() string {
@@ -33,19 +36,20 @@ func (s *stringSlice) Set(val string) error {
 
 // cliConfig 保存解析后的命令行配置。
 type cliConfig struct {
-	ReadOnly   []string
-	ReadWrite  []string
-	Exec       []string
-	Env        []string
-	Preset     string
-	WorkDir    string
-	DenyNet    bool
-	BestEffort bool
-	CheckOnly  bool
-	Command    []string
+	ReadOnly    []string
+	ReadWrite   []string
+	Exec        []string
+	Env         []string
+	Preset      string
+	WorkDir     string
+	DenyNet     bool
+	BestEffort  bool
+	CheckOnly   bool
+	ShowVersion bool
+	Command     []string
 }
 
-const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] -- COMMAND [ARGS...]"
+const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] -- COMMAND [ARGS...]"
 
 // parseArgs 解析命令行参数（不含 os.Args[0]），支持 `--reviewer WORKDIR` 作为 `--preset reviewer --workdir DIR` 的兼容别名。
 func parseArgs(args []string) (cliConfig, error) {
@@ -60,6 +64,7 @@ func parseArgs(args []string) (cliConfig, error) {
 		denyNet     bool
 		bestEffort  bool
 		checkOnly   bool
+		showVersion bool
 	)
 
 	fs := flag.NewFlagSet("sbx", flag.ContinueOnError)
@@ -75,6 +80,7 @@ func parseArgs(args []string) (cliConfig, error) {
 	fs.BoolVar(&denyNet, "deny-net", false, "禁止所有 TCP bind 与 connect（需 Landlock ABI >= 4）")
 	fs.BoolVar(&bestEffort, "best-effort", false, "当内核不支持或路径缺失时告警降级而非报错退出")
 	fs.BoolVar(&checkOnly, "check", false, "仅检测当前内核 Landlock 支持状态并退出")
+	fs.BoolVar(&showVersion, "version", false, "打印版本号并退出")
 
 	if err := fs.Parse(args); err != nil {
 		return cliConfig{}, err
@@ -116,21 +122,22 @@ func parseArgs(args []string) (cliConfig, error) {
 	}
 
 	cmdArgs := fs.Args()
-	if !checkOnly && len(cmdArgs) == 0 {
+	if !checkOnly && !showVersion && len(cmdArgs) == 0 {
 		return cliConfig{}, errors.New("sbx: missing command")
 	}
 
 	return cliConfig{
-		ReadOnly:   []string(roPaths),
-		ReadWrite:  []string(rwPaths),
-		Exec:       []string(execPaths),
-		Env:        []string(envVars),
-		Preset:     presetName,
-		WorkDir:    workDir,
-		DenyNet:    denyNet,
-		BestEffort: bestEffort,
-		CheckOnly:  checkOnly,
-		Command:    cmdArgs,
+		ReadOnly:    []string(roPaths),
+		ReadWrite:   []string(rwPaths),
+		Exec:        []string(execPaths),
+		Env:         []string(envVars),
+		Preset:      presetName,
+		WorkDir:     workDir,
+		DenyNet:     denyNet,
+		BestEffort:  bestEffort,
+		CheckOnly:   checkOnly,
+		ShowVersion: showVersion,
+		Command:     cmdArgs,
 	}, nil
 }
 
@@ -226,6 +233,11 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n%s\n", err, usageLine)
 		os.Exit(2)
+	}
+
+	if cfg.ShowVersion {
+		fmt.Printf("sbx %s\n", version)
+		os.Exit(0)
 	}
 
 	if cfg.CheckOnly {

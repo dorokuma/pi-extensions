@@ -189,3 +189,25 @@ func cleanupPolicyTempDirs(p sandbox.Policy) {
 		}
 	}
 }
+
+func TestParseArgsVersion(t *testing.T) {
+	cfg, err := parseArgs([]string{"--version"})
+	if err != nil {
+		t.Fatalf("parseArgs(--version) failed: %v", err)
+	}
+	if !cfg.ShowVersion {
+		t.Fatal("expected ShowVersion=true")
+	}
+	if cfg.CheckOnly {
+		t.Fatal("expected CheckOnly=false for --version")
+	}
+	if len(cfg.Command) != 0 {
+		t.Fatalf("expected empty Command for --version, got %v", cfg.Command)
+	}
+}
+
+func TestVersionDefaultDev(t *testing.T) {
+	if version == "" {
+		t.Fatal("version must be non-empty (default \"dev\" or ldflags-injected)")
+	}
+}
