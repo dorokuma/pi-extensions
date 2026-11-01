@@ -19,7 +19,7 @@ var (
 	ErrInvalidPolicy = errors.New("sandbox: invalid policy")
 	// ErrEmptyPolicy 表示策略既未指定任何文件路径，也未启用网络隔离。
 	ErrEmptyPolicy = errors.New("sandbox: policy specifies no filesystem rules and DenyNet is false")
-	// ErrForbiddenExec 表示 Exec 白名单中包含被禁止的嵌套执行器。
+	// ErrForbiddenExec 表示 Exec 白名单中包含被禁止的嵌套执行器或动态链接器。
 	ErrForbiddenExec = errors.New("sandbox: executable is in forbidden list")
 )
 
@@ -27,8 +27,9 @@ var (
 //
 // 当 ReadOnly、ReadWrite 或 Exec 中任意一项非空时，文件系统进入白名单模式：
 // 除显式声明的路径外，其余所有受 Landlock 管控的文件系统访问均被拒绝。
-// ReadWrite 默认仅授予读写、创建、删除、截断等权限，不授予执行权限（遵循 W^X 原则）；
-// 若某路径同时出现在 ReadWrite 与 Exec（如只读审查员预设中的私有 GOTMPDIR），则兼具读写与执行权限。
+// ReadWrite 默认仅授予读写、创建、删除、截断权限，不授予执行权限（严格遵循 W^X 原则）。
+// 在 ReadOnlyReviewer 预设下，所有可写目录（含 <workdir>/reports、TMPDIR、GOTMPDIR、GOCACHE）
+// 均不具备执行权限；go test 编译产物由受控的 Go 工具链包装器在独立的只读可执行目录中构建并降权运行。
 type Policy struct {
 	// ReadOnly 允许只读访问的目录或文件路径列表。
 	ReadOnly []string
@@ -40,7 +41,7 @@ type Policy struct {
 	DenyNet bool
 
 	// Env 需要在沙盒生效时注入当前进程及子进程的环境变量列表（格式为 "KEY=VALUE"）。
-	// 例如 ReadOnlyReviewer 会在此设置指向私有可写目录的 TMPDIR、GOTMPDIR、GOCACHE。
+	// 例如 ReadOnlyReviewer 会在此设置指向私有可写目录的 TMPDIR、GOTMPDIR、GOCACHE 以及受控 PATH。
 	Env []string
 
 	// BestEffort 为 true 时，若内核不支持 Landlock，或 ABI < 4 不支持 DenyNet，
@@ -93,7 +94,7 @@ func NormalizePaths(paths []string) ([]string, error) {
 	return out, nil
 }
 
-// Validate 校验 Policy 的合法性，包括非空检查、路径规范化、禁止执行的二进制拦截以及环境变量格式校验。
+// Validate 校验 Policy 的合法性，包括非空检查、路径规范化、禁止执行的二进制与动态链接器拦截以及环境变量格式校验。
 func (p Policy) Validate() error {
 	if len(p.ReadOnly) == 0 && len(p.ReadWrite) == 0 && len(p.Exec) == 0 && !p.DenyNet {
 		return ErrEmptyPolicy
@@ -109,7 +110,7 @@ func (p Policy) Validate() error {
 		return fmt.Errorf("Exec: %w", err)
 	}
 	for _, ep := range execPaths {
-		if IsForbiddenExec(ep) {
+		if IsForbiddenExec(ep) || IsELFInterpreter(ep) {
 			return fmt.Errorf("%w: %s", ErrForbiddenExec, ep)
 		}
 	}
@@ -154,14 +155,14 @@ func (p Policy) warnf(format string, args ...any) {
 }
 
 // Supported 检测当前内核是否支持并启用了 Landlock。
-// 若支持，返回最高支持的 ABI 版本号（>= 1）和 true；否则返回 (0, false)。
+// 若支持，返回最高支持的 ABI 版本号 (>= 1) 和 true；否则返回 (0, false)。
 func Supported() (abi int, ok bool) {
 	return supported()
 }
 
-// Apply 将给定的沙盒策略应用到当前进程（及其之后 fork/exec 的所有子进程），
+// Apply 将给定沙盒策略应用到当前进程（及其之后 fork/exec 的所有子进程），
 // 并将 Policy.Env 中声明的环境变量写入当前进程环境。
-// 该操作一旦成功即不可撤销，后续只能继续叠加更严格的规则。
+// 该操作一旦成功不可撤销，后续只能继续叠加更严格的规则。
 func Apply(p Policy) error {
 	return applyPolicy(p)
 }
