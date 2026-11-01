@@ -18,6 +18,10 @@
   - **严格执行 `W^X`（可写与可执行完全分离）**：所有 `ReadWrite` 目录（`<workdir>/reports`、`TMPDIR`、`GOTMPDIR`、`GOCACHE`）均**不**授予 `LANDLOCK_ACCESS_FS_EXECUTE` 权限；
   - 建立独立的只读可执行目录 `/tmp/pi-reviewer-exec-*`，通过受控的 `go` 包装器与前置构建代理支持 `go build`、`go vet`、`go test`；
   - 严格限制可执行二进制白名单，显式拦截嵌套代理与调度器（`pig`、`pi`、`agy`、`grok`、`dispatch-agent`）以及直接调用 ELF 动态链接器（`ld-linux*.so*`）。
+- `sandbox.ReviewerAgent(workdir string) Policy`：在 `ReadOnlyReviewer` 之上允许**顶层**启动 `agy`/`pig`/`pi`，并对 pig 与 agy MCP 生态做三层安全修复：
+  - **ctxmode/MCP 数据隔离**：点名放行 `ctxmode`/`codegraph-go`/`jev-mcp`/`jev-mcp-go`/`agy-recall`（含软链目标）；未显式指定 `CTXMODE_DB` 时注入 `<privateTmpDir>/ctxmode/context_mode.db`（0700）；宿主兜底仅精确放行 `~/.local/share/ctxmode` 与 `agy-recall` state，绝不放宽到 `~/.local/share` 或 `gemini-web`。
+  - **pig AgentDir 私有隔离**：宿主 `/root/.pig/agent` 保持 100% 只读；进沙盒前把白名单配置文件 0600 拷入 `<privateTmpDir>/pig-agent`（`extensions` 软链指向只读宿主目录），并按需注入 `PIG_CODING_AGENT_DIR`。
+  - **Cell 缓存 W^X**：宿主态预刷新 `<PIG_HOME>/cache` 下有效缓存单元 `usage.json`（沙盒内 `TouchUsage` 命中 <1h 纯只读短路）；仅 `.locks` 目录与 `cache/toolchains` 版本记录目录可写，仅已构建 `<digest>/runner` 与 `cache/ext` 可执行产物可执行，`ReadWrite`/`Exec` 无任何父子包含。
 
 ## 构建与测试
 

@@ -4,6 +4,56 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
+MINOR：向后兼容地补齐 reviewer-agent 预设对 pig 与 agy MCP 生态的三层安全修复（
+ctxmode/MCP 数据隔离、pig AgentDir 私有隔离、Cell 缓存 W^X 预热）。
+
+### Added
+
+- `ReviewerAgent` 在 `Policy.Exec` 中按名字逐个点名放行 MCP 服务二进制
+  `ctxmode` / `codegraph-go` / `jev-mcp` / `jev-mcp-go` / `agy-recall`，经
+  `ResolveMCPServerPaths()` 同时覆盖 PATH、`standardBinDirs`、`agentLookupDirs` 与
+  `agyHookLookupDirs()`（homeDir() 与 /root 两种 HOME），并把软链解析目标一并放行。
+  依旧不整目录放行 `~/.local/bin`（`herdr`、`dispatch-agent`、`dispatch-agent-go`、
+  `grok` 不进白名单）。
+- ctxmode 私有数据库：`CTXMODE_DB` 未显式指定时，`Policy.Env` 注入
+  `CTXMODE_DB=<privateTmpDir>/ctxmode/context_mode.db`（宿主态预建 0700；
+  `go/ctxmode` 的 `roleEnviron` 不经滤地透传环境，沙盒内 ctxmode 直接读取该值）。
+  宿主兜底仅精确放行 `~/.local/share/ctxmode` 与
+  `~/.gemini/config/plugins/agy-recall/state`（覆盖 `homeDir()`、`/root`、
+  `/root/.agy-pro-home`），绝不放宽到 `~/.local/share` 或触碰
+  `~/.local/share/gemini-web/chrome-profile`。
+- pig AgentDir 私有隔离：进入 Landlock 前在 `<privateTmpDir>/pig-agent`（0700）下
+  以 0600 拷入白名单配置文件（`settings.json`、`models.json`、`models-store.json`、
+  `auth.json`、`keybindings.json`、`trusted-projects.json`，不拷 `sessions/`、`.lock`、
+  日志等），并把 `extensions` 软链指向只读的宿主 `/root/.pig/agent/extensions`。
+  `PIG_CODING_AGENT_DIR` 未被调用方显式指定时注入私有目录；显式指定时保留。
+  宿主 `/root/.pig/agent` 保持 100% 只读，绝不进 `Policy.ReadWrite`。
+- Cell 缓存预热与最小权限：宿主态在进入 Landlock 前扫描 `<PIG_HOME>/cache`
+  （`PIG_HOME` 缺省取 `~/.pig`）下含有效 `ready.json` 的缓存单元，以原子写把
+  `usage.json` 的 `lastUsed` 刷新为当前 Unix 秒（与 PiG `runtimecell.TouchUsage`
+  同语义，沙盒内命中 <1h 纯只读短路，不写 `<digest>/` 临时文件）。
+  仅 `cells/<lang>/.locks`、`ext/.locks`（宿主态预建 0755）与 `cache/toolchains`
+  版本记录目录（含 `*.json.lock`）进 `ReadWrite`；仅已构建缓存单元的 artifact
+  （`cells/<lang>/<digest>/runner`、`cache/ext/<entry>/<artifact>` 带执行位普通文件）
+  进 `Exec`。
+
+### Security
+
+- 沙盒内 pig 不再拥有对宿主 AgentDir 的任何写权限；`usage.json` 刷新把
+  运行期 `TouchUsage` 变为纯只读短路，`<digest>/` 单元目录保持只读。
+- 新单测断言 `~/.local/share` 与 `~/.local/share/gemini-web` 绝不出现在
+  `Policy.ReadWrite`，并断言 `Policy.ReadWrite` 与 `Policy.Exec` 之间不存在
+  任何相等或父子包含关系（W^X）。
+
+### Known Risks
+
+- 既有边界不变：`/proc/<pid>/fd` TOCTOU、只读路径已存在 `.so` 经 `LD_PRELOAD` 注入、
+  顶层放行后嵌套再起同名代理、`DenyNet: false` 等，详见 README 与 0.1.0 条目。
+- 调用方显式设置 `PIG_CODING_AGENT_DIR` / `CTXMODE_DB` 时，对应目录的写权限
+  由调用方自负责；预设只做最小兜底。
+
 ## [0.2.1] - 2026-11-01
 
 PATCH：修复 reviewer-agent 下 agy 派活路径无法写状态 / 打开 TTY 的问题。
@@ -63,7 +113,8 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...HEAD
+[0.3.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...go/sandbox/v0.3.0
 [0.2.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...go/sandbox/v0.2.1
 [0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...go/sandbox/v0.2.0
 [0.1.0]: https://github.com/dorokuma/pi-extensions/releases/tag/go/sandbox/v0.1.0

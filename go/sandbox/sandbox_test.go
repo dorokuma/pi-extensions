@@ -2,6 +2,7 @@ package sandbox_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -1152,5 +1154,343 @@ func TestReviewerAgentAgyHooks(t *testing.T) {
 	}
 	if _, ok := roSet[herdsmanGo]; ok {
 		t.Fatal("ReadOnlyReviewer Exec unexpectedly contains herdsman-go ELF")
+	}
+}
+
+// TestReviewerAgentMCPServerExec 安全细则一回归：ReviewerAgent 必须放行精确的
+// MCP 服务二进制（ctxmode / codegraph-go / jev-mcp / jev-mcp-go / agy-recall，含软链目标），
+// 仍不整目录放行 ~/.local/bin，且 dispatch-agent / dispatch-agent-go / herdr / grok 不进 Exec。
+func TestReviewerAgentMCPServerExec(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("ReviewerAgent Validate failed: %v", err)
+	}
+
+	execSet := make(map[string]struct{}, len(policy.Exec)*2)
+	for _, ep := range policy.Exec {
+		execSet[ep] = struct{}{}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			execSet[r] = struct{}{}
+		}
+	}
+	for _, name := range []string{"ctxmode", "codegraph-go", "jev-mcp", "jev-mcp-go", "agy-recall"} {
+		hostPath := filepath.Join("/root/.local/bin", name)
+		if _, err := os.Stat(hostPath); err != nil {
+			t.Fatalf("host MCP binary %s missing: %v", hostPath, err)
+		}
+		if _, ok := execSet[hostPath]; !ok {
+			t.Fatalf("MCP binary %s not in ReviewerAgent Exec", hostPath)
+		}
+	}
+	for _, ep := range policy.Exec {
+		if ep == "/root/.local/bin" || ep == "/root/.local/bin/" {
+			t.Fatal("ReviewerAgent must not Exec-allow whole /root/.local/bin")
+		}
+		if st, err := os.Stat(ep); err == nil && st.IsDir() && (ep == "/root/.local" || ep == "/root") {
+			t.Fatalf("ReviewerAgent must not Exec-allow dir %s", ep)
+		}
+		switch filepath.Base(ep) {
+		case "herdr", "dispatch-agent", "dispatch-agent-go", "grok":
+			t.Fatalf("ReviewerAgent Exec unexpectedly contains %s", ep)
+		}
+	}
+}
+
+// TestReviewerAgentCtxmodeIsolation 安全细则一回归：CTXMODE_DB 未显式指定时注入沙盒私有
+// 数据库路径；显式指定时保留调用方值。宿主兜底只允许 ~/.local/share/ctxmode 与
+// agy-recall state；~/.local/share 与 ~/.local/share/gemini-web 绝不出现在 ReadWrite。
+func TestReviewerAgentCtxmodeIsolation(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	t.Run("default private db", func(t *testing.T) {
+		os.Unsetenv("CTXMODE_DB")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		db := envMap["CTXMODE_DB"]
+		if db == "" {
+			t.Fatalf("expected injected CTXMODE_DB, env=%v", policy.Env)
+		}
+		if !strings.HasPrefix(db, "/tmp/pi-reviewer-") || !strings.HasSuffix(db, "/ctxmode/context_mode.db") {
+			t.Fatalf("unexpected CTXMODE_DB %q", db)
+		}
+		dir := filepath.Dir(db)
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("ctxmode private dir %s missing: %v", dir, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("ctxmode private dir mode = %o, want 0700", got)
+		}
+	})
+
+	t.Run("explicit CTXMODE_DB preserved", func(t *testing.T) {
+		t.Setenv("CTXMODE_DB", "/custom/ctx.db")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		if got := parseEnvMap(policy.Env)["CTXMODE_DB"]; got != "" {
+			t.Fatalf("CTXMODE_DB must not be overridden, got %q", got)
+		}
+	})
+
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root/.local/share" || strings.HasPrefix(rw, "/root/.local/share/gemini-web") ||
+			strings.Contains(rw, "chrome-profile") {
+			t.Fatalf("ReadWrite must not widen to %q", rw)
+		}
+	}
+	foundCtxmodeShare := false
+	foundRecallState := false
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root/.local/share/ctxmode" {
+			foundCtxmodeShare = true
+		}
+		if strings.HasSuffix(rw, "/plugins/agy-recall/state") {
+			foundRecallState = true
+		}
+	}
+	if !foundCtxmodeShare {
+		t.Fatalf("expected /root/.local/share/ctxmode in ReadWrite, got %v", policy.ReadWrite)
+	}
+	if !foundRecallState {
+		t.Fatalf("expected agy-recall state dir in ReadWrite, got %v", policy.ReadWrite)
+	}
+
+	// 对照：ReadOnlyReviewer 不得注入 CTXMODE_DB、不得获得这些放宽。
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	if got := parseEnvMap(ro.Env)["CTXMODE_DB"]; got != "" {
+		t.Fatalf("ReadOnlyReviewer must not inject CTXMODE_DB, got %q", got)
+	}
+	for _, rw := range ro.ReadWrite {
+		if strings.Contains(rw, ".local/share") || strings.Contains(rw, "agy-recall") {
+			t.Fatalf("ReadOnlyReviewer must not grant %s", rw)
+		}
+	}
+}
+
+// TestReviewerAgentPigAgentDirIsolation 安全细则二回归：宿主 /root/.pig/agent 保持 100% 只读；
+// 私有 <privateTmpDir>/pig-agent 只含白名单配置文件（0600）与 extensions 只读软链；
+// PIG_CODING_AGENT_DIR 未显式指定时注入私有目录，显式指定时保留。
+func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	t.Run("default injection", func(t *testing.T) {
+		os.Unsetenv("PIG_CODING_AGENT_DIR")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		dst := envMap["PIG_CODING_AGENT_DIR"]
+		if dst == "" {
+			t.Fatalf("expected injected PIG_CODING_AGENT_DIR, env=%v", policy.Env)
+		}
+		if !strings.HasPrefix(dst, "/tmp/pi-reviewer-") || !strings.HasSuffix(dst, "/pig-agent") {
+			t.Fatalf("unexpected PIG_CODING_AGENT_DIR %q", dst)
+		}
+		info, err := os.Stat(dst)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("private pig-agent dir %s bad state: %v mode=%v", dst, err, info.Mode())
+		}
+		// 白名单配置文件 0600 拷入（宿主存在时）；sessions/.lock 等不拷。
+		hostAgent := "/root/.pig/agent"
+		for _, name := range []string{"settings.json", "models.json", "auth.json", "keybindings.json"} {
+			srcFile := filepath.Join(hostAgent, name)
+			dstFile := filepath.Join(dst, name)
+			if _, err := os.Stat(srcFile); err != nil {
+				continue
+			}
+			fi, err := os.Stat(dstFile)
+			if err != nil {
+				t.Fatalf("expected copied %s: %v", dstFile, err)
+			}
+			if got := fi.Mode().Perm(); got != 0o600 {
+				t.Fatalf("%s mode = %o, want 0600", dstFile, got)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(dst, "sessions")); !os.IsNotExist(err) {
+			t.Fatal("private pig-agent must not contain sessions")
+		}
+		// extensions 是指向宿主只读目录的软链。
+		extLink := filepath.Join(dst, "extensions")
+		fi, err := os.Lstat(extLink)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("expected extensions symlink at %s, err=%v", extLink, err)
+		}
+		if target, err := os.Readlink(extLink); err != nil || target != filepath.Join(hostAgent, "extensions") {
+			t.Fatalf("extensions symlink target = %q, want %s", target, filepath.Join(hostAgent, "extensions"))
+		}
+	})
+
+	t.Run("explicit PIG_CODING_AGENT_DIR preserved", func(t *testing.T) {
+		t.Setenv("PIG_CODING_AGENT_DIR", "/custom/agent")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		if got := parseEnvMap(policy.Env)["PIG_CODING_AGENT_DIR"]; got != "" {
+			t.Fatalf("PIG_CODING_AGENT_DIR must not be overridden, got %q", got)
+		}
+	})
+
+	// 宿主 AgentDir 绝不进 ReadWrite（含 PIG_HOME 解析形式）。
+	os.Unsetenv("PIG_CODING_AGENT_DIR")
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root/.pig" || rw == "/root/.pig/agent" || strings.HasPrefix(rw, "/root/.pig/agent/") {
+			t.Fatalf("host pig agent dir must stay read-only, ReadWrite=%q", rw)
+		}
+		if strings.Contains(rw, "pig-agent") && !strings.HasPrefix(rw, "/tmp/pi-reviewer-") {
+			t.Fatalf("unexpected pig-agent ReadWrite %q", rw)
+		}
+	}
+}
+
+// TestReviewerAgentCellCachePolicy 安全细则三回归：宿主态刷新 usage.json 为当前时间；
+// 仅 .locks 目录与 toolchains 锁文件目录进 ReadWrite，已构建 runner/产物进 Exec，
+// 且 ReadWrite 与 Exec 之间不存在任何相等或父子包含关系（W^X）。
+func TestReviewerAgentCellCachePolicy(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("ReviewerAgent Validate failed: %v", err)
+	}
+
+	// usage.json 刷新：<pigHome>/cache 下有效缓存单元 lastUsed 必须足够新
+	// （TouchUsage 有 <1h 短路，同一测试进程内最早的 ReviewerAgent 调用可能已完成写入）。
+	freshThreshold := time.Now().Unix() - 600
+	cacheRoot := "/root/.pig/cache"
+	if env := os.Getenv("PIG_HOME"); env != "" {
+		cacheRoot = filepath.Join(env, "cache")
+	}
+	checked := 0
+	for _, lang := range []string{"go", "node"} {
+		langRoot := filepath.Join(cacheRoot, "cells", lang)
+		entries, err := os.ReadDir(langRoot)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
+				continue
+			}
+			dir := filepath.Join(langRoot, ent.Name())
+			if _, err := os.Stat(filepath.Join(dir, "ready.json")); err != nil {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, "usage.json"))
+			if err != nil {
+				t.Fatalf("usage.json missing in %s: %v", dir, err)
+			}
+			var usage struct {
+				LastUsed int64 `json:"lastUsed"`
+			}
+			if err := json.Unmarshal(data, &usage); err != nil {
+				t.Fatalf("usage.json malformed in %s: %v", dir, err)
+			}
+			if usage.LastUsed < freshThreshold {
+				t.Fatalf("usage.json stale in %s: lastUsed=%d < %d", dir, usage.LastUsed, freshThreshold)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("expected at least one valid cell entry to check")
+	}
+
+	// 锁目录在 ReadWrite，缓存单元目录不在 ReadWrite。
+	rwSet := make(map[string]struct{}, len(policy.ReadWrite))
+	for _, rw := range policy.ReadWrite {
+		rwSet[rw] = struct{}{}
+	}
+	for _, dir := range []string{
+		filepath.Join(cacheRoot, "cells", "go", ".locks"),
+		filepath.Join(cacheRoot, "ext", ".locks"),
+	} {
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			if _, ok := rwSet[dir]; !ok {
+				t.Fatalf("expected %s in ReadWrite", dir)
+			}
+		}
+	}
+	if _, ok := rwSet[filepath.Join(cacheRoot, "cells")]; ok {
+		t.Fatal("cells dir itself must not be ReadWrite")
+	}
+	if _, ok := rwSet[filepath.Join(cacheRoot, "ext")]; ok {
+		t.Fatal("ext dir itself must not be ReadWrite")
+	}
+
+	// 至少一个已构建 runner 在 Exec。
+	foundRunner := false
+	for _, ep := range policy.Exec {
+		if strings.HasPrefix(ep, filepath.Join(cacheRoot, "cells", "go")+string(filepath.Separator)) &&
+			filepath.Base(ep) == "runner" {
+			foundRunner = true
+			break
+		}
+	}
+	if !foundRunner {
+		t.Fatalf("expected at least one cached runner in Exec, got %v", policy.Exec)
+	}
+
+	// W^X：ReadWrite 与 Exec 之间不存在任何相等或父子包含关系。
+	execSet := make(map[string]struct{}, len(policy.Exec)*2)
+	for _, ep := range policy.Exec {
+		execSet[ep] = struct{}{}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			execSet[r] = struct{}{}
+		}
+	}
+	for _, rw := range policy.ReadWrite {
+		normRW, err := sandbox.NormalizePath(rw)
+		if err != nil {
+			t.Fatalf("NormalizePath rw %q: %v", rw, err)
+		}
+		for ep := range execSet {
+			normEP, err := sandbox.NormalizePath(ep)
+			if err != nil {
+				continue
+			}
+			if normRW == normEP ||
+				strings.HasPrefix(normEP, normRW+string(filepath.Separator)) ||
+				strings.HasPrefix(normRW, normEP+string(filepath.Separator)) {
+				t.Fatalf("W^X violation: ReadWrite %q overlaps Exec %q", normRW, normEP)
+			}
+		}
+	}
+
+	// 对照：ReadOnlyReviewer 不得放行 .locks 或缓存产物。
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	for _, rw := range ro.ReadWrite {
+		if strings.Contains(rw, "/.pig/cache") {
+			t.Fatalf("ReadOnlyReviewer must not grant %s", rw)
+		}
+	}
+	for _, ep := range ro.Exec {
+		if strings.Contains(ep, "/.pig/cache") {
+			t.Fatalf("ReadOnlyReviewer must not Exec %s", ep)
+		}
 	}
 }
