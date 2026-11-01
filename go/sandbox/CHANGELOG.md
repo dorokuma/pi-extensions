@@ -4,7 +4,9 @@
 
 ## [Unreleased]
 
-拟发布为 **v0.2.0**（MINOR：向后兼容的新预设与 CLI 能力）。
+## [0.2.0] - 2026-11-01
+
+MINOR：向后兼容的新预设与 CLI 能力。
 
 ### Added
 
@@ -47,5 +49,6 @@
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...HEAD
+[0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...go/sandbox/v0.2.0
 [0.1.0]: https://github.com/dorokuma/pi-extensions/releases/tag/go/sandbox/v0.1.0
