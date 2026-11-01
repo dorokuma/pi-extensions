@@ -497,6 +497,11 @@ func ResolveEntryAgentPaths() []string {
 			add(m)
 		}
 	}
+	// agy stub (/root/.local/bin/agy) 会再 exec 到 antigravity-cli/bin/agy（动态链接真实本体）
+	agyStateBin := filepath.Join(homeDir(), ".gemini", "antigravity-cli", "bin")
+	for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
+		add(filepath.Join(agyStateBin, name))
+	}
 	return out
 }
 
@@ -515,8 +520,8 @@ func homeDir() string {
 //
 // 额外能力：
 //   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
-//   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）与 ~/.gemini/antigravity-cli（agy 状态，
-//     含根目录下 settings/history 等文件，以目录为最小可写单元）；
+//   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
+//     下数据子目录 + 根目录已有状态文件（不含 bin/，避免对可执行文件 W^X 写穿）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
 //
@@ -537,9 +542,27 @@ func ReviewerAgent(workdir string) Policy {
 	_ = os.MkdirAll(sessionRoot, 0o700)
 	p.ReadWrite = append(p.ReadWrite, sessionRoot)
 
+	// agy 状态：只开放数据子目录，不开放 bin/（真实 ELF 在 bin/agy，须保持只读+Exec，避免 W^X 被写穿）。
+	// 根目录下已有状态文件（settings.json / history.jsonl / *.db 等）单独按文件开放写。
 	agyStateDir := filepath.Join(homeDir(), ".gemini", "antigravity-cli")
-	_ = os.MkdirAll(agyStateDir, 0o755)
-	p.ReadWrite = append(p.ReadWrite, agyStateDir)
+	for _, sub := range []string{
+		"conversations", "cache", "scratch", "log", "crashes",
+		"annotations", "presence", "updater", "brain", "plugin_data",
+		"knowledge", "implicit", "mcp",
+	} {
+		d := filepath.Join(agyStateDir, sub)
+		_ = os.MkdirAll(d, 0o755)
+		p.ReadWrite = append(p.ReadWrite, d)
+	}
+	if entries, err := os.ReadDir(agyStateDir); err == nil {
+		for _, ent := range entries {
+			if ent.IsDir() {
+				continue
+			}
+			// 跳过指向别处的纯符号链接目标若不存在；对常规状态文件开放写
+			p.ReadWrite = append(p.ReadWrite, filepath.Join(agyStateDir, ent.Name()))
+		}
+	}
 
 	return p
 }

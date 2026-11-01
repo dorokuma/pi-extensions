@@ -245,19 +245,29 @@ func TestParseArgsReviewerAgent(t *testing.T) {
 
 	foundSession := false
 	foundAgyState := false
+	foundAgyBin := false
 	for _, rw := range pol.ReadWrite {
 		if rw == "/tmp/herdr-role-sessions" {
 			foundSession = true
 		}
-		if strings.HasSuffix(rw, "/.gemini/antigravity-cli") || strings.Contains(rw, "/.gemini/antigravity-cli") {
+		if strings.Contains(rw, "/.gemini/antigravity-cli/") {
 			foundAgyState = true
+		}
+	}
+	for _, ep := range pol.EntryAgents {
+		if strings.Contains(ep, "/.gemini/antigravity-cli/bin/agy") {
+			foundAgyBin = true
+			break
 		}
 	}
 	if !foundSession {
 		t.Fatalf("expected /tmp/herdr-role-sessions in ReadWrite, got %v", pol.ReadWrite)
 	}
 	if !foundAgyState {
-		t.Fatalf("expected antigravity-cli state dir in ReadWrite, got %v", pol.ReadWrite)
+		t.Fatalf("expected antigravity-cli data paths in ReadWrite, got %v", pol.ReadWrite)
+	}
+	if !foundAgyBin {
+		t.Fatalf("expected antigravity-cli/bin/agy in EntryAgents, got %v", pol.EntryAgents)
 	}
 	if pol.DenyNet {
 		t.Fatal("reviewer-agent must keep DenyNet=false for Magpie")
