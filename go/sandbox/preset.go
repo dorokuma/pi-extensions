@@ -764,8 +764,9 @@ func appendAgyStateReadWrite(p *Policy) {
 //     ~/.local/share/ctxmode 与 ~/.gemini/config/plugins/agy-recall/state（含
 //     /root/.agy-pro-home 对应目录），绝不放宽到 ~/.local/share 或 gemini-web；
 //   - ReadWrite（pig AgentDir 私有隔离）：宿主 /root/.pig/agent 保持 100% 只读；
-//     进入 Landlock 前把必要配置文件 0600 拷入 <privateTmpDir>/pig-agent（extensions
-//     软链指向只读宿主目录），并注入 PIG_CODING_AGENT_DIR；
+//     进入 Landlock 前把必要配置文件 0600 拷入 <privateTmpDir>/pig-agent，并在私有
+//     settings.json 中显式声明宿主扩展目录绝对路径（不再用 extensions 软链，避免
+//     cfg.Source 变成随机私有路径而脱靶 packed-go 打包缓存），注入 PIG_CODING_AGENT_DIR；
 //   - ReadWrite/Exec（Cell 缓存 W^X）：宿主态预刷新 <pigHome>/cache 下缓存单元 usage.json
 //     （TouchUsage <1h 只读短路）；仅 cells/<lang>/.locks、ext/.locks 与 toolchains 锁文件
 //     可写，仅已构建 <digest>/runner 与 cache/ext 下可执行产物可执行；
@@ -857,6 +858,7 @@ func preparePrivateCtxmodeDir(privateTmpDir string) string {
 // appendCtxmodeStateReadWrite 为宿主态 ctxmode / agy-recall 状态目录做精确兜底放行：
 //   - <home>/.local/share/ctxmode：CTXMODE_DB 显式指定指回宿主时的最小写域；
 //   - <home>/.gemini/config/plugins/agy-recall/state（覆盖 homeDir() 与 /root/.agy-pro-home）。
+//
 // 绝不加入 ~/.local/share 本身或其兄弟目录（特别是 gemini-web/chrome-profile）。
 func appendCtxmodeStateReadWrite(p *Policy) {
 	seen := make(map[string]struct{}, 4)
@@ -894,8 +896,15 @@ var pigAgentConfigFiles = []string{
 }
 
 // preparePrivatePigAgentDir 在 <privateTmpDir>/pig-agent（0700）下构建私有 AgentDir：
-// 仅当宿主 AgentDir 下对应普通文件存在时才以 0600 拷入白名单配置文件，
-// 并把 extensions 软链指向只读的宿主扩展目录。返回目录路径。
+// 仅当宿主 AgentDir 下对应普通文件存在时才以 0600 拷入白名单配置文件。返回目录路径。
+//
+// 不创建 extensions 软链：自动发现走 <agentDir>/extensions 会把 cfg.Source 记成
+// 随机私有路径（/tmp/pi-sandbox-XXXXXX/pig-agent/extensions/<ext>），packed-go 的
+// cellHash 直接对该路径取哈希，导致每次启动都脱靶宿主已构建的打包 cell。
+// 改为在私有 settings.json 中显式声明 "extensions": ["<宿主扩展目录绝对路径>"]
+// （仅当宿主 settings.json 未显式设置 extensions 字段时注入；已设置则原样保留），
+// 使 settings 条目经 ResolveConfiguredWithError 解析出的 cfg.Source 与宿主自动发现
+// 完全一致，packed cell.Key 与 goPackedCellHash 逐字节命中宿主缓存。
 func preparePrivatePigAgentDir(privateTmpDir string) string {
 	dst := filepath.Join(privateTmpDir, "pig-agent")
 	if err := os.MkdirAll(dst, 0o700); err != nil {
@@ -904,6 +913,11 @@ func preparePrivatePigAgentDir(privateTmpDir string) string {
 	_ = os.Chmod(dst, 0o700)
 
 	src := filepath.Join(pigHomeDir(), "agent")
+	srcExt := filepath.Join(src, "extensions")
+	hasHostExt := false
+	if info, err := os.Stat(srcExt); err == nil && info.IsDir() {
+		hasHostExt = true
+	}
 	for _, name := range pigAgentConfigFiles {
 		srcFile := filepath.Join(src, name)
 		info, err := os.Stat(srcFile)
@@ -914,19 +928,49 @@ func preparePrivatePigAgentDir(privateTmpDir string) string {
 		if err != nil {
 			continue
 		}
+		if name == "settings.json" && hasHostExt {
+			data = injectHostExtensionsSetting(data, srcExt)
+		}
 		_ = os.WriteFile(filepath.Join(dst, name), data, 0o600)
 	}
-
-	// extensions 软链指向宿主只读目录（宿主 /root/.pig/agent/extensions 严禁改动，
-	// 沙盒内经只读根规则保持只读）。已存在的普通目录/文件不覆盖。
-	dstExt := filepath.Join(dst, "extensions")
-	srcExt := filepath.Join(src, "extensions")
-	if _, err := os.Stat(srcExt); err == nil {
-		if _, err := os.Lstat(dstExt); os.IsNotExist(err) {
-			_ = os.Symlink(srcExt, dstExt)
+	// 宿主缺 settings.json 但存在扩展目录时，补一份最小 settings.json
+	// 声明扩展路径，保持与旧软链方案一致的加载行为（且命中打包缓存）。
+	if hasHostExt {
+		dstSettings := filepath.Join(dst, "settings.json")
+		if _, err := os.Lstat(dstSettings); os.IsNotExist(err) {
+			minimal := injectHostExtensionsSetting([]byte("{}"), srcExt)
+			_ = os.WriteFile(dstSettings, minimal, 0o600)
 		}
 	}
 	return dst
+}
+
+// injectHostExtensionsSetting 向私有 settings.json 注入 "extensions": [hostExtDir]，
+// 保留宿主原有全部键值。仅当 JSON 可解析为对象且未显式声明 extensions 时注入；
+// 解析失败或已有 extensions 字段（含显式 null/数组）一律原样返回，尊重宿主配置。
+func injectHostExtensionsSetting(data []byte, hostExtDir string) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
+		return data
+	}
+	if _, exists := obj["extensions"]; exists {
+		return data
+	}
+	obj["extensions"] = json.RawMessage(mustMarshalJSON([]string{hostExtDir}))
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
+// mustMarshalJSON 序列化不会失败的值；兜底返回 "null"（调用方已校验类型）。
+func mustMarshalJSON(v any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return []byte("null")
+	}
+	return data
 }
 
 // injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR=<privatePigAgentDir>：
@@ -1075,6 +1119,7 @@ func refreshCellUsageMetadata(pigHome string, now time.Time) int {
 //   - ReadWrite：仅锁目录 cells/<lang>/.locks、ext/.locks（宿主态预建 0755）
 //     与 toolchains 版本记录锁文件（*.json.lock 所在目录，非可执行目录）；
 //   - Exec：已构建缓存单元的 artifact 文件（cells/<lang>/<digest>/runner、cache/ext/<entry>/<artifact>）。
+//
 // 缓存单元目录本身保持只读；锁目录与可执行文件分离，不破坏 W^X。
 func appendCellCachePolicy(p *Policy, pigHome string) {
 	cacheRoot := filepath.Join(pigHome, "cache")

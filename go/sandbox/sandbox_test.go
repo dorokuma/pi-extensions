@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -1283,7 +1284,8 @@ func TestReviewerAgentCtxmodeIsolation(t *testing.T) {
 }
 
 // TestReviewerAgentPigAgentDirIsolation 安全细则二回归：宿主 /root/.pig/agent 保持 100% 只读；
-// 私有 <privateTmpDir>/pig-agent 只含白名单配置文件（0600）与 extensions 只读软链；
+// 私有 <privateTmpDir>/pig-agent 只含白名单配置文件（0600），settings.json 注入宿主
+// 扩展目录绝对路径（不再创建 extensions 软链，保证 packed-go cell.Key 与宿主一致命中缓存）；
 // PIG_CODING_AGENT_DIR 未显式指定时注入私有目录，显式指定时保留。
 func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 	tmp := t.TempDir()
@@ -1327,14 +1329,62 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dst, "sessions")); !os.IsNotExist(err) {
 			t.Fatal("private pig-agent must not contain sessions")
 		}
-		// extensions 是指向宿主只读目录的软链。
-		extLink := filepath.Join(dst, "extensions")
-		fi, err := os.Lstat(extLink)
-		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-			t.Fatalf("expected extensions symlink at %s, err=%v", extLink, err)
+		// 不再创建 extensions 软链：软链会让自动发现的 cfg.Source 指向随机私有
+		// 路径，packed-go cellHash 随之变化，永久脱靶宿主打包缓存。
+		hostExt := filepath.Join(hostAgent, "extensions")
+		srcExtExists := false
+		if info, err := os.Stat(hostExt); err == nil && info.IsDir() {
+			srcExtExists = true
 		}
-		if target, err := os.Readlink(extLink); err != nil || target != filepath.Join(hostAgent, "extensions") {
-			t.Fatalf("extensions symlink target = %q, want %s", target, filepath.Join(hostAgent, "extensions"))
+		if _, err := os.Lstat(filepath.Join(dst, "extensions")); !os.IsNotExist(err) {
+			t.Fatalf("private pig-agent must not contain extensions entry (symlink or dir), err=%v", err)
+		}
+		if srcExtExists {
+			// 私有 settings.json 必须显式声明宿主扩展目录绝对路径，并保留原有键值。
+			data, err := os.ReadFile(filepath.Join(dst, "settings.json"))
+			if err != nil {
+				t.Fatalf("expected private settings.json: %v", err)
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(data, &obj); err != nil {
+				t.Fatalf("private settings.json not a JSON object: %v", err)
+			}
+			rawExt, ok := obj["extensions"]
+			if !ok {
+				t.Fatal("private settings.json missing injected extensions entry")
+			}
+			var extEntries []string
+			if err := json.Unmarshal(rawExt, &extEntries); err != nil || len(extEntries) == 0 {
+				t.Fatalf("extensions entry must be a non-empty string array: %s err=%v", rawExt, err)
+			}
+			found := false
+			for _, e := range extEntries {
+				if e == hostExt {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("extensions entry %v does not contain host extensions dir %s", extEntries, hostExt)
+			}
+			// 宿主原有键值逐项保留（宿主 settings.json 无 extensions 字段时注入不丢项）。
+			srcData, err := os.ReadFile(filepath.Join(hostAgent, "settings.json"))
+			if err == nil {
+				var srcObj map[string]json.RawMessage
+				if err := json.Unmarshal(srcData, &srcObj); err == nil {
+					for key, srcVal := range srcObj {
+						dstVal, ok := obj[key]
+						if !ok {
+							t.Fatalf("private settings.json lost host key %q", key)
+						}
+						var srcNorm, dstNorm any
+						if json.Unmarshal(srcVal, &srcNorm) == nil && json.Unmarshal(dstVal, &dstNorm) == nil {
+							if !reflect.DeepEqual(srcNorm, dstNorm) {
+								t.Fatalf("private settings.json key %q changed: %s -> %s", key, srcVal, dstVal)
+							}
+						}
+					}
+				}
+			}
 		}
 	})
 
@@ -1344,6 +1394,48 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 		if got := parseEnvMap(policy.Env)["PIG_CODING_AGENT_DIR"]; got != "" {
 			t.Fatalf("PIG_CODING_AGENT_DIR must not be overridden, got %q", got)
+		}
+	})
+
+	t.Run("custom host extensions preserved", func(t *testing.T) {
+		os.Unsetenv("PIG_CODING_AGENT_DIR")
+		fakeHome := filepath.Join(tmp, "fakepig")
+		agentDir := filepath.Join(fakeHome, "agent")
+		if err := os.MkdirAll(filepath.Join(agentDir, "extensions"), 0o755); err != nil {
+			t.Fatalf("mkdir fake extensions: %v", err)
+		}
+		src := `{"theme":"dark","extensions":["/custom/ext-a","./rel-ext"]}`
+		if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), []byte(src), 0o600); err != nil {
+			t.Fatalf("write fake settings.json: %v", err)
+		}
+		t.Setenv("PIG_HOME", fakeHome)
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		dst := parseEnvMap(policy.Env)["PIG_CODING_AGENT_DIR"]
+		if dst == "" {
+			t.Fatal("expected injected PIG_CODING_AGENT_DIR")
+		}
+		if _, err := os.Lstat(filepath.Join(dst, "extensions")); !os.IsNotExist(err) {
+			t.Fatalf("private pig-agent must not contain extensions entry, err=%v", err)
+		}
+		data, err := os.ReadFile(filepath.Join(dst, "settings.json"))
+		if err != nil {
+			t.Fatalf("expected private settings.json: %v", err)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(data, &obj); err != nil {
+			t.Fatalf("private settings.json not a JSON object: %v", err)
+		}
+		var extEntries []string
+		if err := json.Unmarshal(obj["extensions"], &extEntries); err != nil {
+			t.Fatalf("extensions entry must stay a string array: %v", err)
+		}
+		if !reflect.DeepEqual(extEntries, []string{"/custom/ext-a", "./rel-ext"}) {
+			t.Fatalf("host custom extensions must be preserved verbatim, got %v", extEntries)
+		}
+		var theme string
+		if err := json.Unmarshal(obj["theme"], &theme); err != nil || theme != "dark" {
+			t.Fatalf("host theme must be preserved, got %s err=%v", obj["theme"], err)
 		}
 	})
 
