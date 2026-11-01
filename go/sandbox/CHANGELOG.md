@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-01
+
+PATCH：修复 reviewer-agent 下 agy 派活路径无法写状态 / 打开 TTY 的问题。
+
+### Fixed
+
+- `ReviewerAgent` 同时放行 agy 硬编码 HOME 下的状态根 `/root/.agy-pro-home/.gemini/antigravity-cli`（数据子目录 + 根级状态文件，**仍不含** `bin/`）。原先只按 `os.UserHomeDir()`/`$HOME` 开放 `~/.gemini/antigravity-cli`，与 agy 实际写入路径不一致，导致派活命令下 log / oauth token 刷新出现 `permission denied`，并表现为未登录。
+- `ReviewerAgent` 额外放行 `/dev/tty`：`dispatch-agent-go reviewer --executor agy` 使用 `-i`（`--prompt-interactive`），bubbletea 需要控制终端；仅本预设放行，不改全局 `defaultNullDevices`。
+- 根级 `bin` 符号链接（agy-pro-home 下常见）按名字显式跳过，避免被当成普通文件加入 ReadWrite 而破坏 W^X。
+
+### Tests
+
+- CLI / 预设测试断言 agy-pro-home 数据路径与 `/dev/tty` 在 ReadWrite 中；断言 `bin/` 不在 ReadWrite；断言 ReadOnlyReviewer 不获得上述放宽。
+
 ## [0.2.0] - 2026-11-01
 
 MINOR：向后兼容的新预设与 CLI 能力。
@@ -49,6 +63,7 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...HEAD
+[0.2.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...go/sandbox/v0.2.1
 [0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...go/sandbox/v0.2.0
 [0.1.0]: https://github.com/dorokuma/pi-extensions/releases/tag/go/sandbox/v0.1.0
