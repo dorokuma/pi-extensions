@@ -879,13 +879,36 @@ func TestReviewerAgentPreset(t *testing.T) {
 	}
 
 	foundSession := false
+	foundAgyProHome := false
+	foundTTY := false
+	foundBinRW := false
 	for _, rw := range policy.ReadWrite {
 		if rw == "/tmp/herdr-role-sessions" {
 			foundSession = true
 		}
+		if strings.Contains(rw, "/root/.agy-pro-home/.gemini/antigravity-cli/") {
+			foundAgyProHome = true
+		}
+		if rw == "/dev/tty" {
+			foundTTY = true
+		}
+		if rw == "/root/.gemini/antigravity-cli/bin" || rw == "/root/.agy-pro-home/.gemini/antigravity-cli/bin" ||
+			strings.HasPrefix(rw, "/root/.gemini/antigravity-cli/bin/") ||
+			strings.HasPrefix(rw, "/root/.agy-pro-home/.gemini/antigravity-cli/bin/") {
+			foundBinRW = true
+		}
 	}
 	if !foundSession {
 		t.Fatal("expected /tmp/herdr-role-sessions in ReadWrite")
+	}
+	if !foundAgyProHome {
+		t.Fatalf("expected /root/.agy-pro-home/.gemini/antigravity-cli in ReadWrite, got %v", policy.ReadWrite)
+	}
+	if !foundTTY {
+		t.Fatal("expected /dev/tty in ReviewerAgent ReadWrite")
+	}
+	if foundBinRW {
+		t.Fatal("antigravity-cli/bin must not be in ReadWrite (W^X)")
 	}
 
 	// 对照：原 ReadOnlyReviewer 仍拒绝把 ForbiddenExec 放进 Exec，且无 EntryAgents
@@ -911,6 +934,33 @@ func TestReviewerAgentPreset(t *testing.T) {
 	}
 	if err := bad.Validate(); !errors.Is(err, sandbox.ErrForbiddenExec) {
 		t.Fatalf("expected ErrForbiddenExec for dispatch-agent even with EntryAgents, got %v", err)
+	}
+}
+
+func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root" || rw == "/" {
+			t.Fatalf("ReadWrite must not widen to %q", rw)
+		}
+	}
+	// ReadOnlyReviewer 不得获得 /dev/tty 或 agy-pro-home 写权限
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	for _, rw := range ro.ReadWrite {
+		if rw == "/dev/tty" {
+			t.Fatal("ReadOnlyReviewer must not grant /dev/tty")
+		}
+		if strings.Contains(rw, ".agy-pro-home") {
+			t.Fatalf("ReadOnlyReviewer must not grant agy-pro-home RW: %s", rw)
+		}
 	}
 }
 

@@ -245,6 +245,8 @@ func TestParseArgsReviewerAgent(t *testing.T) {
 
 	foundSession := false
 	foundAgyState := false
+	foundAgyProHome := false
+	foundTTY := false
 	foundAgyBin := false
 	for _, rw := range pol.ReadWrite {
 		if rw == "/tmp/herdr-role-sessions" {
@@ -252,6 +254,12 @@ func TestParseArgsReviewerAgent(t *testing.T) {
 		}
 		if strings.Contains(rw, "/.gemini/antigravity-cli/") {
 			foundAgyState = true
+		}
+		if strings.Contains(rw, "/root/.agy-pro-home/.gemini/antigravity-cli/") {
+			foundAgyProHome = true
+		}
+		if rw == "/dev/tty" {
+			foundTTY = true
 		}
 	}
 	for _, ep := range pol.EntryAgents {
@@ -265,6 +273,12 @@ func TestParseArgsReviewerAgent(t *testing.T) {
 	}
 	if !foundAgyState {
 		t.Fatalf("expected antigravity-cli data paths in ReadWrite, got %v", pol.ReadWrite)
+	}
+	if !foundAgyProHome {
+		t.Fatalf("expected /root/.agy-pro-home/.gemini/antigravity-cli data paths in ReadWrite, got %v", pol.ReadWrite)
+	}
+	if !foundTTY {
+		t.Fatalf("expected /dev/tty in ReadWrite for agy -i / bubbletea, got %v", pol.ReadWrite)
 	}
 	if !foundAgyBin {
 		t.Fatalf("expected antigravity-cli/bin/agy in EntryAgents, got %v", pol.EntryAgents)

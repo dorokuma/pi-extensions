@@ -515,13 +515,70 @@ func homeDir() string {
 	return "/root"
 }
 
+// agyProHomeStateDir 是 agy 二进制硬编码 HOME（/root/.agy-pro-home）下的 antigravity-cli 状态根。
+// agy 不跟随 $HOME / UserHomeDir；仅放行 homeDir()/.gemini/... 时，派活路径会因写 log/oauth token 失败。
+const agyProHomeStateDir = "/root/.agy-pro-home/.gemini/antigravity-cli"
+
+// agyStateDataSubdirs 是 antigravity-cli 下需要可写的数据子目录（不含 bin/）。
+var agyStateDataSubdirs = []string{
+	"conversations", "cache", "scratch", "log", "crashes",
+	"annotations", "presence", "updater", "brain", "plugin_data",
+	"knowledge", "implicit", "mcp",
+}
+
+// agyAntigravityStateDirs 返回需要开放写权限的 antigravity-cli 状态根（去重）。
+// 同时覆盖 UserHomeDir 路径与 agy 硬编码的 /root/.agy-pro-home 路径。
+func agyAntigravityStateDirs() []string {
+	seen := make(map[string]struct{}, 2)
+	var out []string
+	add := func(d string) {
+		d = filepath.Clean(strings.TrimSpace(d))
+		if d == "" || d == "." {
+			return
+		}
+		if _, ok := seen[d]; ok {
+			return
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	add(filepath.Join(homeDir(), ".gemini", "antigravity-cli"))
+	add(agyProHomeStateDir)
+	return out
+}
+
+// appendAgyStateReadWrite 为每个 antigravity-cli 状态根开放数据子目录与根级状态文件写权限（不含 bin/）。
+func appendAgyStateReadWrite(p *Policy) {
+	for _, agyStateDir := range agyAntigravityStateDirs() {
+		for _, sub := range agyStateDataSubdirs {
+			d := filepath.Join(agyStateDir, sub)
+			_ = os.MkdirAll(d, 0o755)
+			p.ReadWrite = append(p.ReadWrite, d)
+		}
+		if entries, err := os.ReadDir(agyStateDir); err == nil {
+			for _, ent := range entries {
+				name := ent.Name()
+				// bin/ 必须保持只读+Exec；agy-pro-home 下 bin 常为指向真实 ELF 目录的符号链接，
+				// DirEntry.IsDir 对符号链接为 false，须按名字显式跳过，避免 W^X 写穿。
+				if ent.IsDir() || name == "bin" {
+					continue
+				}
+				// 根级状态文件（settings.json / history.jsonl / antigravity-oauth-token / *.db 等）
+				p.ReadWrite = append(p.ReadWrite, filepath.Join(agyStateDir, name))
+			}
+		}
+	}
+}
+
 // ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig，
 // 并开放代理会话状态目录写权限。
 //
 // 额外能力：
 //   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
 //   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
-//     下数据子目录 + 根目录已有状态文件（不含 bin/，避免对可执行文件 W^X 写穿）；
+//     与 /root/.agy-pro-home/.gemini/antigravity-cli 下数据子目录 + 根目录已有状态文件
+//     （不含 bin/，避免对可执行文件 W^X 写穿）；以及 /dev/tty（dispatch-agent-go 对 agy 使用
+//     --prompt-interactive / -i，bubbletea 需要打开控制终端）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
 //
@@ -543,26 +600,12 @@ func ReviewerAgent(workdir string) Policy {
 	p.ReadWrite = append(p.ReadWrite, sessionRoot)
 
 	// agy 状态：只开放数据子目录，不开放 bin/（真实 ELF 在 bin/agy，须保持只读+Exec，避免 W^X 被写穿）。
-	// 根目录下已有状态文件（settings.json / history.jsonl / *.db 等）单独按文件开放写。
-	agyStateDir := filepath.Join(homeDir(), ".gemini", "antigravity-cli")
-	for _, sub := range []string{
-		"conversations", "cache", "scratch", "log", "crashes",
-		"annotations", "presence", "updater", "brain", "plugin_data",
-		"knowledge", "implicit", "mcp",
-	} {
-		d := filepath.Join(agyStateDir, sub)
-		_ = os.MkdirAll(d, 0o755)
-		p.ReadWrite = append(p.ReadWrite, d)
-	}
-	if entries, err := os.ReadDir(agyStateDir); err == nil {
-		for _, ent := range entries {
-			if ent.IsDir() {
-				continue
-			}
-			// 跳过指向别处的纯符号链接目标若不存在；对常规状态文件开放写
-			p.ReadWrite = append(p.ReadWrite, filepath.Join(agyStateDir, ent.Name()))
-		}
-	}
+	// 同时覆盖 homeDir() 与 agy 硬编码 HOME（/root/.agy-pro-home），否则派活路径写 log/token 会 EACCES。
+	appendAgyStateReadWrite(&p)
+
+	// dispatch-agent-go reviewer 对 agy 使用 -i（--prompt-interactive），bubbletea 需要 /dev/tty。
+	// 仅本预设放行；不改全局 defaultNullDevices，避免扩大其他预设攻击面。
+	p.ReadWrite = append(p.ReadWrite, "/dev/tty")
 
 	return p
 }
