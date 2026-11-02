@@ -44,6 +44,9 @@ func TestClassifyTypesafeSystemOne(t *testing.T) {
 		if got := request.Header.Get("authorization"); got != "Bearer test-key" {
 			t.Errorf("authorization = %q", got)
 		}
+		if got := request.Header.Get("user-agent"); !strings.HasPrefix(got, "jev/") {
+			t.Errorf("user-agent = %q", got)
+		}
 		if request.URL.Path != "/systemone" {
 			t.Errorf("path = %q", request.URL.Path)
 		}

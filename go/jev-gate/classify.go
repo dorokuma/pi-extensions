@@ -84,6 +84,7 @@ func classifyWith(api JevAPI, model map[string]any, request sdk.ClassifierContex
 	}
 	httpRequest.Header.Set("authorization", "Bearer "+key)
 	httpRequest.Header.Set("content-type", "application/json")
+	httpRequest.Header.Set("user-agent", userAgent)
 	client := api.Client
 	if client == nil {
 		client = http.DefaultClient

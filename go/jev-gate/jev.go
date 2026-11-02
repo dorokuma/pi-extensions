@@ -38,6 +38,12 @@ const maxResponseBodyBytes = 4 << 20
 // a transport failure, so the caller reports it verbatim.
 var errResponseBodyTooLarge = errors.New("response body too large")
 
+// userAgent is sent on every request to the Magpie gateway. Magpie names the
+// caller from the product token before the first "/" or space, so "jev/1.0"
+// shows up as "jev" in its usage log instead of Go's default
+// "Go-http-client/1.1" (which Magpie files under libraries, not agents).
+const userAgent = "jev/1.0"
+
 // readBoundedBody reads one response body up to maxResponseBodyBytes + 1 so an
 // oversized body is detected without buffering it whole.
 func readBoundedBody(body io.Reader) ([]byte, error) {
@@ -241,6 +247,7 @@ func (api JevAPI) Call(ctx context.Context, payload string, questions Questions)
 	}
 	request.Header.Set("authorization", "Bearer "+key)
 	request.Header.Set("content-type", "application/json")
+	request.Header.Set("user-agent", userAgent)
 
 	client := api.Client
 	if client == nil {
