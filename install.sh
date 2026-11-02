@@ -19,7 +19,15 @@
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
-#   install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pi/agent/extensions
+#   install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pig/agent/extensions
+#
+# 部署保护（zero-node / 原生 Go 接管；详见 README『原生 Go 扩展共存保护』与
+# 『zero-node 无原生 Go 兜底保护』）：
+#   - 目标存在同名目录（含软链）且含 go.mod → 原生 Go 接管：跳过 TS 安装/级联并自愈残留 .ts。
+#   - zero-node 宿主机（无 node 且无原生 Go 目录）上，对真实 pig 扩展目录（默认目录或
+#     经 realpath -m 规范化后等于 $HOME/.pig/agent/extensions 或 registry .defaultDestDir
+#     的目录）：--all 跳过该条并自愈残留 .ts；显式单装显式 FAILED 拒绝（避免把 .ts 写进
+#     pig 扩展目录在启动时崩 pig）。PI_EXT_ALLOW_ZERO_NODE_TS=1 可显式放行（仅测试/特殊场景用）。
 #
 # 铁律相关（详见 AGENTS.md）：
 #   - --all / 位置参数都绝不可能写 herdr-agent-state.ts：external 类别剔除 + NEVERWRITE 硬白名单
@@ -51,11 +59,14 @@ Usage:
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)
-  install.sh --dest-dir <DIR> ...  override target dir; defaults to $PI_EXT_DEST_DIR or ~/.pi/agent/extensions
+  install.sh --dest-dir <DIR> ...  override target dir; defaults to $PI_EXT_DEST_DIR or ~/.pig/agent/extensions
   install.sh -h | --help           this help
 
 Env:
-  PI_EXT_DEST_DIR        default target dir (CLI --dest-dir wins over it)
+  PI_EXT_DEST_DIR            default target dir (CLI --dest-dir wins over it)
+  PI_EXT_ALLOW_ZERO_NODE_TS  set to 1 to allow TypeScript installs into the real
+                             pig extensions dir on a zero-node host (node not in PATH
+                             and no native Go extension dir); default 0 protects it
 
 Data source: federated/registry.json. This repo NEVER writes herdr-agent-state.ts.
 EOF
@@ -64,6 +75,7 @@ EOF
 # ---- 预检：md5sum 缺了必须显式失败（对齐样板：曾经的静默 exit 127 / 输出全空形态）----
 command -v md5sum >/dev/null 2>&1 || fail "md5sum not found in PATH (PATH=$PATH) — install.sh requires GNU md5sum"
 command -v jq    >/dev/null 2>&1 || fail "jq not found in PATH (PATH=$PATH) — install.sh reads federated/registry.json via jq"
+command -v realpath >/dev/null 2>&1 || fail "realpath not found in PATH (PATH=$PATH) — install.sh requires GNU coreutils realpath"
 [ -f "$REGISTRY" ] || fail "registry not found: $REGISTRY"
 jq -e . "$REGISTRY" >/dev/null 2>&1 || fail "registry is not valid JSON: $REGISTRY"
 
@@ -123,7 +135,60 @@ refuse_if_neverwrite() { # $1=destFile
   return 0
 }
 
-# ---- 目标目录解析：CLI --dest-dir > $PI_EXT_DEST_DIR > ~/.pi/agent/extensions ----
+# ---- 原生 Go 扩展接管判定（只读探测）----
+# 给定 dest 目标文件路径（<destDir>/<ext>.ts），计算同名目录 ${dest%.ts}：
+# 命中条件 = 存在同名目录（含指向目录的软链，-d 跟随软链解析）且目录内含 go.mod。
+# 不命中形态：无同名目录 / 悬空软链（-d 为假）/ 同名普通文件 / 目录但无 go.mod。
+# 命中即表示宿主机上该扩展已由原生 Go 实现接管（zero-node 上 .ts 与原生 Go 并存是
+# pig 崩溃引信），安装/级联必须跳过并自愈残留 .ts，巡检报 native Go active / DRIFT。
+native_go_ext_dir() { # $1=dest file path  → stdout: native dir | rc 1
+  local native_dir="${1%.ts}"
+  if [ "$native_dir" != "$1" ] && [ -d "$native_dir" ] && [ -f "$native_dir/go.mod" ]; then
+    printf '%s' "$native_dir"
+    return 0
+  fi
+  return 1
+}
+
+# ---- zero-node 宿主机真实 pig 扩展目录保护判定（只读探测）----
+# 背景：zero-node 宿主机（无 node）上 pig 启动若扫描到 .ts 扩展会直接崩溃。真实
+# pig 扩展目录（$HOME/.pig/agent/extensions）下，凡未被 native_go_ext_dir 接管
+# （无同名 go.mod 目录）的条目，绝不允许写入 .ts：--all 跳过并自愈残留 .ts，
+# 显式单装显式 FAILED 拒绝（PI_EXT_ALLOW_ZERO_NODE_TS=1 可放行）。
+# 命中条件（三条件同时成立）：
+#   ① 未设 PI_EXT_ALLOW_ZERO_NODE_TS=1（显式逃生门）；
+#   ② 当前环境无 node（command -v node 失败）；测试可用
+#      PI_EXT_TEST_PATH_NO_NODE=1 模拟无 node 环境（不改 PATH）；
+#   ③ 目标是真实 pig 扩展目录：EXPLICIT_DEST_DIR=0（默认目录即该路径），或
+#      EXPLICIT_DEST_DIR=1 但 DEST_DIR 经 realpath -m 规范化（自动消除尾随 `/`、`..`、
+#      `.` 并解析已存在前缀上的全部符号链接；支持末级目录尚不存在；realpath -m 异常
+#      失败时保守视为受保护、拒绝放行）后等于以下任一锚点：
+#        - $HOME/.pig/agent/extensions（$HOME 非空时；$HOME 为空则跳过该锚点）；
+#        - registry .defaultDestDir（非空时）——不硬编码 /root，既防住 env -u HOME
+#          --dest-dir /root/.pig/agent/extensions/ 之类路径等价绕过，又允许隔离单测在
+#          临时 registry.json 中把 .defaultDestDir 指到 $FAKE_DEST。
+# 显式 --dest-dir /tmp/... 等其它目录不受限，离线打包与单测在无 node 主机照常工作。
+is_zero_node_protected_dest() {
+  [ "${PI_EXT_ALLOW_ZERO_NODE_TS:-0}" != "1" ] || return 1
+  if [ "${PI_EXT_TEST_PATH_NO_NODE:-0}" != "1" ] && command -v node >/dev/null 2>&1; then
+    return 1
+  fi
+  [ "${EXPLICIT_DEST_DIR:-0}" -eq 0 ] && return 0
+  local dest_norm="" home_pig="" reg_def="" reg_pig=""
+  dest_norm="$(realpath -m -- "$DEST_DIR")" || return 0
+  if [ -n "${HOME:-}" ]; then
+    home_pig="$(realpath -m -- "$HOME/.pig/agent/extensions")" || home_pig=""
+    [ -n "$home_pig" ] && [ "$dest_norm" = "$home_pig" ] && return 0
+  fi
+  reg_def="$(jq -r '.defaultDestDir // empty' "$REGISTRY")"
+  if [ -n "$reg_def" ]; then
+    reg_pig="$(realpath -m -- "$reg_def")" || reg_pig=""
+    [ -n "$reg_pig" ] && [ "$dest_norm" = "$reg_pig" ] && return 0
+  fi
+  return 1
+}
+
+# ---- 目标目录解析：CLI --dest-dir > $PI_EXT_DEST_DIR > ~/.pig/agent/extensions ----
 DEST_DIR="${PI_EXT_DEST_DIR:-}"
 DEST_DIR_SET=0
 MODE="install"       # install | list | audit | all
@@ -153,7 +218,14 @@ fi
 if [ -z "$DEST_DIR" ]; then
   HOME_DIR="${HOME:-}"
   [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set --dest-dir / PI_EXT_DEST_DIR"
-  DEST_DIR="$HOME_DIR/.pi/agent/extensions"
+  DEST_DIR="$HOME_DIR/.pig/agent/extensions"
+fi
+# 是否显式指定目标目录（--dest-dir 或非空 PI_EXT_DEST_DIR）：供
+# is_zero_node_protected_dest 区分「默认即真实 pig 扩展目录」与「显式指向其它目录」。
+if [ "$DEST_DIR_SET" -eq 1 ] || [ -n "${PI_EXT_DEST_DIR:-}" ]; then
+  EXPLICIT_DEST_DIR=1
+else
+  EXPLICIT_DEST_DIR=0
 fi
 case "$DEST_DIR" in
   /*) ;;
@@ -178,7 +250,7 @@ validate_target_file() { # $1 = full file path
 # ---- 状态判定（list/audit 共用，只读）----
 # 打印：<status>\t<src_md5>\t<dest_md5>\t<dest_perms>
 status_of() { # $1=name  $2=dest_dir
-  local name="$1" ddir="$2" cat src dest smd5="" dmd5="(none)" perms="(n/a)" status
+  local name="$1" ddir="$2" cat src dest smd5="" dmd5="(none)" perms="(n/a)" status="" native_dir=""
   cat="$(regq "$name" '.category')"
   src="$(regq "$name" '.authority.sourcePath // ""')"
   dest="$ddir/$(regq "$name" '.destFile')"
@@ -186,6 +258,9 @@ status_of() { # $1=name  $2=dest_dir
   if [ "$cat" = "federated" ]; then
     local script; script="$(regq "$name" '.authority.installScript // ""')"
     if [ -z "$script" ] || [ ! -e "$script" ]; then ext_exist="missing"; fi
+  fi
+  if [ "$cat" != "external" ]; then
+    native_dir="$(native_go_ext_dir "$dest")" || native_dir=""
   fi
   if [ -n "$src" ] && [ ! -L "$src" ] && [ -f "$src" ] && md5_of "$src" >/dev/null 2>&1; then
     smd5="$(md5_of "$src")" || smd5=""
@@ -205,6 +280,17 @@ status_of() { # $1=name  $2=dest_dir
     else
       status="absent (herdr-managed)"
     fi
+  elif [ -n "$native_dir" ]; then
+    # 原生 Go 扩展共存：无 .ts = 正常接管；旁挂残留 .ts（即使 md5 相同）= 危险漂移。
+    if [ ! -L "$dest" ] && [ ! -e "$dest" ]; then
+      if [ "$ext_exist" != "missing" ]; then
+        status="native Go active ($native_dir)"
+      fi
+    else
+      if [ "$ext_exist" != "missing" ]; then
+        status="DRIFT (stale .ts alongside native Go ext $native_dir)"
+      fi
+    fi
   elif [ -z "$smd5" ]; then
     status="source missing: $src"
   elif [ ! -L "$dest" ] && [ ! -e "$dest" ]; then
@@ -217,7 +303,15 @@ status_of() { # $1=name  $2=dest_dir
     status="DRIFT"
   fi
   if [ "$cat" = "federated" ] && [ "$ext_exist" = "missing" ]; then
-    status="missing (upstream script not found)"
+    if [ -n "$native_dir" ]; then
+      if [ ! -L "$dest" ] && [ ! -e "$dest" ]; then
+        status="missing (upstream script not found; native Go active at $native_dir)"
+      else
+        status="DRIFT (stale .ts alongside native Go ext $native_dir; upstream script not found)"
+      fi
+    else
+      status="missing (upstream script not found)"
+    fi
   fi
   printf '%s\t%s\t%s\t%s\n' "$status" "${smd5:---}" "${dmd5}" "$perms"
 }
@@ -449,13 +543,56 @@ audit_unregistered_dest() { # $1=dest_dir
 
 # ---- hosted 安装（逐字节、md5 幂等）----
 install_hosted() { # $1=name
-  local name="$1" src dest smd5
+  local name="$1" src dest smd5 native_dir
   src="$(regq "$name" '.authority.sourcePath // ""')"
   [ -n "$src" ] || fail "hosted extension '$name' has no authority.sourcePath in registry"
   [ -f "$src" ] || fail "source not found: $src"
   dest="$DEST_DIR/$(regq "$name" '.destFile')"
   validate_target_file "$dest"
   refuse_if_neverwrite "$(regq "$name" '.destFile')"
+  # 原生 Go 扩展共存保护：同名目录含 go.mod 即由原生实现接管，跳过 TS 安装并自愈残留 .ts。
+  if native_dir="$(native_go_ext_dir "$dest")"; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if [ -L "$dest" ] || [ -e "$dest" ]; then
+        echo "[dry-run] $name (hosted): native Go extension active at $native_dir — would remove stale $dest and skip TypeScript install"
+      else
+        echo "[dry-run] $name (hosted): native Go extension active at $native_dir — would skip TypeScript install ($dest)"
+      fi
+      return 0
+    fi
+    if [ -L "$dest" ] || [ -e "$dest" ]; then
+      rm -f -- "$dest" || fail "failed to remove stale TypeScript extension: $dest"
+      CHANGED_ANY=1
+      echo "$name (hosted): skipped — native Go extension active at $native_dir (removed stale $dest)"
+    else
+      echo "$name (hosted): skipped — native Go extension active at $native_dir (TypeScript $dest not installed)"
+    fi
+    return 0
+  fi
+  # zero-node 宿主机真实 pig 扩展目录保护：无 node 且无原生 Go 目录时，绝不把 .ts
+  # 写进真实 pig 扩展目录（pig 启动扫描到 .ts 会崩溃）。--all 跳过并自愈残留 .ts；
+  # 显式单装显式 FAILED 拒绝，避免用户误以为安装生效。
+  if is_zero_node_protected_dest; then
+    if [ "$MODE" = "all" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        if [ -L "$dest" ] || [ -e "$dest" ]; then
+          echo "[dry-run] $name (hosted): zero-node host without native Go extension — would remove stale $dest and skip TypeScript install"
+        else
+          echo "[dry-run] $name (hosted): zero-node host without native Go extension — would skip TypeScript install ($dest)"
+        fi
+        return 0
+      fi
+      if [ -L "$dest" ] || [ -e "$dest" ]; then
+        rm -f -- "$dest" || fail "failed to remove stale TypeScript extension: $dest"
+        CHANGED_ANY=1
+        echo "$name (hosted): skipped — zero-node host (node not found) and no native Go extension at ${dest%.ts} (removed stale $dest; TypeScript not installed)"
+      else
+        echo "$name (hosted): skipped — zero-node host (node not found) and no native Go extension at ${dest%.ts} (TypeScript $dest not installed)"
+      fi
+      return 0
+    fi
+    fail "refusing to install TypeScript extension '$name' ($dest): node not found in PATH and no native Go extension at ${dest%.ts} — writing .ts into pig extensions on a zero-node host crashes pig at startup (pass --dest-dir <staging-dir> or PI_EXT_ALLOW_ZERO_NODE_TS=1 to override)"
+  fi
   smd5="$(md5_of "$src")" || fail "md5sum failed for source: $src"
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] $name (hosted): would install -m 644 $src -> $dest (source md5 $smd5)"
@@ -473,12 +610,56 @@ install_hosted() { # $1=name
 
 # ---- federated 安装（级联宿主仓 install.sh；缺失/失败都容忍并记 WARN）----
 install_federated() { # $1=name
-  local name="$1" script envname dest out rc
+  local name="$1" script envname dest out rc native_dir
   script="$(regq "$name" '.authority.installScript // ""')"
   envname="$(regq "$name" '.authority.installDestEnv // ""')"
   dest="$DEST_DIR/$(regq "$name" '.destFile')"
   validate_target_file "$dest"
   refuse_if_neverwrite "$(regq "$name" '.destFile')"
+  # 原生 Go 扩展共存保护：命中即跳过上游级联（不注入 PI_EXT_DEST/PI_CTXMODE_EXT），
+  # 残留 .ts 自愈清除；也避免已迁原生 Go、旧 TS 仓退役的扩展误报 upstream missing。
+  if native_dir="$(native_go_ext_dir "$dest")"; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if [ -L "$dest" ] || [ -e "$dest" ]; then
+        echo "[dry-run] $name (federated): native Go extension active at $native_dir — would remove stale $dest and skip upstream cascade"
+      else
+        echo "[dry-run] $name (federated): native Go extension active at $native_dir — would skip upstream cascade ($dest)"
+      fi
+      return 0
+    fi
+    if [ -L "$dest" ] || [ -e "$dest" ]; then
+      rm -f -- "$dest" || fail "failed to remove stale TypeScript extension: $dest"
+      CHANGED_ANY=1
+      echo "$name (federated): skipped — native Go extension active at $native_dir (cascade skipped; removed stale $dest)"
+    else
+      echo "$name (federated): skipped — native Go extension active at $native_dir (cascade skipped; $dest not installed)"
+    fi
+    return 0
+  fi
+  # zero-node 宿主机真实 pig 扩展目录保护（同 install_hosted）：无 node 且无原生
+  # Go 目录时绝不把 .ts 级联写进真实 pig 扩展目录。--all 跳过并自愈残留 .ts；
+  # 显式单装显式 FAILED 拒绝。
+  if is_zero_node_protected_dest; then
+    if [ "$MODE" = "all" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        if [ -L "$dest" ] || [ -e "$dest" ]; then
+          echo "[dry-run] $name (federated): zero-node host without native Go extension — would remove stale $dest and skip upstream cascade"
+        else
+          echo "[dry-run] $name (federated): zero-node host without native Go extension — would skip TypeScript install ($dest)"
+        fi
+        return 0
+      fi
+      if [ -L "$dest" ] || [ -e "$dest" ]; then
+        rm -f -- "$dest" || fail "failed to remove stale TypeScript extension: $dest"
+        CHANGED_ANY=1
+        echo "$name (federated): skipped — zero-node host (node not found) and no native Go extension at ${dest%.ts} (cascade skipped; removed stale $dest)"
+      else
+        echo "$name (federated): skipped — zero-node host (node not found) and no native Go extension at ${dest%.ts} (cascade skipped; TypeScript $dest not installed)"
+      fi
+      return 0
+    fi
+    fail "refusing to install TypeScript extension '$name' ($dest): node not found in PATH and no native Go extension at ${dest%.ts} — writing .ts into pig extensions on a zero-node host crashes pig at startup (pass --dest-dir <staging-dir> or PI_EXT_ALLOW_ZERO_NODE_TS=1 to override)"
+  fi
   if [ -z "$script" ] || [ ! -e "$script" ]; then
     warn "$name: missing (upstream script not found): ${script:-<none in registry>} — cannot cascade; edit the host repo instead"
     return 0
@@ -537,6 +718,10 @@ case "$MODE" in
       st="${line%%$'\t'*}"; rest="${line#*$'\t'}"; smd5="${rest%%$'\t'*}"; rest2="${rest#*$'\t'}"; dmd5="${rest2%%$'\t'*}"; perms="${rest2#*$'\t'}"
       match="MISMATCH"; if [ -n "$smd5" ] && [ "$smd5" = "$dmd5" ]; then match="MATCH"; fi
       if [ "$cat" = "external" ] || [ -z "$smd5" ]; then match="----"; fi
+      case "$st" in
+        "native Go active"*) match="NATIVE" ;;
+        DRIFT*|missing*)     match="MISMATCH" ;;
+      esac
       printf '%-17s %-9s %-34s %-5s %s\n' "$nm" "$cat" "$dmd5" "$perms" "$match — $st"
       if [ "$cat" = "federated" ]; then
         script="$(regq "$nm" '.authority.installScript // ""')"

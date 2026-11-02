@@ -14,16 +14,16 @@
 
 | 名称 | 类别 | 权威源（绝对路径） | 目标安装路径 |
 |---|---|---|---|
-| auto-continue | hosted | `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts` | `/root/.pi/agent/extensions/auto-continue.ts` |
-| no-tables | hosted | `/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts` | `/root/.pi/agent/extensions/no-tables.ts` |
-| ctx-orchestrate | hosted | `/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts` | `/root/.pi/agent/extensions/ctx-orchestrate.ts` |
-| jev-gate | hosted | `/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts` | `/root/.pi/agent/extensions/jev-gate.ts` |
-| exclude-tools-guard | hosted | `/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts` | `/root/.pi/agent/extensions/exclude-tools-guard.ts` |
-| magpie-image | hosted | `/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts` | `/root/.pi/agent/extensions/magpie-image.ts` |
-| codegraph-go | federated | `/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/codegraph-go.ts` |
-| ctxmode | federated | `/root/workspace/ctxmode/integrations/pi/ctxmode.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/ctxmode.ts` |
-| pi-cache-stats | federated | `/root/workspace/pi-cache-stats/extensions/cache-stats.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pi/agent/extensions/cache-stats.ts` |
-| herdr-agent-state | external | herdr 二进制托管（带外，无本仓/宿主仓权威源） | `/root/.pi/agent/extensions/herdr-agent-state.ts`（只读，绝不写） |
+| auto-continue | hosted | `/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts` | `/root/.pig/agent/extensions/auto-continue.ts` |
+| no-tables | hosted | `/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts` | `/root/.pig/agent/extensions/no-tables.ts` |
+| ctx-orchestrate | hosted | `/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts` | `/root/.pig/agent/extensions/ctx-orchestrate.ts` |
+| jev-gate | hosted | `/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts` | `/root/.pig/agent/extensions/jev-gate.ts` |
+| exclude-tools-guard | hosted | `/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts` | `/root/.pig/agent/extensions/exclude-tools-guard.ts` |
+| magpie-image | hosted | `/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts` | `/root/.pig/agent/extensions/magpie-image.ts` |
+| codegraph-go | federated | `/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pig/agent/extensions/codegraph-go.ts` |
+| ctxmode | federated | `/root/workspace/ctxmode/integrations/pi/ctxmode.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pig/agent/extensions/ctxmode.ts` |
+| pi-cache-stats | federated | `/root/workspace/pi-cache-stats/extensions/cache-stats.ts`（宿主仓 `integrations/pi/install.sh`） | `/root/.pig/agent/extensions/cache-stats.ts` |
+| herdr-agent-state | external | herdr 二进制托管（带外，无本仓/宿主仓权威源） | `/root/.pig/agent/extensions/herdr-agent-state.ts`（只读，绝不写） |
 
 ## 命令用法
 
@@ -37,14 +37,15 @@ bash install.sh --audit    # 只读巡检 10 扩展（md5/权限/外生脚本/he
 bash install.sh --dry-run <name...>   # 只演练，不写任何文件
 bash install.sh <name...>  # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all      # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
-bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pi/agent/extensions
+bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pig/agent/extensions
 ```
 
 ## 环境变量
 
 | 变量 | 作用 | 优先级 / 备注 |
 |---|---|---|
-| `PI_EXT_DEST_DIR` | 目标部署目录 | CLI `--dest-dir` > `$PI_EXT_DEST_DIR` > `~/.pi/agent/extensions`；须为绝对路径 |
+| `PI_EXT_DEST_DIR` | 目标部署目录 | CLI `--dest-dir` > `$PI_EXT_DEST_DIR` > `~/.pig/agent/extensions`；须为绝对路径 |
+| `PI_EXT_ALLOW_ZERO_NODE_TS` | zero-node 逃生门 | 默认 `0`；设 `1` 允许在无 `node` 且无原生 Go 目录时仍把 `.ts` 装进真实 pig 扩展目录（仅测试/特殊场景；正常使用会致 pig 启动崩溃） |
 
 可通过 `bash install.sh --help` 的 `Env:` 段自查。
 
@@ -52,6 +53,34 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 `set -euo pipefail`、`md5sum` 预检、md5 幂等（同则 `unchanged`、不动 mtime）、源缺失即失败、
 目标父目录 `mkdir -p` + `install -m 644`、DEST 非绝对/为目录显式 `FAILED` 非零退出、实质改动
 后提示 `/reload` 或新会话生效、外生脚本缺失/失败容忍并在最后一行重打 `WARN` 汇总。
+
+**原生 Go 扩展共存保护（`native_go_ext_dir`）**：当目标 `<destDir>/<ext>.ts` 存在同名目录
+（含指向目录的软链）且目录内含 `go.mod` 时，视为该扩展已由原生 Go 实现接管：
+- `install_hosted` / `install_federated` 跳过 TS 安装与上游级联，并 `rm -f` 自愈清除残留 `.ts`；
+- `--dry-run` 仅打印演练文案，不删不调；
+- `--list` 状态为 `native Go active (<dir>)`（残留 `.ts` 并存时报 `DRIFT (stale .ts alongside native Go ext ...)`；
+  若同时命中 federated 上游脚本缺失，则合并为 `missing (upstream script not found; native Go active at <dir>)` /
+  `DRIFT (stale .ts alongside native Go ext <dir>; upstream script not found)`，不掩盖注册表上游脚本路径失效）；
+- `--audit` 将 `native Go active` 标为 `NATIVE`（非 `MISMATCH`），将残留 `.ts` 并存标为 `MISMATCH — DRIFT`
+  （即使 `.ts` md5 与源一致，`match` 计算在 `case "$st"` 中显式覆盖所有 DRIFT/missing 态，绝不出现 `MATCH — DRIFT`），
+  将上游脚本缺失态（含合并态 `missing (upstream script not found; ...)`）标为 `MISMATCH`。
+
+**zero-node 无原生 Go 兜底保护（`is_zero_node_protected_dest`）**：在 zero-node 宿主机
+（`command -v node` 失败）上，pig 启动若扫描到 `.ts` 扩展会直接崩溃；因此对**真实 pig 扩展目录**——
+未显式指定目标目录（默认 `~/.pig/agent/extensions`），或 `--dest-dir` / `PI_EXT_DEST_DIR`
+显式指向经 `realpath -m` 规范化后（自动消除尾随 `/`、`..`、`.` 并解析已存在前缀上的全部符号链接，
+支持末级目录尚不存在；`realpath -m` 异常失败时保守视为受保护、拒绝放行）恰为以下**双锚点**之一的目录
+——① `$HOME/.pig/agent/extensions`（`$HOME` 非空时）或 ② `registry.json` 的 `.defaultDestDir`
+（不硬编码 `/root`，防住 `env -u HOME --dest-dir /root/.pig/agent/extensions/` 之类路径等价绕过）——
+凡 `native_go_ext_dir` 未命中（无同名含 `go.mod` 目录）的条目一律不写 `.ts`：
+- `--all`：打印 `skipped — zero-node host (node not found) and no native Go extension at <dir>`，
+  `rm -f` 自愈残留 `.ts`（含软链），退出码 `0`；`--dry-run` 仅打印演练文案；
+- 显式单装（`install.sh <name>`）：显式 `FAILED` 非零退出并输出
+  `refusing to install TypeScript extension ...`，不静默跳过、不写 `.ts`，避免用户误以为安装生效；
+- `PI_EXT_ALLOW_ZERO_NODE_TS=1` 为显式逃生门（仅测试/特殊场景）；显式 `--dest-dir` 指向其它目录
+  （如 `/tmp` 暂存目录）不受本保护限制，离线打包与单测在无 `node` 主机上照常工作；
+- 顶部预检要求 GNU coreutils `realpath`（缺失即显式 `FAILED`，与 `md5sum`/`jq` 同级预检）；
+- 测试可用 `PI_EXT_TEST_PATH_NO_NODE=1` 在不改 `PATH` 的前提下模拟无 `node` 环境。
 `--audit` 保持严格只读，在巡检完 10 项已登记扩展后，额外对目标目录（`DEST_DIR`）执行顶层差集比对与子目录递归扫描（`find -P -mindepth 2` 无限深度，不跟随符号链接、不进入符号链接目录）：
 顶层条目与 `federated/registry.json` 的 `.extensions[].destFile` 做差集，子目录**大小写不敏感**递归收集 `.ts` 文件（覆盖 `.ts` / `.TS` / `.Ts` / `.tS`；非 `.ts` 嵌套文件不逐条列，仅在汇总行计入 `nested non-.ts not listed`），
 在明细表中按 8 类 `KIND` 标注（`other *.ts` 顶层独立或残留 `.ts`［大小写不敏感］、`nested *.ts` 非 `__tests__/` 子目录内未登记 `.ts`［大小写不敏感］、`__tests__ file` 任意层级 `__tests__/` 目录内［匹配 `__tests__/*` 或 `*/__tests__/*`］的合法冻结测试文件、`historical backup` 冻结历史备份［含 `*.bak-*` 与 `*.bak`，大小写敏感］、`__tests__ dir` / `dir` 目录、`other-file` / `other`），
