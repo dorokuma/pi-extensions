@@ -18,6 +18,15 @@
   - **严格执行 `W^X`（可写与可执行完全分离）**：所有 `ReadWrite` 目录（`<workdir>/reports`、`TMPDIR`、`GOTMPDIR`、`GOCACHE`）均**不**授予 `LANDLOCK_ACCESS_FS_EXECUTE` 权限；
   - 建立独立的只读可执行目录 `/tmp/pi-reviewer-exec-*`，通过受控的 `go` 包装器与前置构建代理支持 `go build`、`go vet`、`go test`；
   - 严格限制可执行二进制白名单，显式拦截嵌套代理与调度器（`pig`、`pi`、`agy`、`grok`、`dispatch-agent`）以及直接调用 ELF 动态链接器（`ld-linux*.so*`）。
+- `sandbox.ReviewerAgent(workdir string) Policy`：在 `ReadOnlyReviewer` 之上允许**顶层**启动 `agy`/`pig`/`pi`，并对 pig 与 agy MCP 生态做四层私有隔离：
+  - **ctxmode/MCP 数据隔离**：点名放行 `ctxmode`/`codegraph-go`/`jev-mcp`/`jev-mcp-go`/`agy-recall`（含软链目标）；未显式指定 `CTXMODE_DB` 时注入 `<privateTmpDir>/ctxmode/context_mode.db`（0700）；宿主兜底仅精确放行 `~/.local/share/ctxmode` 与 `agy-recall` state，绝不放宽到 `~/.local/share` 或 `gemini-web`。
+  - **pig AgentDir 私有隔离**：宿主 `/root/.pig/agent` 保持 100% 只读；进沙盒前把白名单配置文件 0600 拷入 `<privateTmpDir>/pig-agent`，并在私有 `settings.json` 中显式声明宿主扩展目录绝对路径（**不再用 `extensions` 软链**——软链会让自动发现的 `cfg.Source` 变成随机私有路径而脱靶 packed-go 打包缓存；已有 `extensions` 数组时相对本地路径条目相对宿主 `<pigHome>/agent` 解析并在未显式排除时追加宿主扩展目录），并按需注入 `PIG_CODING_AGENT_DIR`（`PIG_USE_PI_DIRS=1` 时对称注入 `PI_CODING_AGENT_DIR`）。
+  - **Cell 缓存 W^X**：宿主态预刷新 `<PIG_HOME>/cache` 下有效缓存单元 `usage.json`（沙盒内 `TouchUsage` 命中 <1h 纯只读短路）；仅 `.locks` 目录与已有记录的 `cache/toolchains` 目录可写，仅已构建 `<digest>/runner` 与 `cache/ext` 可执行产物可执行，`ReadWrite`/`Exec` 无任何父子包含；目标路径经 `Lstat` 拒绝符号链接 + `EvalSymlinks` 校验严格位于预期根内且不与 `Exec` 重合。
+  - **XDG_RUNTIME_DIR 私有隔离**：宿主 `/run/user/0`（systemd user bus、keyring 等敏感套接字）绝不进 `ReadWrite`；在 `<privateTmpDir>` 下预建 0700 短名 `rt` 并覆写注入 `XDG_RUNTIME_DIR=<privateTmpDir>/rt`。
+
+### `sbx --preset` 失败清理
+
+`--preset reviewer` / `reviewer-agent` 在构造策略时会创建 `/tmp/pi-reviewer-*` 与 `/tmp/pi-reviewer-exec-*` 私有临时目录。若在进入 `syscall.Exec` 前的参数校验、命令解析或 `sandbox.Apply` 阶段提前退出，`sbx` 会主动清理这两个目录，不泄漏到 `/tmp`。
 
 ## 构建与测试
 
@@ -87,3 +96,8 @@ go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo -- /root/.local
 3. **被审查仓库自身的测试代码与构建期代码**：运行 `go test` 时，被审查仓库中的 `*_test.go` 代码会在沙盒内执行。由于 `pi-test-runner` 在启动测试二进制前已叠加了审查员的 Landlock 规则集且继承了 `seccomp` `PROT_EXEC` 守卫，测试代码同样无法篡改仓库源码、无法向可执行目录写入文件、也无法执行禁用二进制。
 4. **`/proc/<pid>/fd/<fd>` 路径检查的极窄 TOCTOU 窗口**：`seccomp_unotify` 通过读取 `/proc/<pid>/fd/<fd>` 校验被映射文件的路径。由于审查员对所有可执行目录均无写权限，且所有可写目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`、`reports`）均被整体禁止 `PROT_EXEC` 映射，审查员无法在可执行目录内通过硬链接或重命名制造竞争条件。
 5. **默认未开启网络隔离**：`ReadOnlyReviewer` 默认 `DenyNet: false`；若需彻底阻断 TCP 网络连接，可将 `Policy.DenyNet` 设为 `true`（要求内核 Landlock ABI >= 4）或配合 `sbx --deny-net` 使用。
+6. **`usage.json` 预刷新的时间窗口**：宿主态预刷新把 `lastUsed` 写入缓存单元；沙盒内 pig `TouchUsage` 的 `<1h` 只读短路只在「会话剩余时长 <55m」内稳定命中。`>55m` 的超长会话里 pig 可能重新尝试写 `usage.json` 临时文件并被 Landlock 拒绝——这属于 PiG 侧只读容错范围，不视为沙盒漏洞，但调用方应知晓长会话下 pig 可能报只读写入失败。
+7. **冷启动新增语言 `cells/<lang>` 需宿主先预热构建**：沙盒内 `cells/<lang>` 单元目录保持只读，新语言首次构建产物无法在沙盒内落盘；需先在宿主跑一次构建生成 `ready.json`/`runner`，后续沙盒会话才能复用。
+8. **`cache/toolchains` 目录级可写**：toolchain `*.json.lock` 与记录文件同目录，无法只放锁文件路径；仅在目录下已存在记录时才放行，不创建空可写目录。
+9. **`/tmp/herdr-role-sessions` 为同会话共享写根**：同一沙盒会话内多个角色会话共享该目录，不保证互相隔离。
+10. **Landlock 路径级 `Exec` 无一次性 `execve` 计数器**：`EntryAgents`（agy/pig/pi）顶层放行后，子进程在 OS 层仍可再 `execve` 同一路径；兜底依赖只读角色工具白名单（无 `bash`/`run_command`），`dispatch-agent`/`grok` 仍不在白名单。

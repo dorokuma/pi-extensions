@@ -160,6 +160,45 @@ func applyEnv(env []string) error {
 	return nil
 }
 
+// lookupEnvValue 返回 env 中首个 key= 前缀条目的值；未命中返回空串。
+// 供跨平台预设构造（preset.go）与 Linux 实现（landlock_linux.go）共用，
+// 必须留在无构建标签的文件中，否则 GOOS!=linux 编译缺符号。
+func lookupEnvValue(env []string, key string) string {
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return ""
+}
+
+// overrideEnvKey 将 env 中 key= 前缀条目替换为 key=val；不存在则追加。
+// 同名键出现多次时仅在首个命中位置替换一次，后续重复条目跳过（去重，
+// 消除调用方传入切片本身含重复同名键时的双键残留）。
+// 供跨平台预设构造（preset.go）与 Linux 实现（landlock_linux.go）共用，
+// 必须留在无构建标签的文件中，否则 GOOS!=linux 编译缺符号。
+func overrideEnvKey(env []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			if replaced {
+				continue
+			}
+			out = append(out, prefix+val)
+			replaced = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !replaced {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
 func (p Policy) warnf(format string, args ...any) {
 	w := p.WarnWriter
 	if w == nil {

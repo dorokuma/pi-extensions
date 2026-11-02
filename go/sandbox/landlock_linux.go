@@ -1336,34 +1336,6 @@ func runTestRunnerClient(goExecDir string) int {
 	return 0
 }
 
-func lookupEnvValue(env []string, key string) string {
-	prefix := key + "="
-	for _, kv := range env {
-		if strings.HasPrefix(kv, prefix) {
-			return strings.TrimPrefix(kv, prefix)
-		}
-	}
-	return ""
-}
-
-func overrideEnvKey(env []string, key, val string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(env)+1)
-	replaced := false
-	for _, kv := range env {
-		if strings.HasPrefix(kv, prefix) {
-			out = append(out, prefix+val)
-			replaced = true
-		} else {
-			out = append(out, kv)
-		}
-	}
-	if !replaced {
-		out = append(out, prefix+val)
-	}
-	return out
-}
-
 func removeEnvKey(env []string, key string) []string {
 	prefix := key + "="
 	out := make([]string, 0, len(env))

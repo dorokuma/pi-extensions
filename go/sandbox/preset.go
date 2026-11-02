@@ -1,12 +1,14 @@
 package sandbox
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // ReviewerReportSubdir 是 ReadOnlyReviewer 在 workdir 下默认开放写权限的报告目录名。
@@ -443,6 +445,178 @@ func IsEntryAgentPath(entryAgents []string, pathOrName string) bool {
 	return false
 }
 
+// agyHookBinaryNames 是 agy 生命周期钩子（SessionStart/PreInvocation/PreToolUse/PostToolUse/
+// PreCompress/Stop）会 exec 的钩子二进制名。来源：/root/.gemini/config/hooks.json、
+// /root/.agy-pro-home/.gemini/config/hooks.json 及插件 hooks.json（agy-recall）。
+// herdsman 是 bash 包装脚本，exec 到 $HOME/.local/lib/herdsman-go/herdsman（ELF 本体）。
+// 严禁整目录放行 ~/.local/bin（含 herdr、dispatch-agent），按名字逐个点名。
+var agyHookBinaryNames = []string{
+	"herdsman",
+	"agy-rules-hook",
+	"moshi-hook",
+	"agy-recover-400",
+	"agy-recall",
+}
+
+// agyHookLookupDirs 是在 standardBinDirs/agentLookupDirs 之外为 agy 钩子二进制
+// 追加搜索的宿主目录，覆盖 homeDir() 与硬编码 /root 两种 HOME 形态。
+func agyHookLookupDirs() []string {
+	seen := make(map[string]struct{}, 2)
+	var out []string
+	add := func(d string) {
+		d = filepath.Clean(strings.TrimSpace(d))
+		if d == "" || d == "." {
+			return
+		}
+		if _, ok := seen[d]; ok {
+			return
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	add(filepath.Join(homeDir(), ".local", "bin"))
+	add("/root/.local/bin")
+	return out
+}
+
+// ResolveAgyHookPaths 解析 agy 生命周期钩子可执行路径：逐个在 PATH、standardBinDirs、
+// agentLookupDirs、agyHookLookupDirs() 下查找 agyHookBinaryNames，校验存在、非目录、可执行，
+// 并自动 EvalSymlinks 把符号链接与真实目标一并纳入（如 agy-recall → plugins/agy-recall/bin/agy-recall）。
+// 对 herdsman 额外纳入其 bash exec 目标 ~/.local/lib/herdsman-go/herdsman 及 HERDSMAN_GO_BIN 覆盖值。
+// 不放行整个 ~/.local/bin，避免 herdr/dispatch-agent 被连带放行。
+func ResolveAgyHookPaths() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		norm, err := NormalizePath(candidate)
+		if err != nil {
+			return
+		}
+		info, err := os.Stat(norm)
+		if err != nil || info.IsDir() {
+			return
+		}
+		if info.Mode()&0o111 == 0 {
+			return
+		}
+		if _, ok := seen[norm]; !ok {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+			if rn, err := NormalizePath(resolved); err == nil {
+				if st, err := os.Stat(rn); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+					if _, ok := seen[rn]; !ok {
+						seen[rn] = struct{}{}
+						out = append(out, rn)
+					}
+				}
+			}
+		}
+	}
+
+	for _, name := range agyHookBinaryNames {
+		if lp, err := exec.LookPath(name); err == nil {
+			add(lp)
+		}
+		for _, dir := range standardBinDirs {
+			add(filepath.Join(dir, name))
+		}
+		for _, dir := range agentLookupDirs {
+			add(filepath.Join(dir, name))
+		}
+		for _, dir := range agyHookLookupDirs() {
+			add(filepath.Join(dir, name))
+		}
+	}
+
+	// herdsman 包装脚本 exec 到 herdsman-go 真实二进制；HERDSMAN_GO_BIN 优先于默认路径。
+	// 覆盖 homeDir() 与 /root 两种 HOME，确保 HOME=/root/.agy-pro-home 下同样解析到本体。
+	addHerdsmanGoBin := func(root string) {
+		add(filepath.Join(root, ".local", "lib", "herdsman-go", "herdsman"))
+	}
+	if envBin := strings.TrimSpace(os.Getenv("HERDSMAN_GO_BIN")); envBin != "" {
+		add(envBin)
+	}
+	addHerdsmanGoBin(homeDir())
+	addHerdsmanGoBin("/root")
+
+	return out
+}
+
+// mcpServerBinaryNames 是 pig / agy MCP 生态中作为独立进程被代理直接 exec 的服务二进制名。
+// 它们通过 PATH 或软链调用，经 resolveExecutableCandidate 把软链与 ELF 本体一并放行。
+// 注意：严禁整目录放行 ~/.local/bin（含 herdr/dispatch-agent/dispatch-agent-go/grok），按名字逐个点名。
+var mcpServerBinaryNames = []string{
+	"ctxmode",
+	"codegraph-go",
+	"jev-mcp",
+	"jev-mcp-go",
+	"agy-recall",
+}
+
+// resolveExecutableCandidate 校验 candidate 为存在的可执行普通文件，并把符号链接
+// 解析目标一并纳入输出（去重，保持首次出现顺序）。
+func resolveExecutableCandidate(candidate string, seen map[string]struct{}, out *[]string) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return
+	}
+	norm, err := NormalizePath(candidate)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(norm)
+	if err != nil || info.IsDir() {
+		return
+	}
+	if info.Mode()&0o111 == 0 {
+		return
+	}
+	if _, ok := seen[norm]; !ok {
+		seen[norm] = struct{}{}
+		*out = append(*out, norm)
+	}
+	if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
+		if rn, err := NormalizePath(resolved); err == nil {
+			if st, err := os.Stat(rn); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+				if _, ok := seen[rn]; !ok {
+					seen[rn] = struct{}{}
+					*out = append(*out, rn)
+				}
+			}
+		}
+	}
+}
+
+// ResolveMCPServerPaths 解析 pig / agy MCP 生态的服务二进制及其包装脚本目标：
+// ctxmode、codegraph-go、jev-mcp、jev-mcp-go、agy-recall，逐个在 PATH、
+// standardBinDirs、agentLookupDirs、agyHookLookupDirs()（覆盖 homeDir() 与 /root 两种 HOME）
+// 下查找，软链与 ELF 本体一并放行（去重）。不放行整个 ~/.local/bin。
+func ResolveMCPServerPaths() []string {
+	seen := make(map[string]struct{}, len(mcpServerBinaryNames)*2)
+	var out []string
+	for _, name := range mcpServerBinaryNames {
+		if lp, err := exec.LookPath(name); err == nil {
+			resolveExecutableCandidate(lp, seen, &out)
+		}
+		for _, dir := range standardBinDirs {
+			resolveExecutableCandidate(filepath.Join(dir, name), seen, &out)
+		}
+		for _, dir := range agentLookupDirs {
+			resolveExecutableCandidate(filepath.Join(dir, name), seen, &out)
+		}
+		for _, dir := range agyHookLookupDirs() {
+			resolveExecutableCandidate(filepath.Join(dir, name), seen, &out)
+		}
+	}
+	return out
+}
+
 // ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi 及其符号链接目标，供 ReviewerAgent 顶层启动。
 // 不把 dispatch-agent / grok 纳入；嵌套禁止无法靠 Landlock 一次性放行实现，见 ReviewerAgent 注释。
 func ResolveEntryAgentPaths() []string {
@@ -570,58 +744,43 @@ func appendAgyStateReadWrite(p *Policy) {
 	}
 }
 
-// pigLockReadWriteDirs are the narrow directories pig must write inside reviewer-agent.
-// Measured with strace (mkdirat/openat EACCES) under --preset reviewer-agent:
-//   - /root/.pig/agent: proper-lockfile mkdir/rmdir of settings.json.lock /
-//     auth.json.lock / models-store.json.lock (MAKE_DIR/REMOVE_DIR on parent;
-//     lock-path-only rules cannot acquire locks, and pre-creating lock dirs
-//     leaves them "already held").
-//   - /root/.pig/cache/cells/go: cell build locks under .locks/ plus ephemeral
-//     .build-* scratch dirs (mkdir).
-//   - /root/.pig/cache/toolchains: toolchain *.json.lock (open O_CREAT).
-//
-// Do not grant /root or the whole /root/.pig tree.
-var pigLockReadWriteDirs = []string{
-	"/root/.pig/agent",
-	"/root/.pig/cache/cells/go",
-	"/root/.pig/cache/toolchains",
-	"/run/user/0/pig",
-}
-
-// appendPigLockReadWrite grants the measured pig lock / build-scratch write set.
-// /root/.pig/cache/cells/go also goes on Exec: packed extension runners live there and
-// must be executable. Being on both ReadWrite and Exec opts the path out of
-// computeNonExecRWDirs (seccomp W^X), which is required for pig cells and is a
-// documented Known Risk limited to this cache tree.
-func appendPigLockReadWrite(p *Policy) {
-	for _, dir := range pigLockReadWriteDirs {
-		// /run/user/0/pig is ephemeral XDG runtime; create if missing so Landlock can open it.
-		if dir == "/run/user/0/pig" {
-			_ = os.MkdirAll(dir, 0o700)
-		}
-		if st, err := os.Stat(dir); err == nil && st.IsDir() {
-			p.ReadWrite = append(p.ReadWrite, dir)
-			if dir == "/root/.pig/cache/cells/go" {
-				p.Exec = append(p.Exec, dir)
-			}
-		}
-	}
-}
-
 // ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig，
 // 并开放代理会话状态目录写权限。
 //
 // 额外能力：
 //   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
+//     agy 生命周期钩子二进制（herdsman 及其 herdsman-go ELF 本体、agy-rules-hook、moshi-hook、
+//     agy-recover-400、agy-recall，含软链目标），否则 SessionStart/PreInvocation/PreToolUse/
+//     PostToolUse/PreCompress/Stop 钩子在沙盒内被 Landlock 拦截，只读子代理无法向 Herdsman
+//     注册会话/上报 agent.turn.completed；
+//   - Exec：pig / agy MCP 生态服务二进制（ctxmode / codegraph-go / jev-mcp / jev-mcp-go /
+//     agy-recall，含软链解析目标），仍不整目录放行 ~/.local/bin；
 //   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
 //     与 /root/.agy-pro-home/.gemini/antigravity-cli 下数据子目录 + 根目录已有状态文件
-//     （不含 bin/，避免对可执行文件 W^X 写穿）；/dev/tty（dispatch-agent-go 对 agy 使用
-//     --prompt-interactive / -i，bubbletea 需要打开控制终端）；以及 pig 锁路径：
-//     /root/.pig/agent（settings/auth/models-store 的 mkdir 锁父目录）、
-//     /root/.pig/cache/cells/go（.locks 与 .build-*）、/root/.pig/cache/toolchains
-//     与 /run/user/0/pig（扩展 harness；不开放整个 /root/.pig）；
+//     （不含 bin/，避免对可执行文件 W^X 写穿）；以及 /dev/tty（dispatch-agent-go 对 agy 使用
+//     --prompt-interactive / -i，bubbletea 需要打开控制终端）；
+//   - ReadWrite（ctxmode/MCP 数据隔离）：CTXMODE_DB 未显式指定时注入
+//     <privateTmpDir>/ctxmode/context_mode.db（沙盒私有 0700）；宿主兜底仅精确放行
+//     ~/.local/share/ctxmode 与 ~/.gemini/config/plugins/agy-recall/state（含
+//     /root/.agy-pro-home 对应目录），绝不放宽到 ~/.local/share 或 gemini-web；
+//   - ReadWrite（pig AgentDir 私有隔离）：宿主 /root/.pig/agent 保持 100% 只读；
+//     进入 Landlock 前把必要配置文件 0600 拷入 <privateTmpDir>/pig-agent，并在私有
+//     settings.json 中显式声明宿主扩展目录绝对路径（不再用 extensions 软链，避免
+//     cfg.Source 变成随机私有路径而脱靶 packed-go 打包缓存），注入 PIG_CODING_AGENT_DIR；
+//   - Env/ReadWrite（XDG_RUNTIME_DIR 私有隔离）：宿主 /run/user/0（systemd user bus、
+//     keyring 等敏感套接字）绝不进 ReadWrite；在 <privateTmpDir> 下预建 0700 的短名
+//     私有运行目录 rt（短名 rt 保证 XDG socket 路径远低于 sun_path 108 字节上限），
+//     并覆写注入 XDG_RUNTIME_DIR=<privateTmpDir>/rt——sbx mergeEnv 按同名键覆盖，
+//     宿主 os.Environ() 中已有的 XDG_RUNTIME_DIR=/run/user/0 被确定性替换，
+//     pig 扩展加载期 mkdir /run/user/0/pig/... 的 EACCES 不再发生；
+//   - ReadWrite/Exec（Cell 缓存 W^X）：宿主态预刷新 <pigHome>/cache 下缓存单元 usage.json
+//     （TouchUsage <1h 只读短路）；仅 cells/<lang>/.locks、ext/.locks 与 toolchains 锁文件
+//     可写，仅已构建 <digest>/runner 与 cache/ext 下可执行产物可执行；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
+//
+// 注意：herdsman 访问 /root/.herdsman（runtime.json/herdsman.sock）保持只读；
+// /root/.herdsman 绝不加入 ReadWrite，HOME=/root/.agy-pro-home 时经软链指向同一目录亦然。
 //
 // 嵌套限制（如实）：Landlock 按路径授予 EXECUTE，顶层放行后子进程通常也能再 exec 同一路径；
 // 当前实现没有 execve 计数 / 一次性 ticket。沙盒内再起 agy/pig 在 OS 层仍可能成功。
@@ -632,9 +791,11 @@ func ReviewerAgent(workdir string) Policy {
 
 	extraTools := BuildExecWhitelist([]string{"mkdir", "cp", "touch"})
 	agents := ResolveEntryAgentPaths()
+	hooks := ResolveAgyHookPaths()
 	p.EntryAgents = agents
 	p.Exec = append(p.Exec, extraTools...)
 	p.Exec = append(p.Exec, agents...)
+	p.Exec = append(p.Exec, hooks...)
 
 	sessionRoot := "/tmp/herdr-role-sessions"
 	_ = os.MkdirAll(sessionRoot, 0o700)
@@ -648,8 +809,650 @@ func ReviewerAgent(workdir string) Policy {
 	// 仅本预设放行；不改全局 defaultNullDevices，避免扩大其他预设攻击面。
 	p.ReadWrite = append(p.ReadWrite, "/dev/tty")
 
-	// pig 扩展加载与 settings/auth 需要写锁（strace 实测 EACCES 路径）；窄放行，不开放整个 /root/.pig。
-	appendPigLockReadWrite(&p)
+	// privateTmpDir 由 ReadOnlyReviewer 创建并记录在 Policy.Env 的 TMPDIR 中。
+	privateTmpDir := lookupEnvValue(p.Env, "TMPDIR")
+
+	// 安全细则一：pig / agy MCP 生态的服务二进制（ctxmode / codegraph-go / jev-mcp /
+	// jev-mcp-go / agy-recall）按名字逐个点名放行，含软链解析目标。
+	p.Exec = append(p.Exec, ResolveMCPServerPaths()...)
+
+	// 安全细则一：为沙盒内 ctxmode 提供私有数据库目录并注入 CTXMODE_DB，
+	// 避免写宿主 ~/.local/share/ctxmode（gemini-web chrome-profile 同父目录，绝不放行）。
+	privateCtxDir := preparePrivateCtxmodeDir(privateTmpDir)
+	if strings.TrimSpace(os.Getenv("CTXMODE_DB")) == "" {
+		p.Env = append(p.Env, "CTXMODE_DB="+filepath.Join(privateCtxDir, "context_mode.db"))
+	}
+	// 宿主兜底：仅精确放行 ctxmode 数据目录与 agy-recall 的状态目录；
+	// 绝不允许 ~/.local/share 整体可写（会连带 ~/.local/share/gemini-web/chrome-profile）。
+	appendCtxmodeStateReadWrite(&p)
+
+	// 安全细则二：pig AgentDir 私有隔离。宿主 /root/.pig/agent 保持 100% 只读，
+	// 沙盒内 pig 经 PIG_CODING_AGENT_DIR 指向 privateTmpDir 下的私有副本。
+	preparePrivatePigAgentDir(privateTmpDir)
+	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"))
+
+	// 安全细则三：宿主态预刷新缓存单元 usage.json（沙盒内 TouchUsage 命中 <1h 只读短路），
+	// 只放行锁目录与已构建产物，严守 W^X。
+	refreshCellUsageMetadata(pigHomeDir(), time.Now())
+	appendCellCachePolicy(&p, pigHomeDir())
+
+	// 安全细则四：XDG_RUNTIME_DIR 私有隔离。宿主 /run/user/0 内含 systemd user bus、
+	// keyring 等敏感套接字，绝不加入 ReadWrite；改为在 privateTmpDir 下预建 0700 的
+	// 短名运行目录 rt（短名 rt 确保 Unix domain socket 路径远低于 sun_path 108 字节
+	// 上限），并用 overrideEnvKey 覆写注入 XDG_RUNTIME_DIR。sbx mergeEnv 按同名键
+	// 覆盖宿主 os.Environ()，因此即使宿主已有 XDG_RUNTIME_DIR=/run/user/0 也会被
+	// 确定性替换，不留双键残留；pig 扩展加载写 /run/user/0/pig/... 的 EACCES 消除。
+	privateRtDir := preparePrivateRuntimeDir(privateTmpDir)
+	p.Env = overrideEnvKey(p.Env, "XDG_RUNTIME_DIR", privateRtDir)
 
 	return p
+}
+
+// pigHomeDir 返回宿主 PIG_HOME：$PIG_HOME 优先，其次 homeDir()/.pig，最后 /root/.pig。
+func pigHomeDir() string {
+	if v := strings.TrimSpace(os.Getenv("PIG_HOME")); v != "" {
+		if abs, err := filepath.Abs(v); err == nil {
+			return filepath.Clean(abs)
+		}
+		return filepath.Clean(v)
+	}
+	return filepath.Join(homeDir(), ".pig")
+}
+
+// preparePrivateCtxmodeDir 创建 <privateTmpDir>/ctxmode（0700）并返回路径。
+// 与 CTXMODE_DB 注入配合：ctxmode 对自定义 CTXMODE_DB 的父目录只做 MkdirAll 不再 chmod，
+// 所以这里先预建为 0700。
+func preparePrivateCtxmodeDir(privateTmpDir string) string {
+	dir := filepath.Join(privateTmpDir, "ctxmode")
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		_ = os.Chmod(dir, 0o700)
+	}
+	return dir
+}
+
+// preparePrivateRuntimeDir 创建 <privateTmpDir>/rt（0700）并返回路径。
+// 取短名 rt 是有意的：XDG_RUNTIME_DIR 会拼接 socket 文件名，短前缀保证
+// Unix domain socket 路径远低于 Linux sun_path 108 字节上限。
+// 目录落在 privateTmpDir 内，已由 ReadOnlyReviewer 的 ReadWrite 覆盖，无需额外放行。
+func preparePrivateRuntimeDir(privateTmpDir string) string {
+	dir := filepath.Join(privateTmpDir, "rt")
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		_ = os.Chmod(dir, 0o700)
+	}
+	return dir
+}
+
+// resolvePolicyPathWithin 校验 candidate 是 root 内部（不含 root 本身）的真实目录：
+// Lstat 拒绝符号链接本体，EvalSymlinks 解析后的目标必须与 resolvedRoot 下
+// 同一相对路径一致（容许 root 祖先含系统软链如 macOS /var -> /private/var，
+// 同时拒绝 root 内部任意层级的中间软链），且不得与 p.Exec 中已有路径相等或
+// 互为父子（含 Exec 条目解析后的真实路径），彻底闭合 W^X 写穿。
+// 命中任何一条拒绝规则返回 ""。
+func resolvePolicyPathWithin(candidate, root string, p *Policy) string {
+	candidate = filepath.Clean(strings.TrimSpace(candidate))
+	root = filepath.Clean(strings.TrimSpace(root))
+	if candidate == "" || candidate == "." || root == "" || root == "." {
+		return ""
+	}
+	// 相对路径必须严格落在 root 内部（不含 root 本身），不解析软链先排除
+	// .. 逃逸与拼写异常。
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return ""
+	}
+	// root 允许经祖先软链（如系统 /var -> /private/var）传入：先解析出真实根。
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil || resolvedRoot == "" {
+		return ""
+	}
+	if info, err := os.Lstat(candidate); err != nil {
+		return ""
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		// 显式拒绝符号链接本体（含指向目录的软链）；非目录一律拒绝。
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil || resolved == "" {
+		return ""
+	}
+	// 解析后的真实路径必须等于 resolvedRoot 下同一相对路径：root 祖先的
+	// 系统软链被同时解析抵消，而 root 内部任意层级软链会使 resolved 偏离
+	// expectedResolved 被拒。resolved 也必须严格位于 resolvedRoot 之内。
+	expectedResolved := filepath.Join(resolvedRoot, rel)
+	resolvedClean := filepath.Clean(resolved)
+	resolvedRootClean := filepath.Clean(resolvedRoot)
+	if resolvedClean != filepath.Clean(expectedResolved) ||
+		!strings.HasPrefix(resolvedClean, resolvedRootClean+string(filepath.Separator)) {
+		return ""
+	}
+	// 绝不与 Exec 已有路径（含其软链解析目标）重合或互为父子，避免 W^X 被写穿。
+	sep := string(filepath.Separator)
+	for _, ep := range p.Exec {
+		targets := []string{ep}
+		if norm, err := NormalizePath(ep); err == nil && norm != "" {
+			targets = append(targets, norm)
+		}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			targets = append(targets, r)
+		}
+		for _, target := range targets {
+			epClean := filepath.Clean(target)
+			if resolvedClean == epClean ||
+				strings.HasPrefix(epClean, resolvedClean+sep) ||
+				strings.HasPrefix(resolvedClean, epClean+sep) {
+				return ""
+			}
+		}
+	}
+	return resolved
+}
+
+// appendCtxmodeStateReadWrite 为宿主态 ctxmode / agy-recall 状态目录做精确兜底放行：
+//   - <home>/.local/share/ctxmode：CTXMODE_DB 显式指定指回宿主时的最小写域；
+//   - <home>/.gemini/config/plugins/agy-recall/state（覆盖 homeDir() 与 /root/.agy-pro-home）。
+//
+// 绝不加入 ~/.local/share 本身或其兄弟目录（特别是 gemini-web/chrome-profile）。
+func appendCtxmodeStateReadWrite(p *Policy) {
+	seen := make(map[string]struct{}, 4)
+	add := func(d string, mkdir bool, root string) {
+		d = filepath.Clean(strings.TrimSpace(d))
+		if d == "" || d == "." {
+			return
+		}
+		if mkdir {
+			// 仅在目标不存在时创建；已存在的软链或非常规目录不得被 MkdirAll 静默接受。
+			if _, err := os.Lstat(d); os.IsNotExist(err) {
+				_ = os.MkdirAll(d, 0o700)
+			}
+		}
+		resolved := resolvePolicyPathWithin(d, root, p)
+		if resolved == "" {
+			return
+		}
+		if _, ok := seen[resolved]; ok {
+			return
+		}
+		seen[resolved] = struct{}{}
+		p.ReadWrite = append(p.ReadWrite, resolved)
+	}
+	for _, root := range dedupeStrings([]string{homeDir(), "/root", "/root/.agy-pro-home"}) {
+		// root 限定到各自 home 根：任何软链/.. 逃逸出该根的目录一律拒绝。
+		add(filepath.Join(root, ".local", "share", "ctxmode"), false, root)
+		add(filepath.Join(root, ".gemini", "config", "plugins", "agy-recall", "state"), true, root)
+	}
+}
+
+// pigAgentConfigFiles 是拷贝进私有 pig-agent 目录的必要配置文件白名单。
+// 绝不拷贝 sessions/、logs/、crash-output/、.lock/ 目录或其它非清单文件。
+var pigAgentConfigFiles = []string{
+	"settings.json",
+	"models.json",
+	"models-store.json",
+	"auth.json",
+	"keybindings.json",
+	"trusted-projects.json",
+}
+
+// preparePrivatePigAgentDir 在 <privateTmpDir>/pig-agent（0700）下构建私有 AgentDir：
+// 仅当宿主 AgentDir 下对应普通文件存在时才以 0600 拷入白名单配置文件。返回目录路径。
+//
+// 不创建 extensions 软链：自动发现走 <agentDir>/extensions 会把 cfg.Source 记成
+// 随机私有路径（/tmp/pi-sandbox-XXXXXX/pig-agent/extensions/<ext>），packed-go 的
+// cellHash 直接对该路径取哈希，导致每次启动都脱靶宿主已构建的打包 cell。
+// 改为在私有 settings.json 中显式声明宿主扩展目录（见 injectHostExtensionsSetting：
+// 未声明时注入 [hostExtDir]，已有数组时相对路径相对宿主 <pigHome>/agent 解析并
+// 视需要追加），使 settings 条目经 ResolveConfiguredWithError 解析出的 cfg.Source
+// 与宿主自动发现完全一致，packed cell.Key 与 goPackedCellHash 逐字节命中宿主缓存。
+func preparePrivatePigAgentDir(privateTmpDir string) string {
+	dst := filepath.Join(privateTmpDir, "pig-agent")
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return dst
+	}
+	_ = os.Chmod(dst, 0o700)
+
+	src := filepath.Join(pigHomeDir(), "agent")
+	srcExt := filepath.Join(src, "extensions")
+	hasHostExt := false
+	if info, err := os.Stat(srcExt); err == nil && info.IsDir() {
+		hasHostExt = true
+	}
+	for _, name := range pigAgentConfigFiles {
+		srcFile := filepath.Join(src, name)
+		info, err := os.Stat(srcFile)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(srcFile)
+		if err != nil {
+			continue
+		}
+		if name == "settings.json" && hasHostExt {
+			data = injectHostExtensionsSetting(data, srcExt)
+		}
+		_ = os.WriteFile(filepath.Join(dst, name), data, 0o600)
+	}
+	// 宿主缺 settings.json 但存在扩展目录时，补一份最小 settings.json
+	// 声明扩展路径，保持与旧软链方案一致的加载行为（且命中打包缓存）。
+	if hasHostExt {
+		dstSettings := filepath.Join(dst, "settings.json")
+		if _, err := os.Lstat(dstSettings); os.IsNotExist(err) {
+			minimal := injectHostExtensionsSetting([]byte("{}"), srcExt)
+			_ = os.WriteFile(dstSettings, minimal, 0o600)
+		}
+	}
+	return dst
+}
+
+// injectHostExtensionsSetting 向私有 settings.json 注入宿主扩展目录 hostExtDir，
+// 保留宿主原有全部键值：
+//   - 未声明 "extensions"：注入 [hostExtDir]；
+//   - "extensions" 为 null 或非数组（含解析失败）：原样返回，尊重宿主配置；
+//   - "extensions" 为字符串数组：相对本地路径条目（非空，且不以 / ~ - !
+//     npm: git: http:// https:// 开头；以 + 开头则保留前缀后对剩余路径按同规则
+//     解析）相对宿主 <pigHome>/agent（即 filepath.Dir(hostExtDir)）解析为绝对路径，
+//     排除项（- / ! 前缀）中的相对路径同样改写为相对宿主 agentDir 的绝对排除路径；
+//     若数组经解析后未包含等价 hostExtDir（含 "./extensions"/"extensions"/
+//     "+./extensions"/末尾带 / 等写法）且未显式排除（"-"/"!" 前缀 + hostExtDir /
+//     "extensions" / "./extensions" / 解析后等价路径），追加 hostExtDir——
+//     PIG_CODING_AGENT_DIR 改指私有目录后自动发现的 <agentDir>/extensions 已不存在，
+//     不追加会丢失宿主默认扩展。
+func injectHostExtensionsSetting(data []byte, hostExtDir string) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
+		return data
+	}
+	raw, exists := obj["extensions"]
+	if !exists {
+		obj["extensions"] = json.RawMessage(mustMarshalJSON([]string{hostExtDir}))
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return data
+		}
+		return out
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		// 显式 null：原样保留，尊重宿主配置。
+		return data
+	}
+
+	var entries []string
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		// null / 非数组 / 非字符串元素：原样保留。
+		return data
+	}
+
+	agentDir := filepath.Dir(hostExtDir)
+	foundHostExt := false
+	excluded := false
+	out := make([]string, 0, len(entries)+1)
+	for _, e := range entries {
+		// 解析后比对："./extensions"、"extensions"、"+./extensions"、末尾带 /
+		// 等写法都会解析为同一 hostExtDir，不得二次追加造成重复。
+		resolvedEntry := resolveHostExtensionEntry(e, agentDir)
+		if rest, ok := strings.CutPrefix(resolvedEntry, "+"); ok {
+			if filepath.Clean(rest) == filepath.Clean(hostExtDir) {
+				foundHostExt = true
+			}
+		} else if filepath.Clean(resolvedEntry) == filepath.Clean(hostExtDir) {
+			foundHostExt = true
+		}
+		// 显式排除项：- / ! 前缀。除 "extensions" 组名外，相对路径条目在私有
+		// AgentDir 下会失配（相对 <privateTmpDir>/pig-agent 解析），统一改写为
+		// 相对宿主 agentDir 的绝对排除路径。
+		if e != "" && (e[0] == '-' || e[0] == '!') {
+			rest := e[1:]
+			if rest == "extensions" || rest == "./extensions" ||
+				filepath.Clean(rest) == filepath.Clean(hostExtDir) {
+				excluded = true
+			} else if rel, ok := strings.CutPrefix(rest, "./"); ok {
+				if filepath.Join(agentDir, rel) == filepath.Clean(hostExtDir) {
+					excluded = true
+				}
+			} else if rel, ok := strings.CutPrefix(rest, "../"); ok {
+				if filepath.Clean(filepath.Join(agentDir, "../"+rel)) == filepath.Clean(hostExtDir) {
+					excluded = true
+				}
+			}
+			// 仅 ./ ../ 开头的相对路径排除项改写为相对宿主 agentDir 的绝对路径；
+			// 裸名（如 "extensions"、"excluded"）是扩展名排除而非路径，原样保留。
+			if strings.HasPrefix(rest, "./") || strings.HasPrefix(rest, "../") {
+				resolvedEntry = e[:1] + filepath.Join(agentDir, rest)
+			}
+		}
+		out = append(out, resolvedEntry)
+	}
+	if !foundHostExt && !excluded {
+		out = append(out, hostExtDir)
+	}
+	obj["extensions"] = json.RawMessage(mustMarshalJSON(out))
+	data2, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return data2
+}
+
+// resolveHostExtensionEntry 把 settings.json extensions 数组中的相对本地路径条目
+// 解析为相对 agentDir 的绝对路径。非路径条目（npm:/git:/http(s)://）、绝对路径、
+// ~ 开头、空串以及 - / ! 显式排除前缀一律原样返回；+ 前缀（启用标记）保留前缀
+// 后对剩余路径按同一规则解析。
+func resolveHostExtensionEntry(entry, agentDir string) string {
+	if entry == "" {
+		return entry
+	}
+	prefix := ""
+	rest := entry
+	switch rest[0] {
+	case '+':
+		prefix = "+"
+		rest = rest[1:]
+	case '-', '!':
+		// 显式排除项：按原样保留，不做路径解析（含 "-extensions" 整组排除）。
+		return entry
+	}
+	if isAbsoluteExtensionPath(rest) {
+		return prefix + rest
+	}
+	return prefix + filepath.Join(agentDir, rest)
+}
+
+// isAbsoluteExtensionPath 判断 extensions 条目是否为绝对路径 / 非本地相对路径：
+// 空串、/ 或 ~ 开头、URI 类前缀（npm: git: http:// https://）返回 true。
+// - / ! 前缀由调用方先行剥离/短路，不在此处判断。
+func isAbsoluteExtensionPath(rest string) bool {
+	if rest == "" {
+		return true
+	}
+	if rest[0] == '/' || rest[0] == '~' {
+		return true
+	}
+	for _, scheme := range []string{"npm:", "git:", "http://", "https://"} {
+		if strings.HasPrefix(rest, scheme) {
+			return true
+		}
+	}
+	return false
+}
+
+// mustMarshalJSON 序列化不会失败的值；兜底返回 "null"（调用方已校验类型）。
+func mustMarshalJSON(v any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return []byte("null")
+	}
+	return data
+}
+
+// injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR=<privatePigAgentDir>：
+// 仅当调用方未显式将 PIG_CODING_AGENT_DIR（或 Policy.Env 同名键）指向其它可写目录时生效。
+// 对称地，当宿主环境或 env 中 PIG_USE_PI_DIRS == "1"（pig 以 PI_* 变量名读取 AgentDir）
+// 且 PI_CODING_AGENT_DIR 在宿主环境与 env 中均未设置时，追加
+// PI_CODING_AGENT_DIR=<privatePigAgentDir>，保持私有隔离不被宿主默认路径打穿。
+func injectPigCodingAgentDir(env []string, privatePigAgentDir string) []string {
+	if strings.TrimSpace(os.Getenv("PIG_CODING_AGENT_DIR")) != "" {
+		return env
+	}
+	if lookupEnvValue(env, "PIG_CODING_AGENT_DIR") != "" {
+		return env
+	}
+	env = append(env, "PIG_CODING_AGENT_DIR="+privatePigAgentDir)
+
+	usePiDirs := os.Getenv("PIG_USE_PI_DIRS") == "1" || lookupEnvValue(env, "PIG_USE_PI_DIRS") == "1"
+	if usePiDirs {
+		if strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")) == "" &&
+			lookupEnvValue(env, "PI_CODING_AGENT_DIR") == "" {
+			env = append(env, "PI_CODING_AGENT_DIR="+privatePigAgentDir)
+		}
+	}
+	return env
+}
+
+// cellReadyMeta 是缓存单元 ready.json 中校验所需的字段。
+type cellReadyMeta struct {
+	InputDigest string `json:"inputDigest"`
+	Artifact    string `json:"artifact"`
+	Size        int64  `json:"size"`
+	Created     int64  `json:"created"`
+}
+
+// validCellEntryDir 判断 dir 是否为含有效 ready.json 的缓存单元目录：
+// ready.json 可解析、Created>0、目录名与 InputDigest 绑定（<digest> 或 <name>-<digest>）、
+// artifact 名为单路径元素且对应普通文件大小一致。与 PiG runtimecell.readReadyMetadata 对齐。
+func validCellEntryDir(dir string) (cellReadyMeta, string, bool) {
+	data, err := os.ReadFile(filepath.Join(dir, "ready.json"))
+	if err != nil {
+		return cellReadyMeta{}, "", false
+	}
+	var meta cellReadyMeta
+	if json.Unmarshal(data, &meta) != nil || meta.Created <= 0 {
+		return cellReadyMeta{}, "", false
+	}
+	base := filepath.Base(dir)
+	if meta.InputDigest == "" || (base != meta.InputDigest && !strings.HasSuffix(base, "-"+meta.InputDigest)) {
+		return cellReadyMeta{}, "", false
+	}
+	name := meta.Artifact
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || filepath.Base(name) != name {
+		return cellReadyMeta{}, "", false
+	}
+	artifactPath := filepath.Join(dir, name)
+	info, err := os.Lstat(artifactPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != meta.Size {
+		return cellReadyMeta{}, "", false
+	}
+	return meta, artifactPath, true
+}
+
+// usageTouchMinInterval 是 touchUsageJSON 的跳过重写窗口：lastUsed 距今小于该值则只读短路。
+// 取 5m，比沙盒内 pig 的 PiG runtimecell.TouchUsage <1h 短路更紧，确保宿主态预刷新后
+// usage.json 足够新：<55m 的沙盒会话内 pig 运行期 <1h 短路稳定命中、不向缓存目录
+// 写临时文件（>55m 超长会话属 PiG 侧只读容错范围外，见 README Known Risks）。
+const usageTouchMinInterval = 5 * time.Minute
+
+// touchUsageJSON 与 PiG runtimecell.TouchUsage 同形：<usageTouchMinInterval（5m）
+// 或未来时间戳只读短路，否则原子写 <dir>/usage.json（tmp + rename，0644）。
+// 宿主态调用，沙盒内不会执行；窗口比 pig 运行期 <1h 短路更紧是有意的。
+func touchUsageJSON(entryDir string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if data, err := os.ReadFile(filepath.Join(entryDir, "usage.json")); err == nil {
+		var current struct {
+			LastUsed int64 `json:"lastUsed"`
+		}
+		if json.Unmarshal(data, &current) == nil && current.LastUsed > 0 {
+			last := time.Unix(current.LastUsed, 0)
+			if last.After(now) || now.Sub(last) < usageTouchMinInterval {
+				return nil
+			}
+		}
+	}
+	data, err := json.Marshal(struct {
+		LastUsed int64 `json:"lastUsed"`
+	}{LastUsed: now.Unix()})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(entryDir, ".usage-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(entryDir, "usage.json"))
+}
+
+// cellCacheEntryDirs 返回缓存根下全部缓存单元目录（ext/<entry> 与 cells/<lang>/<entry>）。
+// 与 PiG runtimecell.cacheEntryPaths 同构：跳过点开头目录，tombstone 除外。
+func cellCacheEntryDirs(cacheRoot string) []string {
+	var paths []string
+	addEntries := func(root string) {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return
+		}
+		for _, ent := range entries {
+			// DirEntry.IsDir 对符号链接为 false，软链条目一律跳过（防逃逸）。
+			if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
+				continue
+			}
+			name := ent.Name()
+			if strings.HasPrefix(name, ".") && !strings.HasPrefix(name, ".tombstone-") {
+				continue
+			}
+			paths = append(paths, filepath.Join(root, name))
+		}
+	}
+	addEntries(filepath.Join(cacheRoot, "ext"))
+	cellsRoot := filepath.Join(cacheRoot, "cells")
+	if langs, err := os.ReadDir(cellsRoot); err == nil {
+		for _, lang := range langs {
+			if lang.Type()&os.ModeSymlink != 0 || !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
+				continue
+			}
+			addEntries(filepath.Join(cellsRoot, lang.Name()))
+		}
+	}
+	return paths
+}
+
+// refreshCellUsageMetadata 在进入 Landlock 前（宿主态）把 <pigHome>/cache 下
+// 所有含有效 ready.json 的缓存单元 usage.json 原子刷新为 now.Unix()，
+// 确保沙盒内 pig 的 TouchUsage 命中 <1h 纯只读短路、不向缓存目录写临时文件。
+// 返回实际刷新的单元数；调用方应将 now 取在进入 Landlock 前不久。
+func refreshCellUsageMetadata(pigHome string, now time.Time) int {
+	cacheRoot := filepath.Join(pigHome, "cache")
+	refreshed := 0
+	for _, dir := range cellCacheEntryDirs(cacheRoot) {
+		if _, _, ok := validCellEntryDir(dir); !ok {
+			continue
+		}
+		if err := touchUsageJSON(dir, now); err == nil {
+			refreshed++
+		}
+	}
+	return refreshed
+}
+
+// appendCellCachePolicy 为 pig 缓存追加最小权限：
+//   - ReadWrite：仅锁目录 cells/<lang>/.locks、ext/.locks（宿主态预建 0755）
+//     与 toolchains 版本记录锁文件（*.json.lock 所在目录，非可执行目录）；
+//   - Exec：已构建缓存单元的 artifact 文件（cells/<lang>/<digest>/runner、cache/ext/<entry>/<artifact>）。
+//
+// 缓存单元目录本身保持只读；锁目录与可执行文件分离，不破坏 W^X。
+func appendCellCachePolicy(p *Policy, pigHome string) {
+	cacheRoot := filepath.Join(pigHome, "cache")
+	// cacheRoot 自身是软链视为非预期布局直接返回；祖先目录含系统软链（如
+	// macOS /var -> /private/var）不受影响——resolvePolicyPathWithin 会把
+	// root 与其子项解析到同一真实根下比较。
+	if info, err := os.Lstat(cacheRoot); err != nil ||
+		info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return
+	}
+
+	// 先收集已构建产物进 Exec，再处理锁目录 ReadWrite：使 addRW 内的
+	// resolvePolicyPathWithin 能看到完整 Exec 集，.locks 软链指向 artifact
+	// 目录时能被 Exec 重合检查拒绝，严守 W^X。
+	seenExec := make(map[string]struct{}, 8)
+	for _, dir := range cellCacheEntryDirs(cacheRoot) {
+		_, artifactPath, ok := validCellEntryDir(dir)
+		if !ok {
+			continue
+		}
+		info, err := os.Stat(artifactPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		// 缓存产物按普通文件处理：仅放行带执行位的真实文件。
+		if info.Mode()&0o111 == 0 {
+			continue
+		}
+		norm, err := NormalizePath(artifactPath)
+		if err != nil {
+			continue
+		}
+		if _, ok := seenExec[norm]; !ok {
+			seenExec[norm] = struct{}{}
+			p.Exec = append(p.Exec, norm)
+		}
+	}
+
+	seenRW := make(map[string]struct{}, 4)
+	addRW := func(d string) {
+		d = filepath.Clean(d)
+		if _, ok := seenRW[d]; ok {
+			return
+		}
+		seenRW[d] = struct{}{}
+		// 仅当目标不存在时才创建；已存在的软链/非常规目录不被 MkdirAll 静默接受。
+		if _, err := os.Lstat(d); os.IsNotExist(err) {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				return
+			}
+		}
+		// Lstat 拒绝软链本体 + EvalSymlinks 校验严格位于 cacheRoot 内 + 不与 Exec 重合。
+		resolved := resolvePolicyPathWithin(d, cacheRoot, p)
+		if resolved == "" {
+			return
+		}
+		p.ReadWrite = append(p.ReadWrite, resolved)
+	}
+
+	// 锁目录：cells/<lang>/.locks 与 ext/.locks。
+	addRW(filepath.Join(cacheRoot, "ext", ".locks"))
+	cellsRoot := filepath.Join(cacheRoot, "cells")
+	if langs, err := os.ReadDir(cellsRoot); err == nil {
+		for _, lang := range langs {
+			if lang.Type()&os.ModeSymlink != 0 || !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
+				continue
+			}
+			addRW(filepath.Join(cellsRoot, lang.Name(), ".locks"))
+		}
+	}
+	// toolchains 版本记录的锁文件 (*.json.lock)：锁文件与记录同目录，
+	// 仅当目录下已有记录或锁文件时预建并放行（不创建空的可写目录）。
+	toolchainsDir := filepath.Join(cacheRoot, "toolchains")
+	if entries, err := os.ReadDir(toolchainsDir); err == nil {
+		hasRecords := false
+		for _, ent := range entries {
+			name := ent.Name()
+			if !ent.IsDir() && (strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".json.lock")) {
+				hasRecords = true
+				break
+			}
+		}
+		if hasRecords {
+			addRW(toolchainsDir)
+		}
+	}
+}
+
+// dedupeStrings 去重并保持首次出现顺序。
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	var out []string
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }

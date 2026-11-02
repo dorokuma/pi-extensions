@@ -4,6 +4,105 @@
 
 ## [Unreleased]
 
+MINOR（未发版草拟，原 [0.3.0] 段落合并于此）：以四层私有隔离取代 `0.2.2` 的
+宿主目录写放行与 `cells/go` 目录级 RW∩Exec W^X 例外，向后兼容地补齐
+reviewer-agent 预设对 pig 与 agy MCP 生态的安全修复（ctxmode/MCP 数据隔离、
+pig AgentDir 私有隔离、Cell 缓存 W^X 预热、XDG_RUNTIME_DIR 私有隔离），并补齐
+初审确认的 7 项修复（SBX-M1..M3、SBX-S1..S4）。
+
+### Added
+
+- `ReviewerAgent` 在 `Policy.Exec` 中按名字逐个点名放行 MCP 服务二进制
+  `ctxmode` / `codegraph-go` / `jev-mcp` / `jev-mcp-go` / `agy-recall`，经
+  `ResolveMCPServerPaths()` 同时覆盖 PATH、`standardBinDirs`、`agentLookupDirs` 与
+  `agyHookLookupDirs()`（homeDir() 与 /root 两种 HOME），并把软链解析目标一并放行。
+  依旧不整目录放行 `~/.local/bin`（`herdr`、`dispatch-agent`、`dispatch-agent-go`、
+  `grok` 不进白名单）。
+- ctxmode 私有数据库：`CTXMODE_DB` 未显式指定时，`Policy.Env` 注入
+  `CTXMODE_DB=<privateTmpDir>/ctxmode/context_mode.db`（宿主态预建 0700；
+  `go/ctxmode` 的 `roleEnviron` 不经滤地透传环境，沙盒内 ctxmode 直接读取该值）。
+  宿主兜底仅精确放行 `~/.local/share/ctxmode` 与
+  `~/.gemini/config/plugins/agy-recall/state`（覆盖 `homeDir()`、`/root`、
+  `/root/.agy-pro-home`），绝不放宽到 `~/.local/share` 或触碰
+  `~/.local/share/gemini-web/chrome-profile`。
+- pig AgentDir 私有隔离：进入 Landlock 前在 `<privateTmpDir>/pig-agent`（0700）下
+  以 0600 拷入白名单配置文件（`settings.json`、`models.json`、`models-store.json`、
+  `auth.json`、`keybindings.json`、`trusted-projects.json`，不拷 `sessions/`、`.lock`、
+  日志等），并在私有 `settings.json` 中经 `injectHostExtensionsSetting` 显式声明
+  宿主扩展目录绝对路径（**不再创建 `extensions` 软链**——软链会让自动发现的
+  `cfg.Source` 变成随机私有路径而脱靶 packed-go 打包缓存）。
+  `PIG_CODING_AGENT_DIR` 未被调用方显式指定时注入私有目录；显式指定时保留。
+  宿主 `/root/.pig/agent` 保持 100% 只读，绝不进 `Policy.ReadWrite`。
+- Cell 缓存预热与最小权限：宿主态在进入 Landlock 前扫描 `<PIG_HOME>/cache`
+  （`PIG_HOME` 缺省取 `~/.pig`）下含有效 `ready.json` 的缓存单元，以原子写把
+  `usage.json` 的 `lastUsed` 刷新为当前 Unix 秒（与 PiG `runtimecell.TouchUsage`
+  同语义，沙盒内命中 <1h 纯只读短路，不写 `<digest>/` 临时文件）。
+  仅 `cells/<lang>/.locks`、`ext/.locks`（宿主态预建 0755）与 `cache/toolchains`
+  版本记录目录（含 `*.json.lock`）进 `ReadWrite`；仅已构建缓存单元的 artifact
+  （`cells/<lang>/<digest>/runner`、`cache/ext/<entry>/<artifact>` 带执行位普通文件）
+  进 `Exec`。
+
+### Changed（相对 `0.2.2` 行为）
+
+- **废弃并移除** `0.2.2` 的 `pigLockReadWriteDirs` / `appendPigLockReadWrite`：不再向
+  `/root/.pig/agent`、`/root/.pig/cache/cells/go`、`/root/.pig/cache/toolchains`、
+  `/run/user/0/pig` 授予宿主写权限；`cells/go` 目录本身不再进入 `Exec`（
+  0.2.2 的目录级 RW∩Exec W^X 例外取消，改为仅已构建 artifact 文件 Exec、
+  仅 `.locks` 子目录与已有记录的 `toolchains` 目录可写）。
+- **四层私有隔离**（完整保留本分支方案）：
+  - `ResolveAgyHookPaths()` / `ResolveMCPServerPaths()` 按名放行 `ctxmode`、
+    `codegraph-go`、`jev-mcp`、`jev-mcp-go`、`agy-recall` 及软链目标；
+  - 私有 `CTXMODE_DB`（`<privateTmpDir>/ctxmode/context_mode.db`）+ 精确宿主兜底
+    （`appendCtxmodeStateReadWrite`）；
+  - 私有 `PIG_CODING_AGENT_DIR`（宿主 `/root/.pig/agent` 100% 只读，`settings.json`
+    经 `injectHostExtensionsSetting` 声明宿主扩展目录）；
+  - 宿主态预刷新缓存单元 `usage.json` + `appendCellCachePolicy`（严守 W^X）；
+  - 私有短名 `XDG_RUNTIME_DIR=<privateTmpDir>/rt`（宿主 `/run/user/0` 100% 只读）。
+
+### Fixed（初审 7 项）
+
+- **SBX-M1**（跨平台编译）：`lookupEnvValue` / `overrideEnvKey` 自 `landlock_linux.go`
+  移入无构建标签的 `sandbox.go`，`GOOS=darwin` 编译恢复通过；测试侧把仅 Linux 可用的
+  `occupySeccompListenerSlot` 拆分至 `sandbox_linux_test.go` + `sandbox_other_test.go` 存根。
+- **SBX-M2**（防软链逃逸与 W^X 绕过）：新增 `resolvePolicyPathWithin`，
+  `appendCtxmodeStateReadWrite` 与 `appendCellCachePolicy` 对目标路径 `Lstat` 拒绝
+  符号链接、`EvalSymlinks` 校验严格位于预期根之内且不与 `Policy.Exec` 已有路径重合。
+- **SBX-M3**（`settings.json` 已有 `extensions` 数组）：`injectHostExtensionsSetting`
+  支持把相对本地路径条目相对宿主 `<pigHome>/agent` 解析为绝对路径；未含等价
+  `hostExtDir` 且未显式排除（`-`/`!` 前缀或 `-extensions`/`!extensions`）时追加，
+  避免 `PIG_CODING_AGENT_DIR` 改指私有目录后丢失宿主默认扩展；`null`/非数组原样保留。
+- **SBX-S1**（`PIG_USE_PI_DIRS=1` 对称注入）：`injectPigCodingAgentDir` 在
+  `PIG_USE_PI_DIRS=1` 且 `PI_CODING_AGENT_DIR` 未设置时对称追加私有目录。
+- **SBX-S2**（CLI 预 `Exec` 失败清理）：`sbx` 在 `--preset` 已生成私有 `TMPDIR` /
+  `PI_SANDBOX_GO_EXEC_DIR` 后、进入 `syscall.Exec` 前的参数校验/二进制查找/沙盒初始化
+  错误分支，主动 `os.RemoveAll` 清理，避免泄漏 `/tmp/pi-reviewer-*`。
+- **SBX-S3**（测试隔离）：测试内裸 `os.Unsetenv` 全部改为 `t.Setenv` / `unsetEnv`（
+  带 `t.Cleanup` 还原）；新增用例默认绑定 `t.TempDir()` 构造的隔离 `PIG_HOME` / `HOME`，
+  不改写宿主真实 `/root/.pig/cache` 或 `~/.local/share/gemini-web/chrome-profile`。
+- **SBX-S4**（文档对齐）：README、`preset.go` 注释（`usageTouchMinInterval`、
+  `injectHostExtensionsSetting`）与本文件更新，清理过时 `extensions` 软链表述。
+
+### Security
+
+- 沙盒内 pig 不再拥有对宿主 AgentDir 的任何写权限；`usage.json` 刷新把
+  运行期 `TouchUsage` 变为纯只读短路，`<digest>/` 单元目录保持只读。
+- 新单测断言 `~/.local/share` 与 `~/.local/share/gemini-web` 绝不出现在
+  `Policy.ReadWrite`，并断言 `Policy.ReadWrite` 与 `Policy.Exec` 之间不存在
+  任何相等或父子包含关系（W^X）。
+
+### Known Risks（继承并补充）
+
+- `usage.json` 预刷新后，`<55m` 会话内 pig `TouchUsage` 命中 `<1h` 只读短路；
+  `>55m` 超长会话属 PiG 侧只读容错范围外（可能回退为写临时文件并被 Landlock 拒绝）。
+- 冷启动新增语言 `cells/<lang>` 需宿主先预热构建，沙盒内不创建新语言缓存树。
+- `cache/toolchains` 在存在 `*.json`/`*.json.lock` 记录时为目录级可写（锁文件同目录要求）。
+- `/tmp/herdr-role-sessions` 为同会话共享写根。
+- Landlock 路径级 `Exec` 无一次性 `execve` 计数器：顶层放行后嵌套再起同名代理 OS 层仍可能成功。
+- 既有边界不变：`/proc/<pid>/fd` TOCTOU、只读路径已存在 `.so` 经 `LD_PRELOAD` 注入、
+  顶层放行后嵌套再起同名代理、`DenyNet: false` 等，详见 README 与 0.1.0 条目。
+- 调用方显式设置 `PIG_CODING_AGENT_DIR` / `CTXMODE_DB` 时，对应目录的写权限
+  由调用方自负责；预设只做最小兜底。
+
 ## [0.2.2] - 2026-11-01
 
 PATCH：修复 reviewer-agent 下 pig 扩展加载因锁目录 / 构建缓存 / harness 运行时目录写权限不足而失败的问题。
