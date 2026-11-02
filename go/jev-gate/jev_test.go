@@ -124,6 +124,7 @@ func TestCallJevRequestShape(t *testing.T) {
 		path        string
 		auth        string
 		contentType string
+		userAgent   string
 		body        map[string]any
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -132,6 +133,7 @@ func TestCallJevRequestShape(t *testing.T) {
 		captured.path = request.URL.Path
 		captured.auth = request.Header.Get("authorization")
 		captured.contentType = request.Header.Get("content-type")
+		captured.userAgent = request.Header.Get("user-agent")
 		_ = json.Unmarshal(raw, &captured.body)
 		_, _ = io.WriteString(writer, `{"answers":{"g1_evidence_missing_fields":{"noul":0.1}}}`)
 	}))
@@ -156,6 +158,10 @@ func TestCallJevRequestShape(t *testing.T) {
 	}
 	if !strings.HasPrefix(captured.contentType, "application/json") {
 		t.Fatalf("content-type = %q", captured.contentType)
+	}
+	// Prefix only: magpie files the caller under the product token before "/".
+	if !strings.HasPrefix(captured.userAgent, "jev/") {
+		t.Fatalf("user-agent = %q", captured.userAgent)
 	}
 	if captured.body["model"] != DefaultModelID {
 		t.Fatalf("model = %v", captured.body["model"])
