@@ -29,6 +29,10 @@ import (
 	jevgate "github.com/dorokuma/pi-extensions/go/jev-gate"
 )
 
+// version is injected at build time via -ldflags "-X main.version=X.Y.Z"
+// (see VERSIONING.md); the source default is "dev".
+var version = "dev"
+
 // ---------------------------------------------------------------------------
 // Tool metadata (FALLBACK_* of jev-mcp.mjs; identical to the TS extension).
 // ---------------------------------------------------------------------------
@@ -429,7 +433,7 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 			"protocolVersion": protocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"instructions":    jevInstructions,
-			"serverInfo":      map[string]any{"name": "jev", "version": "1.0.0"},
+			"serverInfo":      map[string]any{"name": "jev", "version": version},
 		})
 	case "ping":
 		w.sendResult(id, map[string]any{})
@@ -633,6 +637,12 @@ func drain(carry []byte, w *responseWriter) []byte {
 }
 
 func main() {
+	for i := 1; i < len(os.Args); i++ {
+		if arg := os.Args[i]; arg == "--version" || arg == "-version" {
+			fmt.Println(version)
+			return
+		}
+	}
 	// JEV_TIMEOUT_MS default of the .mjs (15000 for the MCP server, where the
 	// extension default is 60000).
 	if strings.TrimSpace(os.Getenv("JEV_TIMEOUT_MS")) == "" {
