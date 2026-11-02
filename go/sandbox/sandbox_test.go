@@ -1470,7 +1470,7 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 	}
 
 	// usage.json 刷新：<pigHome>/cache 下有效缓存单元 lastUsed 必须足够新
-	// （TouchUsage 有 <1h 短路，同一测试进程内最早的 ReviewerAgent 调用可能已完成写入）。
+	// （touchUsageJSON 有 <5m 短路，同一测试进程内最早的 ReviewerAgent 调用可能已完成写入）。
 	freshThreshold := time.Now().Unix() - 600
 	cacheRoot := "/root/.pig/cache"
 	if env := os.Getenv("PIG_HOME"); env != "" {
@@ -1584,5 +1584,86 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 		if strings.Contains(ep, "/.pig/cache") {
 			t.Fatalf("ReadOnlyReviewer must not Exec %s", ep)
 		}
+	}
+}
+
+// TestReviewerAgentPrivateXDGRuntimeDir 安全细则四回归：宿主环境预设
+// XDG_RUNTIME_DIR=/run/user/0 时，ReviewerAgent 产出的合成 Env 中
+// XDG_RUNTIME_DIR 必须指向 <privateTmpDir>/rt（0700，目录已预建），
+// 且宿主值 /run/user/0 不残留（sbx mergeEnv 按同名键覆盖，无同名双键）。
+// 私有目录在 privateTmpDir 内，已由既有 ReadWrite 覆盖，无需额外放行；
+// 宿主 /run/user/0（含 systemd user bus/keyring 套接字）绝不进 ReadWrite。
+// 对照：ReadOnlyReviewer 契约不变，不注入 XDG_RUNTIME_DIR。
+func TestReviewerAgentPrivateXDGRuntimeDir(t *testing.T) {
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/0")
+	policy := sandbox.ReviewerAgent(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+
+	envMap := parseEnvMap(policy.Env)
+	privateTmp := envMap["TMPDIR"]
+	if !strings.HasPrefix(privateTmp, "/tmp/pi-reviewer-") {
+		t.Fatalf("unexpected TMPDIR %q", privateTmp)
+	}
+	rt := envMap["XDG_RUNTIME_DIR"]
+	want := filepath.Join(privateTmp, "rt")
+	if rt != want {
+		t.Fatalf("XDG_RUNTIME_DIR = %q, want %q", rt, want)
+	}
+
+	// Env 中不得残留宿主值，也不得有同名双键。
+	count := 0
+	for _, kv := range policy.Env {
+		if strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") {
+			count++
+			if kv != "XDG_RUNTIME_DIR="+want {
+				t.Fatalf("unexpected XDG_RUNTIME_DIR entry %q", kv)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one XDG_RUNTIME_DIR entry, got %d in %v", count, policy.Env)
+	}
+
+	// 私有运行目录已预建且权限严格 0700。
+	info, err := os.Stat(rt)
+	if err != nil {
+		t.Fatalf("private runtime dir %s must exist: %v", rt, err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private runtime dir %s bad state: mode=%v", rt, info.Mode())
+	}
+
+	// 宿主 /run/user/0 不得出现在任何 ReadWrite（敏感套接字目录）。
+	for _, rw := range policy.ReadWrite {
+		if rw == "/run/user/0" || strings.HasPrefix(rw, "/run/user/0/") || strings.HasPrefix(rw, "/run/user/") {
+			t.Fatalf("host XDG_RUNTIME_DIR must not be writable, ReadWrite=%q", rw)
+		}
+	}
+	// 私有 rt 被 privateTmpDir 的可写规则覆盖，无需单独放行。
+	foundParentRW := false
+	for _, rw := range policy.ReadWrite {
+		if rw == privateTmp {
+			foundParentRW = true
+		}
+		if rw == rt || strings.HasPrefix(rw, rt+string(filepath.Separator)) {
+			t.Fatalf("rt must stay under privateTmpDir coverage, unexpected ReadWrite %q", rw)
+		}
+	}
+	if !foundParentRW {
+		t.Fatalf("expected ReadWrite to contain privateTmpDir %q, got %v", privateTmp, policy.ReadWrite)
+	}
+
+	// 对照：ReadOnlyReviewer 契约不变——不注入 XDG_RUNTIME_DIR，宿主值由
+	// os.Environ() 原样透传（该预设不放行代理，无 socket 写入需求）。
+	ro := sandbox.ReadOnlyReviewer(workDir)
+	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
+	if got := parseEnvMap(ro.Env)["XDG_RUNTIME_DIR"]; got != "" {
+		t.Fatalf("ReadOnlyReviewer must not inject XDG_RUNTIME_DIR, got %q", got)
 	}
 }

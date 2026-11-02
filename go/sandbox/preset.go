@@ -767,6 +767,12 @@ func appendAgyStateReadWrite(p *Policy) {
 //     进入 Landlock 前把必要配置文件 0600 拷入 <privateTmpDir>/pig-agent，并在私有
 //     settings.json 中显式声明宿主扩展目录绝对路径（不再用 extensions 软链，避免
 //     cfg.Source 变成随机私有路径而脱靶 packed-go 打包缓存），注入 PIG_CODING_AGENT_DIR；
+//   - Env/ReadWrite（XDG_RUNTIME_DIR 私有隔离）：宿主 /run/user/0（systemd user bus、
+//     keyring 等敏感套接字）绝不进 ReadWrite；在 <privateTmpDir> 下预建 0700 的短名
+//     私有运行目录 rt（短名 rt 保证 XDG socket 路径远低于 sun_path 108 字节上限），
+//     并覆写注入 XDG_RUNTIME_DIR=<privateTmpDir>/rt——sbx mergeEnv 按同名键覆盖，
+//     宿主 os.Environ() 中已有的 XDG_RUNTIME_DIR=/run/user/0 被确定性替换，
+//     pig 扩展加载期 mkdir /run/user/0/pig/... 的 EACCES 不再发生；
 //   - ReadWrite/Exec（Cell 缓存 W^X）：宿主态预刷新 <pigHome>/cache 下缓存单元 usage.json
 //     （TouchUsage <1h 只读短路）；仅 cells/<lang>/.locks、ext/.locks 与 toolchains 锁文件
 //     可写，仅已构建 <digest>/runner 与 cache/ext 下可执行产物可执行；
@@ -830,6 +836,15 @@ func ReviewerAgent(workdir string) Policy {
 	refreshCellUsageMetadata(pigHomeDir(), time.Now())
 	appendCellCachePolicy(&p, pigHomeDir())
 
+	// 安全细则四：XDG_RUNTIME_DIR 私有隔离。宿主 /run/user/0 内含 systemd user bus、
+	// keyring 等敏感套接字，绝不加入 ReadWrite；改为在 privateTmpDir 下预建 0700 的
+	// 短名运行目录 rt（短名 rt 确保 Unix domain socket 路径远低于 sun_path 108 字节
+	// 上限），并用 overrideEnvKey 覆写注入 XDG_RUNTIME_DIR。sbx mergeEnv 按同名键
+	// 覆盖宿主 os.Environ()，因此即使宿主已有 XDG_RUNTIME_DIR=/run/user/0 也会被
+	// 确定性替换，不留双键残留；pig 扩展加载写 /run/user/0/pig/... 的 EACCES 消除。
+	privateRtDir := preparePrivateRuntimeDir(privateTmpDir)
+	p.Env = overrideEnvKey(p.Env, "XDG_RUNTIME_DIR", privateRtDir)
+
 	return p
 }
 
@@ -849,6 +864,18 @@ func pigHomeDir() string {
 // 所以这里先预建为 0700。
 func preparePrivateCtxmodeDir(privateTmpDir string) string {
 	dir := filepath.Join(privateTmpDir, "ctxmode")
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		_ = os.Chmod(dir, 0o700)
+	}
+	return dir
+}
+
+// preparePrivateRuntimeDir 创建 <privateTmpDir>/rt（0700）并返回路径。
+// 取短名 rt 是有意的：XDG_RUNTIME_DIR 会拼接 socket 文件名，短前缀保证
+// Unix domain socket 路径远低于 Linux sun_path 108 字节上限。
+// 目录落在 privateTmpDir 内，已由 ReadOnlyReviewer 的 ReadWrite 覆盖，无需额外放行。
+func preparePrivateRuntimeDir(privateTmpDir string) string {
+	dir := filepath.Join(privateTmpDir, "rt")
 	if err := os.MkdirAll(dir, 0o700); err == nil {
 		_ = os.Chmod(dir, 0o700)
 	}
@@ -1021,8 +1048,14 @@ func validCellEntryDir(dir string) (cellReadyMeta, string, bool) {
 	return meta, artifactPath, true
 }
 
-// touchUsageJSON 与 PiG runtimecell.TouchUsage 同语义：<1h 或未来时间戳只读短路，
-// 否则原子写 <dir>/usage.json（tmp + rename，0644）。宿主态调用，沙盒内不会执行。
+// usageTouchMinInterval 是 touchUsageJSON 的跳过重写窗口：lastUsed 距今小于该值则只读短路。
+// 取 5m，比沙盒内 pig 的 PiG runtimecell.TouchUsage <1h 短路更紧，确保宿主态预刷新后
+// usage.json 足够新，pig 运行期 <1h 短路在整个沙盒会话内稳定命中、不向缓存目录写临时文件。
+const usageTouchMinInterval = 5 * time.Minute
+
+// touchUsageJSON 与 PiG runtimecell.TouchUsage 同形：<usageTouchMinInterval（5m）
+// 或未来时间戳只读短路，否则原子写 <dir>/usage.json（tmp + rename，0644）。
+// 宿主态调用，沙盒内不会执行；窗口比 pig 运行期 <1h 短路更紧是有意的。
 func touchUsageJSON(entryDir string, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now()
@@ -1033,7 +1066,7 @@ func touchUsageJSON(entryDir string, now time.Time) error {
 		}
 		if json.Unmarshal(data, &current) == nil && current.LastUsed > 0 {
 			last := time.Unix(current.LastUsed, 0)
-			if last.After(now) || now.Sub(last) < time.Hour {
+			if last.After(now) || now.Sub(last) < usageTouchMinInterval {
 				return nil
 			}
 		}
