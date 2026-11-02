@@ -4,7 +4,9 @@
 
 ## [Unreleased]
 
-MINOR（未发版草拟，原 [0.3.0] 段落合并于此）：以四层私有隔离取代 `0.2.2` 的
+## [0.3.0] - 2026-11-02
+
+MINOR：以四层私有隔离取代 `0.2.2` 的
 宿主目录写放行与 `cells/go` 目录级 RW∩Exec W^X 例外，向后兼容地补齐
 reviewer-agent 预设对 pig 与 agy MCP 生态的安全修复（ctxmode/MCP 数据隔离、
 pig AgentDir 私有隔离、Cell 缓存 W^X 预热、XDG_RUNTIME_DIR 私有隔离），并补齐
@@ -184,7 +186,8 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.2...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...HEAD
+[0.3.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.2...go/sandbox/v0.3.0
 [0.2.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...go/sandbox/v0.2.2
 [0.2.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...go/sandbox/v0.2.1
 [0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...go/sandbox/v0.2.0
