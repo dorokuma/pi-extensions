@@ -914,6 +914,37 @@ func TestReviewerAgentPreset(t *testing.T) {
 		t.Fatal("antigravity-cli/bin must not be in ReadWrite (W^X)")
 	}
 
+	// 四层私有隔离取代宿主锁目录放宽：宿主敏感目录不得出现在 ReadWrite，
+	// cells/go 目录本身不得同时处于 RW∩Exec（0.2.2 的 W^X 例外已移除；
+	// .locks 子目录可写、已构建 runner 产物可执行的分离策略由
+	// TestReviewerAgentCellCachePolicy 专门断言）。
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root/.pig" || rw == "/root" {
+			t.Fatalf("must not grant whole /root/.pig or /root in ReadWrite: %q", rw)
+		}
+		if rw == "/root/.pig/agent" || strings.HasPrefix(rw, "/root/.pig/agent/") {
+			t.Fatalf("host /root/.pig/agent must stay read-only, got ReadWrite %q", rw)
+		}
+		if rw == "/run/user/0" || strings.HasPrefix(rw, "/run/user/0/") {
+			t.Fatalf("host /run/user/0 must not be writable, got ReadWrite %q", rw)
+		}
+	}
+	rwSetCheck := make(map[string]struct{}, len(policy.ReadWrite))
+	for _, rw := range policy.ReadWrite {
+		rwSetCheck[rw] = struct{}{}
+	}
+	for _, ep := range policy.Exec {
+		if ep == "/root/.pig/cache/cells/go" {
+			if _, ok := rwSetCheck[ep]; ok {
+				t.Fatalf("cells/go must not be simultaneously ReadWrite+Exec (W^X): %q", ep)
+			}
+			t.Fatalf("cells/go dir itself must not be in Exec (per-artifact Exec only): %q", ep)
+		}
+		if ep == "/root/.pig/agent" || ep == "/run/user/0/pig" {
+			t.Fatalf("host sensitive dir must not be in Exec: %q", ep)
+		}
+	}
+
 	// 对照：原 ReadOnlyReviewer 仍拒绝把 ForbiddenExec 放进 Exec，且无 EntryAgents
 	ro := sandbox.ReadOnlyReviewer(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
@@ -950,11 +981,11 @@ func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
 	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 
 	for _, rw := range policy.ReadWrite {
-		if rw == "/root" || rw == "/" {
+		if rw == "/root" || rw == "/" || rw == "/root/.pig" {
 			t.Fatalf("ReadWrite must not widen to %q", rw)
 		}
 	}
-	// ReadOnlyReviewer 不得获得 /dev/tty 或 agy-pro-home 写权限
+	// ReadOnlyReviewer 不得获得 /dev/tty、agy-pro-home 或 pig 锁写权限
 	ro := sandbox.ReadOnlyReviewer(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
 	for _, rw := range ro.ReadWrite {
@@ -963,6 +994,9 @@ func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
 		}
 		if strings.Contains(rw, ".agy-pro-home") {
 			t.Fatalf("ReadOnlyReviewer must not grant agy-pro-home RW: %s", rw)
+		}
+		if rw == "/root/.pig/agent" || strings.Contains(rw, "/root/.pig/cache/") {
+			t.Fatalf("ReadOnlyReviewer must not grant pig lock RW: %s", rw)
 		}
 	}
 }
