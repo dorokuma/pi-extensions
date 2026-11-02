@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-01
+
+PATCH：修复 reviewer-agent 下 pig 扩展加载因锁目录 / 构建缓存 / harness 运行时目录写权限不足而失败的问题。
+
+### Fixed
+
+- `ReviewerAgent` 窄放行 pig 实测必需的写路径（strace `mkdirat`/`openat` EACCES）：
+  - `/root/.pig/agent`：`settings.json.lock` / `auth.json.lock` / `models-store.json.lock` 的 proper-lockfile 父目录（mkdir/rmdir；仅放锁路径无法取得 MAKE_DIR，且预建锁目录会导致 already held）
+  - `/root/.pig/cache/cells/go`：`.locks/*` 与 ephemeral `.build-*` scratch
+  - `/root/.pig/cache/toolchains`：toolchain `*.json.lock`
+  - `/run/user/0/pig`：扩展 harness socket 目录（`mkdir h*`；不存在时 `MkdirAll`）
+- `/root/.pig/cache/cells/go` 同时进入 `Exec`：packed extension `runner` 需可执行；借助既有 `computeNonExecRWDirs` 机制（RW∩Exec 路径不进 seccomp W^X 拒绝集）。**不**放行整个 `/root` 或 `/root/.pig`。
+
+### Known Risks
+
+- `/root/.pig/cache/cells/go` 同时可写可执行，是为 pig 扩展 runner 保留的局部 W^X 例外；仅限该缓存树，不扩大到 `/root/.pig` 整树。
+
+### Tests
+
+- CLI / 预设测试断言上述 pig 路径在 ReadWrite；`cells/go` 在 Exec；整树 `/root/.pig` 与 `/root` 不在 ReadWrite；ReadOnlyReviewer 不获得 pig 锁放宽。
+
 ## [0.2.1] - 2026-11-01
 
 PATCH：修复 reviewer-agent 下 agy 派活路径无法写状态 / 打开 TTY 的问题。
@@ -63,7 +84,8 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.2...HEAD
+[0.2.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...go/sandbox/v0.2.2
 [0.2.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...go/sandbox/v0.2.1
 [0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.1.0...go/sandbox/v0.2.0
 [0.1.0]: https://github.com/dorokuma/pi-extensions/releases/tag/go/sandbox/v0.1.0

@@ -570,6 +570,44 @@ func appendAgyStateReadWrite(p *Policy) {
 	}
 }
 
+// pigLockReadWriteDirs are the narrow directories pig must write inside reviewer-agent.
+// Measured with strace (mkdirat/openat EACCES) under --preset reviewer-agent:
+//   - /root/.pig/agent: proper-lockfile mkdir/rmdir of settings.json.lock /
+//     auth.json.lock / models-store.json.lock (MAKE_DIR/REMOVE_DIR on parent;
+//     lock-path-only rules cannot acquire locks, and pre-creating lock dirs
+//     leaves them "already held").
+//   - /root/.pig/cache/cells/go: cell build locks under .locks/ plus ephemeral
+//     .build-* scratch dirs (mkdir).
+//   - /root/.pig/cache/toolchains: toolchain *.json.lock (open O_CREAT).
+//
+// Do not grant /root or the whole /root/.pig tree.
+var pigLockReadWriteDirs = []string{
+	"/root/.pig/agent",
+	"/root/.pig/cache/cells/go",
+	"/root/.pig/cache/toolchains",
+	"/run/user/0/pig",
+}
+
+// appendPigLockReadWrite grants the measured pig lock / build-scratch write set.
+// /root/.pig/cache/cells/go also goes on Exec: packed extension runners live there and
+// must be executable. Being on both ReadWrite and Exec opts the path out of
+// computeNonExecRWDirs (seccomp W^X), which is required for pig cells and is a
+// documented Known Risk limited to this cache tree.
+func appendPigLockReadWrite(p *Policy) {
+	for _, dir := range pigLockReadWriteDirs {
+		// /run/user/0/pig is ephemeral XDG runtime; create if missing so Landlock can open it.
+		if dir == "/run/user/0/pig" {
+			_ = os.MkdirAll(dir, 0o700)
+		}
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			p.ReadWrite = append(p.ReadWrite, dir)
+			if dir == "/root/.pig/cache/cells/go" {
+				p.Exec = append(p.Exec, dir)
+			}
+		}
+	}
+}
+
 // ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig，
 // 并开放代理会话状态目录写权限。
 //
@@ -577,8 +615,11 @@ func appendAgyStateReadWrite(p *Policy) {
 //   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
 //   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
 //     与 /root/.agy-pro-home/.gemini/antigravity-cli 下数据子目录 + 根目录已有状态文件
-//     （不含 bin/，避免对可执行文件 W^X 写穿）；以及 /dev/tty（dispatch-agent-go 对 agy 使用
-//     --prompt-interactive / -i，bubbletea 需要打开控制终端）；
+//     （不含 bin/，避免对可执行文件 W^X 写穿）；/dev/tty（dispatch-agent-go 对 agy 使用
+//     --prompt-interactive / -i，bubbletea 需要打开控制终端）；以及 pig 锁路径：
+//     /root/.pig/agent（settings/auth/models-store 的 mkdir 锁父目录）、
+//     /root/.pig/cache/cells/go（.locks 与 .build-*）、/root/.pig/cache/toolchains
+//     与 /run/user/0/pig（扩展 harness；不开放整个 /root/.pig）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
 //
@@ -606,6 +647,9 @@ func ReviewerAgent(workdir string) Policy {
 	// dispatch-agent-go reviewer 对 agy 使用 -i（--prompt-interactive），bubbletea 需要 /dev/tty。
 	// 仅本预设放行；不改全局 defaultNullDevices，避免扩大其他预设攻击面。
 	p.ReadWrite = append(p.ReadWrite, "/dev/tty")
+
+	// pig 扩展加载与 settings/auth 需要写锁（strace 实测 EACCES 路径）；窄放行，不开放整个 /root/.pig。
+	appendPigLockReadWrite(&p)
 
 	return p
 }

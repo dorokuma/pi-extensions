@@ -911,6 +911,56 @@ func TestReviewerAgentPreset(t *testing.T) {
 		t.Fatal("antigravity-cli/bin must not be in ReadWrite (W^X)")
 	}
 
+	foundPigAgent := false
+	foundPigCellsGo := false
+	foundPigToolchains := false
+	foundWholePig := false
+	for _, rw := range policy.ReadWrite {
+		if rw == "/root/.pig/agent" {
+			foundPigAgent = true
+		}
+		if rw == "/root/.pig/cache/cells/go" {
+			foundPigCellsGo = true
+		}
+		if rw == "/root/.pig/cache/toolchains" {
+			foundPigToolchains = true
+		}
+		if rw == "/root/.pig" || rw == "/root" {
+			foundWholePig = true
+		}
+	}
+	if !foundPigAgent {
+		t.Fatal("expected /root/.pig/agent in ReviewerAgent ReadWrite (mkdir lock parent)")
+	}
+	if !foundPigCellsGo {
+		t.Fatal("expected /root/.pig/cache/cells/go in ReviewerAgent ReadWrite (.locks + .build-*)")
+	}
+	foundCellsGoExec := false
+	for _, ep := range policy.Exec {
+		if ep == "/root/.pig/cache/cells/go" {
+			foundCellsGoExec = true
+			break
+		}
+	}
+	if !foundCellsGoExec {
+		t.Fatal("expected /root/.pig/cache/cells/go in ReviewerAgent Exec (packed runners)")
+	}
+	if !foundPigToolchains {
+		t.Fatal("expected /root/.pig/cache/toolchains in ReviewerAgent ReadWrite")
+	}
+	foundRunPig := false
+	for _, rw := range policy.ReadWrite {
+		if rw == "/run/user/0/pig" {
+			foundRunPig = true
+		}
+	}
+	if !foundRunPig {
+		t.Fatal("expected /run/user/0/pig in ReviewerAgent ReadWrite")
+	}
+	if foundWholePig {
+		t.Fatal("must not grant whole /root/.pig or /root in ReadWrite")
+	}
+
 	// 对照：原 ReadOnlyReviewer 仍拒绝把 ForbiddenExec 放进 Exec，且无 EntryAgents
 	ro := sandbox.ReadOnlyReviewer(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
@@ -947,11 +997,11 @@ func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
 	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 
 	for _, rw := range policy.ReadWrite {
-		if rw == "/root" || rw == "/" {
+		if rw == "/root" || rw == "/" || rw == "/root/.pig" {
 			t.Fatalf("ReadWrite must not widen to %q", rw)
 		}
 	}
-	// ReadOnlyReviewer 不得获得 /dev/tty 或 agy-pro-home 写权限
+	// ReadOnlyReviewer 不得获得 /dev/tty、agy-pro-home 或 pig 锁写权限
 	ro := sandbox.ReadOnlyReviewer(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
 	for _, rw := range ro.ReadWrite {
@@ -960,6 +1010,9 @@ func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
 		}
 		if strings.Contains(rw, ".agy-pro-home") {
 			t.Fatalf("ReadOnlyReviewer must not grant agy-pro-home RW: %s", rw)
+		}
+		if rw == "/root/.pig/agent" || strings.Contains(rw, "/root/.pig/cache/") {
+			t.Fatalf("ReadOnlyReviewer must not grant pig lock RW: %s", rw)
 		}
 	}
 }
