@@ -7,7 +7,9 @@
 
 1. **严禁直接编辑部署目录下的 `.ts`**：`/root/.pi/agent/extensions/*.ts` 一律只读。
    不要在那里改代码、不要手动 `cp` 覆盖、不要删/改/命名其下任何文件（含 8 个 `.bak-*`
-   历史备份，其归档/清理属后续阶段）。部署副本只能由本仓 `install.sh` 依 md5 幂等同步。
+   历史备份，其归档/清理属后续阶段）。（注：运行态默认部署目录已随 `registry.json`
+   迁至 `/root/.pig/agent/extensions`，历史 `/root/.pi/agent/extensions/*.ts` 与
+   8 个 `.bak-*` 仍严格只读冻结。）部署副本只能由本仓 `install.sh` 依 md5 幂等同步。
 
 2. **内生（hosted）扩展改动只在本仓做**：`auto-continue` / `no-tables` /
    `ctx-orchestrate` / `jev-gate` / `exclude-tools-guard` / `magpie-image`
@@ -63,7 +65,7 @@ bash install.sh --audit          # 只读巡检 10 扩展（md5/权限/外生脚
 bash install.sh --dry-run <name> # 只演练，不写任何文件
 bash install.sh <name...>        # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 bash install.sh --all            # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
-bash install.sh --dest-dir <DIR> # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pi/agent/extensions
+bash install.sh --dest-dir <DIR> # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pig/agent/extensions
 ```
 
 数据源唯一：`federated/registry.json`。`install.sh` 契约与
