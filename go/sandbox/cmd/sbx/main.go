@@ -263,15 +263,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
+	cleanupPresetTempDirs := func() { cleanupPresetTempDirsFromEnv(policy.Env) }
 
 	// 当启用了 Exec 白名单时，在应用沙盒前双重校验目标命令是否属于被禁用的代理或动态链接器。
 	// reviewer-agent 预设允许顶层 EntryAgents（agy/pig/pi）；其余 ForbiddenExec 仍拒绝。
 	if len(policy.Exec) > 0 {
 		if sandbox.IsELFInterpreter(cfg.Command[0]) {
+			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
 			os.Exit(126)
 		}
 		if sandbox.IsForbiddenExec(cfg.Command[0]) && !sandbox.IsEntryAgentPath(policy.EntryAgents, cfg.Command[0]) {
+			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
 			os.Exit(126)
 		}
@@ -280,29 +283,53 @@ func main() {
 	// 在调用 sandbox.Apply 收紧目录读取权限前先解析目标命令路径（优先参考 policy.Env 中注入的受控 PATH）。
 	bin, err := resolveCommandPath(cfg.Command[0], policy.Env)
 	if err != nil {
+		cleanupPresetTempDirs()
 		fmt.Fprintf(os.Stderr, "sbx: resolve command %q: %v\n", cfg.Command[0], err)
 		os.Exit(127)
 	}
 
 	if len(policy.Exec) > 0 {
 		if sandbox.IsELFInterpreter(bin) {
+			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
 			os.Exit(126)
 		}
 		if sandbox.IsForbiddenExec(bin) && !sandbox.IsEntryAgentPath(policy.EntryAgents, bin) {
+			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
 			os.Exit(126)
 		}
 	}
 
 	if err := sandbox.Apply(policy); err != nil {
+		cleanupPresetTempDirs()
 		fmt.Fprintf(os.Stderr, "sbx: apply sandbox policy failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	execEnv := mergeEnv(os.Environ(), policy.Env)
 	if err := syscall.Exec(bin, cfg.Command, execEnv); err != nil {
+		cleanupPresetTempDirs()
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
 		os.Exit(126)
+	}
+}
+
+// cleanupPresetTempDirsFromEnv 删除预设构造阶段创建的私有临时目录
+// （/tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*）。仅在进入 syscall.Exec
+// 之前的提前退出分支调用，避免 --preset 异常路径泄漏 /tmp/pi-reviewer-*。
+// 仅删带固定前缀的目录，绝不递归删除任意 TMPDIR。
+func cleanupPresetTempDirsFromEnv(env []string) {
+	m := make(map[string]string, len(env))
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			m[k] = v
+		}
+	}
+	if dir := m["TMPDIR"]; strings.HasPrefix(dir, "/tmp/pi-reviewer-") {
+		_ = os.RemoveAll(dir)
+	}
+	if dir := m["PI_SANDBOX_GO_EXEC_DIR"]; strings.HasPrefix(dir, "/tmp/pi-reviewer-exec-") {
+		_ = os.RemoveAll(dir)
 	}
 }

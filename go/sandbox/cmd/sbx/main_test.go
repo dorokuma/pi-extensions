@@ -212,7 +212,61 @@ func TestVersionDefaultDev(t *testing.T) {
 	}
 }
 
+// TestCleanupPresetTempDirsFromEnv 覆盖 SBX-S2：--preset 构造出的私有临时目录
+// （/tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*）在提前退出路径被主动清理，
+// 不泄漏到 /tmp；非预设前缀的路径绝不误删。
+func TestCleanupPresetTempDirsFromEnv(t *testing.T) {
+	tmp := t.TempDir()
+	privateTmp := filepath.Join(tmp, "pi-reviewer-abc123")
+	execDir := filepath.Join(tmp, "pi-reviewer-exec-def456")
+	keep := filepath.Join(tmp, "pi-reviewer-keep")
+	other := filepath.Join(tmp, "other")
+	for _, d := range []string{privateTmp, execDir, keep, other} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	// 模拟 preset Env：前缀目录被删，keep（非 /tmp/pi-reviewer-* 前缀但含同名段）与其它不动。
+	// 注意：实现要求 /tmp/pi-reviewer- 前缀，这里用 /tmp 真实前缀路径验证。
+	realPrivate, err := os.MkdirTemp("/tmp", "pi-reviewer-testclean-")
+	if err != nil {
+		t.Fatalf("MkdirTemp private: %v", err)
+	}
+	realExec, err := os.MkdirTemp("/tmp", "pi-reviewer-exec-testclean-")
+	if err != nil {
+		t.Fatalf("MkdirTemp exec: %v", err)
+	}
+	env := []string{
+		"TMPDIR=" + realPrivate,
+		"PI_SANDBOX_GO_EXEC_DIR=" + realExec,
+		"PATH=/usr/bin:/bin",
+	}
+	cleanupPresetTempDirsFromEnv(env)
+	if _, err := os.Stat(realPrivate); !os.IsNotExist(err) {
+		t.Fatalf("TMPDIR %s should be removed", realPrivate)
+	}
+	if _, err := os.Stat(realExec); !os.IsNotExist(err) {
+		t.Fatalf("exec dir %s should be removed", realExec)
+	}
+
+	// 非 /tmp/pi-reviewer-* 前缀的路径绝不删除（防误删任意 TMPDIR）。
+	safeEnv := []string{
+		"TMPDIR=" + keep,
+		"PI_SANDBOX_GO_EXEC_DIR=" + other,
+	}
+	cleanupPresetTempDirsFromEnv(safeEnv)
+	for _, d := range []string{keep, other} {
+		if _, err := os.Stat(d); err != nil {
+			t.Fatalf("%s must not be removed: %v", d, err)
+		}
+	}
+}
+
 func TestParseArgsReviewerAgent(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，reviewer-agent 预设（ReviewerAgent）不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	workDir := t.TempDir()
 	cfg, err := parseArgs([]string{
 		"--preset", "reviewer-agent",

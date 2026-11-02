@@ -11,10 +11,8 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -431,60 +429,6 @@ func TestLandlockSeccompGuardFailureHandling(t *testing.T) {
 	}
 }
 
-func occupySeccompListenerSlot() (int, error) {
-	const (
-		seccompSetModeFilter         uintptr = 1
-		seccompFilterFlagTSync       uintptr = 1 << 0
-		seccompFilterFlagNewListener uintptr = 1 << 3
-		seccompFilterFlagTSyncESRCH  uintptr = 1 << 4
-		seccompRetAllow              uint32  = 0x7fff0000
-		bpfRET                       uint16  = 0x06
-		bpfK                         uint16  = 0x00
-	)
-
-	runtime.LockOSThread()
-	_, _, errno := syscall.AllThreadsSyscall6(
-		unix.SYS_PRCTL,
-		unix.PR_SET_NO_NEW_PRIVS,
-		1, 0, 0, 0, 0,
-	)
-	if errno != 0 {
-		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-			return -1, err
-		}
-	}
-
-	filter := []unix.SockFilter{
-		{Code: bpfRET | bpfK, K: seccompRetAllow},
-	}
-	prog := unix.SockFprog{
-		Len:    uint16(len(filter)),
-		Filter: &filter[0],
-	}
-
-	flags := seccompFilterFlagNewListener | seccompFilterFlagTSync | seccompFilterFlagTSyncESRCH
-	r1, _, sysErrno := unix.Syscall(
-		unix.SYS_SECCOMP,
-		seccompSetModeFilter,
-		flags,
-		uintptr(unsafe.Pointer(&prog)),
-	)
-	if sysErrno != 0 {
-		r1, _, sysErrno = unix.Syscall(
-			unix.SYS_SECCOMP,
-			seccompSetModeFilter,
-			seccompFilterFlagNewListener,
-			uintptr(unsafe.Pointer(&prog)),
-		)
-	}
-	runtime.KeepAlive(&filter)
-	runtime.KeepAlive(&prog)
-	if sysErrno != 0 {
-		return -1, sysErrno
-	}
-	return int(r1), nil
-}
-
 func subprocSeccompFailure() {
 	roDir := os.Getenv("TEST_RO_DIR")
 	rwDir := os.Getenv("TEST_RW_DIR")
@@ -849,7 +793,27 @@ func cleanupReviewerTempDirs(p sandbox.Policy) {
 	}
 }
 
+// unsetEnv 保证 key 在本测试内不存在，并在 t.Cleanup 恢复原值（含原本未设置情形）。
+// 代替裸 os.Unsetenv，避免污染环境且不还原。
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	orig, existed := os.LookupEnv(key)
+	if existed {
+		_ = os.Unsetenv(key)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(key, orig)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
+
 func TestReviewerAgentPreset(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -972,6 +936,9 @@ func TestReviewerAgentPreset(t *testing.T) {
 }
 
 func TestReviewerAgentKeepsRootNarrow(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -1091,6 +1058,9 @@ func TestIsEntryAgentPath(t *testing.T) {
 // 含符号链接目标），且不放宽 ReadOnlyReviewer、不把 /root/.herdsman 加入 ReadWrite、
 // 保持 W^X（Exec 与 ReadWrite 无父子目录交叠）。
 func TestReviewerAgentAgyHooks(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -1196,6 +1166,9 @@ func TestReviewerAgentAgyHooks(t *testing.T) {
 // MCP 服务二进制（ctxmode / codegraph-go / jev-mcp / jev-mcp-go / agy-recall，含软链目标），
 // 仍不整目录放行 ~/.local/bin，且 dispatch-agent / dispatch-agent-go / herdr / grok 不进 Exec。
 func TestReviewerAgentMCPServerExec(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -1242,6 +1215,9 @@ func TestReviewerAgentMCPServerExec(t *testing.T) {
 // 数据库路径；显式指定时保留调用方值。宿主兜底只允许 ~/.local/share/ctxmode 与
 // agy-recall state；~/.local/share 与 ~/.local/share/gemini-web 绝不出现在 ReadWrite。
 func TestReviewerAgentCtxmodeIsolation(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -1249,7 +1225,7 @@ func TestReviewerAgentCtxmodeIsolation(t *testing.T) {
 	}
 
 	t.Run("default private db", func(t *testing.T) {
-		os.Unsetenv("CTXMODE_DB")
+		unsetEnv(t, "CTXMODE_DB")
 		policy := sandbox.ReviewerAgent(workDir)
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 		envMap := parseEnvMap(policy.Env)
@@ -1329,7 +1305,36 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 	}
 
 	t.Run("default injection", func(t *testing.T) {
-		os.Unsetenv("PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		// SBX-S3：完整隔离 fakePigHome，绝不触碰宿主真实 /root/.pig/agent。
+		fakePigHome := filepath.Join(t.TempDir(), "fakepig")
+		hostAgent := filepath.Join(fakePigHome, "agent")
+		hostExt := filepath.Join(hostAgent, "extensions")
+		if err := os.MkdirAll(hostExt, 0o755); err != nil {
+			t.Fatalf("mkdir fake extensions: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(hostExt, "demo.ts"), []byte("// demo\n"), 0o644); err != nil {
+			t.Fatalf("write fake extension file: %v", err)
+		}
+		srcSettings := `{"theme":"dark","customKey":42}`
+		for name, content := range map[string]string{
+			"settings.json":    srcSettings,
+			"models.json":      "{}",
+			"auth.json":        "{}",
+			"keybindings.json": "{}",
+		} {
+			if err := os.WriteFile(filepath.Join(hostAgent, name), []byte(content), 0o600); err != nil {
+				t.Fatalf("write fake %s: %v", name, err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(hostAgent, "sessions"), 0o755); err != nil {
+			t.Fatalf("mkdir fake sessions: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(hostAgent, "sessions", "dummy.jsonl"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write fake sessions/dummy.jsonl: %v", err)
+		}
+		t.Setenv("PIG_HOME", fakePigHome)
+
 		policy := sandbox.ReviewerAgent(workDir)
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 		envMap := parseEnvMap(policy.Env)
@@ -1344,14 +1349,9 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 			t.Fatalf("private pig-agent dir %s bad state: %v mode=%v", dst, err, info.Mode())
 		}
-		// 白名单配置文件 0600 拷入（宿主存在时）；sessions/.lock 等不拷。
-		hostAgent := "/root/.pig/agent"
+		// 4 个白名单配置文件 0600 拷入；sessions/.lock 等不拷。
 		for _, name := range []string{"settings.json", "models.json", "auth.json", "keybindings.json"} {
-			srcFile := filepath.Join(hostAgent, name)
 			dstFile := filepath.Join(dst, name)
-			if _, err := os.Stat(srcFile); err != nil {
-				continue
-			}
 			fi, err := os.Stat(dstFile)
 			if err != nil {
 				t.Fatalf("expected copied %s: %v", dstFile, err)
@@ -1365,64 +1365,61 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		}
 		// 不再创建 extensions 软链：软链会让自动发现的 cfg.Source 指向随机私有
 		// 路径，packed-go cellHash 随之变化，永久脱靶宿主打包缓存。
-		hostExt := filepath.Join(hostAgent, "extensions")
-		srcExtExists := false
-		if info, err := os.Stat(hostExt); err == nil && info.IsDir() {
-			srcExtExists = true
-		}
 		if _, err := os.Lstat(filepath.Join(dst, "extensions")); !os.IsNotExist(err) {
 			t.Fatalf("private pig-agent must not contain extensions entry (symlink or dir), err=%v", err)
 		}
-		if srcExtExists {
-			// 私有 settings.json 必须显式声明宿主扩展目录绝对路径，并保留原有键值。
-			data, err := os.ReadFile(filepath.Join(dst, "settings.json"))
-			if err != nil {
-				t.Fatalf("expected private settings.json: %v", err)
+		// 私有 settings.json 必须显式声明宿主扩展目录绝对路径，并保留原有键值。
+		data, err := os.ReadFile(filepath.Join(dst, "settings.json"))
+		if err != nil {
+			t.Fatalf("expected private settings.json: %v", err)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(data, &obj); err != nil {
+			t.Fatalf("private settings.json not a JSON object: %v", err)
+		}
+		rawExt, ok := obj["extensions"]
+		if !ok {
+			t.Fatal("private settings.json missing injected extensions entry")
+		}
+		var extEntries []string
+		if err := json.Unmarshal(rawExt, &extEntries); err != nil || len(extEntries) == 0 {
+			t.Fatalf("extensions entry must be a non-empty string array: %s err=%v", rawExt, err)
+		}
+		found := false
+		for _, e := range extEntries {
+			if e == hostExt {
+				found = true
 			}
-			var obj map[string]json.RawMessage
-			if err := json.Unmarshal(data, &obj); err != nil {
-				t.Fatalf("private settings.json not a JSON object: %v", err)
-			}
-			rawExt, ok := obj["extensions"]
+		}
+		if !found {
+			t.Fatalf("extensions entry %v does not contain host extensions dir %s", extEntries, hostExt)
+		}
+		// 宿主原有键值逐项保留（theme/customKey 不因注入丢失或改写）。
+		var srcObj map[string]json.RawMessage
+		srcData, err := os.ReadFile(filepath.Join(hostAgent, "settings.json"))
+		if err != nil {
+			t.Fatalf("read fake host settings.json: %v", err)
+		}
+		if err := json.Unmarshal(srcData, &srcObj); err != nil {
+			t.Fatalf("fake host settings.json not a JSON object: %v", err)
+		}
+		for key, srcVal := range srcObj {
+			dstVal, ok := obj[key]
 			if !ok {
-				t.Fatal("private settings.json missing injected extensions entry")
+				t.Fatalf("private settings.json lost host key %q", key)
 			}
-			var extEntries []string
-			if err := json.Unmarshal(rawExt, &extEntries); err != nil || len(extEntries) == 0 {
-				t.Fatalf("extensions entry must be a non-empty string array: %s err=%v", rawExt, err)
-			}
-			found := false
-			for _, e := range extEntries {
-				if e == hostExt {
-					found = true
-				}
-			}
-			if !found {
-				t.Fatalf("extensions entry %v does not contain host extensions dir %s", extEntries, hostExt)
-			}
-			// 宿主原有键值逐项保留（宿主 settings.json 无 extensions 字段时注入不丢项）。
-			srcData, err := os.ReadFile(filepath.Join(hostAgent, "settings.json"))
-			if err == nil {
-				var srcObj map[string]json.RawMessage
-				if err := json.Unmarshal(srcData, &srcObj); err == nil {
-					for key, srcVal := range srcObj {
-						dstVal, ok := obj[key]
-						if !ok {
-							t.Fatalf("private settings.json lost host key %q", key)
-						}
-						var srcNorm, dstNorm any
-						if json.Unmarshal(srcVal, &srcNorm) == nil && json.Unmarshal(dstVal, &dstNorm) == nil {
-							if !reflect.DeepEqual(srcNorm, dstNorm) {
-								t.Fatalf("private settings.json key %q changed: %s -> %s", key, srcVal, dstVal)
-							}
-						}
-					}
+			var srcNorm, dstNorm any
+			if json.Unmarshal(srcVal, &srcNorm) == nil && json.Unmarshal(dstVal, &dstNorm) == nil {
+				if !reflect.DeepEqual(srcNorm, dstNorm) {
+					t.Fatalf("private settings.json key %q changed: %s -> %s", key, srcVal, dstVal)
 				}
 			}
 		}
 	})
 
 	t.Run("explicit PIG_CODING_AGENT_DIR preserved", func(t *testing.T) {
+		// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
 		t.Setenv("PIG_CODING_AGENT_DIR", "/custom/agent")
 		policy := sandbox.ReviewerAgent(workDir)
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
@@ -1432,7 +1429,7 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 	})
 
 	t.Run("custom host extensions preserved", func(t *testing.T) {
-		os.Unsetenv("PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
 		fakeHome := filepath.Join(tmp, "fakepig")
 		agentDir := filepath.Join(fakeHome, "agent")
 		if err := os.MkdirAll(filepath.Join(agentDir, "extensions"), 0o755); err != nil {
@@ -1464,8 +1461,8 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		if err := json.Unmarshal(obj["extensions"], &extEntries); err != nil {
 			t.Fatalf("extensions entry must stay a string array: %v", err)
 		}
-		if !reflect.DeepEqual(extEntries, []string{"/custom/ext-a", "./rel-ext"}) {
-			t.Fatalf("host custom extensions must be preserved verbatim, got %v", extEntries)
+		if !reflect.DeepEqual(extEntries, []string{"/custom/ext-a", filepath.Join(agentDir, "rel-ext"), filepath.Join(agentDir, "extensions")}) {
+			t.Fatalf("relative extension must resolve against host agent dir and host ext dir must be appended, got %v", extEntries)
 		}
 		var theme string
 		if err := json.Unmarshal(obj["theme"], &theme); err != nil || theme != "dark" {
@@ -1474,7 +1471,10 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 	})
 
 	// 宿主 AgentDir 绝不进 ReadWrite（含 PIG_HOME 解析形式）。
-	os.Unsetenv("PIG_CODING_AGENT_DIR")
+	// SBX-S3：此处仅断言策略路径构成，隔离 PIG_HOME 为通用空目录即可，
+	// 不再依赖宿主 /root/.pig/agent 的真实布局。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+	unsetEnv(t, "PIG_CODING_AGENT_DIR")
 	policy := sandbox.ReviewerAgent(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 	for _, rw := range policy.ReadWrite {
@@ -1487,9 +1487,12 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 	}
 }
 
-// TestReviewerAgentCellCachePolicy 安全细则三回归：宿主态刷新 usage.json 为当前时间；
-// 仅 .locks 目录与 toolchains 锁文件目录进 ReadWrite，已构建 runner/产物进 Exec，
-// 且 ReadWrite 与 Exec 之间不存在任何相等或父子包含关系（W^X）。
+// TestReviewerAgentCellCachePolicy 安全细则三回归（SBX-M2/SBX-S3）：在
+// t.TempDir() 下自建完整隔离 fakePigHome（PIG_HOME 指向它，零触碰宿主
+// /root/.pig/cache），构造过期与新鲜 usage.json 各一，验证宿主态仅刷新过期
+// usage.json（fresh <5m 只读短路不重写）；仅 .locks 目录与 toolchains 锁文件
+// 目录进 ReadWrite，已构建 runner/产物进 Exec，且 ReadWrite 与 Exec 之间不存在
+// 任何相等或父子包含关系（W^X）。
 func TestReviewerAgentCellCachePolicy(t *testing.T) {
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
@@ -1497,55 +1500,92 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 		t.Fatalf("mkdir repo: %v", err)
 	}
 
+	// 完整隔离 fakePigHome：cells/go/<digest>/runner + ext/demo-<digest2>/ext.js
+	// 两个有效缓存单元（0o755 非空普通文件 + 匹配文件大小的 ready.json）与
+	// toolchains/go.json 记录。
+	fakePigHome := filepath.Join(tmp, "fakepig")
+	cacheRoot := filepath.Join(fakePigHome, "cache")
+	goCellDir := filepath.Join(cacheRoot, "cells", "go", "018957e3099bb082ccfa2203f7c3e681e56cbc86f8c748d8193125177940f18c")
+	extCellDir := filepath.Join(cacheRoot, "ext", "demo-56cbc86f8c748d8193125177940f18c018957e3099bb082ccfa2203f7c3e681")
+	toolchainsDir := filepath.Join(cacheRoot, "toolchains")
+	for _, d := range []string{goCellDir, extCellDir, toolchainsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	writeCell := func(dir, artifact string, lastUsed int64) {
+		t.Helper()
+		artifactPath := filepath.Join(dir, artifact)
+		data := []byte("#!/bin/sh\nexit 0\n")
+		if err := os.WriteFile(artifactPath, data, 0o755); err != nil {
+			t.Fatalf("write artifact %s: %v", artifactPath, err)
+		}
+		ready := map[string]any{
+			"inputDigest": strings.TrimPrefix(filepath.Base(dir), "demo-"),
+			"artifact":    artifact,
+			"size":        int64(len(data)),
+			"created":     time.Now().Unix(),
+		}
+		readyData, err := json.Marshal(ready)
+		if err != nil {
+			t.Fatalf("marshal ready.json: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "ready.json"), readyData, 0o644); err != nil {
+			t.Fatalf("write ready.json: %v", err)
+		}
+		usageData, err := json.Marshal(struct {
+			LastUsed int64 `json:"lastUsed"`
+		}{LastUsed: lastUsed})
+		if err != nil {
+			t.Fatalf("marshal usage.json: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "usage.json"), usageData, 0o644); err != nil {
+			t.Fatalf("write usage.json: %v", err)
+		}
+	}
+	// 过期单元：lastUsed=1，宿主态必须原子刷新为当前时间。
+	writeCell(goCellDir, "runner", 1)
+	// 新鲜单元：lastUsed=now-1m，命中 <5m 只读短路，绝不重写。
+	freshLastUsed := time.Now().Add(-1 * time.Minute).Unix()
+	writeCell(extCellDir, "ext.js", freshLastUsed)
+
+	if err := os.WriteFile(filepath.Join(toolchainsDir, "go.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write toolchains/go.json: %v", err)
+	}
+
+	staleBefore := time.Now().Unix()
+	t.Setenv("PIG_HOME", fakePigHome)
 	policy := sandbox.ReviewerAgent(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
 	if err := policy.Validate(); err != nil {
 		t.Fatalf("ReviewerAgent Validate failed: %v", err)
 	}
 
-	// usage.json 刷新：<pigHome>/cache 下有效缓存单元 lastUsed 必须足够新
-	// （touchUsageJSON 有 <5m 短路，同一测试进程内最早的 ReviewerAgent 调用可能已完成写入）。
-	freshThreshold := time.Now().Unix() - 600
-	cacheRoot := "/root/.pig/cache"
-	if env := os.Getenv("PIG_HOME"); env != "" {
-		cacheRoot = filepath.Join(env, "cache")
-	}
-	checked := 0
-	for _, lang := range []string{"go", "node"} {
-		langRoot := filepath.Join(cacheRoot, "cells", lang)
-		entries, err := os.ReadDir(langRoot)
+	readLastUsed := func(dir string) int64 {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, "usage.json"))
 		if err != nil {
-			continue
+			t.Fatalf("usage.json missing in %s: %v", dir, err)
 		}
-		for _, ent := range entries {
-			if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
-				continue
-			}
-			dir := filepath.Join(langRoot, ent.Name())
-			if _, err := os.Stat(filepath.Join(dir, "ready.json")); err != nil {
-				continue
-			}
-			data, err := os.ReadFile(filepath.Join(dir, "usage.json"))
-			if err != nil {
-				t.Fatalf("usage.json missing in %s: %v", dir, err)
-			}
-			var usage struct {
-				LastUsed int64 `json:"lastUsed"`
-			}
-			if err := json.Unmarshal(data, &usage); err != nil {
-				t.Fatalf("usage.json malformed in %s: %v", dir, err)
-			}
-			if usage.LastUsed < freshThreshold {
-				t.Fatalf("usage.json stale in %s: lastUsed=%d < %d", dir, usage.LastUsed, freshThreshold)
-			}
-			checked++
+		var usage struct {
+			LastUsed int64 `json:"lastUsed"`
 		}
-	}
-	if checked == 0 {
-		t.Fatal("expected at least one valid cell entry to check")
+		if err := json.Unmarshal(data, &usage); err != nil {
+			t.Fatalf("usage.json malformed in %s: %v", dir, err)
+		}
+		return usage.LastUsed
 	}
 
-	// 锁目录在 ReadWrite，缓存单元目录不在 ReadWrite。
+	// 过期 usage.json 已刷新（>= 调用前基线），新鲜 usage.json 保持原值未被重写。
+	if got := readLastUsed(goCellDir); got < staleBefore {
+		t.Fatalf("stale usage.json not refreshed: lastUsed=%d < %d", got, staleBefore)
+	}
+	if got := readLastUsed(extCellDir); got != freshLastUsed {
+		t.Fatalf("fresh usage.json must not be rewritten (<5m 短路): lastUsed=%d, want %d", got, freshLastUsed)
+	}
+
+	// 锁目录与 toolchains 锁文件目录在 ReadWrite，缓存单元目录不在 ReadWrite。
 	rwSet := make(map[string]struct{}, len(policy.ReadWrite))
 	for _, rw := range policy.ReadWrite {
 		rwSet[rw] = struct{}{}
@@ -1553,34 +1593,25 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 	for _, dir := range []string{
 		filepath.Join(cacheRoot, "cells", "go", ".locks"),
 		filepath.Join(cacheRoot, "ext", ".locks"),
+		toolchainsDir,
 	} {
-		if st, err := os.Stat(dir); err == nil && st.IsDir() {
-			if _, ok := rwSet[dir]; !ok {
-				t.Fatalf("expected %s in ReadWrite", dir)
-			}
+		if _, ok := rwSet[dir]; !ok {
+			t.Fatalf("expected %s in ReadWrite, got %v", dir, policy.ReadWrite)
 		}
 	}
-	if _, ok := rwSet[filepath.Join(cacheRoot, "cells")]; ok {
-		t.Fatal("cells dir itself must not be ReadWrite")
-	}
-	if _, ok := rwSet[filepath.Join(cacheRoot, "ext")]; ok {
-		t.Fatal("ext dir itself must not be ReadWrite")
-	}
-
-	// 至少一个已构建 runner 在 Exec。
-	foundRunner := false
-	for _, ep := range policy.Exec {
-		if strings.HasPrefix(ep, filepath.Join(cacheRoot, "cells", "go")+string(filepath.Separator)) &&
-			filepath.Base(ep) == "runner" {
-			foundRunner = true
-			break
+	for _, dir := range []string{
+		filepath.Join(cacheRoot, "cells"),
+		filepath.Join(cacheRoot, "cells", "go"),
+		filepath.Join(cacheRoot, "ext"),
+		goCellDir,
+		extCellDir,
+	} {
+		if _, ok := rwSet[dir]; ok {
+			t.Fatalf("%s must not be ReadWrite", dir)
 		}
 	}
-	if !foundRunner {
-		t.Fatalf("expected at least one cached runner in Exec, got %v", policy.Exec)
-	}
 
-	// W^X：ReadWrite 与 Exec 之间不存在任何相等或父子包含关系。
+	// 已构建 runner 与 ext.js 产物在 Exec。
 	execSet := make(map[string]struct{}, len(policy.Exec)*2)
 	for _, ep := range policy.Exec {
 		execSet[ep] = struct{}{}
@@ -1588,6 +1619,16 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 			execSet[r] = struct{}{}
 		}
 	}
+	for _, want := range []string{
+		filepath.Join(goCellDir, "runner"),
+		filepath.Join(extCellDir, "ext.js"),
+	} {
+		if _, ok := execSet[want]; !ok {
+			t.Fatalf("expected cached artifact %s in Exec, got %v", want, policy.Exec)
+		}
+	}
+
+	// W^X：ReadWrite 与 Exec 之间不存在任何相等或父子包含关系。
 	for _, rw := range policy.ReadWrite {
 		normRW, err := sandbox.NormalizePath(rw)
 		if err != nil {
@@ -1606,16 +1647,16 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 		}
 	}
 
-	// 对照：ReadOnlyReviewer 不得放行 .locks 或缓存产物。
+	// 对照：ReadOnlyReviewer 不得放行 .locks、缓存产物或任何 fakePigHome 下路径。
 	ro := sandbox.ReadOnlyReviewer(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(ro) })
 	for _, rw := range ro.ReadWrite {
-		if strings.Contains(rw, "/.pig/cache") {
+		if strings.Contains(rw, fakePigHome) || strings.Contains(rw, "/.pig/cache") {
 			t.Fatalf("ReadOnlyReviewer must not grant %s", rw)
 		}
 	}
 	for _, ep := range ro.Exec {
-		if strings.Contains(ep, "/.pig/cache") {
+		if strings.Contains(ep, fakePigHome) || strings.Contains(ep, "/.pig/cache") {
 			t.Fatalf("ReadOnlyReviewer must not Exec %s", ep)
 		}
 	}
@@ -1629,6 +1670,9 @@ func TestReviewerAgentCellCachePolicy(t *testing.T) {
 // 宿主 /run/user/0（含 systemd user bus/keyring 套接字）绝不进 ReadWrite。
 // 对照：ReadOnlyReviewer 契约不变，不注入 XDG_RUNTIME_DIR。
 func TestReviewerAgentPrivateXDGRuntimeDir(t *testing.T) {
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {

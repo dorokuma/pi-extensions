@@ -882,6 +882,72 @@ func preparePrivateRuntimeDir(privateTmpDir string) string {
 	return dir
 }
 
+// resolvePolicyPathWithin 校验 candidate 是 root 内部（不含 root 本身）的真实目录：
+// Lstat 拒绝符号链接本体，EvalSymlinks 解析后的目标必须与 resolvedRoot 下
+// 同一相对路径一致（容许 root 祖先含系统软链如 macOS /var -> /private/var，
+// 同时拒绝 root 内部任意层级的中间软链），且不得与 p.Exec 中已有路径相等或
+// 互为父子（含 Exec 条目解析后的真实路径），彻底闭合 W^X 写穿。
+// 命中任何一条拒绝规则返回 ""。
+func resolvePolicyPathWithin(candidate, root string, p *Policy) string {
+	candidate = filepath.Clean(strings.TrimSpace(candidate))
+	root = filepath.Clean(strings.TrimSpace(root))
+	if candidate == "" || candidate == "." || root == "" || root == "." {
+		return ""
+	}
+	// 相对路径必须严格落在 root 内部（不含 root 本身），不解析软链先排除
+	// .. 逃逸与拼写异常。
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return ""
+	}
+	// root 允许经祖先软链（如系统 /var -> /private/var）传入：先解析出真实根。
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil || resolvedRoot == "" {
+		return ""
+	}
+	if info, err := os.Lstat(candidate); err != nil {
+		return ""
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		// 显式拒绝符号链接本体（含指向目录的软链）；非目录一律拒绝。
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil || resolved == "" {
+		return ""
+	}
+	// 解析后的真实路径必须等于 resolvedRoot 下同一相对路径：root 祖先的
+	// 系统软链被同时解析抵消，而 root 内部任意层级软链会使 resolved 偏离
+	// expectedResolved 被拒。resolved 也必须严格位于 resolvedRoot 之内。
+	expectedResolved := filepath.Join(resolvedRoot, rel)
+	resolvedClean := filepath.Clean(resolved)
+	resolvedRootClean := filepath.Clean(resolvedRoot)
+	if resolvedClean != filepath.Clean(expectedResolved) ||
+		!strings.HasPrefix(resolvedClean, resolvedRootClean+string(filepath.Separator)) {
+		return ""
+	}
+	// 绝不与 Exec 已有路径（含其软链解析目标）重合或互为父子，避免 W^X 被写穿。
+	sep := string(filepath.Separator)
+	for _, ep := range p.Exec {
+		targets := []string{ep}
+		if norm, err := NormalizePath(ep); err == nil && norm != "" {
+			targets = append(targets, norm)
+		}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			targets = append(targets, r)
+		}
+		for _, target := range targets {
+			epClean := filepath.Clean(target)
+			if resolvedClean == epClean ||
+				strings.HasPrefix(epClean, resolvedClean+sep) ||
+				strings.HasPrefix(resolvedClean, epClean+sep) {
+				return ""
+			}
+		}
+	}
+	return resolved
+}
+
 // appendCtxmodeStateReadWrite 为宿主态 ctxmode / agy-recall 状态目录做精确兜底放行：
 //   - <home>/.local/share/ctxmode：CTXMODE_DB 显式指定指回宿主时的最小写域；
 //   - <home>/.gemini/config/plugins/agy-recall/state（覆盖 homeDir() 与 /root/.agy-pro-home）。
@@ -889,25 +955,31 @@ func preparePrivateRuntimeDir(privateTmpDir string) string {
 // 绝不加入 ~/.local/share 本身或其兄弟目录（特别是 gemini-web/chrome-profile）。
 func appendCtxmodeStateReadWrite(p *Policy) {
 	seen := make(map[string]struct{}, 4)
-	add := func(d string, mkdir bool) {
+	add := func(d string, mkdir bool, root string) {
 		d = filepath.Clean(strings.TrimSpace(d))
 		if d == "" || d == "." {
 			return
 		}
-		if _, ok := seen[d]; ok {
+		if mkdir {
+			// 仅在目标不存在时创建；已存在的软链或非常规目录不得被 MkdirAll 静默接受。
+			if _, err := os.Lstat(d); os.IsNotExist(err) {
+				_ = os.MkdirAll(d, 0o700)
+			}
+		}
+		resolved := resolvePolicyPathWithin(d, root, p)
+		if resolved == "" {
 			return
 		}
-		seen[d] = struct{}{}
-		if mkdir {
-			_ = os.MkdirAll(d, 0o700)
+		if _, ok := seen[resolved]; ok {
+			return
 		}
-		if st, err := os.Stat(d); err == nil && st.IsDir() {
-			p.ReadWrite = append(p.ReadWrite, d)
-		}
+		seen[resolved] = struct{}{}
+		p.ReadWrite = append(p.ReadWrite, resolved)
 	}
 	for _, root := range dedupeStrings([]string{homeDir(), "/root", "/root/.agy-pro-home"}) {
-		add(filepath.Join(root, ".local", "share", "ctxmode"), false)
-		add(filepath.Join(root, ".gemini", "config", "plugins", "agy-recall", "state"), true)
+		// root 限定到各自 home 根：任何软链/.. 逃逸出该根的目录一律拒绝。
+		add(filepath.Join(root, ".local", "share", "ctxmode"), false, root)
+		add(filepath.Join(root, ".gemini", "config", "plugins", "agy-recall", "state"), true, root)
 	}
 }
 
@@ -928,10 +1000,10 @@ var pigAgentConfigFiles = []string{
 // 不创建 extensions 软链：自动发现走 <agentDir>/extensions 会把 cfg.Source 记成
 // 随机私有路径（/tmp/pi-sandbox-XXXXXX/pig-agent/extensions/<ext>），packed-go 的
 // cellHash 直接对该路径取哈希，导致每次启动都脱靶宿主已构建的打包 cell。
-// 改为在私有 settings.json 中显式声明 "extensions": ["<宿主扩展目录绝对路径>"]
-// （仅当宿主 settings.json 未显式设置 extensions 字段时注入；已设置则原样保留），
-// 使 settings 条目经 ResolveConfiguredWithError 解析出的 cfg.Source 与宿主自动发现
-// 完全一致，packed cell.Key 与 goPackedCellHash 逐字节命中宿主缓存。
+// 改为在私有 settings.json 中显式声明宿主扩展目录（见 injectHostExtensionsSetting：
+// 未声明时注入 [hostExtDir]，已有数组时相对路径相对宿主 <pigHome>/agent 解析并
+// 视需要追加），使 settings 条目经 ResolveConfiguredWithError 解析出的 cfg.Source
+// 与宿主自动发现完全一致，packed cell.Key 与 goPackedCellHash 逐字节命中宿主缓存。
 func preparePrivatePigAgentDir(privateTmpDir string) string {
 	dst := filepath.Join(privateTmpDir, "pig-agent")
 	if err := os.MkdirAll(dst, 0o700); err != nil {
@@ -972,23 +1044,135 @@ func preparePrivatePigAgentDir(privateTmpDir string) string {
 	return dst
 }
 
-// injectHostExtensionsSetting 向私有 settings.json 注入 "extensions": [hostExtDir]，
-// 保留宿主原有全部键值。仅当 JSON 可解析为对象且未显式声明 extensions 时注入；
-// 解析失败或已有 extensions 字段（含显式 null/数组）一律原样返回，尊重宿主配置。
+// injectHostExtensionsSetting 向私有 settings.json 注入宿主扩展目录 hostExtDir，
+// 保留宿主原有全部键值：
+//   - 未声明 "extensions"：注入 [hostExtDir]；
+//   - "extensions" 为 null 或非数组（含解析失败）：原样返回，尊重宿主配置；
+//   - "extensions" 为字符串数组：相对本地路径条目（非空，且不以 / ~ - !
+//     npm: git: http:// https:// 开头；以 + 开头则保留前缀后对剩余路径按同规则
+//     解析）相对宿主 <pigHome>/agent（即 filepath.Dir(hostExtDir)）解析为绝对路径，
+//     排除项（- / ! 前缀）中的相对路径同样改写为相对宿主 agentDir 的绝对排除路径；
+//     若数组经解析后未包含等价 hostExtDir（含 "./extensions"/"extensions"/
+//     "+./extensions"/末尾带 / 等写法）且未显式排除（"-"/"!" 前缀 + hostExtDir /
+//     "extensions" / "./extensions" / 解析后等价路径），追加 hostExtDir——
+//     PIG_CODING_AGENT_DIR 改指私有目录后自动发现的 <agentDir>/extensions 已不存在，
+//     不追加会丢失宿主默认扩展。
 func injectHostExtensionsSetting(data []byte, hostExtDir string) []byte {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
 		return data
 	}
-	if _, exists := obj["extensions"]; exists {
+	raw, exists := obj["extensions"]
+	if !exists {
+		obj["extensions"] = json.RawMessage(mustMarshalJSON([]string{hostExtDir}))
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return data
+		}
+		return out
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		// 显式 null：原样保留，尊重宿主配置。
 		return data
 	}
-	obj["extensions"] = json.RawMessage(mustMarshalJSON([]string{hostExtDir}))
-	out, err := json.Marshal(obj)
+
+	var entries []string
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		// null / 非数组 / 非字符串元素：原样保留。
+		return data
+	}
+
+	agentDir := filepath.Dir(hostExtDir)
+	foundHostExt := false
+	excluded := false
+	out := make([]string, 0, len(entries)+1)
+	for _, e := range entries {
+		// 解析后比对："./extensions"、"extensions"、"+./extensions"、末尾带 /
+		// 等写法都会解析为同一 hostExtDir，不得二次追加造成重复。
+		resolvedEntry := resolveHostExtensionEntry(e, agentDir)
+		if rest, ok := strings.CutPrefix(resolvedEntry, "+"); ok {
+			if filepath.Clean(rest) == filepath.Clean(hostExtDir) {
+				foundHostExt = true
+			}
+		} else if filepath.Clean(resolvedEntry) == filepath.Clean(hostExtDir) {
+			foundHostExt = true
+		}
+		// 显式排除项：- / ! 前缀。除 "extensions" 组名外，相对路径条目在私有
+		// AgentDir 下会失配（相对 <privateTmpDir>/pig-agent 解析），统一改写为
+		// 相对宿主 agentDir 的绝对排除路径。
+		if e != "" && (e[0] == '-' || e[0] == '!') {
+			rest := e[1:]
+			if rest == "extensions" || rest == "./extensions" ||
+				filepath.Clean(rest) == filepath.Clean(hostExtDir) {
+				excluded = true
+			} else if rel, ok := strings.CutPrefix(rest, "./"); ok {
+				if filepath.Join(agentDir, rel) == filepath.Clean(hostExtDir) {
+					excluded = true
+				}
+			} else if rel, ok := strings.CutPrefix(rest, "../"); ok {
+				if filepath.Clean(filepath.Join(agentDir, "../"+rel)) == filepath.Clean(hostExtDir) {
+					excluded = true
+				}
+			}
+			// 仅 ./ ../ 开头的相对路径排除项改写为相对宿主 agentDir 的绝对路径；
+			// 裸名（如 "extensions"、"excluded"）是扩展名排除而非路径，原样保留。
+			if strings.HasPrefix(rest, "./") || strings.HasPrefix(rest, "../") {
+				resolvedEntry = e[:1] + filepath.Join(agentDir, rest)
+			}
+		}
+		out = append(out, resolvedEntry)
+	}
+	if !foundHostExt && !excluded {
+		out = append(out, hostExtDir)
+	}
+	obj["extensions"] = json.RawMessage(mustMarshalJSON(out))
+	data2, err := json.Marshal(obj)
 	if err != nil {
 		return data
 	}
-	return out
+	return data2
+}
+
+// resolveHostExtensionEntry 把 settings.json extensions 数组中的相对本地路径条目
+// 解析为相对 agentDir 的绝对路径。非路径条目（npm:/git:/http(s)://）、绝对路径、
+// ~ 开头、空串以及 - / ! 显式排除前缀一律原样返回；+ 前缀（启用标记）保留前缀
+// 后对剩余路径按同一规则解析。
+func resolveHostExtensionEntry(entry, agentDir string) string {
+	if entry == "" {
+		return entry
+	}
+	prefix := ""
+	rest := entry
+	switch rest[0] {
+	case '+':
+		prefix = "+"
+		rest = rest[1:]
+	case '-', '!':
+		// 显式排除项：按原样保留，不做路径解析（含 "-extensions" 整组排除）。
+		return entry
+	}
+	if isAbsoluteExtensionPath(rest) {
+		return prefix + rest
+	}
+	return prefix + filepath.Join(agentDir, rest)
+}
+
+// isAbsoluteExtensionPath 判断 extensions 条目是否为绝对路径 / 非本地相对路径：
+// 空串、/ 或 ~ 开头、URI 类前缀（npm: git: http:// https://）返回 true。
+// - / ! 前缀由调用方先行剥离/短路，不在此处判断。
+func isAbsoluteExtensionPath(rest string) bool {
+	if rest == "" {
+		return true
+	}
+	if rest[0] == '/' || rest[0] == '~' {
+		return true
+	}
+	for _, scheme := range []string{"npm:", "git:", "http://", "https://"} {
+		if strings.HasPrefix(rest, scheme) {
+			return true
+		}
+	}
+	return false
 }
 
 // mustMarshalJSON 序列化不会失败的值；兜底返回 "null"（调用方已校验类型）。
@@ -1002,6 +1186,9 @@ func mustMarshalJSON(v any) []byte {
 
 // injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR=<privatePigAgentDir>：
 // 仅当调用方未显式将 PIG_CODING_AGENT_DIR（或 Policy.Env 同名键）指向其它可写目录时生效。
+// 对称地，当宿主环境或 env 中 PIG_USE_PI_DIRS == "1"（pig 以 PI_* 变量名读取 AgentDir）
+// 且 PI_CODING_AGENT_DIR 在宿主环境与 env 中均未设置时，追加
+// PI_CODING_AGENT_DIR=<privatePigAgentDir>，保持私有隔离不被宿主默认路径打穿。
 func injectPigCodingAgentDir(env []string, privatePigAgentDir string) []string {
 	if strings.TrimSpace(os.Getenv("PIG_CODING_AGENT_DIR")) != "" {
 		return env
@@ -1009,7 +1196,16 @@ func injectPigCodingAgentDir(env []string, privatePigAgentDir string) []string {
 	if lookupEnvValue(env, "PIG_CODING_AGENT_DIR") != "" {
 		return env
 	}
-	return append(env, "PIG_CODING_AGENT_DIR="+privatePigAgentDir)
+	env = append(env, "PIG_CODING_AGENT_DIR="+privatePigAgentDir)
+
+	usePiDirs := os.Getenv("PIG_USE_PI_DIRS") == "1" || lookupEnvValue(env, "PIG_USE_PI_DIRS") == "1"
+	if usePiDirs {
+		if strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")) == "" &&
+			lookupEnvValue(env, "PI_CODING_AGENT_DIR") == "" {
+			env = append(env, "PI_CODING_AGENT_DIR="+privatePigAgentDir)
+		}
+	}
+	return env
 }
 
 // cellReadyMeta 是缓存单元 ready.json 中校验所需的字段。
@@ -1050,7 +1246,8 @@ func validCellEntryDir(dir string) (cellReadyMeta, string, bool) {
 
 // usageTouchMinInterval 是 touchUsageJSON 的跳过重写窗口：lastUsed 距今小于该值则只读短路。
 // 取 5m，比沙盒内 pig 的 PiG runtimecell.TouchUsage <1h 短路更紧，确保宿主态预刷新后
-// usage.json 足够新，pig 运行期 <1h 短路在整个沙盒会话内稳定命中、不向缓存目录写临时文件。
+// usage.json 足够新：<55m 的沙盒会话内 pig 运行期 <1h 短路稳定命中、不向缓存目录
+// 写临时文件（>55m 超长会话属 PiG 侧只读容错范围外，见 README Known Risks）。
 const usageTouchMinInterval = 5 * time.Minute
 
 // touchUsageJSON 与 PiG runtimecell.TouchUsage 同形：<usageTouchMinInterval（5m）
@@ -1107,7 +1304,8 @@ func cellCacheEntryDirs(cacheRoot string) []string {
 			return
 		}
 		for _, ent := range entries {
-			if !ent.IsDir() {
+			// DirEntry.IsDir 对符号链接为 false，软链条目一律跳过（防逃逸）。
+			if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
 				continue
 			}
 			name := ent.Name()
@@ -1121,7 +1319,7 @@ func cellCacheEntryDirs(cacheRoot string) []string {
 	cellsRoot := filepath.Join(cacheRoot, "cells")
 	if langs, err := os.ReadDir(cellsRoot); err == nil {
 		for _, lang := range langs {
-			if !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
+			if lang.Type()&os.ModeSymlink != 0 || !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
 				continue
 			}
 			addEntries(filepath.Join(cellsRoot, lang.Name()))
@@ -1156,8 +1354,39 @@ func refreshCellUsageMetadata(pigHome string, now time.Time) int {
 // 缓存单元目录本身保持只读；锁目录与可执行文件分离，不破坏 W^X。
 func appendCellCachePolicy(p *Policy, pigHome string) {
 	cacheRoot := filepath.Join(pigHome, "cache")
-	if st, err := os.Stat(cacheRoot); err != nil || !st.IsDir() {
+	// cacheRoot 自身是软链视为非预期布局直接返回；祖先目录含系统软链（如
+	// macOS /var -> /private/var）不受影响——resolvePolicyPathWithin 会把
+	// root 与其子项解析到同一真实根下比较。
+	if info, err := os.Lstat(cacheRoot); err != nil ||
+		info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return
+	}
+
+	// 先收集已构建产物进 Exec，再处理锁目录 ReadWrite：使 addRW 内的
+	// resolvePolicyPathWithin 能看到完整 Exec 集，.locks 软链指向 artifact
+	// 目录时能被 Exec 重合检查拒绝，严守 W^X。
+	seenExec := make(map[string]struct{}, 8)
+	for _, dir := range cellCacheEntryDirs(cacheRoot) {
+		_, artifactPath, ok := validCellEntryDir(dir)
+		if !ok {
+			continue
+		}
+		info, err := os.Stat(artifactPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		// 缓存产物按普通文件处理：仅放行带执行位的真实文件。
+		if info.Mode()&0o111 == 0 {
+			continue
+		}
+		norm, err := NormalizePath(artifactPath)
+		if err != nil {
+			continue
+		}
+		if _, ok := seenExec[norm]; !ok {
+			seenExec[norm] = struct{}{}
+			p.Exec = append(p.Exec, norm)
+		}
 	}
 
 	seenRW := make(map[string]struct{}, 4)
@@ -1167,10 +1396,18 @@ func appendCellCachePolicy(p *Policy, pigHome string) {
 			return
 		}
 		seenRW[d] = struct{}{}
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		// 仅当目标不存在时才创建；已存在的软链/非常规目录不被 MkdirAll 静默接受。
+		if _, err := os.Lstat(d); os.IsNotExist(err) {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				return
+			}
+		}
+		// Lstat 拒绝软链本体 + EvalSymlinks 校验严格位于 cacheRoot 内 + 不与 Exec 重合。
+		resolved := resolvePolicyPathWithin(d, cacheRoot, p)
+		if resolved == "" {
 			return
 		}
-		p.ReadWrite = append(p.ReadWrite, d)
+		p.ReadWrite = append(p.ReadWrite, resolved)
 	}
 
 	// 锁目录：cells/<lang>/.locks 与 ext/.locks。
@@ -1178,7 +1415,7 @@ func appendCellCachePolicy(p *Policy, pigHome string) {
 	cellsRoot := filepath.Join(cacheRoot, "cells")
 	if langs, err := os.ReadDir(cellsRoot); err == nil {
 		for _, lang := range langs {
-			if !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
+			if lang.Type()&os.ModeSymlink != 0 || !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
 				continue
 			}
 			addRW(filepath.Join(cellsRoot, lang.Name(), ".locks"))
@@ -1198,33 +1435,6 @@ func appendCellCachePolicy(p *Policy, pigHome string) {
 		}
 		if hasRecords {
 			addRW(toolchainsDir)
-		}
-	}
-
-	// 已构建产物：artifact 普通文件进 Exec（cells/<digest>/runner、ext/<entry>/bin、
-	// ext/node-runtime 的 content.sha256 除外——其虽带执行位但不是 ELF，按统一规则放行也无执行面）。
-	seenExec := make(map[string]struct{}, 8)
-	for _, dir := range cellCacheEntryDirs(cacheRoot) {
-		meta, artifactPath, ok := validCellEntryDir(dir)
-		if !ok {
-			continue
-		}
-		_ = meta
-		info, err := os.Stat(artifactPath)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		// 缓存产物按普通文件处理：仅放行带执行位的真实文件。
-		if info.Mode()&0o111 == 0 {
-			continue
-		}
-		norm, err := NormalizePath(artifactPath)
-		if err != nil {
-			continue
-		}
-		if _, ok := seenExec[norm]; !ok {
-			seenExec[norm] = struct{}{}
-			p.Exec = append(p.Exec, norm)
 		}
 	}
 }
