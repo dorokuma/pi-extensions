@@ -54,6 +54,25 @@ go run ./cmd/sbx --preset reviewer --workdir /path/to/repo -- go test ./...
 go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo -- /root/.local/bin/agy --help
 ```
 
+## 受控发布 `scripts/deploy.sh`
+
+`scripts/deploy.sh`（0755）是 `sbx` 二进制的唯一受控发布入口，禁止手改部署副本。它首先（在任何 `cd`/子 shell 与任何文件系统副作用之前）完成三项零副作用校验：拒绝从 `*/.wt/*` 或顶层 `*/.wt` 调用方物理 cwd 发起发布；校验 `SBX_DEPLOY_TARGET` 非空、不以 `/` 结尾、不指向已存在目录（含指向目录的软链）；相对目标路径仅在内存中拼接到调用方 cwd。随后只在满足以下**三道硬门禁**时才继续：
+
+1. **禁止 worktree 发布**：`git rev-parse --absolute-git-dir` 与 `--git-common-dir` 的 `realpath` 必须相等（主仓 `.git` 非 worktree），且 top-level 不以 `/.wt` 结尾或含 `/.wt/`；
+2. **禁止非 `main` 分支发布**：`git symbolic-ref --short HEAD` 必须为 `main`；
+3. **禁止 dirty 工作树发布**：`git status --porcelain --untracked-files=normal` 独立赋值（保留非零退出码）后必须为空。
+
+随后默认执行 `go vet -p 2 ./...` 与 `go test -p 2 -race -count=1 ./...` 预检（所有 `go` 调用显式 `-p 2` 限流，不依赖可被外部覆盖的 `GOFLAGS`）；**仅在三道硬门禁、版本提取与预检全部通过后才首次触碰文件系统**——`mkdir -p` 目标父目录并把 `SBX_DEPLOY_TARGET` 经 `pwd -P` 规范化为物理绝对路径（再次确认非目录），在目标同目录编译 `<target_dir>/.sbx.new.$$` 并注入 `-ldflags "-s -w -X main.version=<baseVer>+<shortSHA>"`（`<baseVer>` 权威源是 `go/sandbox/CHANGELOG.md` 首个已发布 `## [X.Y.Z]` SemVer 章节号——`cmd/sbx/main.go` 的 `var version = "dev"` 仅是未注入兜底，`[Unreleased]`/缺失/非 SemVer 一律拒绝，绝不产出 `sbx dev*`）。对临时二进制执行 `--version`（精确相等断言 `sbx <baseVer>+<shortSHA>` + SemVer+SHA 正则双校验）、`--check`（**Linux 下默认硬阻断**：须零退出且输出含 `Landlock supported`，仅显式 `SBX_DEPLOY_ALLOW_NO_LANDLOCK=1` 可在无 Landlock 内核测试环境降级为 WARN）以及 reviewer-agent + codegraph-go 冒烟（workdir 与 `reports/` 全部落在私有 `SMOKE_PIG_HOME` 内，绝不写主仓；冒烟结束经沙盒回传精确路径 + 严格 `^/tmp/pi-reviewer-[A-Za-z0-9._-]+$` 前缀校验清理两个私有目录，零残留且绝不通配误删并发审查窗格的目录）；**任一失败立即删除临时二进制退出，绝不触碰线上目标**。冒烟通过后先 `chmod 0555` 临时二进制并对它做 `chattr +i/-i` 前置探测（探测失败即在触碰任何备份与线上目标之前退出），再备份旧目标为 `<target>.bak-<时间戳>-<pid>-<旧版本标识>`（`0444`，mtime 取当前备份时刻；旧版本标识取自旧二进制 `--version` 首行末列、`awk` 输出无尾随换行、清洗非法字符后截断 40），然后仅在紧贴 `mv -f` 原子替换前解除旧目标 `chattr -i`（最小化无锁窗口，`lsattr` 复核确认 i 标志确实清除才继续），`mv -f` 与新 `chattr +i` 全部成功后才裁剪仅保留最新 3 个 `.bak*`（纯 bash 数组 + `[[ -nt ]]` 排序，新备份固定排保留首位，不使用 `ls -1t`；mv 或加锁失败时绝不提前删历史备份），最后 `chattr +i` 加**内核级防误写锁**；统一 `EXIT` `trap` 兜底清理临时二进制/冒烟目录并在部署未成功时恢复 `+i`（恢复失败显式 `ERROR`）。
+
+另：脚本在任何 `git` 查询前先剥掉全部 `GIT_*` 本地环境变量（`git rev-parse --local-env-vars`），并强校验模块物理路径必须归属 `<toplevel>/go/sandbox`，封堵经 `GIT_DIR`/`GIT_WORK_TREE` 伪造主仓查询从而从 worktree 编译的绕过路径。
+
+环境变量：`SBX_DEPLOY_TARGET`（目标路径，必须指向文件路径——首次安装尚不存在，或升级覆盖已存在普通文件；空值、以 `/` 结尾、已存在目录（含指向目录的软链）一律拒绝；允许相对路径，在任何 `cd` 前于内存中拼接到调用方 cwd，门禁通过后经 `pwd -P` 规范化为物理绝对路径）、`SBX_DEPLOY_SKIP_IMMUTABLE=1`（仅无 `CAP_LINUX_IMMUTABLE` 的单测/临时目录，跳过 `chattr`）、`SBX_DEPLOY_FAST_VERIFY=1`（仅防止 `go test` 内调用 `deploy.sh` 递归套娃 `go test`，仍执行 `go vet -p 2` 并跳过 `go test` 与 reviewer-agent 冒烟）、`SBX_DEPLOY_ALLOW_NO_LANDLOCK=1`（仅无 Landlock 内核的特殊测试环境，让 Linux `--check` 降级为 WARN）。生产发布这些开关均必须为 `0`/未设置。
+
+```bash
+# 生产发布（主仓 main、干净工作树）：
+bash go/sandbox/scripts/deploy.sh
+```
+
 ## 安全机制与本轮封堵的绕过路径
 
 ### 1. 可写临时目录与可执行目录分离（`W^X`）+ 受控 `go` 工具链代理
