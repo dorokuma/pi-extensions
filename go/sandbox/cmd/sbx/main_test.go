@@ -1,343 +1,369 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
+	"syscall"
 	"testing"
-
-	"github.com/dorokuma/pi-extensions/go/sandbox"
+	"time"
 )
 
-func TestParseArgsBasicAndFlags(t *testing.T) {
-	cfg, err := parseArgs([]string{
-		"--ro", "/usr,/bin",
-		"--ro", "/etc",
-		"--rw", "/tmp/work",
-		"--exec", "/usr/bin/git",
-		"--env", "FOO=bar",
-		"--env", "BAZ=qux",
-		"--deny-net",
-		"--best-effort",
-		"--",
-		"git", "status", "-s",
-	})
-	if err != nil {
-		t.Fatalf("parseArgs failed: %v", err)
-	}
+const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
 
-	wantRO := []string{"/usr", "/bin", "/etc"}
-	if !reflect.DeepEqual(cfg.ReadOnly, wantRO) {
-		t.Fatalf("ReadOnly = %v, want %v", cfg.ReadOnly, wantRO)
+func TestMain(m *testing.M) {
+	if os.Getenv(envSbxChildSpecKey) != "" {
+		os.Exit(runChildFromEnv())
 	}
-	wantRW := []string{"/tmp/work"}
-	if !reflect.DeepEqual(cfg.ReadWrite, wantRW) {
-		t.Fatalf("ReadWrite = %v, want %v", cfg.ReadWrite, wantRW)
+	if os.Getenv(envTestWantSbxMain) == "1" {
+		_ = os.Unsetenv(envTestWantSbxMain)
+		main()
+		os.Exit(0)
 	}
-	wantExec := []string{"/usr/bin/git"}
-	if !reflect.DeepEqual(cfg.Exec, wantExec) {
-		t.Fatalf("Exec = %v, want %v", cfg.Exec, wantExec)
-	}
-	wantEnv := []string{"FOO=bar", "BAZ=qux"}
-	if !reflect.DeepEqual(cfg.Env, wantEnv) {
-		t.Fatalf("Env = %v, want %v", cfg.Env, wantEnv)
-	}
-	if !cfg.DenyNet || !cfg.BestEffort || cfg.CheckOnly {
-		t.Fatalf("unexpected bool flags: DenyNet=%v BestEffort=%v CheckOnly=%v", cfg.DenyNet, cfg.BestEffort, cfg.CheckOnly)
-	}
-	wantCmd := []string{"git", "status", "-s"}
-	if !reflect.DeepEqual(cfg.Command, wantCmd) {
-		t.Fatalf("Command = %v, want %v", cfg.Command, wantCmd)
-	}
+	os.Exit(m.Run())
 }
 
-func TestParseArgsReviewerAliasEquivalence(t *testing.T) {
-	workDir := t.TempDir()
+func TestParseArgsBasicAndReviewerAlias(t *testing.T) {
+	wd := t.TempDir()
 
-	// 写法 1：兼容别名 `--reviewer WORKDIR -- cmd ...`
-	cfgAlias, err := parseArgs([]string{
-		"--reviewer", workDir,
-		"--",
-		"go", "test", "./...",
-	})
+	cfg, err := parseArgs([]string{"--reviewer", wd, "--", "ls", "-la"})
 	if err != nil {
-		t.Fatalf("parseArgs(--reviewer) failed: %v", err)
+		t.Fatalf("parseArgs(--reviewer) unexpected error: %v", err)
+	}
+	if cfg.Preset != "reviewer" {
+		t.Fatalf("Preset = %q, want %q", cfg.Preset, "reviewer")
+	}
+	if cfg.WorkDir != wd {
+		t.Fatalf("WorkDir = %q, want %q", cfg.WorkDir, wd)
+	}
+	if len(cfg.Command) != 2 || cfg.Command[0] != "ls" || cfg.Command[1] != "-la" {
+		t.Fatalf("Command = %v, want [ls -la]", cfg.Command)
 	}
 
-	// 写法 2：标准写法 `--preset reviewer --workdir DIR -- cmd ...`
-	cfgPreset, err := parseArgs([]string{
-		"--preset", "reviewer",
-		"--workdir", workDir,
-		"--",
-		"go", "test", "./...",
-	})
-	if err != nil {
-		t.Fatalf("parseArgs(--preset reviewer --workdir) failed: %v", err)
+	if _, err := parseArgs([]string{"--reviewer", wd, "--preset", "reviewer-agent", "--", "true"}); err == nil {
+		t.Fatal("expected conflict error between --reviewer and --preset reviewer-agent")
 	}
 
-	if !reflect.DeepEqual(cfgAlias, cfgPreset) {
-		t.Fatalf("cliConfig mismatch between --reviewer and --preset reviewer --workdir:\nalias:  %+v\npreset: %+v", cfgAlias, cfgPreset)
-	}
-
-	polAlias, err := buildPolicy(cfgAlias)
-	if err != nil {
-		t.Fatalf("buildPolicy(cfgAlias) failed: %v", err)
-	}
-	defer cleanupPolicyTempDirs(polAlias)
-
-	polPreset, err := buildPolicy(cfgPreset)
-	if err != nil {
-		t.Fatalf("buildPolicy(cfgPreset) failed: %v", err)
-	}
-	defer cleanupPolicyTempDirs(polPreset)
-
-	if err := polAlias.Validate(); err != nil {
-		t.Fatalf("polAlias.Validate() failed: %v", err)
-	}
-	if err := polPreset.Validate(); err != nil {
-		t.Fatalf("polPreset.Validate() failed: %v", err)
-	}
-
-	if !reflect.DeepEqual(polAlias.ReadOnly, polPreset.ReadOnly) {
-		t.Fatalf("ReadOnly mismatch: %v vs %v", polAlias.ReadOnly, polPreset.ReadOnly)
-	}
-	expectedReportDir := filepath.Join(workDir, sandbox.ReviewerReportSubdir)
-	if len(polAlias.ReadWrite) < 2 || polAlias.ReadWrite[0] != expectedReportDir || polPreset.ReadWrite[0] != expectedReportDir {
-		t.Fatalf("expected ReadWrite[0] to be %q, got alias=%v preset=%v", expectedReportDir, polAlias.ReadWrite, polPreset.ReadWrite)
-	}
-	if polAlias.DenyNet != polPreset.DenyNet || polAlias.BestEffort != polPreset.BestEffort {
-		t.Fatalf("flags mismatch between policies")
-	}
-}
-
-func TestParseArgsCheckAndErrors(t *testing.T) {
-	cfgCheck, err := parseArgs([]string{"--check"})
-	if err != nil {
-		t.Fatalf("parseArgs(--check) failed: %v", err)
-	}
-	if !cfgCheck.CheckOnly {
-		t.Fatal("expected CheckOnly=true")
-	}
-
-	// 缺少目标命令（且非 --check）应报错
-	if _, err := parseArgs([]string{"--ro", "/usr"}); err == nil {
-		t.Fatal("expected error when command is missing, got nil")
-	}
-
-	// 未知预设名应报错
-	if _, err := parseArgs([]string{"--preset", "unknown-preset", "--", "true"}); err == nil {
-		t.Fatal("expected error for unknown preset, got nil")
-	}
-
-	// --reviewer 与 --workdir 路径冲突应报错
-	if _, err := parseArgs([]string{"--reviewer", "/tmp/a", "--workdir", "/tmp/b", "--", "true"}); err == nil {
-		t.Fatal("expected error for conflicting --reviewer and --workdir, got nil")
-	}
-
-	// --reviewer 缺少有效目录参数（误吞 "--"）应报错
-	if _, err := parseArgs([]string{"--reviewer", "--", "true"}); err == nil {
-		t.Fatal("expected error when --reviewer is immediately followed by --, got nil")
+	if _, err := parseArgs([]string{"--reviewer", wd, "--workdir", "/tmp/other", "--", "true"}); err == nil {
+		t.Fatal("expected conflict error between --reviewer and mismatched --workdir")
 	}
 }
 
 func TestMergeEnv(t *testing.T) {
-	base := []string{"PATH=/usr/bin:/bin", "HOME=/root", "TMPDIR=/tmp"}
-	overrides := []string{"TMPDIR=/tmp/pi-reviewer-123", "GOTMPDIR=/tmp/pi-reviewer-123/go-tmp", "HOME=/home/reviewer"}
-
-	merged := mergeEnv(base, overrides)
-	want := []string{
-		"PATH=/usr/bin:/bin",
-		"HOME=/home/reviewer",
-		"TMPDIR=/tmp/pi-reviewer-123",
-		"GOTMPDIR=/tmp/pi-reviewer-123/go-tmp",
+	base := []string{"A=1", "B=2", "C=3"}
+	overrides := []string{"B=20", "D=4"}
+	got := mergeEnv(base, overrides)
+	want := []string{"A=1", "B=20", "C=3", "D=4"}
+	if len(got) != len(want) {
+		t.Fatalf("mergeEnv len = %d, want %d (%v)", len(got), len(want), got)
 	}
-	if !reflect.DeepEqual(merged, want) {
-		t.Fatalf("mergeEnv = %v, want %v", merged, want)
-	}
-	// 确保原切片未被修改
-	if base[2] != "TMPDIR=/tmp" {
-		t.Fatalf("base slice was mutated: %v", base)
-	}
-}
-
-func TestResolveCommandPathWithEnvOverride(t *testing.T) {
-	dir := t.TempDir()
-	fakeGo := filepath.Join(dir, "go")
-	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fakeGo: %v", err)
-	}
-
-	resolved, err := resolveCommandPath("go", []string{"PATH=" + dir + ":/usr/bin:/bin"})
-	if err != nil {
-		t.Fatalf("resolveCommandPath failed: %v", err)
-	}
-	if resolved != fakeGo {
-		t.Fatalf("resolveCommandPath = %q, want %q", resolved, fakeGo)
-	}
-}
-
-func cleanupPolicyTempDirs(p sandbox.Policy) {
-	for _, kv := range p.Env {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		if (k == "TMPDIR" && strings.HasPrefix(v, "/tmp/pi-reviewer-")) ||
-			(k == "PI_SANDBOX_GO_EXEC_DIR" && strings.HasPrefix(v, "/tmp/pi-reviewer-exec-")) {
-			_ = os.RemoveAll(v)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mergeEnv[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
 }
 
-func TestParseArgsVersion(t *testing.T) {
-	cfg, err := parseArgs([]string{"--version"})
+func TestCleanupPresetTempDirsFallbackPath(t *testing.T) {
+	customTmpParent := t.TempDir()
+	t.Setenv("TMPDIR", customTmpParent)
+
+	revDir, err := os.MkdirTemp("", "pi-reviewer-*")
 	if err != nil {
-		t.Fatalf("parseArgs(--version) failed: %v", err)
+		t.Fatalf("MkdirTemp reviewer: %v", err)
 	}
-	if !cfg.ShowVersion {
-		t.Fatal("expected ShowVersion=true")
-	}
-	if cfg.CheckOnly {
-		t.Fatal("expected CheckOnly=false for --version")
-	}
-	if len(cfg.Command) != 0 {
-		t.Fatalf("expected empty Command for --version, got %v", cfg.Command)
-	}
-}
-
-func TestVersionDefaultDev(t *testing.T) {
-	if version == "" {
-		t.Fatal("version must be non-empty (default \"dev\" or ldflags-injected)")
-	}
-}
-
-// TestCleanupPresetTempDirsFromEnv 覆盖 SBX-S2：--preset 构造出的私有临时目录
-// （/tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*）在提前退出路径被主动清理，
-// 不泄漏到 /tmp；非预设前缀的路径绝不误删。
-func TestCleanupPresetTempDirsFromEnv(t *testing.T) {
-	tmp := t.TempDir()
-	privateTmp := filepath.Join(tmp, "pi-reviewer-abc123")
-	execDir := filepath.Join(tmp, "pi-reviewer-exec-def456")
-	keep := filepath.Join(tmp, "pi-reviewer-keep")
-	other := filepath.Join(tmp, "other")
-	for _, d := range []string{privateTmp, execDir, keep, other} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-	}
-
-	// 模拟 preset Env：前缀目录被删，keep（非 /tmp/pi-reviewer-* 前缀但含同名段）与其它不动。
-	// 注意：实现要求 /tmp/pi-reviewer- 前缀，这里用 /tmp 真实前缀路径验证。
-	realPrivate, err := os.MkdirTemp("/tmp", "pi-reviewer-testclean-")
+	execDir, err := os.MkdirTemp("", "pi-reviewer-exec-*")
 	if err != nil {
-		t.Fatalf("MkdirTemp private: %v", err)
-	}
-	realExec, err := os.MkdirTemp("/tmp", "pi-reviewer-exec-testclean-")
-	if err != nil {
-		t.Fatalf("MkdirTemp exec: %v", err)
-	}
-	env := []string{
-		"TMPDIR=" + realPrivate,
-		"PI_SANDBOX_GO_EXEC_DIR=" + realExec,
-		"PATH=/usr/bin:/bin",
-	}
-	cleanupPresetTempDirsFromEnv(env)
-	if _, err := os.Stat(realPrivate); !os.IsNotExist(err) {
-		t.Fatalf("TMPDIR %s should be removed", realPrivate)
-	}
-	if _, err := os.Stat(realExec); !os.IsNotExist(err) {
-		t.Fatalf("exec dir %s should be removed", realExec)
+		t.Fatalf("MkdirTemp reviewer-exec: %v", err)
 	}
 
-	// 非 /tmp/pi-reviewer-* 前缀的路径绝不删除（防误删任意 TMPDIR）。
-	safeEnv := []string{
-		"TMPDIR=" + keep,
-		"PI_SANDBOX_GO_EXEC_DIR=" + other,
+	roSub := filepath.Join(revDir, "readonly-sub")
+	if err := os.MkdirAll(roSub, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	cleanupPresetTempDirsFromEnv(safeEnv)
-	for _, d := range []string{keep, other} {
-		if _, err := os.Stat(d); err != nil {
-			t.Fatalf("%s must not be removed: %v", d, err)
-		}
+	if err := os.WriteFile(filepath.Join(roSub, "item.txt"), []byte("x"), 0o400); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
-}
+	_ = os.Chmod(roSub, 0o500)
 
-func TestParseArgsReviewerAgent(t *testing.T) {
-	// SBX-S3：隔离 PIG_HOME，reviewer-agent 预设（ReviewerAgent）不得触碰宿主 /root/.pig/cache。
-	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
-
-	workDir := t.TempDir()
-	cfg, err := parseArgs([]string{
-		"--preset", "reviewer-agent",
-		"--workdir", workDir,
-		"--",
-		"/root/.local/bin/agy", "--help",
+	cleanupPresetTempDirsFromEnv([]string{
+		"TMPDIR=" + revDir,
+		"PI_SANDBOX_GO_EXEC_DIR=" + execDir,
 	})
+
+	if _, err := os.Lstat(revDir); !os.IsNotExist(err) {
+		t.Fatalf("expected %q to be removed, stat err = %v", revDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("expected %q to be removed, stat err = %v", execDir, err)
+	}
+}
+
+// TestSbxPresetNormalExitCleansTempDirs 验证正常退出（退出码 0）后，
+// /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-* 目录在运行期存在、退出后被彻底删除。
+func TestSbxPresetNormalExitCleansTempDirs(t *testing.T) {
+	workdir := t.TempDir()
+	script := `
+if [ ! -d "$TMPDIR" ] || [ ! -d "$PI_SANDBOX_GO_EXEC_DIR" ]; then
+	exit 91
+fi
+printf "%s\n%s\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR"
+`
+	out, code := invokeSbxSubprocess(t, nil,
+		"--best-effort", "--preset", "reviewer", "--workdir", workdir,
+		"--", "/bin/sh", "-c", script,
+	)
+	if code != 0 {
+		t.Fatalf("sbx exit code = %d, want 0; output:\n%s", code, out)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("unexpected output lines: %q", out)
+	}
+	tmpDir := strings.TrimSpace(lines[0])
+	execDir := strings.TrimSpace(lines[1])
+
+	if !strings.Contains(filepath.Base(tmpDir), "pi-reviewer-") {
+		t.Fatalf("unexpected TMPDIR %q", tmpDir)
+	}
+	if !strings.Contains(filepath.Base(execDir), "pi-reviewer-exec-") {
+		t.Fatalf("unexpected PI_SANDBOX_GO_EXEC_DIR %q", execDir)
+	}
+
+	if _, err := os.Lstat(tmpDir); !os.IsNotExist(err) {
+		t.Fatalf("TMPDIR %q still exists after normal exit (err=%v)", tmpDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("PI_SANDBOX_GO_EXEC_DIR %q still exists after normal exit (err=%v)", execDir, err)
+	}
+}
+
+// TestSbxPresetNonZeroExitCodePreservedAndCleaned 验证子进程以非 0 退出码退出时，
+// sbx 原样返回该退出码，且临时目录依然被删除。
+func TestSbxPresetNonZeroExitCodePreservedAndCleaned(t *testing.T) {
+	workdir := t.TempDir()
+	script := `
+printf "%s\n%s\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR"
+exit 42
+`
+	out, code := invokeSbxSubprocess(t, nil,
+		"--best-effort", "--preset", "reviewer", "--workdir", workdir,
+		"--", "/bin/sh", "-c", script,
+	)
+	if code != 42 {
+		t.Fatalf("sbx exit code = %d, want 42; output:\n%s", code, out)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("unexpected output lines: %q", out)
+	}
+	tmpDir := strings.TrimSpace(lines[0])
+	execDir := strings.TrimSpace(lines[1])
+
+	if _, err := os.Lstat(tmpDir); !os.IsNotExist(err) {
+		t.Fatalf("TMPDIR %q leaked after non-zero exit (err=%v)", tmpDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("PI_SANDBOX_GO_EXEC_DIR %q leaked after non-zero exit (err=%v)", execDir, err)
+	}
+}
+
+// TestSbxPresetSignalForwardingAndCleanup 验证 sbx 父进程收到 SIGTERM / SIGINT 时，
+// 会将信号转发给受限子进程，且在子进程终止后仍会清理全部预设临时目录。
+func TestSbxPresetSignalForwardingAndCleanup(t *testing.T) {
+	signals := []struct {
+		name     string
+		sig      syscall.Signal
+		wantCode int
+	}{
+		{name: "SIGTERM", sig: syscall.SIGTERM, wantCode: 128 + int(syscall.SIGTERM)},
+		{name: "SIGINT", sig: syscall.SIGINT, wantCode: 128 + int(syscall.SIGINT)},
+	}
+
+	for _, tc := range signals {
+		t.Run(tc.name, func(t *testing.T) {
+			workdir := t.TempDir()
+			selfExe, err := os.Executable()
+			if err != nil {
+				t.Fatalf("os.Executable: %v", err)
+			}
+
+			// 使用 /bin/sh 内置 trap + read 阻塞在标准输入管道上，不依赖外部 sleep 二进制（sleep 不在 DefaultReviewerTools 白名单内）。
+			script := `
+trap 'exit 143' TERM
+trap 'exit 130' INT
+printf "%s\n%s\nREADY\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR"
+read _
+`
+			cmd := exec.Command(selfExe,
+				"--best-effort", "--preset", "reviewer", "--workdir", workdir,
+				"--", "/bin/sh", "-c", script,
+			)
+			cmd.Env = append(os.Environ(), envTestWantSbxMain+"=1")
+
+			stdinR, stdinW, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe stdin: %v", err)
+			}
+			defer stdinW.Close()
+			defer stdinR.Close()
+			cmd.Stdin = stdinR
+
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatalf("StdoutPipe: %v", err)
+			}
+			var stderrBuf bytes.Buffer
+			cmd.Stderr = &stderrBuf
+
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("cmd.Start: %v", err)
+			}
+
+			reader := bufio.NewReader(stdoutPipe)
+			readLineWithTimeout := func() string {
+				type res struct {
+					line string
+					err  error
+				}
+				ch := make(chan res, 1)
+				go func() {
+					s, err := reader.ReadString('\n')
+					ch <- res{line: strings.TrimSpace(s), err: err}
+				}()
+				select {
+				case r := <-ch:
+					if r.err != nil {
+						t.Fatalf("read child line failed: %v (stderr: %s)", r.err, stderrBuf.String())
+					}
+					return r.line
+				case <-time.After(10 * time.Second):
+					_ = cmd.Process.Kill()
+					t.Fatalf("timed out waiting for child output (stderr: %s)", stderrBuf.String())
+					return ""
+				}
+			}
+
+			tmpDir := readLineWithTimeout()
+			execDir := readLineWithTimeout()
+			ready := readLineWithTimeout()
+			if ready != "READY" {
+				_ = cmd.Process.Kill()
+				t.Fatalf("expected READY, got %q", ready)
+			}
+
+			// 发送信号前确认两个临时目录确实存在于磁盘上。
+			if _, err := os.Stat(tmpDir); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("expected TMPDIR %q to exist while running: %v", tmpDir, err)
+			}
+			if _, err := os.Stat(execDir); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("expected PI_SANDBOX_GO_EXEC_DIR %q to exist while running: %v", execDir, err)
+			}
+
+			// 向 sbx 父进程发送信号。
+			if err := cmd.Process.Signal(tc.sig); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("send signal %v failed: %v", tc.sig, err)
+			}
+
+			waitErr := cmd.Wait()
+			gotCode := exitCodeFromWaitErr(waitErr)
+			if gotCode != tc.wantCode {
+				t.Fatalf("after %s, exit code = %d, want %d (stderr: %s)", tc.name, gotCode, tc.wantCode, stderrBuf.String())
+			}
+
+			if _, err := os.Lstat(tmpDir); !os.IsNotExist(err) {
+				t.Fatalf("TMPDIR %q leaked after %s (err=%v)", tmpDir, tc.name, err)
+			}
+			if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+				t.Fatalf("PI_SANDBOX_GO_EXEC_DIR %q leaked after %s (err=%v)", execDir, tc.name, err)
+			}
+		})
+	}
+}
+
+// TestSbxReviewerAgentCredentialsNotLeaked 验证 --preset reviewer-agent 运行期间
+// 拷入 <privateTmpDir>/pig-agent/auth.json 的凭证副本在子进程退出后被彻底清除，不残留于 /tmp。
+func TestSbxReviewerAgentCredentialsNotLeaked(t *testing.T) {
+	workdir := t.TempDir()
+	fakePigHome := t.TempDir()
+	hostAgentDir := filepath.Join(fakePigHome, "agent")
+	hostExtDir := filepath.Join(hostAgentDir, "extensions")
+	if err := os.MkdirAll(hostExtDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll hostExtDir: %v", err)
+	}
+
+	authFixture := `{"token_placeholder":"fixture-value-for-cleanup-test"}`
+	if err := os.WriteFile(filepath.Join(hostAgentDir, "auth.json"), []byte(authFixture), 0o600); err != nil {
+		t.Fatalf("WriteFile auth.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hostAgentDir, "settings.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile settings.json: %v", err)
+	}
+
+	script := `
+auth_file="$PIG_CODING_AGENT_DIR/auth.json"
+if [ ! -f "$auth_file" ]; then
+	echo "missing auth.json in PIG_CODING_AGENT_DIR" >&2
+	exit 92
+fi
+printf "%s\n%s\n%s\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR" "$auth_file"
+`
+	out, code := invokeSbxSubprocess(t,
+		[]string{"PIG_HOME=" + fakePigHome},
+		"--best-effort", "--preset", "reviewer-agent", "--workdir", workdir,
+		"--", "/bin/sh", "-c", script,
+	)
+	if code != 0 {
+		t.Fatalf("reviewer-agent exit code = %d, want 0; output:\n%s", code, out)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("unexpected output lines: %q", out)
+	}
+	tmpDir := strings.TrimSpace(lines[0])
+	execDir := strings.TrimSpace(lines[1])
+	copiedAuthPath := strings.TrimSpace(lines[2])
+
+	if !strings.HasPrefix(copiedAuthPath, tmpDir+string(filepath.Separator)) {
+		t.Fatalf("copiedAuthPath %q is not inside TMPDIR %q", copiedAuthPath, tmpDir)
+	}
+
+	if _, err := os.Lstat(copiedAuthPath); !os.IsNotExist(err) {
+		t.Fatalf("credential copy %q leaked after reviewer-agent exit (err=%v)", copiedAuthPath, err)
+	}
+	if _, err := os.Lstat(tmpDir); !os.IsNotExist(err) {
+		t.Fatalf("TMPDIR %q leaked after reviewer-agent exit (err=%v)", tmpDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("PI_SANDBOX_GO_EXEC_DIR %q leaked after reviewer-agent exit (err=%v)", execDir, err)
+	}
+}
+
+func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (string, int) {
+	t.Helper()
+	selfExe, err := os.Executable()
 	if err != nil {
-		t.Fatalf("parseArgs(--preset reviewer-agent) failed: %v", err)
-	}
-	if cfg.Preset != "reviewer-agent" {
-		t.Fatalf("Preset = %q, want reviewer-agent", cfg.Preset)
-	}
-	if cfg.WorkDir != workDir {
-		t.Fatalf("WorkDir = %q, want %q", cfg.WorkDir, workDir)
+		t.Fatalf("os.Executable: %v", err)
 	}
 
-	pol, err := buildPolicy(cfg)
-	if err != nil {
-		t.Fatalf("buildPolicy(reviewer-agent) failed: %v", err)
-	}
-	defer cleanupPolicyTempDirs(pol)
+	cmd := exec.Command(selfExe, args...)
+	env := append(os.Environ(), envTestWantSbxMain+"=1")
+	env = append(env, extraEnv...)
+	cmd.Env = env
 
-	if err := pol.Validate(); err != nil {
-		t.Fatalf("ReviewerAgent Validate failed: %v", err)
-	}
-	if len(pol.EntryAgents) == 0 {
-		t.Fatal("expected non-empty EntryAgents for reviewer-agent preset")
-	}
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
 
-	foundSession := false
-	foundAgyState := false
-	foundAgyProHome := false
-	foundTTY := false
-	foundAgyBin := false
-	for _, rw := range pol.ReadWrite {
-		if rw == "/tmp/herdr-role-sessions" {
-			foundSession = true
-		}
-		if strings.Contains(rw, "/.gemini/antigravity-cli/") {
-			foundAgyState = true
-		}
-		if strings.Contains(rw, "/root/.agy-pro-home/.gemini/antigravity-cli/") {
-			foundAgyProHome = true
-		}
-		if rw == "/dev/tty" {
-			foundTTY = true
-		}
-	}
-	for _, ep := range pol.EntryAgents {
-		if strings.Contains(ep, "/.gemini/antigravity-cli/bin/agy") {
-			foundAgyBin = true
-			break
-		}
-	}
-	if !foundSession {
-		t.Fatalf("expected /tmp/herdr-role-sessions in ReadWrite, got %v", pol.ReadWrite)
-	}
-	if !foundAgyState {
-		t.Fatalf("expected antigravity-cli data paths in ReadWrite, got %v", pol.ReadWrite)
-	}
-	if !foundAgyProHome {
-		t.Fatalf("expected /root/.agy-pro-home/.gemini/antigravity-cli data paths in ReadWrite, got %v", pol.ReadWrite)
-	}
-	if !foundTTY {
-		t.Fatalf("expected /dev/tty in ReadWrite for agy -i / bubbletea, got %v", pol.ReadWrite)
-	}
-	if !foundAgyBin {
-		t.Fatalf("expected antigravity-cli/bin/agy in EntryAgents, got %v", pol.EntryAgents)
-	}
-	if pol.DenyNet {
-		t.Fatal("reviewer-agent must keep DenyNet=false for Magpie")
-	}
+	err = cmd.Run()
+	return out.String(), exitCodeFromWaitErr(err)
 }

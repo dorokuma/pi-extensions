@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-03
+
+PATCH：修复 `sbx` 经 `syscall.Exec` 替换自身后无法清理预设临时目录的泄漏——每次
+`--preset reviewer` / `reviewer-agent` 成功路径都会残留 `/tmp/pi-reviewer-*`（含
+`auth.json` 凭证副本）与 `/tmp/pi-reviewer-exec-*`。
+
+### Fixed
+
+- 父进程不再直接 `syscall.Exec` 目标命令；改为以内部环境变量
+  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 派生子进程，由子进程施加 Landlock 后再
+  `Exec` 目标。父进程保持在沙盒外，转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`，
+  等待子进程退出后执行预设临时目录清理，再按子进程退出码退出（被信号杀则
+  `128+信号`）。不 `Setpgid`，继承 stdio。
+- 补强清理路径：综合 `Policy.Env` / `ReadWrite` / `Exec` 识别
+  `pi-reviewer-*` 与 `pi-reviewer-exec-*`，对只读子目录自动补权限并短重试。
+- 新增集成测试覆盖正常退出、非零退出码、信号转发与 `reviewer-agent`
+  凭证副本清理。
+
 ## [0.3.0] - 2026-11-02
 
 MINOR：以四层私有隔离取代 `0.2.2` 的

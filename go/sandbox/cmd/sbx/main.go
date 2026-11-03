@@ -2,21 +2,28 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/dorokuma/pi-extensions/go/sandbox"
 )
 
 // version 由构建时 -ldflags "-X main.version=X.Y.Z" 注入；未注入时为 "dev"。
 var version = "dev"
+
+// envSbxChildSpecKey 是 sbx 父进程向受限子进程传递沙盒策略与目标命令的内部环境变量名。
+// 子进程启动后立即将该变量从环境中移除，再执行 sandbox.Apply 与 syscall.Exec。
+const envSbxChildSpecKey = "PI_SANDBOX_INTERNAL_CHILD_SPEC"
 
 type stringSlice []string
 
@@ -47,6 +54,19 @@ type cliConfig struct {
 	CheckOnly   bool
 	ShowVersion bool
 	Command     []string
+}
+
+// childExecSpec 封装父进程传递给受限子进程的沙盒配置与目标命令。
+type childExecSpec struct {
+	Bin         string   `json:"bin"`
+	Command     []string `json:"command"`
+	ReadOnly    []string `json:"ro"`
+	ReadWrite   []string `json:"rw"`
+	Exec        []string `json:"exec"`
+	DenyNet     bool     `json:"deny_net"`
+	Env         []string `json:"env"`
+	BestEffort  bool     `json:"best_effort"`
+	EntryAgents []string `json:"entry_agents"`
 }
 
 const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] -- COMMAND [ARGS...]"
@@ -237,88 +257,220 @@ func resolveCommandPath(cmdName string, envList []string) (string, error) {
 }
 
 func main() {
-	cfg, err := parseArgs(os.Args[1:])
+	if os.Getenv(envSbxChildSpecKey) != "" {
+		os.Exit(runChildFromEnv())
+	}
+	os.Exit(runMain(os.Args[1:]))
+}
+
+func runMain(args []string) int {
+	cfg, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n%s\n", err, usageLine)
-		os.Exit(2)
+		return 2
 	}
 
 	if cfg.ShowVersion {
 		fmt.Printf("sbx %s\n", version)
-		os.Exit(0)
+		return 0
 	}
 
 	if cfg.CheckOnly {
 		abi, ok := sandbox.Supported()
 		if !ok {
 			fmt.Fprintln(os.Stderr, "sbx: Landlock is not supported by the running kernel")
-			os.Exit(1)
+			return 1
 		}
 		fmt.Printf("sbx: Landlock supported (ABI v%d)\n", abi)
-		os.Exit(0)
+		return 0
 	}
 
 	policy, err := buildPolicy(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(2)
+		return 2
 	}
-	cleanupPresetTempDirs := func() { cleanupPresetTempDirsFromEnv(policy.Env) }
+	defer func() {
+		cleanupPresetTempDirsFromPolicy(policy)
+	}()
 
-	// 当启用了 Exec 白名单时，在应用沙盒前双重校验目标命令是否属于被禁用的代理或动态链接器。
+	// 当启用了 Exec 白名单时，在启动受限子进程前双重校验目标命令是否属于被禁用的代理或动态链接器。
 	// reviewer-agent 预设允许顶层 EntryAgents（agy/pig/pi）；其余 ForbiddenExec 仍拒绝。
 	if len(policy.Exec) > 0 {
 		if sandbox.IsELFInterpreter(cfg.Command[0]) {
-			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
-			os.Exit(126)
+			return 126
 		}
 		if sandbox.IsForbiddenExec(cfg.Command[0]) && !sandbox.IsEntryAgentPath(policy.EntryAgents, cfg.Command[0]) {
-			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])
-			os.Exit(126)
+			return 126
 		}
 	}
 
-	// 在调用 sandbox.Apply 收紧目录读取权限前先解析目标命令路径（优先参考 policy.Env 中注入的受控 PATH）。
+	// 在进入受限子进程前先解析目标命令路径（优先参考 policy.Env 中注入的受控 PATH）。
 	bin, err := resolveCommandPath(cfg.Command[0], policy.Env)
 	if err != nil {
-		cleanupPresetTempDirs()
 		fmt.Fprintf(os.Stderr, "sbx: resolve command %q: %v\n", cfg.Command[0], err)
-		os.Exit(127)
+		return 127
 	}
 
 	if len(policy.Exec) > 0 {
 		if sandbox.IsELFInterpreter(bin) {
-			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
-			os.Exit(126)
+			return 126
 		}
 		if sandbox.IsForbiddenExec(bin) && !sandbox.IsEntryAgentPath(policy.EntryAgents, bin) {
-			cleanupPresetTempDirs()
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", bin)
-			os.Exit(126)
+			return 126
 		}
 	}
 
+	return runSandboxedChild(bin, cfg.Command, policy)
+}
+
+// runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与 syscall.Exec；
+// 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
+// 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
+func runSandboxedChild(bin string, command []string, policy sandbox.Policy) int {
+	selfExe, err := os.Executable()
+	if err != nil || selfExe == "" {
+		fmt.Fprintf(os.Stderr, "sbx: resolve executable failed: %v\n", err)
+		return 1
+	}
+	if resolved, err := filepath.EvalSymlinks(selfExe); err == nil && resolved != "" {
+		selfExe = resolved
+	}
+
+	spec := childExecSpec{
+		Bin:         bin,
+		Command:     command,
+		ReadOnly:    policy.ReadOnly,
+		ReadWrite:   policy.ReadWrite,
+		Exec:        policy.Exec,
+		DenyNet:     policy.DenyNet,
+		Env:         policy.Env,
+		BestEffort:  policy.BestEffort,
+		EntryAgents: policy.EntryAgents,
+	}
+	specBytes, err := json.Marshal(spec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sbx: marshal child spec failed: %v\n", err)
+		return 1
+	}
+
+	cmd := exec.Command(selfExe)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = mergeEnv(os.Environ(), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	defer signal.Stop(sigCh)
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "sbx: start sandboxed child failed: %v\n", err)
+		return 126
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	for {
+		select {
+		case sig := <-sigCh:
+			if cmd.Process != nil {
+				_ = cmd.Process.Signal(sig)
+			}
+		case waitErr := <-waitCh:
+			return exitCodeFromWaitErr(waitErr)
+		}
+	}
+}
+
+// runChildFromEnv 在子进程内读取父进程传入的沙盒配置，清除内部环境变量，施加沙盒限制后调用 syscall.Exec。
+func runChildFromEnv() int {
+	raw := os.Getenv(envSbxChildSpecKey)
+	_ = os.Unsetenv(envSbxChildSpecKey)
+	if raw == "" {
+		fmt.Fprintln(os.Stderr, "sbx: empty internal child spec")
+		return 1
+	}
+
+	var spec childExecSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		fmt.Fprintf(os.Stderr, "sbx: parse internal child spec failed: %v\n", err)
+		return 1
+	}
+	if spec.Bin == "" || len(spec.Command) == 0 {
+		fmt.Fprintln(os.Stderr, "sbx: invalid command in internal child spec")
+		return 1
+	}
+
+	policy := sandbox.Policy{
+		ReadOnly:    spec.ReadOnly,
+		ReadWrite:   spec.ReadWrite,
+		Exec:        spec.Exec,
+		DenyNet:     spec.DenyNet,
+		Env:         spec.Env,
+		BestEffort:  spec.BestEffort,
+		EntryAgents: spec.EntryAgents,
+	}
 	if err := sandbox.Apply(policy); err != nil {
-		cleanupPresetTempDirs()
 		fmt.Fprintf(os.Stderr, "sbx: apply sandbox policy failed: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	execEnv := mergeEnv(os.Environ(), policy.Env)
-	if err := syscall.Exec(bin, cfg.Command, execEnv); err != nil {
-		cleanupPresetTempDirs()
-		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
-		os.Exit(126)
+	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", spec.Bin, err)
+		return 126
+	}
+	return 0
+}
+
+func exitCodeFromWaitErr(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if ws.Signaled() {
+				return 128 + int(ws.Signal())
+			}
+			if ws.Exited() {
+				return ws.ExitStatus()
+			}
+		}
+		if code := exitErr.ExitCode(); code >= 0 {
+			return code
+		}
+	}
+	return 1
+}
+
+// cleanupPresetTempDirsFromPolicy 综合 Policy.Env、Policy.ReadWrite 与 Policy.Exec
+// 清理预设构造阶段创建的私有临时目录（即便用户通过 --env 覆盖了 TMPDIR 也不会漏删）。
+func cleanupPresetTempDirsFromPolicy(policy sandbox.Policy) {
+	cleanupPresetTempDirsFromEnv(policy.Env)
+	for _, rw := range policy.ReadWrite {
+		if isPresetTempDir(rw, "pi-reviewer-") && !isPresetTempDir(rw, "pi-reviewer-exec-") {
+			removePresetTempDir(rw)
+		}
+	}
+	for _, ex := range policy.Exec {
+		if isPresetTempDir(ex, "pi-reviewer-exec-") {
+			removePresetTempDir(ex)
+		}
 	}
 }
 
 // cleanupPresetTempDirsFromEnv 删除预设构造阶段创建的私有临时目录
-// （/tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*）。仅在进入 syscall.Exec
-// 之前的提前退出分支调用，避免 --preset 异常路径泄漏 /tmp/pi-reviewer-*。
-// 仅删带固定前缀的目录，绝不递归删除任意 TMPDIR。
+// （pi-reviewer-* 与 pi-reviewer-exec-*），同时覆盖 /tmp 与 os.TempDir() 兜底路径。
+// 仅删位于合法临时根下且带固定前缀的第一层子目录，绝不递归删除任意 TMPDIR。
 func cleanupPresetTempDirsFromEnv(env []string) {
 	m := make(map[string]string, len(env))
 	for _, kv := range env {
@@ -326,10 +478,83 @@ func cleanupPresetTempDirsFromEnv(env []string) {
 			m[k] = v
 		}
 	}
-	if dir := m["TMPDIR"]; strings.HasPrefix(dir, "/tmp/pi-reviewer-") {
-		_ = os.RemoveAll(dir)
+	if dir := m["TMPDIR"]; isPresetTempDir(dir, "pi-reviewer-") && !isPresetTempDir(dir, "pi-reviewer-exec-") {
+		removePresetTempDir(dir)
 	}
-	if dir := m["PI_SANDBOX_GO_EXEC_DIR"]; strings.HasPrefix(dir, "/tmp/pi-reviewer-exec-") {
-		_ = os.RemoveAll(dir)
+	if goTmp := m["GOTMPDIR"]; goTmp != "" {
+		parent := filepath.Dir(filepath.Clean(goTmp))
+		if isPresetTempDir(parent, "pi-reviewer-") && !isPresetTempDir(parent, "pi-reviewer-exec-") {
+			removePresetTempDir(parent)
+		}
 	}
+	if dir := m["PI_SANDBOX_GO_EXEC_DIR"]; isPresetTempDir(dir, "pi-reviewer-exec-") {
+		removePresetTempDir(dir)
+	}
+}
+
+// isPresetTempDir 校验 dir 是否为位于 /tmp 或 os.TempDir() 下、基名以指定 prefix 开头的预设临时目录。
+func isPresetTempDir(dir, prefix string) bool {
+	trimmed := strings.TrimSpace(dir)
+	if trimmed == "" || prefix == "" {
+		return false
+	}
+	cleanDir := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleanDir) {
+		return false
+	}
+	base := filepath.Base(cleanDir)
+	if !strings.HasPrefix(base, prefix) || len(base) <= len(prefix) {
+		return false
+	}
+	parent := filepath.Dir(cleanDir)
+	for _, root := range allowedTempRoots() {
+		if parent == root {
+			return true
+		}
+	}
+	return false
+}
+
+func allowedTempRoots() []string {
+	roots := []string{"/tmp"}
+	if td := filepath.Clean(strings.TrimSpace(os.TempDir())); td != "" && filepath.IsAbs(td) {
+		roots = append(roots, td)
+	}
+	out := make([]string, 0, len(roots)*2)
+	seen := make(map[string]struct{}, len(roots)*2)
+	for _, r := range roots {
+		if _, ok := seen[r]; !ok {
+			seen[r] = struct{}{}
+			out = append(out, r)
+		}
+		if resolved, err := filepath.EvalSymlinks(r); err == nil && resolved != "" {
+			cleanResolved := filepath.Clean(resolved)
+			if _, ok := seen[cleanResolved]; !ok {
+				seen[cleanResolved] = struct{}{}
+				out = append(out, cleanResolved)
+			}
+		}
+	}
+	return out
+}
+
+// removePresetTempDir 删除预设临时目录；若目录内含 0500/0400 只读子目录或与辅助进程退出发生短暂并发竞争，
+// 自动补齐目录写权限并重试。
+func removePresetTempDir(dir string) {
+	cleanDir := filepath.Clean(dir)
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := os.RemoveAll(cleanDir); err == nil {
+			if _, statErr := os.Lstat(cleanDir); os.IsNotExist(statErr) {
+				return
+			}
+		}
+		_ = filepath.WalkDir(cleanDir, func(p string, d os.DirEntry, walkErr error) error {
+			if walkErr == nil && d != nil && d.IsDir() {
+				_ = os.Chmod(p, 0o700)
+			}
+			return nil
+		})
+		time.Sleep(5 * time.Millisecond)
+	}
+	_ = os.RemoveAll(cleanDir)
 }
