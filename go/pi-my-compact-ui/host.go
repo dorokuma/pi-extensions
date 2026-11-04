@@ -20,9 +20,23 @@ type sdkUI struct {
 	ctx sdk.Context
 }
 
+// callOwnThinkingRuns soft-probes Context.OwnThinkingRuns so this extension
+// compiles against staged SDKs that lack the method (0.5.3 racefix) and still
+// invokes it when the host SDK exposes D214 / #384 (0.6.0). A plain
+// u.ctx.OwnThinkingRuns call is a compile-time dependency and fails the 0.5.3
+// extension build; the any()+interface assertion is runtime-only.
+func callOwnThinkingRuns(ctx any, enabled bool) {
+	type ownThinkingRunner interface {
+		OwnThinkingRuns(bool) error
+	}
+	if r, ok := ctx.(ownThinkingRunner); ok {
+		_ = r.OwnThinkingRuns(enabled)
+	}
+}
+
 func (u sdkUI) ownThinkingRuns(enabled bool) {
 	defer func() { _ = recover() }()
-	_ = u.ctx.OwnThinkingRuns(enabled)
+	callOwnThinkingRuns(any(u.ctx), enabled)
 }
 
 func (u sdkUI) setHiddenThinkingLabel(label string) {
