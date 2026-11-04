@@ -49,7 +49,8 @@ func NewExtension() *sdk.Extension {
 	// thinking blocks from the host's own render; the PiG form is the registered
 	// Markdown transformer, which the host applies to the "assistant-thinking"
 	// Markdown as well and which renders no lines for an empty result
-	// (transformMarkdown, assistant.go).
+	// (transformMarkdown, native_thinking.go -- the adapter layer reserved for
+	// the upstream #384 hook).
 	e.MarkdownTransformer(transformMarkdownFunc)
 
 	// PLAN.md §4: registerToolRenderer. The resolver hands every tool card the
@@ -592,7 +593,7 @@ func (r *runtimeState) handleSessionStart(ctx sdk.Context) {
 	if ui == nil {
 		return
 	}
-	ui.setHiddenThinkingLabel("")
+	r.applyNativeThinkingSuppression(ui)
 	ui.onTerminalInput(r.handleTerminalInput)
 	ui.setWidgetRenderer("compact-anim", r.renderWidget)
 
