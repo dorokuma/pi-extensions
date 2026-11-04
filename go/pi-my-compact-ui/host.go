@@ -20,6 +20,11 @@ type sdkUI struct {
 	ctx sdk.Context
 }
 
+func (u sdkUI) ownThinkingRuns(enabled bool) {
+	defer func() { _ = recover() }()
+	_ = u.ctx.OwnThinkingRuns(enabled)
+}
+
 func (u sdkUI) setHiddenThinkingLabel(label string) {
 	defer func() { _ = recover() }()
 	_ = u.ctx.SetHiddenThinkingLabel(label)
