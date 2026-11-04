@@ -510,6 +510,75 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 	})
 }
 
+// TestEnvArgv0Masking pins F-1: GNU env's -a/--argv0 consumes one argument
+// token (the fake argv0), so `env -a mask-name <forbidden>` must still resolve
+// to the wrapped executable. Treating -a as a boolean flag let the mask name
+// pass off as the executable and smuggled ctxmode past the S4 scan.
+func TestEnvArgv0Masking(t *testing.T) {
+	chains := map[string]string{
+		"env_dash_a":       "env -a mask-name /usr/local/bin/ctxmode",
+		"env_argv0_long":   "env --argv0 mask-name /usr/local/bin/ctxmode",
+		"env_argv0_inline": "env --argv0=mask-name /usr/local/bin/ctxmode",
+	}
+	t.Run("extension_mode", func(t *testing.T) {
+		for name, wrapper := range chains {
+			t.Run(name, func(t *testing.T) {
+				// [ext] -> [env -a mask-name ctxmode] -> [pi host] -> [pane shell]:
+				// the env-wrapped ctxmode hop between host and shell is S4.
+				chain := []AncestorProcess{
+					{PID: 100, PPID: 150, Cmdline: "/opt/ext/jev-gate"},
+					{PID: 150, PPID: 200, Cmdline: wrapper},
+					{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi"},
+					{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
+				}
+				environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+				isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+				if !isSubagent || !strings.Contains(reason, "S4") {
+					t.Fatalf("isSubagent=%v reason=%q, want S4 rejection", isSubagent, reason)
+				}
+			})
+		}
+	})
+	t.Run("mcp_mode", func(t *testing.T) {
+		for name, wrapper := range chains {
+			t.Run(name, func(t *testing.T) {
+				chain := []AncestorProcess{
+					{PID: 100, PPID: 150, Cmdline: "jev-mcp"},
+					{PID: 150, PPID: 200, Cmdline: wrapper},
+					{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
+					{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
+				}
+				environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+				isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
+				if !isSubagent {
+					t.Fatalf("isSubagent=%v reason=%q, want rejection", isSubagent, reason)
+				}
+			})
+		}
+	})
+}
+
+// TestPromptArgStrippingFlagBoundary pins F-2: -i/-p/--prompt only swallow the
+// next token when it is not itself a '-' flag, so a marker flag right after
+// -p stays visible to the launch-marker scan.
+func TestPromptArgStrippingFlagBoundary(t *testing.T) {
+	marked := [][]string{
+		{"agy", "-p", "--name", "role-x"},
+		{"agy", "-p", "--agent", "worker"},
+		{"prog", "-p", "x", "--agent", "worker"},
+	}
+	for _, argv := range marked {
+		if !HasSubagentCliFlags(argv) {
+			t.Fatalf("argv=%v must stay a launch marker: -p may not swallow a flag token", argv)
+		}
+	}
+	// A prompt argument that does not start with '-' is still stripped: prompt
+	// text mentioning a marker is not launch evidence.
+	if HasSubagentCliFlags([]string{"pi", "-p", "contains --name role-x in prompt text"}) {
+		t.Fatal("prompt text must be stripped, not scanned")
+	}
+}
+
 // TestResolveAgentIdentityUnreadableAncestry pins the unreadable /proc branch.
 func TestResolveAgentIdentityUnreadableAncestry(t *testing.T) {
 	environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, []AncestorProcess{{PID: 100, PPID: 1, Cmdline: "pi"}}, 300)

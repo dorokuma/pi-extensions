@@ -10,7 +10,8 @@ Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go �
 - **现行部署链路是 Go 扩展 + MCP 服务器**：`extensions/jev-gate/src/jev-gate.ts` 编译部署为
   Go 扩展（本目录 `go/jev-gate`，module `github.com/dorokuma/pi-extensions/go/jev-gate`，Go 1.26，
   仅依赖标准库 + `github.com/MichaelKinsy/PiG/extensions/sdk`，本地经 `go/go.work` 解析到
-  `go/pigsdk`，**无 `replace`**），同目录的 `cmd/jev-mcp`（`package main`）是
+  `go/pigsdk`；另有一条**测试专用** `replace ../exclude-tools-guard` —— 仅为
+  `packedcell_integration_test.go` 的跨扩展 packed-cell 回归用例服务，非生产代码不导入它），同目录的 `cmd/jev-mcp`（`package main`）是
   `jev-mcp.mjs` 的纯 Go 替代：JSON-RPC 2.0 over stdio（newline 与 Content-Length 双 framing），
   经 `jevgate.ExecuteCheckContext` 直接调同一套判定，身份判据用共享 S1–S4 核心
   （`jevgate.ResolveMCPAgentIdentity`）。`go/Makefile` 同时覆盖根包与 `cmd/jev-mcp` 两个模块
@@ -30,7 +31,7 @@ Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go �
 | `identity.go` | 591 | `SUBAGENT-IDENTITY` 块（S1–S4 fail-closed、`PIG_HARNESS_ARGV_FILE` 桥接的进程级临界区、真实 herdr socket 查询、/proc 祖先链） |
 | `extension.go` | 357 | `executeCheck`、参数 schema、`providerConfig`、`toolDefinition`、`Extension()` 工厂 |
 | `gate_test.go` / `key_test.go` / `jev_test.go` / `extension_test.go` / `identity_test.go` / `classify_test.go` | 499 / 143 / 363 / 352 / 464 / 208 | 见「测试」 |
-| `go.mod` | 5 | 独立嵌套 module（PiG 只按 `go.mod` 识别扩展单元） |
+| `go.mod` | 8 | 独立嵌套 module（PiG 只按 `go.mod` 识别扩展单元）；含一条 `replace ../exclude-tools-guard`，仅供 packed-cell 跨扩展回归测试 |
 
 `go/go.work` 仅新增一行 `./jev-gate`。
 
@@ -97,11 +98,12 @@ socket 查询、S3/S4 祖先链证明；MCP 模式允许 jev-mcp 与 pane shell 
 
 ## 与 TS 的行为差异（逐条）
 
-1. **子代理身份判定（SUBAGENT-IDENTITY）采用家族已审 Go 语义**，与 TS 块有 4 点差异
-   （与 `go/exclude-tools-guard` 一致，便于两个扩展共用同一判据）：
-   - S1 **不再要求 pane 名以 `:p1` 结尾**，只要求 `HERDR_PANE_ID` 非空（pane 名只作查询键与
-     证据串）。理由：pane 可被改名/重编号，命名从来不是防护面；伪造环境变量仍过不了 S2/S3/S4。
-     副作用（改善）：主代理在改过名的 pane 里不会被误判子代理。
+1. **子代理身份判定（SUBAGENT-IDENTITY）采用家族已审 Go 语义**，与 TS 块有差异；
+   **本扩展与 `go/exclude-tools-guard` 的判据已分叉**：exclude-tools-guard 的 Go 身份判据仍是
+   旧家族实现（不强制 `:p1` 等），**未随本分支同步新共享核心**，本轮只如实记录、不扩大范围
+   去同步它（packed-cell 测试只校验两扩展都能读到共享 argv 桥，不校验判据一致）：
+   - S1 要求 `HERDR_PANE_ID` 非空**且**以 `:p1` 结尾（主 pane 的必要条件，先于 socket 查询判
+     决；伪造 `xxx:p1` 仍须过 S2/S3/S4）。TS 侧同样把非 `:p1` pane 判子代理，此处与 TS 方向一致。
    - 宿主锚点由「固定 hop」改为「自身向上第一个 agent-runtime 祖先」（子进程形态）或「自身」
      （融合形态），并新增 `PIG_HARNESS_ARGV_FILE` + `ArgvCache` 桥接（PiG 的 Go 扩展子进程
      argv 为空，负向标记必须从该文件读，读失败即 fail-closed）。
@@ -110,8 +112,9 @@ socket 查询、S3/S4 祖先链证明；MCP 模式允许 jev-mcp 与 pane shell 
      运行，只看 `PIG_EXT_SOCKET` 会把真主代理误判成子代理。
    - 未确证时用 `sync.Once` 打一行 stderr 警告（PiG 会丢弃扩展 stderr，见 D56，属尽力信号）。
    - S2 的 1500ms 预算与「不重试、不延长」纪律保持不变；socket 路径仍是硬编码常量。
-   - **残余面（与 `go/exclude-tools-guard/README.md` 对齐）**：若子代理未携带任何负向标记
-     （`PI_SUBAGENT` / `PI_ROLE` / 三条 argv 标记都不可见），跑在非 `:p1`（甚至任意）pane，但进程链
+   - **残余面**：若子代理未携带任何负向标记
+     （`PI_SUBAGENT` / `PI_ROLE` / 三条 argv 标记都不可见），且 pane 名恰好以 `:p1` 结尾
+     （伪造或复用），但进程链
      形态看起来就是「pane shell 直接起 agent」（宿主是 pi、pane shell 是宿主的严格祖先（含父进程）、无中间 agent
      runtime），S1–S4 会全部成立而被判 main，子代理分支的摘工具/清 addendum 不会发生；现网证据见
      `go/exclude-tools-guard/README.md`（`herdr agent start --kind pi` 不注入负向标记）。
@@ -178,20 +181,28 @@ socket 查询、S3/S4 祖先链证明；MCP 模式允许 jev-mcp 与 pane shell 
     `maxHeaderBytes = 1 << 20` 限制未闭合的 Header 缓冲。`Content-Length` 分支用**减法比较**
     `len(carry)-headerEnd-sepLen < bodyLen` 判断字节是否到齐，彻底消除 `headerEnd+sepLen+bodyLen`
     的加法溢出与切片 panic；`bodyLen < 0` 或 `> maxFrameBytes` 时丢弃异常头部并回报
-    `-32700 Invalid Content-Length header`。
+    `-32700 Invalid Content-Length header`。换行帧分支对称地检查**帧体**（换行前的字节数）
+    `> maxFrameBytes`：恰好 `maxFrameBytes` 字节的帧体 + `\n` 仍被接受（与无换行分支、
+    `Content-Length` 的 `bodyLen` 上限同口径），更大的帧体在 dispatch 前拒绝并回报
+    `-32700 Frame too large`，超限后丢弃全部缓冲尾。
 19. **`cmd/jev-mcp` 异步取消与有界退出**：`ExecuteCheckContext(ctx, params)` 让
     `notifications/cancelled` / `$/cancelRequest` 真正中断底层 `http.Request`（客户端主动取消
     返回 `jev_check failed: cancelled by MCP client`，与自身超时区分）；读循环与 `tools/call`
     执行解耦（`inFlightWg`），请求级 framing 显式传入 `dispatchPayload` → `handleRPC` →
     `sendResult`/`sendError`，消除共享 `responseWriter.current` 的 data race。EOF 时**不**立即取消
-    在途请求（half-close 客户端仍能拿到回包），而是等待 `inFlightWg.Wait()`，同时以
+    在途请求（half-close 客户端在预算内仍能拿到回包），而是等待 `inFlightWg.Wait()`，同时以
     `drainTimeout = callTimeout() + 2s` 为界：超预算则 `cancelAllInFlight()` 并最多再等 200ms 退出，
-    进程退出绝对有界。
-20. **全局 schema 原子写入**：`cmd/jev-mcp` 的懒加载 schema（`~/.gemini/antigravity-cli/mcp/jev/`）
-    由 `writeFileAtomic`（同目录 `CreateTemp` + 完整写入 + `Chmod` + **显式检查 `Close()`** +
-    `Rename` 原子替换，进程内 `schemaWriteMu` 串行化）落盘，并发 agy 读者永远看到完整文件；
-    `tools/list` 被拒分支不再起 `go ensureLazySchemaFiles()` 后台写（子代理被拒时不写全局 schema）。
-    多进程并发写 + 并发读实测见 `TestWriteFileAtomicConcurrent`（真实 OS 子进程）。
+    进程退出绝对有界；**超出该预算、进程退出前尚未写出的回包会被丢弃**（如实记录，不承诺
+    「全部写出」）。同一 id 并发两条 `tools/call` 时后者立即返回
+    `duplicate in-flight request id` 错误结果（requestKey 带类型标签，数字 `1` 与字符串 `"1"`
+    互不覆盖），保证登记、取消、清理一一对应。
+20. **全局 schema 原子写入（惰性）**：`cmd/jev-mcp` 的懒加载 schema
+    （`~/.gemini/antigravity-cli/mcp/jev/`）由 `writeFileAtomic`（同目录 `CreateTemp` + 完整写入 +
+    `Chmod` + **显式检查 `Close()`** + `Rename` 原子替换，进程内 `schemaWriteMu` 串行化）落盘，
+    并发 agy 读者永远看到完整文件；写入只在**首个 `tools/list` 允许分支**触发（MCP init 必然调
+    `tools/list`，惰性不损功能）——启动路径与被拒分支一律不写全局 schema（子代理被拒时连
+    后台 fire-and-forget 写都不起）。多进程并发写 + 并发读实测见 `TestWriteFileAtomicConcurrent`
+    （真实 OS 子进程）。
 21. **`jsNumber` 二进制/八进制与超时整数化**：`jsNumber` 在 `0x` 之外支持 `0b`/`0B`（基数 2）与
     `0o`/`0O`（基数 8）；带符号前缀（`+0b10`）仍为 NaN。`nodeSetTimeout` 对 `[1, maxTimeoutMs]`
     内的浮点数执行 `math.Trunc` 整数毫秒化（`1500.75` → `1.5s`）。
@@ -275,7 +286,7 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
    **原因（非缺陷）**：本次运行发生在派发 pane `HERDR_PANE_ID=w37:p8` 内，进程链为
    `扩展 → pig → sh → pi(当前 agent) → pane shell`，S4 发现「宿主与 pane shell 之间存在另一个 agent
    runtime」→ 按设计 **fail-closed 判子代理** → 子代理分支不注册 `jev_check`/`magpie-jev`，只清空
-   `typesafe`。这与 TS 判据方向一致（TS 还会额外因 pane 名不含 `:p1` 判子代理）。
+   `typesafe`。该 pane 名 `w37:p8` 本身也不满足现行 S1 的 `:p1` 必要条件，同一结论。
    主代理分支的注册内容由 `TestToolDefinition` / `TestProviderConfig` / `TestNewExtensionBranches`
    静态覆盖；**在真正的 p1 主代理里看到 `jev_check` 仍需 verifier 在非嵌套会话复跑一次**（未做，
    如实记录）。

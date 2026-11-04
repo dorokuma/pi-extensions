@@ -467,14 +467,19 @@ func checkExecutableTokens(tokens []string, depth int) bool {
 					}
 					return checkExecutableTokens(rest, depth+1)
 				}
-				// -u/--unset and -C/--chdir consume their own argument token.
-				if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+				// -u/--unset, -C/--chdir and -a/--argv0 consume their own argument
+				// token: the argv0 mask name must never be read as the wrapped
+				// executable (F-1).
+				if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" ||
+					token == "-a" || token == "--argv0" {
 					index += 2
 					continue
 				}
 				if strings.HasPrefix(token, "--unset=") || strings.HasPrefix(token, "--chdir=") ||
+					strings.HasPrefix(token, "--argv0=") ||
 					(strings.HasPrefix(token, "-u") && len(token) > 2) ||
-					(strings.HasPrefix(token, "-C") && len(token) > 2) {
+					(strings.HasPrefix(token, "-C") && len(token) > 2) ||
+					(strings.HasPrefix(token, "-a") && len(token) > 2) {
 					index++
 					continue
 				}
@@ -568,7 +573,10 @@ func executableTokenOf(tokens []string, depth int) string {
 				rest := append(strings.Fields(splitValue), tokens[index+2:]...)
 				return executableTokenOf(rest, depth+1)
 			}
-			if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+			// -a/--argv0 (and -u/--unset, -C/--chdir) consume one argument
+			// token that must not be mistaken for the wrapped executable (F-1).
+			if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" ||
+				token == "-a" || token == "--argv0" {
 				index += 2
 				continue
 			}
@@ -668,15 +676,20 @@ var agentRuntimePattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js`)
 // ---------------------------------------------------------------------------
 
 // StripPromptArgTokens removes -i, -p, --prompt and the one argument token
-// that follows each, plus their = forms: a main agent's prompt text may
-// legitimately contain "--agent" or "/tmp/dispatch-..." as task description,
-// which is not launch evidence. Exported for the MCP layer and tests.
+// that follows each — only when the next token is not itself a '-' flag:
+// a dash-prefixed token is an option, not prompt text, so it stays visible
+// to the marker scan (F-2) — plus their = forms: a main agent's prompt text
+// may legitimately contain "--agent" or "/tmp/dispatch-..." as task
+// description, which is not launch evidence. Exported for the MCP layer and
+// tests.
 func StripPromptArgTokens(tokens []string) []string {
 	structural := make([]string, 0, len(tokens))
 	for index := 0; index < len(tokens); index++ {
 		token := tokens[index]
 		if token == "-i" || token == "-p" || token == "--prompt" {
-			index++
+			if index+1 < len(tokens) && !strings.HasPrefix(tokens[index+1], "-") {
+				index++
+			}
 			continue
 		}
 		if strings.HasPrefix(token, "-i=") || strings.HasPrefix(token, "-p=") ||

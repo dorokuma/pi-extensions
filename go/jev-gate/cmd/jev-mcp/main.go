@@ -11,8 +11,9 @@
 // notifications/cancelled / $/cancelRequest through context cancellation.
 //
 // The lazy schema files agy reads before the first handshake
-// (~/.gemini/antigravity-cli/mcp/jev/) are written on startup, on every
-// tools/list, and (best effort) on a denial, exactly like the .mjs.
+// (~/.gemini/antigravity-cli/mcp/jev/) are written on the first allowed
+// tools/list — never at startup and never on a denial, so a rejected
+// subagent's server instance leaves the global dirs untouched.
 package main
 
 import (
@@ -252,16 +253,17 @@ func (w *responseWriter) sendError(id any, code int, message string, framingMode
 	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}}, framingMode)
 }
 
-// requestKey normalises a JSON-RPC id (number or string) to the map key the
-// in-flight table uses (TS: String(id)).
+// requestKey normalises a JSON-RPC id to the in-flight table key. The id
+// carries a type tag so the numeric id 1 and the string id "1" — distinct
+// JSON-RPC ids — never collapse onto one map entry (F-3).
 func requestKey(id any) string {
 	switch v := id.(type) {
 	case string:
-		return v
+		return "s:" + v
 	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
+		return "n:" + strconv.FormatFloat(v, 'f', -1, 64)
 	default:
-		return fmt.Sprintf("%v", v)
+		return fmt.Sprintf("%T:%v", id, v)
 	}
 }
 
@@ -287,10 +289,17 @@ type inFlightCall struct {
 	cancelledByClient atomic.Bool
 }
 
-func registerInFlight(key string, call *inFlightCall) {
+// registerInFlight records one call under key and reports whether the key
+// was free: a duplicate in-flight request id is refused by the caller so
+// register/cancel/drop stay one-to-one (F-3).
+func registerInFlight(key string, call *inFlightCall) bool {
 	inFlightMu.Lock()
+	defer inFlightMu.Unlock()
+	if _, exists := inFlight[key]; exists {
+		return false
+	}
 	inFlight[key] = call
-	inFlightMu.Unlock()
+	return true
 }
 
 func dropInFlight(key string) {
@@ -462,7 +471,15 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMo
 	ctx, cancel := context.WithCancel(context.Background())
 	call := &inFlightCall{cancel: cancel}
 	key := requestKey(id)
-	registerInFlight(key, call)
+	if !registerInFlight(key, call) {
+		// A second request reusing an in-flight id is refused outright:
+		// registering it would overwrite the first entry, and the first
+		// worker's dropInFlight would then delete the new registration,
+		// leaving the second call unreachable for cancellation (F-3).
+		cancel()
+		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: duplicate in-flight request id %v", id)), framingMode)
+		return
+	}
 	inFlightWg.Add(1)
 	go func() {
 		defer inFlightWg.Done()
@@ -650,6 +667,19 @@ func drain(carry []byte, w *responseWriter) []byte {
 			}
 			break
 		}
+		// The same bound applies once the line terminator is in the buffer:
+		// a complete line frame whose body (nl bytes before the newline)
+		// exceeds maxFrameBytes must be refused before dispatch, not only
+		// while still incomplete. The bound mirrors the newline-less branch
+		// (body bytes ≤ maxFrameBytes is accepted; the newline itself is the
+		// terminator, not payload) and the Content-Length branch (bodyLen ≤
+		// maxFrameBytes). The whole buffered tail is dropped, matching those
+		// branches.
+		if nl+1 > maxFrameBytes+1 {
+			carry = nil
+			w.sendError(nil, -32700, "Frame too large", "line")
+			break
+		}
 		line := strings.TrimSpace(string(carry[:nl]))
 		carry = carry[nl+1:]
 		if line != "" {
@@ -671,7 +701,9 @@ func main() {
 	if strings.TrimSpace(os.Getenv("JEV_TIMEOUT_MS")) == "" {
 		_ = os.Setenv("JEV_TIMEOUT_MS", "15000")
 	}
-	ensureLazySchemaFiles()
+	// The lazy schema files are written on the first allowed tools/list only:
+	// a server that is launched but never lists tools (e.g. a denied
+	// subagent's probe) must not touch the global schema dirs.
 	w := &responseWriter{out: os.Stdout}
 	readLoop(os.Stdin, w)
 }

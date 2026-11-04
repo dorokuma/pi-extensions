@@ -550,7 +550,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 			"PIG_EXT_SOCKET": "/tmp/pig-ext-sock.sock",
 		}
 		return IdentityEnv{
-			Getenv: func(k string) string { return envMap[k] },
+			Getenv:     func(k string) string { return envMap[k] },
 			Args:       []string{"/root/workspace/pi-extensions/go/bin/exclude-tools-guard"},
 			PID:        100,
 			SocketPath: "/tmp/fake.sock",
@@ -821,9 +821,9 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 	packedCellEnv := func(envMap map[string]string) IdentityEnv {
 		envMap["HERDR_PANE_ID"] = "herdr:tab1:p1"
 		return IdentityEnv{
-			Getenv:   func(k string) string { return envMap[k] },
-			Args:     []string{packedRunner},
-			PID:      100,
+			Getenv: func(k string) string { return envMap[k] },
+			Args:   []string{packedRunner},
+			PID:    100,
 			// Environ 按真实进程环境枚举键名（packed 成员键名不可预知，只能前缀扫描）。
 			Environ: func() []string {
 				entries := make([]string, 0, len(envMap))
