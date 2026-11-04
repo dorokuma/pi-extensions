@@ -24,4 +24,5 @@ use (
 	./pigsdk
 	./rpiv-ask-user-question
 	./sandbox
+	./verifier-expect-fail
 )
