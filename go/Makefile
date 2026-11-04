@@ -48,10 +48,14 @@ sdk-check:
 	trap 'rm -rf "$$tmpdir"' 0 1 2 15; \
 	staged=""; \
 	for d in "$(PIG_HOME_DIR)"/state/pigsdk/sdk-*; do \
+		[ -d "$$d" ] || continue; \
 		case "$$d" in \
-			*/sdk-py-*|*/sdk-rs-*|*'*') continue ;; \
-			*) [ -d "$$d" ] && staged="$$d" ;; \
+			*'*') continue ;; \
 		esac; \
+		[ -f "$$d/go.mod" ] || continue; \
+		if [ -z "$$staged" ] || [ "$$d" -nt "$$staged" ]; then \
+			staged="$$d"; \
+		fi; \
 	done; \
 	if [ -z "$$staged" ] || [ ! -d "$$staged" ]; then \
 		echo "SKIP: staged SDK not found under $(PIG_HOME_DIR)/state/pigsdk"; \
