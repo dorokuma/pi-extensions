@@ -135,16 +135,15 @@ func (f *fakeTUI) lastOverlay() (remoteComponent, bool) {
 
 // fakeUI records the host UI calls a session_start or command makes.
 type fakeUI struct {
-	mu               sync.Mutex
-	ownThinkingCalls []bool
-	hiddenLabels     []string
-	inputHandlers    []func(string) terminalInputVerdict
-	unsubscribed     int
-	widgetKeys       []string
-	notices          []fakeNotice
-	customCalls      int
-	customFn         func(remoteComponentFactory, any) (any, error)
-	ui               bool
+	mu            sync.Mutex
+	hiddenLabels  []string
+	inputHandlers []func(string) terminalInputVerdict
+	unsubscribed  int
+	widgetKeys    []string
+	notices       []fakeNotice
+	customCalls   int
+	customFn      func(remoteComponentFactory, any) (any, error)
+	ui            bool
 }
 
 type fakeNotice struct {
@@ -153,12 +152,6 @@ type fakeNotice struct {
 }
 
 func newFakeUI() *fakeUI { return &fakeUI{ui: true} }
-
-func (f *fakeUI) ownThinkingRuns(enabled bool) {
-	f.mu.Lock()
-	f.ownThinkingCalls = append(f.ownThinkingCalls, enabled)
-	f.mu.Unlock()
-}
 
 func (f *fakeUI) setHiddenThinkingLabel(label string) {
 	f.mu.Lock()
