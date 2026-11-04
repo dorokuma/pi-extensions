@@ -144,9 +144,10 @@ type overlayCloser interface {
 // sdk.Context whose zero value would hide a nil dereference.
 //
 // ownThinkingRuns is the D214 host primitive (pi.ownThinkingRuns / Context.OwnThinkingRuns).
-// Keep setHiddenThinkingLabel as the older label seam; the native thinking adapter
-// routes ownership through ownThinkingRuns. New host primitives for this seam land
-// here and on sdkUI as a pair, then through native_thinking.go.
+// Keep setHiddenThinkingLabel as the older label seam (0.5.3 fallback); the native
+// thinking adapter calls ownThinkingRuns first, then setHiddenThinkingLabel("").
+// New host primitives for this seam land here and on sdkUI as a pair, then through
+// native_thinking.go.
 type uiContext interface {
 	ownThinkingRuns(enabled bool)
 	setHiddenThinkingLabel(label string)

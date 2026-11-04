@@ -799,11 +799,15 @@ func TestSessionStart(t *testing.T) {
 	handler := ui.lastInputHandler()
 	ui.mu.Lock()
 	ownCalls := append([]bool(nil), ui.ownThinkingCalls...)
+	labels := append([]string(nil), ui.hiddenLabels...)
 	widgets := append([]string(nil), ui.widgetKeys...)
 	ui.mu.Unlock()
 
 	if len(ownCalls) != 1 || ownCalls[0] != true {
 		t.Errorf("ownThinkingRuns calls = %v, want one true", ownCalls)
+	}
+	if len(labels) != 1 || labels[0] != "" {
+		t.Errorf("setHiddenThinkingLabel calls = %v, want one empty label", labels)
 	}
 	if handler == nil {
 		t.Error("onTerminalInput was not registered")

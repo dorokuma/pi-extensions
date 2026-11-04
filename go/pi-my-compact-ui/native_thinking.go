@@ -8,17 +8,20 @@ import (
 // way this extension suppresses or hides the host's own thinking render lives
 // here. Upstream PiG 0.6.0 (issue #384 / D214) exposes OwnThinkingRuns so a
 // hidden or zero-row thinking run leaves no stub and no spacer rows; that hook
-// is called from applyNativeThinkingSuppression.
+// is called from applyNativeThinkingSuppression. The older setHiddenThinkingLabel
+// seam stays as a fallback for 0.5.3 hosts that lack OwnThinkingRuns.
 //
 // Call-site contract: applyNativeThinkingSuppression is the sole caller of the
-// ownThinkingRuns primitive, and transformMarkdown is the sole registered
-// assistant-thinking seam. New host primitives for this seam land on
-// uiContext/sdkUI as a pair per the accessors.go contract. handleSessionStart
-// stays agnostic.
+// ownThinkingRuns and setHiddenThinkingLabel primitives for this seam, and
+// transformMarkdown is the sole registered assistant-thinking seam. New host
+// primitives for this seam land on uiContext/sdkUI as a pair per the
+// accessors.go contract. handleSessionStart stays agnostic.
 //
 // Two seams share this file because they implement the same suppression goal:
 //   - applyNativeThinkingSuppression / ownThinkingRuns tell the host this
 //     extension owns thinking runs (no stub, no spacers around empty/hidden runs);
+//     setHiddenThinkingLabel("") is the 0.5.3 fallback (empty stub label) and is
+//     a no-op for layout once 0.6.0 has owned the runs;
 //   - transformMarkdown empties the "assistant-thinking" Markdown body so the
 //     run draws zero rows (OwnThinkingRuns then drops the surrounding spacers).
 // installNativeThinkingSuppression / ensureAssistantThinkingPatched are the
@@ -26,12 +29,14 @@ import (
 // belong to the same boundary even though they never touch the host.
 
 // applyNativeThinkingSuppression declares ownership of thinking runs on the
-// host (D214 OwnThinkingRuns). With ownership on, a hidden thinking run leaves
-// no stub row, and a run whose Markdown transformer returned empty text leaves
-// no leading or post-run spacer. The transformer (transformMarkdown) still
-// empties the body; this method only flips the host ownership flag.
+// host (D214 OwnThinkingRuns), then clears the hidden-thinking label as the
+// 0.5.3 fallback. Order matters: own first so a 0.6.0 host skips the stub
+// entirely; the empty label then only matters on older hosts that still draw
+// a hidden-thinking stub. The transformer (transformMarkdown) still empties
+// the body; this method only flips the host ownership / label seams.
 func (r *runtimeState) applyNativeThinkingSuppression(ui uiContext) {
 	ui.ownThinkingRuns(true)
+	ui.setHiddenThinkingLabel("")
 }
 
 // installNativeThinkingSuppression is installNativeThinkingSuppression
