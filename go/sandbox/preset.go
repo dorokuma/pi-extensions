@@ -34,8 +34,8 @@ var ForbiddenExecNames = []string{
 var DefaultReviewerTools = []string{
 	// Shell 与基础命令包装
 	"bash", "sh", "dash", "env", "true", "false",
-	// 版本控制、Go 工具链、C 链接工具链与代码检索
-	"git", "go", "rg", "grep", "egrep", "fgrep", "find", "xargs",
+	// 版本控制、Go 工具链、C 链接工具链、远端只读探查（ssh）与代码检索
+	"git", "go", "rg", "grep", "egrep", "fgrep", "find", "xargs", "ssh",
 	"gcc", "cc", "clang", "ld", "as", "ar", "nm", "objcopy", "objdump", "readelf", "strip", "pkg-config",
 	// 文本查看与只读分析工具
 	"cat", "ls", "head", "tail", "less", "more", "wc", "nl",

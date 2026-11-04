@@ -1197,6 +1197,12 @@ func TestReviewerAgentMCPServerExec(t *testing.T) {
 			t.Fatalf("MCP binary %s not in ReviewerAgent Exec", hostPath)
 		}
 	}
+	// ReviewerAgent 继承 DefaultReviewerTools：宿主 ssh（含软链解析）须在 Exec。
+	if sshBin, err := exec.LookPath("ssh"); err != nil {
+		t.Fatalf("host ssh not found in PATH: %v", err)
+	} else if _, ok := execSet[sshBin]; !ok {
+		t.Fatalf("ssh %s not in ReviewerAgent Exec", sshBin)
+	}
 	for _, ep := range policy.Exec {
 		if ep == "/root/.local/bin" || ep == "/root/.local/bin/" {
 			t.Fatal("ReviewerAgent must not Exec-allow whole /root/.local/bin")
