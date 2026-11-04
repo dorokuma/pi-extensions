@@ -282,8 +282,29 @@ func TestProviderConfig(t *testing.T) {
 	}
 }
 
+// recordingRegistrar captures every RegisterProvider/RegisterTool call so the
+// branch assertions observe real registrations instead of trusting a returned
+// handle (MF-6: the previous test only checked Name() and could not fail).
+type recordingRegistrar struct {
+	providers map[string][]sdk.ProviderConfig
+	tools     []sdk.ToolDefinition
+}
+
+func newRecordingRegistrar() *recordingRegistrar {
+	return &recordingRegistrar{providers: map[string][]sdk.ProviderConfig{}}
+}
+
+func (r *recordingRegistrar) RegisterProvider(name string, config sdk.ProviderConfig) {
+	r.providers[name] = append(r.providers[name], config)
+}
+
+func (r *recordingRegistrar) RegisterTool(definition sdk.ToolDefinition) {
+	r.tools = append(r.tools, definition)
+}
+
 // TestNewExtensionBranches drives both factory branches without a host and
-// without the production herdr socket (the identity verdict is injected).
+// without the production herdr socket (the identity verdict is injected), and
+// asserts the registrations each branch must perform.
 func TestNewExtensionBranches(t *testing.T) {
 	api := JevAPI{
 		Config: Config{BaseURL: "http://127.0.0.1:3425/v1", ModelID: DefaultModelID, MaxStateChars: 24000, TimeoutMs: 2000, Timeout: 2 * time.Second},
@@ -296,14 +317,60 @@ func TestNewExtensionBranches(t *testing.T) {
 		Client: &http.Client{},
 	}
 
-	mainAgent := newExtension(func() bool { return false }, api)
-	if mainAgent == nil || mainAgent.Name() != "jev-gate" {
-		t.Fatalf("main-agent extension = %v", mainAgent)
-	}
-	subagent := newExtension(func() bool { return true }, api)
-	if subagent == nil || subagent.Name() != "jev-gate" {
-		t.Fatalf("subagent extension = %v", subagent)
-	}
+	t.Run("main_agent_registers_tool_and_provider", func(t *testing.T) {
+		registrar := newRecordingRegistrar()
+		wireExtension(registrar, func() bool { return false }, api)
+
+		// The jev_check tool must be registered exactly once.
+		if len(registrar.tools) != 1 || registrar.tools[0].Name != "jev_check" {
+			t.Fatalf("tools = %+v, want exactly jev_check", registrar.tools)
+		}
+
+		// Exactly the magpie-jev provider must be registered, with the
+		// group/classifier model and the typesafe-system-one classifier callback.
+		magpie, ok := registrar.providers[ProviderID]
+		if !ok || len(magpie) != 1 {
+			t.Fatalf("providers = %v, want exactly one %q registration", registrar.providers, ProviderID)
+		}
+		config := magpie[0]
+		models, _ := config["models"].([]any)
+		if len(models) != 1 {
+			t.Fatalf("models = %v", config["models"])
+		}
+		model, _ := models[0].(map[string]any)
+		if model["id"] != "group/classifier" || model["api"] != "typesafe-system-one" {
+			t.Fatalf("model = %v", model)
+		}
+		classifiers, _ := config["classifiers"].(map[string]sdk.ProviderClassifyFunc)
+		if classifiers["typesafe-system-one"] == nil {
+			t.Fatalf("classifiers = %v", config["classifiers"])
+		}
+
+		// The built-in typesafe provider must not be touched on the main agent.
+		if _, cleared := registrar.providers[BuiltinClassifierProvider]; cleared {
+			t.Fatalf("main agent must not re-register %q", BuiltinClassifierProvider)
+		}
+	})
+
+	t.Run("subagent_registers_nothing_but_clears_typesafe", func(t *testing.T) {
+		registrar := newRecordingRegistrar()
+		wireExtension(registrar, func() bool { return true }, api)
+
+		if len(registrar.tools) != 0 {
+			t.Fatalf("subagent must not register tools, got %+v", registrar.tools)
+		}
+		if _, ok := registrar.providers[ProviderID]; ok {
+			t.Fatalf("subagent must not register %q", ProviderID)
+		}
+		typesafe, ok := registrar.providers[BuiltinClassifierProvider]
+		if !ok || len(typesafe) != 1 {
+			t.Fatalf("subagent must clear %q exactly once, providers = %v", BuiltinClassifierProvider, registrar.providers)
+		}
+		models, _ := typesafe[0]["models"].([]any)
+		if models == nil || len(models) != 0 {
+			t.Fatalf("typesafe models = %v, want empty []any{}", typesafe[0]["models"])
+		}
+	})
 }
 
 // TestExecuteCheckConcurrent hammers one endpoint from several goroutines; run
