@@ -208,6 +208,34 @@ func TestBuildExecWhitelistAndReadOnlyReviewerPolicy(t *testing.T) {
 			t.Fatalf("expected %s directory %q to exist, err=%v", key, val, err)
 		}
 	}
+
+	// DefaultReviewerTools 含 ssh：ReadOnlyReviewer（--preset reviewer）的 Exec
+	// 必须含宿主 ssh（含软链解析目标），使沙盒内可执行远端只读探查；
+	// ForbiddenExecNames 绝不入 Exec。
+	roExecSet := make(map[string]struct{}, len(policy.Exec)*2)
+	for _, ep := range policy.Exec {
+		roExecSet[ep] = struct{}{}
+		if r, err := filepath.EvalSymlinks(ep); err == nil && r != "" {
+			roExecSet[r] = struct{}{}
+		}
+	}
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Fatalf("host ssh not found in PATH: %v", err)
+	}
+	if _, ok := roExecSet[sshBin]; !ok {
+		t.Fatalf("ssh %s not in ReadOnlyReviewer Exec", sshBin)
+	}
+	if resolvedSSH, err := filepath.EvalSymlinks(sshBin); err == nil && resolvedSSH != "" {
+		if _, ok := roExecSet[resolvedSSH]; !ok {
+			t.Fatalf("resolved ssh %s not in ReadOnlyReviewer Exec", resolvedSSH)
+		}
+	}
+	for _, ep := range policy.Exec {
+		if sandbox.IsForbiddenExec(ep) {
+			t.Fatalf("ReadOnlyReviewer Exec unexpectedly contains forbidden exec %s", ep)
+		}
+	}
 }
 
 func TestBestEffortDegradation(t *testing.T) {
@@ -1188,13 +1216,30 @@ func TestReviewerAgentMCPServerExec(t *testing.T) {
 			execSet[r] = struct{}{}
 		}
 	}
-	for _, name := range []string{"ctxmode", "codegraph-go", "jev-mcp", "jev-mcp-go", "agy-recall"} {
+	for _, name := range []string{
+		"ctxmode", "codegraph-go", "jev-mcp", "jev-mcp-go", "agy-recall",
+	} {
 		hostPath := filepath.Join("/root/.local/bin", name)
 		if _, err := os.Stat(hostPath); err != nil {
 			t.Fatalf("host MCP binary %s missing: %v", hostPath, err)
 		}
 		if _, ok := execSet[hostPath]; !ok {
 			t.Fatalf("MCP binary %s not in ReviewerAgent Exec", hostPath)
+		}
+	}
+
+	// ReviewerAgent 继承 DefaultReviewerTools：宿主 ssh 必须解析进 Exec（含软链目标），
+	// 使沙盒内可执行远端只读探查。（EntryAgents agy/pig/pi 按预设设计仍属顶层放行。）
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Fatalf("host ssh not found in PATH: %v", err)
+	}
+	if _, ok := execSet[sshBin]; !ok {
+		t.Fatalf("ssh %s not in ReviewerAgent Exec", sshBin)
+	}
+	if resolvedSSH, err := filepath.EvalSymlinks(sshBin); err == nil && resolvedSSH != "" {
+		if _, ok := execSet[resolvedSSH]; !ok {
+			t.Fatalf("resolved ssh %s not in ReviewerAgent Exec", resolvedSSH)
 		}
 	}
 	for _, ep := range policy.Exec {
