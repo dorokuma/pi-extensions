@@ -8,8 +8,9 @@ import (
 // way this extension suppresses or hides the host's own thinking render lives
 // here. Upstream PiG 0.6.0 (issue #384 / D214) exposes OwnThinkingRuns so a
 // hidden or zero-row thinking run leaves no stub and no spacer rows; that hook
-// is called from applyNativeThinkingSuppression. The older setHiddenThinkingLabel
-// seam stays as a fallback for 0.5.3 hosts that lack OwnThinkingRuns.
+// is called from applyNativeThinkingSuppression via a soft interface probe so
+// 0.5.3 staged SDKs without the method still compile. The older
+// setHiddenThinkingLabel seam stays as a fallback for those hosts.
 //
 // Call-site contract: applyNativeThinkingSuppression is the sole caller of the
 // ownThinkingRuns and setHiddenThinkingLabel primitives for this seam, and
