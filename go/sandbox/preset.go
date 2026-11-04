@@ -763,10 +763,14 @@ func appendAgyStateReadWrite(p *Policy) {
 //     <privateTmpDir>/ctxmode/context_mode.db（沙盒私有 0700）；宿主兜底仅精确放行
 //     ~/.local/share/ctxmode 与 ~/.gemini/config/plugins/agy-recall/state（含
 //     /root/.agy-pro-home 对应目录），绝不放宽到 ~/.local/share 或 gemini-web；
-//   - ReadWrite（pig AgentDir 私有隔离）：宿主 /root/.pig/agent 保持 100% 只读；
+//   - ReadWrite（pig AgentDir 私有隔离）：宿主 AgentDir 保持 100% 只读；
 //     进入 Landlock 前把必要配置文件 0600 拷入 <privateTmpDir>/pig-agent，并在私有
 //     settings.json 中显式声明宿主扩展目录绝对路径（不再用 extensions 软链，避免
 //     cfg.Source 变成随机私有路径而脱靶 packed-go 打包缓存），注入 PIG_CODING_AGENT_DIR；
+//     私有副本与预热经 resolveSourcePigAgentDir 对齐同一个实际生效 AgentDir
+//     （PIG_CODING_AGENT_DIR / 有效 PIG_USE_PI_DIRS=1 时的 PI_CODING_AGENT_DIR，
+//     缺省 <PIG_HOME>/agent）；Policy.Env 同时固定注入解析出的 PIG_HOME，
+//     防止 --env PIG_HOME= 空覆盖或子进程 HOME 差异造成缓存根漂移；
 //   - Env/ReadWrite（XDG_RUNTIME_DIR 私有隔离）：宿主 /run/user/0（systemd user bus、
 //     keyring 等敏感套接字）绝不进 ReadWrite；在 <privateTmpDir> 下预建 0700 的短名
 //     私有运行目录 rt（短名 rt 保证 XDG socket 路径远低于 sun_path 108 字节上限），
@@ -786,7 +790,19 @@ func appendAgyStateReadWrite(p *Policy) {
 // 当前实现没有 execve 计数 / 一次性 ticket。沙盒内再起 agy/pig 在 OS 层仍可能成功。
 // 兜底：只读角色本身无 bash/run_command，工具层难以再派发；dispatch-agent/grok 仍不在白名单。
 // 原 ReadOnlyReviewer / --preset reviewer 行为不变。
+// ReviewerAgent 构造「只读审查员代理」预设：等价于 ReviewerAgentWithEnv(workdir, nil)。
 func ReviewerAgent(workdir string) Policy {
+	return ReviewerAgentWithEnv(workdir, nil)
+}
+
+// ReviewerAgentWithEnv 与 ReviewerAgent 相同，但额外接收调用方 --env 注入
+// 列表 cfgEnv：PIG_HOME 按 resolvePigHomeDir 语义解析（最后一项 PIG_HOME 键，
+// 显式空覆盖回退默认 <trustedHome>/.pig），与 MaybeWarmGoExtensionCells 共用，
+// 保证预热指纹/缓存根与沙盒策略引用同一个 PIG_HOME；解析结果同时固定注入
+// Policy.Env，避免 --env 空覆盖或宿主/子进程 HOME 差异导致沙盒内缓存根漂移。
+// 显式 AgentDir（PIG_CODING_AGENT_DIR / PI_CODING_AGENT_DIR）经
+// resolveSourcePigAgentDir 与预热路径完全对齐，私有副本从其克隆。
+func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	p := ReadOnlyReviewer(workdir)
 
 	extraTools := BuildExecWhitelist([]string{"mkdir", "cp", "touch"})
@@ -826,15 +842,25 @@ func ReviewerAgent(workdir string) Policy {
 	// 绝不允许 ~/.local/share 整体可写（会连带 ~/.local/share/gemini-web/chrome-profile）。
 	appendCtxmodeStateReadWrite(&p)
 
-	// 安全细则二：pig AgentDir 私有隔离。宿主 /root/.pig/agent 保持 100% 只读，
+	// 安全细则二：pig AgentDir 私有隔离。宿主 AgentDir 保持 100% 只读，
 	// 沙盒内 pig 经 PIG_CODING_AGENT_DIR 指向 privateTmpDir 下的私有副本。
-	preparePrivatePigAgentDir(privateTmpDir)
+	// PIG_HOME 固定回注 Policy.Env：mergeEnv 允许 --env PIG_HOME= 空覆盖把空串
+	// 写进最终 env，沙盒内 pig 会按外部 HOME 另算缓存根而打穿预热/策略对齐；
+	// 显式 AgentDir 与预热同口径解析，不可信（软链/权限/属主不符）时回退默认
+	// <pigHome>/agent——沙盒侧只复制其配置文件，不做预热级硬拒绝。
+	pigHome := resolvePigHomeDir(cfgEnv)
+	p.Env = overrideEnvKey(p.Env, "PIG_HOME", pigHome)
+	srcAgentDir, customAgentDir := resolveSourcePigAgentDir(pigHome, cfgEnv)
+	if customAgentDir && !validateTrustedPigDir(srcAgentDir, "AgentDir") {
+		srcAgentDir = filepath.Join(pigHome, "agent")
+	}
+	preparePrivatePigAgentDirFromAgent(filepath.Join(privateTmpDir, "pig-agent"), srcAgentDir)
 	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"))
 
 	// 安全细则三：宿主态预刷新缓存单元 usage.json（沙盒内 TouchUsage 命中 <1h 只读短路），
 	// 只放行锁目录与已构建产物，严守 W^X。
-	refreshCellUsageMetadata(pigHomeDir(), time.Now())
-	appendCellCachePolicy(&p, pigHomeDir())
+	refreshCellUsageMetadata(pigHome, time.Now())
+	appendCellCachePolicy(&p, pigHome)
 
 	// 安全细则四：XDG_RUNTIME_DIR 私有隔离。宿主 /run/user/0 内含 systemd user bus、
 	// keyring 等敏感套接字，绝不加入 ReadWrite；改为在 privateTmpDir 下预建 0700 的
@@ -848,15 +874,94 @@ func ReviewerAgent(workdir string) Policy {
 	return p
 }
 
-// pigHomeDir 返回宿主 PIG_HOME：$PIG_HOME 优先，其次 homeDir()/.pig，最后 /root/.pig。
+// resolvePigHomeDir 是 reviewer-agent 预热与策略构造共用的 PIG_HOME 解析：
+// 从后往前找 cfgEnv（--env KEY=VALUE 解析结果）中最后一个 PIG_HOME 键：
+//   - 非空值：返回其绝对路径（命中即停，不回扫更早被覆盖的条目）；
+//   - 显式空串（如 --env PIG_HOME=A --env PIG_HOME=）：空覆盖语义等同未设置，
+//     直接返回默认 <trustedHome>/.pig，绝不回读宿主 os.Getenv("PIG_HOME")；
+//   - cfgEnv 完全不含 PIG_HOME 键：才读宿主环境变量，缺省 <trustedHome>/.pig。
+func resolvePigHomeDir(cfgEnv []string) string {
+	for i := len(cfgEnv) - 1; i >= 0; i-- {
+		k, v, ok := strings.Cut(cfgEnv[i], "=")
+		if !ok || k != "PIG_HOME" {
+			continue
+		}
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return absCleanPath(trimmed)
+		}
+		return filepath.Join(trustedHomeDir(), ".pig")
+	}
+	return pigHomeDir()
+}
+
+// absCleanPath 返回路径的绝对化+规范化形式；filepath.Abs 失败退化为 Clean。
+func absCleanPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(p)
+}
+
+// pigHomeDir 返回宿主 PIG_HOME：$PIG_HOME 优先，其次 <trustedHome>/.pig。
+// 宿主 HOME 经 os/user.LookupId(euid) 获取（trustedHomeDir），不读
+// os.Getenv("HOME")——调用方环境的 HOME 可能被外部篡改。
 func pigHomeDir() string {
 	if v := strings.TrimSpace(os.Getenv("PIG_HOME")); v != "" {
-		if abs, err := filepath.Abs(v); err == nil {
-			return filepath.Clean(abs)
-		}
-		return filepath.Clean(v)
+		return absCleanPath(v)
 	}
-	return filepath.Join(homeDir(), ".pig")
+	return filepath.Join(trustedHomeDir(), ".pig")
+}
+
+// cfgEnvLastValue 返回 cfgEnv 中最后一个 k 键的值：从后往前扫描命中即停。
+// found 区分「键存在但显式空串（空覆盖屏蔽宿主同名环境变量）」与「键完全缺失」。
+func cfgEnvLastValue(cfgEnv []string, key string) (val string, found bool) {
+	for i := len(cfgEnv) - 1; i >= 0; i-- {
+		k, v, ok := strings.Cut(cfgEnv[i], "=")
+		if !ok || k != key {
+			continue
+		}
+		return v, true
+	}
+	return "", false
+}
+
+// resolveSourcePigAgentDir 解析预热与私有副本共用的实际生效宿主 AgentDir，
+// 优先级与 injectPigCodingAgentDir 完全一致：
+//   - PIG_CODING_AGENT_DIR：先查 cfgEnv 最后一项（含显式空串空覆盖屏蔽宿主
+//     同名变量），未设置再查宿主环境；
+//   - 有效 PIG_USE_PI_DIRS == "1"（cfgEnv 最后一项优先，显式空串/非 1 覆盖
+//     宿主）时按同规则查 PI_CODING_AGENT_DIR；
+//   - 均缺省返回 <pigHome>/agent，custom=false。
+// 返回的自定义路径已绝对化；custom=true 时调用方须先做 validateTrustedPigDir
+// 同等校验（非软链、目录、属主、perm & 0o022 == 0）。
+func resolveSourcePigAgentDir(pigHome string, cfgEnv []string) (srcAgentDir string, custom bool) {
+	lookup := func(key string) (string, bool) {
+		if v, ok := cfgEnvLastValue(cfgEnv, key); ok {
+			// cfgEnv 显式声明（含空覆盖）：屏蔽宿主环境变量。
+			return v, true
+		}
+		if v := os.Getenv(key); v != "" {
+			return v, true
+		}
+		return "", false
+	}
+	if v, ok := lookup("PIG_CODING_AGENT_DIR"); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return absCleanPath(trimmed), true
+		}
+	}
+	usePiDirs := false
+	if v, ok := lookup("PIG_USE_PI_DIRS"); ok {
+		usePiDirs = strings.TrimSpace(v) == "1"
+	}
+	if usePiDirs {
+		if v, ok := lookup("PI_CODING_AGENT_DIR"); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return absCleanPath(trimmed), true
+			}
+		}
+	}
+	return filepath.Join(pigHome, "agent"), false
 }
 
 // preparePrivateCtxmodeDir 创建 <privateTmpDir>/ctxmode（0700）并返回路径。
@@ -994,24 +1099,29 @@ var pigAgentConfigFiles = []string{
 	"trusted-projects.json",
 }
 
-// preparePrivatePigAgentDir 在 <privateTmpDir>/pig-agent（0700）下构建私有 AgentDir：
-// 仅当宿主 AgentDir 下对应普通文件存在时才以 0600 拷入白名单配置文件。返回目录路径。
+// preparePrivatePigAgentDirForHome 是默认布局 <pigHome>/agent 的薄包装。
+func preparePrivatePigAgentDirForHome(dir, pigHome string) string {
+	return preparePrivatePigAgentDirFromAgent(dir, filepath.Join(pigHome, "agent"))
+}
+
+// preparePrivatePigAgentDirFromAgent 在 dir（0700）下构建私有 AgentDir：
+// 仅当 <srcAgentDir> 下对应普通文件存在时才以 0600 拷入白名单配置文件。返回目录路径。
 //
 // 不创建 extensions 软链：自动发现走 <agentDir>/extensions 会把 cfg.Source 记成
 // 随机私有路径（/tmp/pi-sandbox-XXXXXX/pig-agent/extensions/<ext>），packed-go 的
 // cellHash 直接对该路径取哈希，导致每次启动都脱靶宿主已构建的打包 cell。
 // 改为在私有 settings.json 中显式声明宿主扩展目录（见 injectHostExtensionsSetting：
-// 未声明时注入 [hostExtDir]，已有数组时相对路径相对宿主 <pigHome>/agent 解析并
+// 未声明时注入 [hostExtDir]，已有数组时相对路径相对宿主 srcAgentDir 解析并
 // 视需要追加），使 settings 条目经 ResolveConfiguredWithError 解析出的 cfg.Source
 // 与宿主自动发现完全一致，packed cell.Key 与 goPackedCellHash 逐字节命中宿主缓存。
-func preparePrivatePigAgentDir(privateTmpDir string) string {
-	dst := filepath.Join(privateTmpDir, "pig-agent")
+func preparePrivatePigAgentDirFromAgent(dir, srcAgentDir string) string {
+	dst := dir
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		return dst
 	}
 	_ = os.Chmod(dst, 0o700)
 
-	src := filepath.Join(pigHomeDir(), "agent")
+	src := filepath.Clean(srcAgentDir)
 	srcExt := filepath.Join(src, "extensions")
 	hasHostExt := false
 	if info, err := os.Stat(srcExt); err == nil && info.IsDir() {
@@ -1102,17 +1212,8 @@ func injectHostExtensionsSetting(data []byte, hostExtDir string) []byte {
 		// 相对宿主 agentDir 的绝对排除路径。
 		if e != "" && (e[0] == '-' || e[0] == '!') {
 			rest := e[1:]
-			if rest == "extensions" || rest == "./extensions" ||
-				filepath.Clean(rest) == filepath.Clean(hostExtDir) {
+			if settingsExtensionExcludes(e, hostExtDir) {
 				excluded = true
-			} else if rel, ok := strings.CutPrefix(rest, "./"); ok {
-				if filepath.Join(agentDir, rel) == filepath.Clean(hostExtDir) {
-					excluded = true
-				}
-			} else if rel, ok := strings.CutPrefix(rest, "../"); ok {
-				if filepath.Clean(filepath.Join(agentDir, "../"+rel)) == filepath.Clean(hostExtDir) {
-					excluded = true
-				}
 			}
 			// 仅 ./ ../ 开头的相对路径排除项改写为相对宿主 agentDir 的绝对路径；
 			// 裸名（如 "extensions"、"excluded"）是扩展名排除而非路径，原样保留。
@@ -1131,6 +1232,33 @@ func injectHostExtensionsSetting(data []byte, hostExtDir string) []byte {
 		return data
 	}
 	return data2
+}
+
+// settingsExtensionExcludes 判断 - / ! 前缀的排除条目是否排除 targetDir
+// （供 injectHostExtensionsSetting 与预热指纹的扩展枚举共用同一口径）：
+// 裸组名 "extensions"/"./extensions"、与 targetDir 等价的绝对/相对路径
+// （相对 targetDir 的父目录 agentDir 解析，含 ./ ../ 写法）均算排除。
+func settingsExtensionExcludes(entry, targetDir string) bool {
+	if entry == "" || (entry[0] != '-' && entry[0] != '!') {
+		return false
+	}
+	rest := entry[1:]
+	target := filepath.Clean(targetDir)
+	agentDir := filepath.Dir(targetDir)
+	if rest == "extensions" || rest == "./extensions" || filepath.Clean(rest) == target {
+		return true
+	}
+	if rel, ok := strings.CutPrefix(rest, "./"); ok {
+		if filepath.Join(agentDir, rel) == target {
+			return true
+		}
+	}
+	if rel, ok := strings.CutPrefix(rest, "../"); ok {
+		if filepath.Clean(filepath.Join(agentDir, "../"+rel)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveHostExtensionEntry 把 settings.json extensions 数组中的相对本地路径条目
@@ -1209,11 +1337,14 @@ func injectPigCodingAgentDir(env []string, privatePigAgentDir string) []string {
 }
 
 // cellReadyMeta 是缓存单元 ready.json 中校验所需的字段。
+// Language 供 cache/ext 语言门鉴别：宿主 node-runtime-* 等非 Go 产物不计入
+// 有效 Go 预热产物（validCellEntryDir 本身不对 Language 做约束，保持向后兼容）。
 type cellReadyMeta struct {
 	InputDigest string `json:"inputDigest"`
 	Artifact    string `json:"artifact"`
 	Size        int64  `json:"size"`
 	Created     int64  `json:"created"`
+	Language    string `json:"language"`
 }
 
 // validCellEntryDir 判断 dir 是否为含有效 ready.json 的缓存单元目录：

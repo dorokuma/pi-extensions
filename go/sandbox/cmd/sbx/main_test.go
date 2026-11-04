@@ -67,6 +67,42 @@ func TestMergeEnv(t *testing.T) {
 	}
 }
 
+// TestBuildPolicyRepinsPigHome 验证 reviewer-agent 预设下 mergeEnv 之后
+// PIG_HOME 被回钉为 ReviewerAgentWithEnv 解析出的非空值：cfgEnv 中的
+// PIG_HOME 键（含前面的覆盖项）不得把其它值/空串写进最终 Policy.Env，
+// 沙盒内 pig 与预热/策略构造引用同一个缓存根。
+func TestBuildPolicyRepinsPigHome(t *testing.T) {
+	fakeHome := t.TempDir()
+	otherHome := t.TempDir()
+	t.Setenv("PIG_HOME", otherHome) // 宿主值必须被 cfgEnv 覆盖，不得进入最终 env
+	workdir := t.TempDir()
+
+	policy, err := buildPolicy(cliConfig{
+		Preset:  "reviewer-agent",
+		WorkDir: workdir,
+		Env:     []string{"PIG_HOME=" + otherHome, "PIG_HOME=" + fakeHome},
+	})
+	if err != nil {
+		t.Fatalf("buildPolicy: %v", err)
+	}
+	defer cleanupPresetTempDirsFromPolicy(policy)
+
+	got := envListValue(policy.Env, "PIG_HOME")
+	if got != fakeHome {
+		t.Fatalf("PIG_HOME must be re-pinned to resolved %q, got %q (env=%v)", fakeHome, got, policy.Env)
+	}
+	// 同名键只保留一个条目。
+	count := 0
+	for _, kv := range policy.Env {
+		if strings.HasPrefix(kv, "PIG_HOME=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one PIG_HOME entry in Policy.Env, got %d (%v)", count, policy.Env)
+	}
+}
+
 func TestCleanupPresetTempDirsFallbackPath(t *testing.T) {
 	customTmpParent := t.TempDir()
 	t.Setenv("TMPDIR", customTmpParent)
