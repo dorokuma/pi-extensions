@@ -2,9 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,16 +59,41 @@ func stubIdentity(t *testing.T, isSubagent bool, reason string) {
 	t.Cleanup(func() { resolveAgentIdentity = old })
 }
 
-// dispatchOne parses the single JSON-RPC response a message produces.
+// lockedBuffer is a writer the async tools/call worker can share with the
+// test goroutine safely.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// dispatchOne parses the single JSON-RPC response a message produces. Replies
+// can arrive asynchronously (tools/call runs on its own goroutine), so it
+// waits until the writer produced a line.
 func dispatchOne(t *testing.T, message map[string]any) map[string]any {
 	t.Helper()
-	buffer := &strings.Builder{}
-	writer := &responseWriter{out: buffer, current: "line"}
-	handleRPC(writer, message)
-	line := strings.TrimSpace(buffer.String())
-	if line == "" {
-		t.Fatal("no response written")
+	buffer := &lockedBuffer{}
+	writer := &responseWriter{out: buffer}
+	handleRPC(writer, message, "line")
+	deadline := time.Now().Add(10 * time.Second)
+	for strings.TrimSpace(buffer.String()) == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("no response written within 10s")
+		}
+		time.Sleep(time.Millisecond)
 	}
+	line := strings.TrimSpace(buffer.String())
 	var reply map[string]any
 	if err := json.Unmarshal([]byte(line), &reply); err != nil {
 		t.Fatalf("response %q is not JSON: %v", line, err)
@@ -218,5 +249,137 @@ func TestToolsCallGate(t *testing.T) {
 	deny, _ := text["text"].(string)
 	if !strings.Contains(deny, "仅限主代理") || !strings.Contains(deny, "nested second host runtime") {
 		t.Fatalf("deny text = %q", deny)
+	}
+}
+
+// TestHelperProcessSchemaWrite is not a test: it is the writer half of
+// TestWriteFileAtomicConcurrent, re-executed as a real OS process so the
+// atomicity claim is proven across processes (rename(2)), not just across
+// goroutines of one binary.
+func TestHelperProcessSchemaWrite(t *testing.T) {
+	if os.Getenv("JEV_SCHEMA_WRITE_HELPER") != "1" {
+		return
+	}
+	target := os.Getenv("JEV_SCHEMA_WRITE_TARGET")
+	writer := os.Getenv("JEV_SCHEMA_WRITE_WRITER")
+	rounds, _ := strconv.Atoi(os.Getenv("JEV_SCHEMA_WRITE_ROUNDS"))
+	if target == "" || rounds <= 0 {
+		os.Exit(2)
+	}
+	for round := 0; round < rounds; round++ {
+		content, _ := json.Marshal(map[string]any{
+			"name":   "jev_check",
+			"writer": writer,
+			"round":  round,
+		})
+		if err := writeFileAtomic(target, content, 0o644); err != nil {
+			os.Exit(3)
+		}
+	}
+	os.Exit(0)
+}
+
+// TestWriteFileAtomicConcurrent hammers one schema file from several real
+// child processes while parent-side readers race them. Every completed read
+// must be a non-empty, fully-parseable JSON object, and no temp file may be
+// left behind.
+func TestWriteFileAtomicConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "jev_check.json")
+
+	const (
+		writers = 4
+		rounds  = 15
+		readers = 4
+	)
+
+	// Seed the file so the first reader already sees valid content.
+	seed, _ := json.Marshal(map[string]any{"name": "jev_check", "round": -1})
+	if err := writeFileAtomic(target, seed, 0o644); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var emptyReads, parseErrors, readCount atomic.Int64
+	var wg sync.WaitGroup
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				data, err := os.ReadFile(target)
+				if err != nil {
+					continue
+				}
+				readCount.Add(1)
+				if len(data) == 0 {
+					emptyReads.Add(1)
+					continue
+				}
+				var parsed map[string]any
+				if err := json.Unmarshal(data, &parsed); err != nil {
+					parseErrors.Add(1)
+				}
+			}
+		}()
+	}
+
+	var procs sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessSchemaWrite$")
+		cmd.Env = append(os.Environ(),
+			"JEV_SCHEMA_WRITE_HELPER=1",
+			"JEV_SCHEMA_WRITE_TARGET="+target,
+			fmt.Sprintf("JEV_SCHEMA_WRITE_WRITER=%d", i),
+			fmt.Sprintf("JEV_SCHEMA_WRITE_ROUNDS=%d", rounds),
+		)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start writer %d: %v", i, err)
+		}
+		procs.Add(1)
+		go func(cmd *exec.Cmd, i int) {
+			defer procs.Done()
+			if err := cmd.Wait(); err != nil {
+				t.Errorf("writer %d exited with error: %v", i, err)
+			}
+		}(cmd, i)
+	}
+	procs.Wait()
+	close(stop)
+	wg.Wait()
+
+	if emptyReads.Load() != 0 {
+		t.Fatalf("readers saw %d empty reads: a torn write exposed an empty file", emptyReads.Load())
+	}
+	if parseErrors.Load() != 0 {
+		t.Fatalf("readers saw %d JSON parse errors: a torn write exposed a partial file", parseErrors.Load())
+	}
+	if readCount.Load() == 0 {
+		t.Fatal("readers never observed the file")
+	}
+	final, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("final read: %v", err)
+	}
+	var last map[string]any
+	if err := json.Unmarshal(final, &last); err != nil {
+		t.Fatalf("final content is not valid JSON: %v", err)
+	}
+	if last["name"] != "jev_check" {
+		t.Fatalf("final content = %v", last)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("temp file left behind: %s", entry.Name())
+		}
 	}
 }

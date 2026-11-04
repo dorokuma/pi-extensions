@@ -356,7 +356,7 @@ func TestValidateAnswers(t *testing.T) {
 		{"score_too_high", scoreQuestion, map[string]any{"s": map[string]any{"score": 3}}, `invalid score answer for "s"`},
 		{"score_negative", scoreQuestion, map[string]any{"s": map[string]any{"score": -1}}, `invalid score answer for "s"`},
 		{"score_not_number", scoreQuestion, map[string]any{"s": map[string]any{"score": "1"}}, `invalid score answer for "s"`},
-		{"unsupported_type", Questions{{ID: "x", Type: "bool"}}, map[string]any{"x": map[string]any{"noul": 0.5}}, `unsupported question type "bool" for "x"`},
+		{"unsupported_type", Questions{{ID: "x", Type: "invalid_type"}}, map[string]any{"x": map[string]any{"noul": 0.5}}, `unsupported question type "invalid_type" for "x"`},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

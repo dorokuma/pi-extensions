@@ -121,9 +121,58 @@ func TestExecuteCheckSuccess(t *testing.T) {
 		t.Fatalf("structured usage = %v", structured["usage"])
 	}
 	details, _ := result.Details.(map[string]any)
-	if details["summary"] != verdict[0] {
-		t.Fatalf("details summary = %v", result.Details)
+	if want := strings.Join(verdict, " | "); details["summary"] != want {
+		t.Fatalf("details summary = %v, want %q", result.Details, want)
 	}
+}
+
+// TestExecuteCheckSummaryKeepsEveryVerdictLine pins SF-2: the details summary
+// must carry the whole verdict, never only the first line — a UNCERTAIN band
+// with no FLAGGED gate, and a material disagreement, must survive in it.
+func TestExecuteCheckSummaryKeepsEveryVerdictLine(t *testing.T) {
+	t.Run("gate_scan_uncertain_only", func(t *testing.T) {
+		// No gate reaches 0.8, so the only line is the UNCERTAIN band: the
+		// summary must still name the field a human has to confirm.
+		body := `{"answers":{` +
+			`"g1_evidence_missing_fields":{"noul":0.2},` +
+			`"g1_criterion_not_executed":{"noul":0.02},` +
+			`"g2_unresolved_must_fix":{"noul":0.5},` +
+			`"g3_unresolved_fatal_doubt":{"noul":0.03},` +
+			`"g4_leftovers_unrecorded":{"noul":0.04}},` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`
+		server := jsonServer(t, http.StatusOK, body)
+		result := executeCheck(newTestAPI(server, 24000, 2*time.Second), context.Background(),
+			map[string]any{"task": "gate_scan", "payload": "report body"})
+		if result.IsError {
+			t.Fatalf("unexpected error: %q", result.Content)
+		}
+		details, _ := result.Details.(map[string]any)
+		summary, _ := details["summary"].(string)
+		if !strings.Contains(summary, "UNCERTAIN") || !strings.Contains(summary, "g2_unresolved_must_fix") {
+			t.Fatalf("summary must keep the UNCERTAIN band: %q", summary)
+		}
+		if strings.Contains(summary, "FLAGGED") {
+			t.Fatalf("no gate was flagged: %q", summary)
+		}
+	})
+	t.Run("disagreement_keeps_material_line", func(t *testing.T) {
+		body := `{"answers":{` +
+			`"has_material_disagreement":{"noul":0.9},` +
+			`"same_finding_set":{"noul":0.2},` +
+			`"relation":{"choice":"b_raises_new","probabilities":{"b_raises_new":0.9,"agrees":0.05,"b_refutes_a":0.05,"both_raise_different":0.0,"b_defers":0.0},"confidence":0.9}},` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`
+		server := jsonServer(t, http.StatusOK, body)
+		result := executeCheck(newTestAPI(server, 24000, 2*time.Second), context.Background(),
+			map[string]any{"task": "disagreement", "payload": "A\n---\nB"})
+		if result.IsError {
+			t.Fatalf("unexpected error: %q", result.Content)
+		}
+		details, _ := result.Details.(map[string]any)
+		summary, _ := details["summary"].(string)
+		if !strings.Contains(summary, "material disagreement: YES") || !strings.Contains(summary, "relation: b_raises_new") {
+			t.Fatalf("summary must keep both verdict lines: %q", summary)
+		}
+	})
 }
 
 // TestExecuteCheckContractLintSuccess pins the role echo and missing-field n/a.

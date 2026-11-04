@@ -97,7 +97,17 @@ func roleParam(params map[string]any) *Role {
 // ExecuteCheck runs one jev_check call against the production endpoint
 // (TS: executeCheck).
 func ExecuteCheck(params map[string]any) sdk.ToolResult {
-	return executeCheck(DefaultJevAPI(), context.Background(), params)
+	return ExecuteCheckContext(context.Background(), params)
+}
+
+// ExecuteCheckContext is ExecuteCheck with caller cancellation: ctx interrupts
+// the underlying HTTP request (MCP notifications/cancelled). A nil ctx falls
+// back to context.Background().
+func ExecuteCheckContext(ctx context.Context, params map[string]any) sdk.ToolResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return executeCheck(DefaultJevAPI(), ctx, params)
 }
 
 // executeCheck runs one call with the given endpoint and cancellation.
@@ -195,7 +205,9 @@ func executeCheck(api JevAPI, ctx context.Context, params map[string]any) sdk.To
 
 	summary := string(task)
 	if len(verdict.Verdict) > 0 {
-		summary = verdict.Verdict[0]
+		// The whole verdict is the summary: a UNCERTAIN band or a material
+		// disagreement that rides a second line must never be dropped.
+		summary = strings.Join(verdict.Verdict, " | ")
 	}
 	return toolResult(text, summary, structured, false)
 }

@@ -111,6 +111,11 @@ export function isLocalGatewayUrl(rawUrl: string): boolean {
     const u = new URL(rawUrl)
     if (u.protocol !== "http:" && u.protocol !== "https:") return false
     if (u.username || u.password) return false
+    // An empty-username userinfo (`http://@127.0.0.1`) is normalised away by
+    // URL: username/password are both empty, so the authority is checked
+    // directly for a userinfo separator before it could host a loopback
+    // fallback.
+    if (/^https?:\/\/[^/?#]*@/u.test(rawUrl.trim())) return false
     const h = u.hostname.toLowerCase()
     if (h === "localhost" || h === "localhost." || h === "::1" || h === "[::1]") return true
     if (isLoopbackIpv4(h)) return true
@@ -437,6 +442,9 @@ export async function callJev(payload: string, questions: Q, signal?: AbortSigna
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ model: MODEL_ID, state, questions }),
       signal: ctrl.signal,
+      // Never follow a 3xx: a redirect would silently forward the payload and
+      // the Authorization header to another host.
+      redirect: "error",
     })
     const raw = await res.text()
     if (!res.ok) {
@@ -697,7 +705,7 @@ export async function executeCheck(
 
     return {
       content: [{ type: "text", text }],
-      details: { summary: verdict[0] ?? task },
+      details: { summary: verdict.length > 0 ? verdict.join(" | ") : task },
       structuredContent: {
         task,
         ...(role ? { role } : {}),

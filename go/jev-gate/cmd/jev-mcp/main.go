@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	jevgate "github.com/dorokuma/pi-extensions/go/jev-gate"
 )
@@ -158,58 +161,95 @@ var jevSchemaDirs = []string{
 }
 
 // ensureLazySchemaFiles writes jev_check.json + instructions.md when missing or
-// stale (TS: ensureLazySchemaFiles). Best effort — every error is ignored.
+// stale (TS: ensureLazySchemaFiles). Every write is atomic (same-directory
+// temp file + rename) so a concurrent agy reader never sees a torn or empty
+// file; every error is ignored (best effort).
 func ensureLazySchemaFiles() {
 	schemaJSON := jevLazySchemaJSON()
 	for _, dir := range jevSchemaDirs {
-		func() {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return
-			}
-			schemaPath := dir + "/jev_check.json"
-			if data, err := os.ReadFile(schemaPath); err != nil || string(data) != schemaJSON {
-				_ = os.WriteFile(schemaPath, []byte(schemaJSON), 0o644)
-			}
-			instrPath := dir + "/instructions.md"
-			if data, err := os.ReadFile(instrPath); err != nil || string(data) != jevInstructions {
-				_ = os.WriteFile(instrPath, []byte(jevInstructions), 0o644)
-			}
-		}()
+		_ = writeFileAtomic(dir+"/jev_check.json", []byte(schemaJSON), 0o644)
+		_ = writeFileAtomic(dir+"/instructions.md", []byte(jevInstructions), 0o644)
 	}
+}
+
+// schemaWriteMu serialises the in-process writers of the lazy schema files
+// (the OS-level atomicity against other processes comes from rename(2)).
+var schemaWriteMu sync.Mutex
+
+// writeFileAtomic replaces targetPath with content atomically: a no-op when
+// the file already matches, otherwise a unique same-directory temp file is
+// fully written (with Close errors checked) and renamed over the target, so a
+// concurrent reader always sees either the old or the new complete file and a
+// crashed writer never leaves a torn target behind.
+func writeFileAtomic(targetPath string, content []byte, perm os.FileMode) error {
+	schemaWriteMu.Lock()
+	defer schemaWriteMu.Unlock()
+	if existing, err := os.ReadFile(targetPath); err == nil && bytes.Equal(existing, content) {
+		return nil
+	}
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".jev-schema-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, targetPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // JSON-RPC plumbing (TS: sendRawFrame / sendResult / sendError).
 // ---------------------------------------------------------------------------
 
+// responseWriter serialises every reply under one mutex. The framing of a
+// reply is the framing of the request it answers ("line" or
+// "content-length"), passed explicitly — a shared mutable "current mode"
+// would race once tools/call dispatches execute concurrently.
 type responseWriter struct {
 	mu  sync.Mutex
 	out io.Writer
-	// current is the framing of the message being dispatched; parse errors and
-	// notifications have no id, so it also answers "which framing do I reply in".
-	current string
 }
 
-func (w *responseWriter) send(payload map[string]any) {
+func (w *responseWriter) send(payload map[string]any, framingMode string) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.current == "content-length" {
+	if framingMode == "content-length" {
 		fmt.Fprintf(w.out, "Content-Length: %d\r\n\r\n%s", len(raw), raw)
 	} else {
 		w.out.Write(append(raw, '\n'))
 	}
 }
 
-func (w *responseWriter) sendResult(id any, result any) {
-	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+func (w *responseWriter) sendResult(id any, result any, framingMode string) {
+	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}, framingMode)
 }
 
-func (w *responseWriter) sendError(id any, code int, message string) {
-	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}})
+func (w *responseWriter) sendError(id any, code int, message string, framingMode string) {
+	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}}, framingMode)
 }
 
 // requestKey normalises a JSON-RPC id (number or string) to the map key the
@@ -231,12 +271,25 @@ func requestKey(id any) string {
 
 var (
 	inFlightMu sync.Mutex
-	inFlight   = map[string]context.CancelFunc{}
+	inFlight   = map[string]*inFlightCall{}
+	// inFlightWg tracks the tools/call workers: readLoop can keep reading
+	// (and cancelling) while calls are in flight, and the EOF drain waits on
+	// it with a bounded budget.
+	inFlightWg sync.WaitGroup
 )
 
-func registerInFlight(key string, cancel context.CancelFunc) {
+// inFlightCall is one cancellable tools/call: cancelledByClient distinguishes
+// a notifications/cancelled / $/cancelRequest abort (the client owns the
+// cancellation and gets the "cancelled by MCP client" result) from an
+// internal deadline or drain-cancel.
+type inFlightCall struct {
+	cancel            context.CancelFunc
+	cancelledByClient atomic.Bool
+}
+
+func registerInFlight(key string, call *inFlightCall) {
 	inFlightMu.Lock()
-	inFlight[key] = cancel
+	inFlight[key] = call
 	inFlightMu.Unlock()
 }
 
@@ -248,10 +301,25 @@ func dropInFlight(key string) {
 
 func cancelInFlight(key string) {
 	inFlightMu.Lock()
-	cancel, ok := inFlight[key]
+	call, ok := inFlight[key]
 	inFlightMu.Unlock()
-	if ok && cancel != nil {
-		cancel()
+	if ok && call != nil {
+		call.cancelledByClient.Store(true)
+		call.cancel()
+	}
+}
+
+// cancelAllInFlight cancels every in-flight call; used by the bounded EOF
+// drain so the process can never hang on a request that outlives stdin.
+func cancelAllInFlight() {
+	inFlightMu.Lock()
+	calls := make([]*inFlightCall, 0, len(inFlight))
+	for _, call := range inFlight {
+		calls = append(calls, call)
+	}
+	inFlightMu.Unlock()
+	for _, call := range calls {
+		call.cancel()
 	}
 }
 
@@ -298,14 +366,15 @@ func sdkResultToMCP(content string, details any, structured any, isError bool) m
 	return out
 }
 
-// handleRPC processes one decoded JSON-RPC object (TS: handleRpcObject).
-func handleRPC(w *responseWriter, msg map[string]any) {
+// handleRPC processes one decoded JSON-RPC object (TS: handleRpcObject). The
+// reply adopts the framing of the raw frame it was parsed from.
+func handleRPC(w *responseWriter, msg map[string]any, framingMode string) {
 	id, hasID := msg["id"]
 	method, _ := msg["method"].(string)
 
 	if method == "" {
 		if hasID {
-			w.sendError(id, -32600, "Invalid Request: missing method")
+			w.sendError(id, -32600, "Invalid Request: missing method", framingMode)
 		}
 		return
 	}
@@ -318,7 +387,7 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 	switch method {
 	case "notifications/initialized":
 		if hasID {
-			w.sendResult(id, map[string]any{})
+			w.sendResult(id, map[string]any{}, framingMode)
 		}
 		return
 	case "notifications/cancelled", "$/cancelRequest":
@@ -328,7 +397,7 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 			cancelInFlight(requestKey(target))
 		}
 		if hasID {
-			w.sendResult(id, map[string]any{})
+			w.sendResult(id, map[string]any{}, framingMode)
 		}
 		return
 	}
@@ -348,36 +417,37 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"instructions":    jevInstructions,
 			"serverInfo":      map[string]any{"name": "jev", "version": version},
-		})
+		}, framingMode)
 	case "ping":
-		w.sendResult(id, map[string]any{})
+		w.sendResult(id, map[string]any{}, framingMode)
 	case "tools/list":
 		if isSubagent, reason := resolveAgentIdentity(); isSubagent {
 			if os.Getenv("PI_IDENTITY_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "[jev-mcp] tools/list denied (%s)\n", reason)
 			}
-			w.sendResult(id, map[string]any{"tools": []any{}})
-			go ensureLazySchemaFiles()
+			// A denied subagent gets an empty list and nothing is written to the
+			// global schema dirs (no async fire-and-forget write either).
+			w.sendResult(id, map[string]any{"tools": []any{}}, framingMode)
 			return
 		}
-		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}})
+		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}}, framingMode)
 		ensureLazySchemaFiles()
 	case "tools/call":
-		handleToolsCall(w, id, params)
+		handleToolsCall(w, id, params, framingMode)
 	default:
-		w.sendError(id, -32601, "Method not found: "+method)
+		w.sendError(id, -32601, "Method not found: "+method, framingMode)
 	}
 }
 
-func handleToolsCall(w *responseWriter, id any, params map[string]any) {
+func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMode string) {
 	if isSubagent, reason := resolveAgentIdentity(); isSubagent {
 		deny := "jev_check denied: 仅限主代理（:p1）调用，子代理严禁自审自批。（" + reason + "）"
-		w.sendResult(id, toolErrorResult(deny))
+		w.sendResult(id, toolErrorResult(deny), framingMode)
 		return
 	}
 	name, _ := params["name"].(string)
 	if name != "jev_check" {
-		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: unknown tool %q", name)))
+		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: unknown tool %q", name)), framingMode)
 		return
 	}
 	rawArgs, _ := params["arguments"].(map[string]any)
@@ -385,77 +455,86 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any) {
 		rawArgs = map[string]any{}
 	}
 
+	// The call executes on its own goroutine so readLoop can keep reading
+	// stdin: a notifications/cancelled or $/cancelRequest that arrives while
+	// the HTTP call is in flight reaches cancelInFlight and interrupts the
+	// underlying request through ctx.
 	ctx, cancel := context.WithCancel(context.Background())
+	call := &inFlightCall{cancel: cancel}
 	key := requestKey(id)
-	registerInFlight(key, cancel)
-	defer func() {
-		dropInFlight(key)
-		cancel()
-	}()
-
-	// jevgate.ExecuteCheck wraps executeCheck with context.Background(); to keep
-	// notifications/cancelled honoured we run it under a goroutine and race
-	// against ctx.Done(). The underlying HTTP call uses its own
-	// JEV_TIMEOUT_MS-bounded context internally, so a cancelled wait never
-	// leaks the process.
-	type outcome struct {
-		content    string
-		details    any
-		structured any
-		isError    bool
-	}
-	done := make(chan outcome, 1)
+	registerInFlight(key, call)
+	inFlightWg.Add(1)
 	go func() {
-		result := jevgate.ExecuteCheck(rawArgs)
-		done <- outcome{
-			content:    result.Content,
-			details:    result.Details,
-			structured: result.StructuredContent,
-			isError:    result.IsError,
+		defer inFlightWg.Done()
+		defer func() {
+			dropInFlight(key)
+			cancel()
+		}()
+		result := jevgate.ExecuteCheckContext(ctx, rawArgs)
+		if call.cancelledByClient.Load() {
+			w.sendResult(id, toolErrorResult("jev_check failed: cancelled by MCP client"), framingMode)
+			return
 		}
+		w.sendResult(id, sdkResultToMCP(result.Content, result.Details, result.StructuredContent, result.IsError), framingMode)
 	}()
-
-	select {
-	case r := <-done:
-		w.sendResult(id, sdkResultToMCP(r.content, r.details, r.structured, r.isError))
-	case <-ctx.Done():
-		text := "jev_check failed: cancelled by MCP client"
-		w.sendResult(id, toolErrorResult(text))
-	}
 }
 
 // ---------------------------------------------------------------------------
 // Framing / read loop (TS: drainBuffer).
 // ---------------------------------------------------------------------------
 
-const maxHeaderBytes = 1 << 20
+const (
+	// maxHeaderBytes bounds one Content-Length header block while it is still
+	// incomplete: an unterminated header stream stops here, not at EOF.
+	maxHeaderBytes = 1 << 20
+	// maxFrameBytes bounds one raw JSON-RPC frame (and one newline-less line
+	// buffer) before it is parsed. This is the protocol-layer OOM guard: the
+	// JEV_MAX_STATE_CHARS budget only truncates the state text *inside* a
+	// decoded frame, so a frame bigger than this is rejected outright — the
+	// refusal is deliberate, not a truncation.
+	maxFrameBytes = 16 << 20
+)
 
 // dispatchPayload parses one raw JSON-RPC frame (TS: dispatchRawPayload).
-func dispatchPayload(w *responseWriter, raw string) {
+func dispatchPayload(w *responseWriter, raw string, framingMode string) {
 	var parsed any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		w.sendError(nil, -32700, "Parse error")
+		w.sendError(nil, -32700, "Parse error", framingMode)
 		return
 	}
 	if batch, ok := parsed.([]any); ok {
 		for _, item := range batch {
 			if msg, ok := item.(map[string]any); ok {
-				handleRPC(w, msg)
+				handleRPC(w, msg, framingMode)
 			} else {
-				w.sendError(nil, -32600, "Invalid Request")
+				w.sendError(nil, -32600, "Invalid Request", framingMode)
 			}
 		}
 		return
 	}
 	if msg, ok := parsed.(map[string]any); ok {
-		handleRPC(w, msg)
+		handleRPC(w, msg, framingMode)
 		return
 	}
-	w.sendError(nil, -32600, "Invalid Request")
+	w.sendError(nil, -32600, "Invalid Request", framingMode)
 }
 
-// readLoop consumes stdin frame by frame. Content-Length frames switch the
-// reply framing; everything else stays newline-delimited (TS: framingMode).
+// callTimeout is the per-request JEV_TIMEOUT_MS budget (the .mjs default for
+// the MCP server is 15000ms).
+func callTimeout() time.Duration {
+	timeout := jevgate.ConfigFromEnv(os.Getenv).Timeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	return timeout
+}
+
+// readLoop consumes stdin frame by frame. Content-Length frames answer in
+// Content-Length framing; everything else stays newline-delimited
+// (TS: framingMode). At EOF the process does not cancel in-flight calls — a
+// client that wrote its request and half-closed stdin must still get its
+// reply — it waits for them inside one bounded drain budget, then cancels
+// whatever is left and exits.
 func readLoop(in io.Reader, w *responseWriter) {
 	var carry []byte
 	buf := make([]byte, 64*1024)
@@ -471,8 +550,26 @@ func readLoop(in io.Reader, w *responseWriter) {
 	}
 	// EOF: any complete remainder is dispatched as one last line frame.
 	if rest := strings.TrimSpace(string(carry)); rest != "" {
-		w.current = "line"
-		dispatchPayload(w, rest)
+		dispatchPayload(w, rest, "line")
+	}
+	// Bounded drain: give the in-flight calls the normal call budget plus a
+	// small margin, then cancel the stragglers and wait briefly for their
+	// cleanup so the process exit is always finite.
+	drainTimeout := callTimeout() + 2*time.Second
+	done := make(chan struct{})
+	go func() {
+		inFlightWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(drainTimeout):
+		cancelAllInFlight()
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -504,8 +601,7 @@ func drain(carry []byte, w *responseWriter) []byte {
 			}
 			if headerEnd < 0 {
 				if len(carry) > maxHeaderBytes {
-					w.current = "content-length"
-					w.sendError(nil, -32700, "Header too large")
+					w.sendError(nil, -32700, "Header too large", "content-length")
 					return nil
 				}
 				break
@@ -522,29 +618,42 @@ func drain(carry []byte, w *responseWriter) []byte {
 			}
 			if bodyLen < 0 {
 				carry = carry[headerEnd+sepLen:]
-				w.current = "content-length"
-				w.sendError(nil, -32700, "Invalid Content-Length header")
+				w.sendError(nil, -32700, "Invalid Content-Length header", "content-length")
 				continue
 			}
-			if len(carry) < headerEnd+sepLen+bodyLen {
+			if bodyLen > maxFrameBytes {
+				// The declared body alone is over the frame bound: drop the whole
+				// buffered tail so a bogus length cannot pin a giant allocation or
+				// poison the next frame.
+				carry = nil
+				w.sendError(nil, -32700, "Invalid Content-Length header", "content-length")
+				break
+			}
+			// Subtraction, not addition: the missing-bytes comparison cannot
+			// overflow no matter what bodyLen says.
+			if len(carry)-headerEnd-sepLen < bodyLen {
 				break
 			}
 			body := string(carry[headerEnd+sepLen : headerEnd+sepLen+bodyLen])
 			carry = carry[headerEnd+sepLen+bodyLen:]
-			w.current = "content-length"
-			dispatchPayload(w, body)
+			dispatchPayload(w, body, "content-length")
 			continue
 		}
 
 		nl := bytes.IndexByte(carry, '\n')
 		if nl < 0 {
+			if len(carry) > maxFrameBytes {
+				// A newline-less stream grew past the frame bound: it can only be
+				// memory pressure, never a deliverable frame.
+				carry = nil
+				w.sendError(nil, -32700, "Frame too large", "line")
+			}
 			break
 		}
 		line := strings.TrimSpace(string(carry[:nl]))
 		carry = carry[nl+1:]
 		if line != "" {
-			w.current = "line"
-			dispatchPayload(w, line)
+			dispatchPayload(w, line, "line")
 		}
 	}
 	return carry
@@ -563,6 +672,6 @@ func main() {
 		_ = os.Setenv("JEV_TIMEOUT_MS", "15000")
 	}
 	ensureLazySchemaFiles()
-	w := &responseWriter{out: os.Stdout, current: "line"}
+	w := &responseWriter{out: os.Stdout}
 	readLoop(os.Stdin, w)
 }
