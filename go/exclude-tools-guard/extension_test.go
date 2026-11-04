@@ -551,10 +551,6 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		}
 		return IdentityEnv{
 			Getenv: func(k string) string { return envMap[k] },
-			Unsetenv: func(k string) error {
-				delete(envMap, k)
-				return nil
-			},
 			Args:       []string{"/root/workspace/pi-extensions/go/bin/exclude-tools-guard"},
 			PID:        100,
 			SocketPath: "/tmp/fake.sock",
@@ -719,25 +715,18 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		}
 	})
 
-	// 用例 5：同进程第二次调用仍判 subagent（argv 进程内缓存，unsetenv 之后不丢标记）。
-	// 与 2b 的 fused 拓扑用例互补：这里走 subprocess 拓扑，证明宿主锚定不会把第 2 个 turn 放行。
+	// 用例 5：同进程第二次调用仍判 subagent（argv 进程内缓存；变量按打包单元共享而保留可读）。
 	t.Run("ConsecutiveCalls_Subagent_ArgvCache", func(t *testing.T) {
 		env := subprocessEnv("herdr:tab1:p1")
 		argvPath := writeArgvFile("consecutive-subprocess.json", `["pi","--name","role-reviewer-consecutive","-p","review"]`)
 		origGet := env.Getenv
-		// 模拟进程级 unsetenv：读取后该变量在本进程内消失（但缓存仍保留解析结果）。
-		argvPathLive := argvPath
+		// PIG_HARNESS_ARGV_FILE 保留在环境：packed cell 内的兄弟扩展也要读它，
+		// 单个扩展不得私自删除（缓存仍在，兜底变量被 harness 清除的场景）。
 		env.Getenv = func(k string) string {
 			if k == "PIG_HARNESS_ARGV_FILE" {
-				return argvPathLive
+				return argvPath
 			}
 			return origGet(k)
-		}
-		env.Unsetenv = func(k string) error {
-			if k == "PIG_HARNESS_ARGV_FILE" {
-				argvPathLive = ""
-			}
-			return nil
 		}
 		env.ReadStat = func(pid int) (int, bool) {
 			switch pid {
@@ -767,8 +756,8 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		if !isSub1 || !strings.Contains(reason1, "launch marker: argv has --name role-") {
 			t.Fatalf("call#1 expected subagent, got isSub=%v, reason=%s", isSub1, reason1)
 		}
-		if v := env.Getenv("PIG_HARNESS_ARGV_FILE"); v != "" {
-			t.Fatalf("expected PIG_HARNESS_ARGV_FILE unset after call#1, got %q", v)
+		if v := env.Getenv("PIG_HARNESS_ARGV_FILE"); v != argvPath {
+			t.Fatalf("expected PIG_HARNESS_ARGV_FILE to stay readable after call#1, got %q", v)
 		}
 
 		isSub2, reason2 := ResolveAgentIdentityWithEnv(env)
@@ -833,7 +822,6 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 		envMap["HERDR_PANE_ID"] = "herdr:tab1:p1"
 		return IdentityEnv{
 			Getenv:   func(k string) string { return envMap[k] },
-			Unsetenv: func(k string) error { delete(envMap, k); return nil },
 			Args:     []string{packedRunner},
 			PID:      100,
 			// Environ 按真实进程环境枚举键名（packed 成员键名不可预知，只能前缀扫描）。
@@ -1207,10 +1195,6 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 			Getenv: func(k string) string {
 				return envMap[k]
 			},
-			Unsetenv: func(k string) error {
-				delete(envMap, k)
-				return nil
-			},
 			Args:       baseArgs,
 			PID:        100,
 			SocketPath: "/tmp/fake.sock",
@@ -1309,28 +1293,24 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 		}
 	})
 
-	// ⑧ post-use cleanup -> PIG_HARNESS_ARGV_FILE is deleted from environment after reading
-	t.Run("PostUseCleanup_UnsetsEnvVar", func(t *testing.T) {
+	// ⑧ post-use: PIG_HARNESS_ARGV_FILE must stay readable — packed cell siblings
+	// share the process environment and read the same file whenever they resolve
+	// their identity (e.g. at EventSessionStart). Deleting it from one extension
+	// would blind every sibling to the launch markers (MF-2 regression).
+	t.Run("PostUse_VariableStaysReadable", func(t *testing.T) {
 		cleanFilePath := writeArgvFile("cleanup-argv.json", `["pi", "-p", "hello"]`)
-		unsetCalled := false
-		var unsetKey string
-		mockUnsetenv := func(k string) error {
-			unsetCalled = true
-			unsetKey = k
-			return nil
-		}
 		mockGetenv := func(k string) string {
 			if k == "PIG_HARNESS_ARGV_FILE" {
 				return cleanFilePath
 			}
 			return ""
 		}
-		args, err := LoadEffectiveArgs(mockGetenv, mockUnsetenv, []string{"base"})
+		args, err := LoadEffectiveArgs(mockGetenv, []string{"base"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !unsetCalled || unsetKey != "PIG_HARNESS_ARGV_FILE" {
-			t.Errorf("expected PIG_HARNESS_ARGV_FILE to be unset after reading, got unsetCalled=%v, key=%s", unsetCalled, unsetKey)
+		if mockGetenv("PIG_HARNESS_ARGV_FILE") != cleanFilePath {
+			t.Errorf("PIG_HARNESS_ARGV_FILE must stay readable for packed cell siblings")
 		}
 		if len(args) != 4 || args[0] != "base" || args[1] != "pi" {
 			t.Errorf("unexpected args: %v", args)
@@ -1349,9 +1329,10 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 			t.Fatalf("call#1 expected subagent with role marker, got isSub=%v, reason=%s", isSub1, reason1)
 		}
 
-		// Verify PIG_HARNESS_ARGV_FILE was indeed unset by call #1
-		if postUnsetVal := env.Getenv("PIG_HARNESS_ARGV_FILE"); postUnsetVal != "" {
-			t.Fatalf("expected PIG_HARNESS_ARGV_FILE to be unset after call#1, got %q", postUnsetVal)
+		// Verify PIG_HARNESS_ARGV_FILE stayed readable after call #1 (packed cell
+		// sibling extensions must still see it).
+		if postVal := env.Getenv("PIG_HARNESS_ARGV_FILE"); postVal != path {
+			t.Fatalf("expected PIG_HARNESS_ARGV_FILE to stay readable after call#1, got %q", postVal)
 		}
 
 		// Call #2: env var is now unset, must reuse cache and remain subagent
@@ -1415,7 +1396,7 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 		}
 
 		// Call #3: env unset again -> cache must hold the successful result from call #2, so the
-		// negative markers still apply after unsetenv.
+		// negative markers still apply when the variable is gone.
 		env.Getenv = func(k string) string { return "" }
 		isSub3, reason3 := ResolveAgentIdentityWithEnv(env)
 		t.Logf("call#3 (unset after success): isSubagent=%v, reason=%s", isSub3, reason3)

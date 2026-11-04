@@ -1,9 +1,9 @@
 // Command jev-mcp is the pure-Go MCP stdio server that replaces
 // jev-mcp.mjs for agy. It serves exactly one tool, jev_check, by calling
-// jevgate.ExecuteCheck directly — the main/subagent identity verdict lives in
-// jevgate.Extension(), which this entry point deliberately does not build;
-// instead it applies the .mjs-flavoured resolveAgentIdentity (launch markers
-// plus the ":p1" pane check) per tools/list and tools/call.
+// jevgate.ExecuteCheck directly; the main/subagent identity verdict is the
+// shared S1–S4 core of the jevgate package (jevgate.ResolveMCPAgentIdentity),
+// applied per tools/list and tools/call exactly where the .mjs applied its
+// resolveAgentIdentity.
 //
 // Protocol: JSON-RPC 2.0 over stdio, both newline-delimited frames and
 // Content-Length headers, mirroring jev-mcp.mjs's drainBuffer. Requests are
@@ -256,107 +256,21 @@ func cancelInFlight(key string) {
 }
 
 // ---------------------------------------------------------------------------
-// Main-agent identity check (port of the .mjs resolveAgentIdentity).
+// Main-agent identity check (shared jevgate S1–S4 core, MCP mode).
 //
-// jevgate.IsSubagentSession is the pi-flavoured verdict: its S3/S4 require an
-// agent-runtime ancestor out of {pi, pig, ctxmode, pi-coding-agent,
-// bundle/cli.js}. agy/antigravity is not in that list, so under the real agy
-// main agent it fails closed — setting PIG_EXT_SOCKET would not help either
-// (the subprocess form still needs such an ancestor). The check below ports
-// the discriminating parts of the .mjs version instead: the negative launch
-// markers (CTXMODE_ROLE / PI_SUBAGENT / PI_ROLE / subagent argv flags) plus
-// the S1 ":p1" pane requirement. The S2-S4 socket/ancestry proof is not
-// ported: jev-mcp is a dedicated process the main agent spawns, and the tool
-// result stays advisory, never a security boundary.
+// jevgate.ResolveMCPAgentIdentity is the fail-closed verdict the .mjs applied
+// inline: negative launch markers on this process AND every ancestor (env +
+// argv, prompt tokens stripped), the S1 ":p1" pane requirement, the S2 herdr
+// socket query, and the S3/S4 ancestry proof with at most one host layer
+// (agy/antigravity or pi/pig) between jev-mcp and the pane shell. The Go
+// version ports the full socket/ancestry proof the .mjs comment deferred.
 // ---------------------------------------------------------------------------
 
-// stripPromptArgTokens drops `-i` / `--prompt` and their argument, and any
-// `--prompt=...` token: the main agent's prompt text may legitimately contain
-// words like "--agent" or "/tmp/dispatch-..." (TS: stripPromptArgTokens).
-func stripPromptArgTokens(tokens []string) []string {
-	structural := make([]string, 0, len(tokens))
-	for i := 0; i < len(tokens); i++ {
-		token := tokens[i]
-		if token == "-i" || token == "--prompt" {
-			i++
-			continue
-		}
-		if strings.HasPrefix(token, "--prompt=") {
-			continue
-		}
-		structural = append(structural, token)
-	}
-	return structural
-}
-
-// hasSubagentCliFlags reports whether argv carries a dispatch marker
-// (TS: hasSubagentCliFlags).
-func hasSubagentCliFlags(tokens []string) bool {
-	tokens = stripPromptArgTokens(tokens)
-	for i, token := range tokens {
-		if token == "--agent" {
-			if i+1 < len(tokens) {
-				return true
-			}
-			continue
-		}
-		if strings.HasPrefix(token, "--agent=") {
-			return true
-		}
-		if token == "--name" {
-			if i+1 < len(tokens) && strings.HasPrefix(tokens[i+1], "role-") {
-				return true
-			}
-			continue
-		}
-		if strings.HasPrefix(token, "--name=role-") {
-			return true
-		}
-		if strings.Contains(token, "/tmp/herdr-role-sessions") {
-			return true
-		}
-		if strings.Contains(token, "/tmp/dispatch-") {
-			return true
-		}
-	}
-	return false
-}
-
-// subagentLaunchMarker returns the first negative marker that matched
-// (TS: subagentLaunchMarker).
-func subagentLaunchMarker() (string, bool) {
-	if v := strings.TrimSpace(os.Getenv("CTXMODE_ROLE")); v != "" {
-		return "CTXMODE_ROLE=" + v, true
-	}
-	if os.Getenv("PI_SUBAGENT") == "1" {
-		return "PI_SUBAGENT=1", true
-	}
-	if v := strings.TrimSpace(os.Getenv("PI_ROLE")); v != "" {
-		return "PI_ROLE=" + v, true
-	}
-	if hasSubagentCliFlags(os.Args) {
-		return "argv has subagent flags", true
-	}
-	return "", false
-}
-
-// isSubagentNow evaluates the identity verdict for this call. ExecuteCheck
-// itself performs no identity check (that lives in Extension()); the gate is
-// applied here, per request, exactly where the .mjs applied
+// resolveAgentIdentity evaluates the identity verdict for this request.
+// ExecuteCheck itself performs no identity check (that lives in Extension());
+// the gate is applied here, per request, exactly where the .mjs applied
 // resolveAgentIdentity.
-func resolveAgentIdentity() (bool, string) {
-	if marker, hit := subagentLaunchMarker(); hit {
-		return true, "launch marker: " + marker
-	}
-	paneID := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
-	if paneID == "" {
-		return true, "S1: HERDR_PANE_ID unset or empty"
-	}
-	if !strings.HasSuffix(paneID, ":p1") {
-		return true, fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID)
-	}
-	return false, "main pane " + paneID + " (launch markers clear; S2-S4 not ported)"
-}
+var resolveAgentIdentity = jevgate.ResolveMCPAgentIdentity
 
 func toolErrorResult(text string) map[string]any {
 	return map[string]any{
