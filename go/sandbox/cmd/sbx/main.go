@@ -166,6 +166,7 @@ func parseArgs(args []string) (cliConfig, error) {
 // buildPolicy 根据解析后的命令行配置构造最终的 sandbox.Policy。
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	var policy sandbox.Policy
+	var pigHome string
 	if cfg.Preset != "" {
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
@@ -179,7 +180,11 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			if strings.TrimSpace(wd) == "" {
 				wd = "."
 			}
-			policy = sandbox.ReviewerAgent(wd)
+			policy = sandbox.ReviewerAgentWithEnv(wd, cfg.Env)
+			// ReviewerAgentWithEnv 把与预热对齐的 PIG_HOME 固定注入 Policy.Env；
+			// 记下来供 mergeEnv 之后回钉（--env PIG_HOME= 空覆盖会把空串写进
+			// 最终 env，导致沙盒内 pig 按外部 HOME 另算缓存根打穿预热对齐）。
+			pigHome = envListValue(policy.Env, "PIG_HOME")
 		default:
 			return sandbox.Policy{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer, reviewer-agent)", cfg.Preset)
 		}
@@ -189,6 +194,9 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	policy.ReadWrite = append(policy.ReadWrite, cfg.ReadWrite...)
 	policy.Exec = append(policy.Exec, cfg.Exec...)
 	policy.Env = mergeEnv(policy.Env, cfg.Env)
+	if cfg.Preset == "reviewer-agent" && pigHome != "" {
+		policy.Env = mergeEnv(policy.Env, []string{"PIG_HOME=" + pigHome})
+	}
 	if cfg.DenyNet {
 		policy.DenyNet = true
 	}
@@ -196,6 +204,17 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 		policy.BestEffort = true
 	}
 	return policy, nil
+}
+
+// envListValue 返回 env 中首个 KEY= 前缀条目的值；未命中返回空串。
+func envListValue(env []string, key string) string {
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return ""
 }
 
 // mergeEnv 将 overrides 中的 KEY=VALUE 覆盖合并到 base 环境变量切片中（保持顺序并原地替换同名键）。
@@ -283,6 +302,15 @@ func runMain(args []string) int {
 		}
 		fmt.Printf("sbx: Landlock supported (ABI v%d)\n", abi)
 		return 0
+	}
+
+	// reviewer-agent 启动 pig 前：宿主态按需预热 Go 扩展 cell，确保
+	// appendCellCachePolicy 在 buildPolicy 内扫描时能命中已构建 runner。
+	// 常态指纹未变时零子进程短路；预热失败仅告警降级，不阻断后续流程；
+	// 预热期被 SIGINT/SIGTERM/SIGHUP/SIGQUIT 中断时返回 128+信号 直接退出，
+	// 不再进入沙盒。
+	if code := sandbox.MaybeWarmGoExtensionCells(cfg.Preset, cfg.Command, cfg.Env); code != 0 {
+		return code
 	}
 
 	policy, err := buildPolicy(cfg)

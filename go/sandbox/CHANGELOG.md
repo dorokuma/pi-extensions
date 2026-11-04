@@ -4,6 +4,93 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-04
+
+PATCH：加固 `reviewer-agent` 宿主态 Go 扩展 cell 预热（
+`MaybeWarmGoExtensionCells`，`buildPolicy` 之前按需执行）的信任边界与
+正确性：固定可信目录解析 pig 入口、`PIG_HOME` 与显式 AgentDir 校验并与
+`--env` 完全对齐、单扩展/合包双缓存形态与 `cache/ext` 语言门、
+真实 ELF 指纹追踪、全量常规文件与 `settings.json` 指纹、
+stderr 失败标记拦截、预热前后指纹一致性有界重试、
+flock 等待与子进程运行全链路信号中断进程组回收。
+
+### Fixed
+
+- **信任边界（pig 入口解析）**：`resolvePigEntryBinary` 彻底移除
+  `exec.LookPath`，不再使用调用方 `os.Getenv("PATH")` 查找 `pig`；仅在固定
+  可信目录（`<trustedHome>/.local/bin`、`<trustedHome>/.pig/bin`、
+  `/root/.local/bin`、`/root/.pig/bin` 及 `standardBinDirs`）中解析，
+  `EvalSymlinks` 后的真实文件必须落在可信前缀（上述目录或
+  `<trustedHome>/.local/opt/pig`、`/root/.local/opt/pig`）内、是普通文件、
+  `perm & 0o022 == 0` 且属主为 root 或当前 euid，任一不满足即拒绝预热。
+  宿主 `HOME` 经 `os/user.LookupId(euid)` 获取（euid==0 兜底 `/root`），
+  不读 `os.Getenv("HOME")`。
+- **`PIG_HOME` 与 `--env` 完全对齐**：`MaybeWarmGoExtensionCells` 与新增
+  `ReviewerAgentWithEnv`（`ReviewerAgent` 兼容签名保留，`buildPolicy`
+  传入 `cfg.Env`）共用 `resolvePigHomeDir`：取 `--env` 最后一个
+  `PIG_HOME` 键命中即停——非空取绝对路径；显式空串（如
+  `--env PIG_HOME=A --env PIG_HOME=`）等同空覆盖，直接回退默认
+  `<trustedHome>/.pig`，不回扫被覆盖条目也不读宿主环境变量；仅
+  `--env` 完全不含该键时才读宿主 `PIG_HOME`。解析结果经
+  `overrideEnvKey` 固定注入 `Policy.Env`，且 `buildPolicy` 在
+  `mergeEnv(policy.Env, cfg.Env)` 之后再次回钉，防止空覆盖把空串写进
+  最终 env 使沙盒内 pig 按外部 `HOME` 另算缓存根打穿对齐。预热前校验
+  `PIG_HOME`：`Lstat` 拒绝符号链接；已存在时必须为目录、属主为当前
+  euid（或 root）且 `perm & 0o022 == 0`（拒绝 `0777` 公共可写目录）。
+- **显式 AgentDir 对齐**：新增 `resolveSourcePigAgentDir`，按与
+  `injectPigCodingAgentDir` 完全一致的优先级（`PIG_CODING_AGENT_DIR`
+  先查 `--env` 最后一项、空覆盖屏蔽宿主，再查宿主；有效
+  `PIG_USE_PI_DIRS=="1"` 时同规则查 `PI_CODING_AGENT_DIR`）解析实际生效的
+  宿主 AgentDir（缺省 `<PIG_HOME>/agent`）。自定义目录在预热前做与
+  `PIG_HOME` 同等的软链/目录/属主/权限校验（不通过仅告警跳过预热）；
+  预热指纹枚举、私有 AgentDir 副本（`preparePrivatePigAgentDirFromAgent`）
+  与策略构造统一以其为源。
+- **私有 AgentDir 同构**：预热子进程经 `preparePrivatePigAgentDirFromAgent`
+  生成 `<sbx-warm-*>/pig-agent` 私有副本并注入 `PIG_CODING_AGENT_DIR` /
+  `PI_CODING_AGENT_DIR`，不再直接指向宿主 AgentDir，与沙盒内扩展
+  发现视图 100% 同构。
+- **双缓存形态、语言门与锁位置**：单扩展编译产物 `cache/ext/<name>-<digest>/`
+  与多扩展合包 `cache/cells/go/<digest>/runner` 同时纳入有效产物计数
+  （`countValidExecutableGoArtifacts`，不扫无关语言 `cells/python` 等）；
+  `cache/ext` 要求 `ready.json` 显式 `language:"go"`（`cellReadyMeta`
+  新增 `Language` 字段，宿主 `node-runtime-*` 等非 Go 产物不计入），
+  `cells/go` 允许 `language` 缺省或 `"go"`；预热互斥锁与指纹墓碑移至
+  `<pigHome>/cache/.locks/`（`pigHome`、`cache`、`cache/.locks` 逐级
+  `Lstat` 拒绝软链，锁文件 `O_NOFOLLOW`，墓碑不在沙盒 `ReadWrite` 中，
+  沙盒内保持只读）。
+- **空 `state/pigsdk` 冷启动**：删除 `len(sdkDirs)==0` 提前返回；只要存在
+  Go 扩展即进入预热，由真实 `pig --help` 自动落盘内嵌 `state/pigsdk/sdk-*`。
+- **真实 ELF 指纹追踪**：指纹除 `pig` 包装脚本外同步纳入
+  `<pigHome>/bin/pi`、`<trustedHome>/.pig/bin/pi`、`/root/.pig/bin/pi`、
+  `<trustedHome>/.local/opt/pig/official/pig`、
+  `/root/.local/opt/pig/official/pig`（存在则 `EvalSymlinks` + `Stat`）
+  的真实路径、`Size` 与纳秒 `ModTime`——包装脚本不变仅切换软链目标的
+  升级同样失效重热。
+- **全量常规文件与 `settings.json` 指纹**：扩展/SDK 目录文件清单移除
+  `go.mod`/`go.sum`/`*.go` 白名单，改为采集全部普通文件（继续跳过
+  `.git`/`testdata`/隐藏目录与软链等非常规条目）——`//go:embed`
+  静态资产（`tools.json`、`locales/*.json` 等）变更同样失效重热；
+  `<srcAgentDir>/settings.json` 内容 `sha256` 拼入指纹，且按其
+  `"extensions"` 字段枚举显式本地路径扩展（与
+  `injectHostExtensionsSetting`/`resolveHostExtensionEntry` 同口径，
+  `null` 显式为空、支持排除默认 `extensions` 目录），配置变更立即使
+  墓碑失效。
+- **拦截假零退出**：流式跨块扫描子进程 stderr（重叠窗口不受 4KB 环形缓冲
+  截断影响），命中 `Failed to load extension` / `extension build failed`
+  即使进程退 0 也判定预热失败、告警降级且绝不写入 `sbx-warm.sha256`。
+  `stderrScanWriter` 加 `sync.Mutex` 保护并经 `Snapshot` 读取：
+  `cmd.WaitDelay` 到期后后台管道拷贝协程仍在 `Write` 时不再产生数据竞争。
+- **预热前后指纹一致性与有界重试**：`flock` 内最多 2 轮；每轮运行前枚举
+  `preStamp`，成功且有效产物 >0 后重枚举 `postStamp`，仅一致才原子写墓碑；
+  预热期间源码漂移（如冷启动落盘 SDK、源码 A->B 切换）触发第 1 轮重验，
+  仍漂移则告警跳过写戳，绝不把未构建的新指纹标为热态。
+- **信号中断进程组回收**：预热期间注册 `SIGINT`/`SIGTERM`/`SIGHUP`/
+  `SIGQUIT`（函数退出 `signal.Stop`）；`flock` 等待改为 `LOCK_NB` 轮询
+  + `sigCtx.Done()` select，等锁期间收到信号同样立即退栈；捕获信号时取消
+  子进程 `ctx` 触发进程组 `SIGKILL`，正常退栈跑完 `defer`
+  （`/tmp/sbx-warm-*` 零残留、释放锁），以 `128+信号` 返回 `runMain`
+  直接退出、不再进入沙盒。
+
 ## [0.3.1] - 2026-11-03
 
 PATCH：修复 `sbx` 经 `syscall.Exec` 替换自身后无法清理预设临时目录的泄漏——每次

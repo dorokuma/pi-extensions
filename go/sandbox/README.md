@@ -23,6 +23,7 @@
   - **pig AgentDir 私有隔离**：宿主 `/root/.pig/agent` 保持 100% 只读；进沙盒前把白名单配置文件 0600 拷入 `<privateTmpDir>/pig-agent`，并在私有 `settings.json` 中显式声明宿主扩展目录绝对路径（**不再用 `extensions` 软链**——软链会让自动发现的 `cfg.Source` 变成随机私有路径而脱靶 packed-go 打包缓存；已有 `extensions` 数组时相对本地路径条目相对宿主 `<pigHome>/agent` 解析并在未显式排除时追加宿主扩展目录），并按需注入 `PIG_CODING_AGENT_DIR`（`PIG_USE_PI_DIRS=1` 时对称注入 `PI_CODING_AGENT_DIR`）。
   - **Cell 缓存 W^X**：宿主态预刷新 `<PIG_HOME>/cache` 下有效缓存单元 `usage.json`（沙盒内 `TouchUsage` 命中 <1h 纯只读短路）；仅 `.locks` 目录与已有记录的 `cache/toolchains` 目录可写，仅已构建 `<digest>/runner` 与 `cache/ext` 可执行产物可执行，`ReadWrite`/`Exec` 无任何父子包含；目标路径经 `Lstat` 拒绝符号链接 + `EvalSymlinks` 校验严格位于预期根内且不与 `Exec` 重合。
   - **XDG_RUNTIME_DIR 私有隔离**：宿主 `/run/user/0`（systemd user bus、keyring 等敏感套接字）绝不进 `ReadWrite`；在 `<privateTmpDir>` 下预建 0700 短名 `rt` 并覆写注入 `XDG_RUNTIME_DIR=<privateTmpDir>/rt`。
+  - **Go 扩展按需宿主预热**：`sbx` 在 `buildPolicy` 之前调用 `MaybeWarmGoExtensionCells`——当 preset 为 `reviewer-agent`、目标命令经固定可信目录（`<trustedHome>/.local/bin`、`<trustedHome>/.pig/bin`、`/root/.local/bin`、`/root/.pig/bin`、`standardBinDirs`；真实文件必须落在可信前缀内、普通文件、`perm & 0o022 == 0`、属主 root 或当前 euid，绝不读调用方 `PATH`）解析为 `pig`、且 `<PIG_HOME>/agent/extensions` 下存在 Go 扩展时，在 `<PIG_HOME>/cache/.locks/sbx-warm.lock` 排他锁内以最小干净环境（私有 cwd、私有 `pig-agent` AgentDir、受控 `PATH`）执行 `pig --help` 完成 cell 编译。指纹（pig + `bin/pi`/`official/pig` 真实 ELF + 扩展/SDK 源清单）与 `cache/.locks/sbx-warm.sha256` 墓碑一致且存在有效产物（`cache/cells/go` 合包或 `cache/ext` 单扩展）时零子进程短路；子进程 stderr 命中 `Failed to load extension` / `extension build failed` 即使退 0 也拒绝写墓碑；预热前后指纹漂移有界重试 2 轮；预热期信号中断按进程组 SIGKILL 回收、`/tmp/sbx-warm-*` 零残留并以 `128+信号` 直接退出。
 
 ### `sbx --preset` 失败清理
 
@@ -116,7 +117,7 @@ bash go/sandbox/scripts/deploy.sh
 4. **`/proc/<pid>/fd/<fd>` 路径检查的极窄 TOCTOU 窗口**：`seccomp_unotify` 通过读取 `/proc/<pid>/fd/<fd>` 校验被映射文件的路径。由于审查员对所有可执行目录均无写权限，且所有可写目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`、`reports`）均被整体禁止 `PROT_EXEC` 映射，审查员无法在可执行目录内通过硬链接或重命名制造竞争条件。
 5. **默认未开启网络隔离**：`ReadOnlyReviewer` 默认 `DenyNet: false`；若需彻底阻断 TCP 网络连接，可将 `Policy.DenyNet` 设为 `true`（要求内核 Landlock ABI >= 4）或配合 `sbx --deny-net` 使用。
 6. **`usage.json` 预刷新的时间窗口**：宿主态预刷新把 `lastUsed` 写入缓存单元；沙盒内 pig `TouchUsage` 的 `<1h` 只读短路只在「会话剩余时长 <55m」内稳定命中。`>55m` 的超长会话里 pig 可能重新尝试写 `usage.json` 临时文件并被 Landlock 拒绝——这属于 PiG 侧只读容错范围，不视为沙盒漏洞，但调用方应知晓长会话下 pig 可能报只读写入失败。
-7. **冷启动新增语言 `cells/<lang>` 需宿主先预热构建**：沙盒内 `cells/<lang>` 单元目录保持只读，新语言首次构建产物无法在沙盒内落盘；需先在宿主跑一次构建生成 `ready.json`/`runner`，后续沙盒会话才能复用。
+7. **冷启动新增语言 `cells/<lang>` 需宿主先预热构建**：`reviewer-agent` 预设的 Go 扩展 cell 已由 `sbx` 宿主态按需预热（见上文），无需手工预构建；其它语言（如 `cells/python`）首次构建产物仍需先在宿主跑一次构建生成 `ready.json`/可执行产物，后续沙盒会话才能复用。
 8. **`cache/toolchains` 目录级可写**：toolchain `*.json.lock` 与记录文件同目录，无法只放锁文件路径；仅在目录下已存在记录时才放行，不创建空可写目录。
 9. **`/tmp/herdr-role-sessions` 为同会话共享写根**：同一沙盒会话内多个角色会话共享该目录，不保证互相隔离。
 10. **Landlock 路径级 `Exec` 无一次性 `execve` 计数器**：`EntryAgents`（agy/pig/pi）顶层放行后，子进程在 OS 层仍可再 `execve` 同一路径；兜底依赖只读角色工具白名单（无 `bash`/`run_command`），`dispatch-agent`/`grok` 仍不在白名单。
