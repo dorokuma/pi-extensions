@@ -2,12 +2,19 @@
 
 Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go 移植。
 
-- 权威源（TS）：`extensions/jev-gate/src/jev-gate.ts`，1005 行 / 48840 字节，md5
-  `f4ff427bb51b6fa378fcfd356b81fa99`（与部署件 `/root/.pi/agent/extensions/jev-gate.ts`
-  逐字节一致）。
-- Go 版：本目录，module `github.com/dorokuma/pi-extensions/go/jev-gate`，Go 1.26，
-  仅依赖标准库 + `github.com/MichaelKinsy/PiG/extensions/sdk`（本地经 `go/go.work` 解析到
-  `go/pigsdk`，PiG 运行时由 staged SDK 注入；**无 `replace`**）。
+- 权威源（TS）：`extensions/jev-gate/src/jev-gate.ts`，1005 行 / 48880 字节，md5
+  `f4ff427bb51b6fa378fcfd356b81fa99`。该 TS 文件是**历史部署快照的权威源**：部署目录
+  `/root/.pi/agent/extensions/` 下的 `jev-gate.ts` 及 8 个 `.bak-*` 备份只读冻结；运行态默认
+  部署目录已随 `registry.json` 迁至 `/root/.pig/agent/extensions`，由本仓 `bash install.sh jev-gate`
+  依 md5 幂等同步。
+- **现行部署链路是 Go 扩展 + MCP 服务器**：`extensions/jev-gate/src/jev-gate.ts` 编译部署为
+  Go 扩展（本目录 `go/jev-gate`，module `github.com/dorokuma/pi-extensions/go/jev-gate`，Go 1.26，
+  仅依赖标准库 + `github.com/MichaelKinsy/PiG/extensions/sdk`，本地经 `go/go.work` 解析到
+  `go/pigsdk`，**无 `replace`**），同目录的 `cmd/jev-mcp`（`package main`）是
+  `jev-mcp.mjs` 的纯 Go 替代：JSON-RPC 2.0 over stdio（newline 与 Content-Length 双 framing），
+  经 `jevgate.ExecuteCheckContext` 直接调同一套判定，身份判据用共享 S1–S4 核心
+  （`jevgate.ResolveMCPAgentIdentity`）。`go/Makefile` 同时覆盖根包与 `cmd/jev-mcp` 两个模块
+  （`[component: jev-gate]` 与 `[component: jev-gate/cmd/jev-mcp]`）。
 - 判定阈值 **冻结不变**：契约 `0.35 / 0.80`、门禁 `0.35 / 0.80`、回传分类
   `0.95`（正常）/ `0.80`（异常）。五个任务的问句表逐字照搬（英文问句 + 中文 state）。
 
@@ -76,6 +83,18 @@ TS 行号取自 `extensions/jev-gate/src/jev-gate.ts`（1005 行）；Go 行号�
 
 TS 侧无对应的 Go 加固：有界响应读取 `jev.go:43-52`（含常量/哨兵为 `33-52`）、分类器答案结构校验 `classify.go:164-186`（含辅助函数 `questionMember` / `criteriaLabels` 为 `158-218`）、argv 桥进程级临界区 `identity.go:282-323`（含注释为 `275-323`）。
 
+## 共享 S1–S4 身份核心（扩展与 MCP 同一套判据）
+
+`identity.go` 是扩展（`ResolveAgentIdentity`）与 `cmd/jev-mcp`（`ResolveMCPAgentIdentity`）**共用**
+的 fail-closed 判据：负向启动标记（env + argv，prompt 参数剥离）、S1 的 `:p1` pane 要求、S2 herdr
+socket 查询、S3/S4 祖先链证明；MCP 模式允许 jev-mcp 与 pane shell 之间至多一层宿主
+（agy/antigravity 或 pi/pig），其余 hop 一律 fail-closed。解释器脚本提取
+（`isAgyTokens` / `isPiPigTokens`）与 `checkExecutableTokens` 共用同一张 flag 表：`--` 与
+`-m`/`--module` 取下一个 token 判定，`inlineTextFlags`（`-e`/`--eval`/`-c`/`--command`/
+`-p`/`--print`）立即结束扫描（`bash -c "agy"` 不会被当成 agy 宿主），`flagsWithArgument`
+（`-r`/`--require` 等）跳过其参数 token。`PIG_HARNESS_ARGV_FILE` 桥接跨扩展保留
+（`ArgvCache` 进程级缓存 + 一把锁包住临界区），packed cell 兄弟进程共享该文件。
+
 ## 与 TS 的行为差异（逐条）
 
 1. **子代理身份判定（SUBAGENT-IDENTITY）采用家族已审 Go 语义**，与 TS 块有 4 点差异
@@ -127,11 +146,55 @@ TS 侧无对应的 Go 加固：有界响应读取 `jev.go:43-52`（含常量/哨
 12. **响应体上限与分类器答案校验（TS 侧无对应加固）**：`jev.go` / `classify.go` 的 HTTP 响应改为
     有界读取（`maxResponseBodyBytes = 4 MiB`，`io.LimitReader(..., +1)`，超出即
     `response body too large` fail-closed，不再随上游无限缓冲）；`classifyWith` 在回传前用与
-    `validateAnswers` **同一套** `validateAnswer` 校验每个答案（`noul` 概率有限且在 `[0,1]`、
+    `validateAnswers` **同一套** `validateAnswer` 校验每个答案（`noul`/`bool` 概率有限且在 `[0,1]`、
     `choice` 的 `probabilities` 对象与 `confidence` 均在 `[0,1]` 且标签属于 `criteria`、`score`
-    为有限数且在 `[0, len(criteria)-1]`、未知 question `type` 一律拒绝），畸形答案返回 `error`
-    而不是 `stopReason: "stop"`。`PIG_HARNESS_ARGV_FILE` 桥接改为一把锁包住整段临界区（cache 命中
-    直接返回），并发调用不会各自重读或退回空 argv。
+    为有限数且 `>=0`，有 `criteria` 时上界 `len(criteria)-1`，`criteria` 亦接受 `[]any` / `[]string`
+    标签数组；未知 question `type` 一律拒绝），畸形答案返回 `error` 而不是 `stopReason: "stop"`。
+    `PIG_HARNESS_ARGV_FILE` 桥接改为一把锁包住整段临界区（cache 命中直接返回），并发调用不会各自
+    重读或退回空 argv。
+13. **HTTP 重定向与凭据外发加固**：`jev.go` 的 `Call`、`classify.go` 的 `classifyWith` 与
+    `DefaultJevAPI()` 一律使用 `noRedirectClient()` / `noRedirectDoer()`
+    （`CheckRedirect` 返回 `http.ErrUseLastResponse`）：任何 3xx 都作为非 2xx HTTP 状态码报错返回，
+    绝不自动跟随重定向转发 `payload` 或 `Authorization` 头。TS 侧对应改动是 `fetch` 的
+    `redirect: "error"`。
+14. **`classifyWith` 的 `baseUrl` 信任校验**：`model["baseUrl"]` 与 `api.Config.BaseURL` 不同且不是
+    本机回环网关时，拒绝使用 `api.Lookup` 中的凭据并发起请求
+    （`refusing to send credentials to untrusted model baseUrl ...`），防止凭据被带到第三方 host。
+15. **回环判定收紧与 agent 目录解析**：`IsLocalGatewayURL` 对任何 userinfo（含空用户名
+    `http://@127.0.0.1`）直接判远端；`ResolveAPIKey` 在 agent 目录无法解析（`HOME` 未设）时不再
+    回退相对路径 `.pig/agent`：本机网关仍返回 `LocalGatewayKey`，否则 fail-closed
+    （`cannot resolve agent config directory (HOME unset)`）。
+16. **`details.summary` 完整拼接**：`executeCheck` 的 `summary` 由「第一条 verdict」改为
+    `strings.Join(verdict.Verdict, " | ")`，`UNCERTAIN` 中间带与 `material disagreement` 不再
+    从摘要里丢失（TS 侧同步改为 `verdict.join(" | ")`）。
+17. **`bool` 题型与 `score` 数组 `criteria`（公开 API 层）**：`type: "bool"` 的公开题型在发往
+    `/systemone` 的 wire 里改为 `type: "noul"`（不改动调用方原表，`criteria` 的 `{true,false}`
+    对象原样携带），答案回传时还原为 `{"type":"bool","probability":p}`；校验侧
+    `validateClassifierAnswers` 只接受 `noul` / `bool` / `choice` / `score` 四种题型
+    （`bool` 按 `noul` 的 `[0,1]` 闭区间校验），其余（如 `invalid_type`）继续 fail-closed。
+18. **`cmd/jev-mcp` 协议层安全上限**：`maxFrameBytes = 16 << 20`（16 MiB）作为解析前原始
+    JSON-RPC 帧体与无换行单行缓冲的显式防线——`JEV_MAX_STATE_CHARS` 是进入 `Call` 之后的文本
+    截断预算，`maxFrameBytes` 是解析前的协议层安全上限，超限拒绝是有意的防 OOM 行为；
+    `maxHeaderBytes = 1 << 20` 限制未闭合的 Header 缓冲。`Content-Length` 分支用**减法比较**
+    `len(carry)-headerEnd-sepLen < bodyLen` 判断字节是否到齐，彻底消除 `headerEnd+sepLen+bodyLen`
+    的加法溢出与切片 panic；`bodyLen < 0` 或 `> maxFrameBytes` 时丢弃异常头部并回报
+    `-32700 Invalid Content-Length header`。
+19. **`cmd/jev-mcp` 异步取消与有界退出**：`ExecuteCheckContext(ctx, params)` 让
+    `notifications/cancelled` / `$/cancelRequest` 真正中断底层 `http.Request`（客户端主动取消
+    返回 `jev_check failed: cancelled by MCP client`，与自身超时区分）；读循环与 `tools/call`
+    执行解耦（`inFlightWg`），请求级 framing 显式传入 `dispatchPayload` → `handleRPC` →
+    `sendResult`/`sendError`，消除共享 `responseWriter.current` 的 data race。EOF 时**不**立即取消
+    在途请求（half-close 客户端仍能拿到回包），而是等待 `inFlightWg.Wait()`，同时以
+    `drainTimeout = callTimeout() + 2s` 为界：超预算则 `cancelAllInFlight()` 并最多再等 200ms 退出，
+    进程退出绝对有界。
+20. **全局 schema 原子写入**：`cmd/jev-mcp` 的懒加载 schema（`~/.gemini/antigravity-cli/mcp/jev/`）
+    由 `writeFileAtomic`（同目录 `CreateTemp` + 完整写入 + `Chmod` + **显式检查 `Close()`** +
+    `Rename` 原子替换，进程内 `schemaWriteMu` 串行化）落盘，并发 agy 读者永远看到完整文件；
+    `tools/list` 被拒分支不再起 `go ensureLazySchemaFiles()` 后台写（子代理被拒时不写全局 schema）。
+    多进程并发写 + 并发读实测见 `TestWriteFileAtomicConcurrent`（真实 OS 子进程）。
+21. **`jsNumber` 二进制/八进制与超时整数化**：`jsNumber` 在 `0x` 之外支持 `0b`/`0B`（基数 2）与
+    `0o`/`0O`（基数 8）；带符号前缀（`+0b10`）仍为 NaN。`nodeSetTimeout` 对 `[1, maxTimeoutMs]`
+    内的浮点数执行 `math.Trunc` 整数毫秒化（`1500.75` → `1.5s`）。
 
 ## PiG SDK / D78 缺口与绕法
 
@@ -182,14 +245,18 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
 | 5 类任务结论 | `TestVerdictContractLint` / `…GateScan` / `…ReturnTriage`（0.94/0.95、0.79/0.80）/ `…Disagreement` / `…SourceAudit` / `TestVerdictUnknownTask` |
 | 问句表 | `TestQuestionsFor`（逐任务键序与类型）、`TestQuestionWireShape`（逐字节 JSON） |
 | 概率/标签解析 | `TestProbOf`（15 例）、`TestChoiceOf`（9 例非法形态） |
-| 配置语义 | `TestConfigFromEnv`（默认、`MAGPIE_BASE_URL` 优先、`WINDHUB` 回落、NaN、0、十六进制、Infinity）、`TestTruncatePayload`、`TestOneLine`、`TestFormatHelpers` |
+| 配置语义 | `TestConfigFromEnv`（默认、`MAGPIE_BASE_URL` 优先、`WINDHUB` 回落、NaN、0、十六进制/二进制/八进制、Infinity、小数毫秒截断）、`TestTruncatePayload`、`TestOneLine`、`TestFormatHelpers`、`TestNodeSetTimeoutTruncates` |
 | 凭据/回环 | `TestIsLocalGatewayURL`（25 例）、`TestResolveAPIKeyOrder`、`TestResolveAPIKeyAgentDir`、`TestResolveKeyOrError` |
 | HTTP 契约 | `TestCallJevAcceptedEnvelopes`（3 形态）、`TestCallJevUsageAliases`（6 例）、`TestCallJevRequestShape`、`TestCallJevFailures`（10 例）、`TestCallJevRateLimitedBody`、`TestCallJevTimeout`、`TestCallJevCallerCancellation`、`TestCallJevMissingCredential`、`TestCallJevTruncatesPayload`、`TestOversizedResponseBodyFailsClosed`（>4 MiB 响应体：`Call` / `classifyWith` 两路均 fail-closed） |
-| 响应校验 | `TestUnwrapSystemOneBody`（6 例）、`TestValidateAnswers`（含 score 档位越界、bool 不支持） |
-| 工具/注册 | `TestExecuteCheckInvalidTask` / `…EmptyPayload` / `…ContractLintRole` / `…Success` / `…ContractLintSuccess` / `…Truncation` / `…HTTPError` / `…RequestBodyIsSmall`、`TestJevCheckSchema`、`TestToolDefinition`、`TestProviderConfig`、`TestNewExtensionBranches` |
-| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（10 子例：S1/S2/S3×2/S4/主代理/打包单元/融合/融合未知/pane 非 `:p1`）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestQueryPaneShellPid`（7 子例 + 无 socket）、`TestQueryPaneShellPidTimeout`、`TestReadProcSelf` |
-| 分类器回调 | `TestClassifyTypesafeSystemOne`、`…Failures`、`TestClassifyWithoutUsage`、`TestClassifyRejectsMalformedAnswers`（10 例畸形答案 + 1 例带 `criteria` 的合法答案正对照） |
+| 响应校验 | `TestUnwrapSystemOneBody`（6 例）、`TestValidateAnswers`（含 score 档位越界、未知题型 fail-closed） |
+| 工具/注册 | `TestExecuteCheckInvalidTask` / `…EmptyPayload` / `…ContractLintRole` / `…Success` / `…SummaryKeepsEveryVerdictLine` / `…ContractLintSuccess` / `…Truncation` / `…HTTPError` / `…RequestBodyIsSmall`、`TestJevCheckSchema`、`TestToolDefinition`、`TestProviderConfig`、`TestNewExtensionBranches` |
+| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（10 子例：S1/S2/S3×2/S4/主代理/打包单元/融合/融合未知/pane 非 `:p1`）、`TestResolveMCPAgentIdentity`（MCP 拓扑：agy/pi 宿主层、`bash -c` inline 非宿主、嵌套宿主、forbidden runtime、未知中间层、空 cmdline）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestQueryPaneShellPid`（7 子例 + 无 socket）、`TestQueryPaneShellPidTimeout`、`TestReadProcSelf` |
+| 分类器回调 | `TestClassifyTypesafeSystemOne`、`…Failures`、`TestClassifyWithoutUsage`、`TestClassifyRejectsMalformedAnswers`（畸形答案 + `bool` 题型 + `score` 数组 `criteria` 正反例）、`TestClassifyBoolQuestionWireMapping`、`TestClassifyRejectsUntrustedBaseUrl` |
 | 并发 | `TestExecuteCheckConcurrent`（8 goroutine × 8 次，`-race`） |
+
+`cmd/jev-mcp` 侧覆盖：`TestVersionFlag`、`TestIdentityResolverIsSharedCore`、`TestMCPIdentityEnvChains`、
+`TestToolsListGate`、`TestToolsCallGate`、`TestWriteFileAtomicConcurrent`（4 个真实 OS 子进程并发
+重写 + 4 个父进程读者并发高频读，断言 0 空读、0 JSON 解析错误、无 `.tmp` 残留）。
 
 ## 隔离 PiG 实测记录（2026-10-24）
 
@@ -224,5 +291,9 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
   `JEV_TIMEOUT_MS` 用 `Number(env || default)`，拼错时得到 NaN —— 超时被 Node 钳到 1ms（每次调用
   立即 abort），截断则完全关闭；建议后续在 TS 侧对非有限值显式告警。负值 `JEV_MAX_STATE_CHARS`
   会触发 `slice(0,-n)` 的「砍尾」怪癖（Go 版已收敛为关闭截断）。分类器阈值语义本身未发现错误。
-- 未提交：按任务要求待 C 档 verifier + reviewer + oracle 门禁后再 `git commit`（提交时须同时带上
-  `go/go.work` 的 `./jev-gate` 一行）。
+- 历史提交说明（第 2 批收尾时）：Go 版初版曾按任务要求等 C 档 verifier + reviewer + oracle
+  门禁通过后才 `git commit`（提交同时带上 `go/go.work` 的 `./jev-gate` 一行）。
+- 本次加固（MF-3/MF-4/MF-5、SF-1/SF-2/SF-5/SF-6、C-2）在分支 `fix/jev-gate-audit-hardening`
+  以 4 个阶段性本地提交落地（未 push、未 merge）；MCP 侧 `readLoop` 的 EOF 有界收尾、原子 schema
+  写入与 `maxFrameBytes` 上限均为该分支新增，TS 权威源保持稳定（TS 侧同步项仅
+  `redirect: "error"`、空 userinfo 拦截与 `summary` 完整拼接三处）。
