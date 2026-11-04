@@ -16,7 +16,7 @@ import "strings"
 // suppression -- applyNativeThinkingSuppression, the "assistant-thinking"
 // Markdown transformer, installNativeThinkingSuppression and
 // ensureAssistantThinkingPatched -- moved to native_thinking.go, the adapter
-// layer reserved for the upstream PiG 0.6.0 hook (#384).
+// layer that calls OwnThinkingRuns (D214 / issue #384).
 
 // thinkingAlreadyShown is thinkingAlreadyShown (L197-211): the same run text
 // already reached a group or the active entry.

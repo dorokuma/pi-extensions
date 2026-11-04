@@ -104,13 +104,13 @@ removeChild / clear`（`installGrouping`）、`AssistantMessageComponent.prototy
    （`grouping.go:839` `isNativeThinkingWidget`）只作用于本移植自己的树，与这条宿主路径
    互不依赖。
    - **上游挂接点收敛在 `native_thinking.go`**：「原生 thinking 行的宿主缝」全部收在该文件
-     的适配层后——`applyNativeThinkingSuppression`（`native_thinking.go:38`，当前本体即
-     `ui.setHiddenThinkingLabel("")`）、`transformMarkdown` 及本地镜像
+     的适配层后——`applyNativeThinkingSuppression`（`native_thinking.go`，调用
+     `ui.ownThinkingRuns(true)` / D214 OwnThinkingRuns）、`transformMarkdown` 及本地镜像
      `installNativeThinkingSuppression` / `ensureAssistantThinkingPatched`。上游 PiG 0.6.0
-     正式钩子（issue #384，扩展接管隐藏 thinking 行的 0 行折叠）公布并落地后，只需改
-     `applyNativeThinkingSuppression` 的实现（及 transformer 取舍），调用点
-     `handleSessionStart` 与 factory 注册处不动；钩子形状未知，适配层只收敛调用点、
-     不预测接口。
+     钩子（issue #384 / D214）已接入：owned 后隐藏/零行 thinking 不再留 stub 与 spacer；
+     transformer 仍负责把 `assistant-thinking` 正文置空。调用点
+     `handleSessionStart` 与 factory 注册处不动。
+
 6. **符号键改用显式字段**：TS 用 `Symbol.for(...)` 的 `PARENT_KEY` / `PATCH_KEY` 等
    把补丁状态挂在宿主组件上；Go 侧无此机制，改为结构体字段与 `map`（如
    `toolComponent.owner`、`runtimeState.groups`），语义等价且可被 race detector 覆盖。
@@ -128,7 +128,7 @@ TS 原版的宿主原型补丁在**进程内**改的是宿主自己的组件树�
 | 宿主面 | 本移植的落地 |
 |---|---|
 | `ctx.SetWidgetRenderer("compact-anim", ...)` | `extension.go:560` `renderWidget`（widget 行） |
-| `ctx.SetHiddenThinkingLabel("")` | `handleSessionStart` 经适配层 `applyNativeThinkingSuppression`（`native_thinking.go:38`）设置，原生 thinking 标签留空 |
+| `ctx.OwnThinkingRuns(true)` | `handleSessionStart` 经适配层 `applyNativeThinkingSuppression`（`native_thinking.go`）声明拥有 thinking runs（D214），隐藏/零行不留 stub 与 spacer |
 | `ext.MarkdownTransformer(...)` | `extension.go:54` 注册 `transformMarkdown`（`native_thinking.go:92`）：`assistant-thinking` 返回空串 → 宿主 0 行 |
 | `ctx.OnTerminalInput` | `extension.go:525` `handleTerminalInput`，`Ctrl+I` 开检查器 |
 | `ctx.Custom` / `AddOverlay` | `runtime_glue.go:195` / `runtime_glue.go:259` 两个 overlay |

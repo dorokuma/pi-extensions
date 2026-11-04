@@ -6,37 +6,32 @@ import (
 
 // This file is the adapter layer for the "native thinking row" host seam: every
 // way this extension suppresses or hides the host's own thinking render lives
-// here, so the upstream PiG 0.6.0 hook (issue #384: the extension takes over
-// rendering the hidden-thinking row, collapsing it to zero lines) lands here.
+// here. Upstream PiG 0.6.0 (issue #384 / D214) exposes OwnThinkingRuns so a
+// hidden or zero-row thinking run leaves no stub and no spacer rows; that hook
+// is called from applyNativeThinkingSuppression.
 //
-// What converges today is the call sites: applyNativeThinkingSuppression is
-// the sole caller of the setHiddenThinkingLabel primitive and transformMarkdown
-// is the sole registered assistant-thinking seam. An unknown hook is not
-// promised to fit this shape: if it needs a new primitive or registration,
-// uiContext/sdkUI and NewExtension gain the pair per the accessors.go
-// contract, so "one place to change" means the adapter layer plus its pair --
-// not a literal single file or function. handleSessionStart stays agnostic.
+// Call-site contract: applyNativeThinkingSuppression is the sole caller of the
+// ownThinkingRuns primitive, and transformMarkdown is the sole registered
+// assistant-thinking seam. New host primitives for this seam land on
+// uiContext/sdkUI as a pair per the accessors.go contract. handleSessionStart
+// stays agnostic.
 //
-// Two different seams are folded into this one file because they implement the
-// same suppression semantics:
-//   - applyNativeThinkingSuppression / setHiddenThinkingLabel work on the
-//     hidden-state row the host draws for a hidden thinking block;
-//   - transformMarkdown works on the "assistant-thinking" Markdown body.
+// Two seams share this file because they implement the same suppression goal:
+//   - applyNativeThinkingSuppression / ownThinkingRuns tell the host this
+//     extension owns thinking runs (no stub, no spacers around empty/hidden runs);
+//   - transformMarkdown empties the "assistant-thinking" Markdown body so the
+//     run draws zero rows (OwnThinkingRuns then drops the surrounding spacers).
 // installNativeThinkingSuppression / ensureAssistantThinkingPatched are the
 // local mirror of that semantics (component flags + the installed record); they
 // belong to the same boundary even though they never touch the host.
 
-// applyNativeThinkingSuppression blanks the host's native hidden-thinking
-// label: its body today is the one primitive the host exposes,
-// setHiddenThinkingLabel(""), so the hidden row still draws one empty stub
-// line (plus the host spacer). The zero-line collapse is what the upstream
-// #384 hook is for; today this only blanks the label.
-//
-// When the #384 hook lands in PiG 0.6.0, the change converges on this method
-// body (call the new hook, or negotiate with it); handleSessionStart stays
-// untouched unless the hook needs a new primitive -- see the file head.
+// applyNativeThinkingSuppression declares ownership of thinking runs on the
+// host (D214 OwnThinkingRuns). With ownership on, a hidden thinking run leaves
+// no stub row, and a run whose Markdown transformer returned empty text leaves
+// no leading or post-run spacer. The transformer (transformMarkdown) still
+// empties the body; this method only flips the host ownership flag.
 func (r *runtimeState) applyNativeThinkingSuppression(ui uiContext) {
-	ui.setHiddenThinkingLabel("")
+	ui.ownThinkingRuns(true)
 }
 
 // installNativeThinkingSuppression is installNativeThinkingSuppression
@@ -73,17 +68,15 @@ const markdownMessageTypeAssistantThinking = "assistant-thinking"
 //   - tui/markdown.go:297-318 renders the transformed text, and when its
 //     widthx.JSTrim is empty it returns []string{} -- zero lines, not one blank
 //     line. That is why returning "" suppresses the native thinking body
-//     whatever hideThinkingBlock is set to (R3 concluded this was impossible; R4
-//     B disproved it against the host code and a live frame).
+//     whatever hideThinkingBlock is set to.
 //
 // Everything else is returned unchanged, so ordinary assistant/user Markdown
 // rendering is exactly the host's (including the Mermaid transformer that runs
 // in the same chain).
 //
-// The upstream #384 hook takes over the *hidden-state row render*; this
-// transformer suppresses the *body markdown*. The two are different seams, so
-// whether the transformer stays once the hook lands is decided by the hook's
-// semantics -- it is kept as-is for now.
+// OwnThinkingRuns (D214) removes the spacers around a zero-row or hidden run;
+// this transformer still empties the body so the run draws no rows. Both are
+// required for the compact-ui layout: empty body + owned spacers.
 //
 // The extension's own tree rows never pass through here: thinkingRow draws a
 // plain one-line string through the ToolRenderer (toolRenderLines), so the

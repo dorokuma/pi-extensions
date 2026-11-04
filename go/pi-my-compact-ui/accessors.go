@@ -143,11 +143,12 @@ type overlayCloser interface {
 // without a live SDK connection, and so no host callback is stored as an
 // sdk.Context whose zero value would hide a nil dereference.
 //
-// setHiddenThinkingLabel stays the sdkUI primitive it is; when a new host UI
-// primitive for the native thinking seam arrives (the upstream #384 hook),
-// route it through the native_thinking.go adapter layer rather than sprinkling
-// it across call sites, and add the primitive here and on sdkUI as a pair.
+// ownThinkingRuns is the D214 host primitive (pi.ownThinkingRuns / Context.OwnThinkingRuns).
+// Keep setHiddenThinkingLabel as the older label seam; the native thinking adapter
+// routes ownership through ownThinkingRuns. New host primitives for this seam land
+// here and on sdkUI as a pair, then through native_thinking.go.
 type uiContext interface {
+	ownThinkingRuns(enabled bool)
 	setHiddenThinkingLabel(label string)
 	onTerminalInput(handler func(data string) terminalInputVerdict) func()
 	setWidgetRenderer(key string, render func(width int) []string)

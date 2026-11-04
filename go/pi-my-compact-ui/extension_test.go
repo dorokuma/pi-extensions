@@ -798,12 +798,12 @@ func TestSessionStart(t *testing.T) {
 	// lastInputHandler takes ui.mu itself, so it runs outside the copy block.
 	handler := ui.lastInputHandler()
 	ui.mu.Lock()
-	labels := append([]string(nil), ui.hiddenLabels...)
+	ownCalls := append([]bool(nil), ui.ownThinkingCalls...)
 	widgets := append([]string(nil), ui.widgetKeys...)
 	ui.mu.Unlock()
 
-	if len(labels) != 1 || labels[0] != "" {
-		t.Errorf("setHiddenThinkingLabel calls = %v, want one empty label", labels)
+	if len(ownCalls) != 1 || ownCalls[0] != true {
+		t.Errorf("ownThinkingRuns calls = %v, want one true", ownCalls)
 	}
 	if handler == nil {
 		t.Error("onTerminalInput was not registered")
@@ -1058,6 +1058,7 @@ func (u *lockProbeUI) check(name string) {
 	}
 }
 
+func (u *lockProbeUI) ownThinkingRuns(bool)          { u.check("ownThinkingRuns") }
 func (u *lockProbeUI) setHiddenThinkingLabel(string) { u.check("setHiddenThinkingLabel") }
 func (u *lockProbeUI) onTerminalInput(func(string) terminalInputVerdict) func() {
 	u.check("onTerminalInput")
