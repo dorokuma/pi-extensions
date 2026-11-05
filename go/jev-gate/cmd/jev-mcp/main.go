@@ -302,9 +302,14 @@ func registerInFlight(key string, call *inFlightCall) bool {
 	return true
 }
 
-func dropInFlight(key string) {
+// dropInFlight removes the registration for key only while it still points
+// at call: a stale cleanup path must never delete a newer registration that
+// reused the id after this call was already dropped (Q4).
+func dropInFlight(key string, call *inFlightCall) {
 	inFlightMu.Lock()
-	delete(inFlight, key)
+	if inFlight[key] == call {
+		delete(inFlight, key)
+	}
 	inFlightMu.Unlock()
 }
 
@@ -439,8 +444,12 @@ func handleRPC(w *responseWriter, msg map[string]any, framingMode string) {
 			w.sendResult(id, map[string]any{"tools": []any{}}, framingMode)
 			return
 		}
-		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}}, framingMode)
+		// The lazy schema files must exist before the tools/list response is
+		// visible: agy reads them as soon as the list arrives, so the write
+		// cannot trail the reply (Q5). The denied branch above never reaches
+		// this — a rejected instance still writes nothing.
 		ensureLazySchemaFiles()
+		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}}, framingMode)
 	case "tools/call":
 		handleToolsCall(w, id, params, framingMode)
 	default:
@@ -484,10 +493,18 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMo
 	go func() {
 		defer inFlightWg.Done()
 		defer func() {
-			dropInFlight(key)
+			dropInFlight(key, call)
 			cancel()
 		}()
 		result := jevgate.ExecuteCheckContext(ctx, rawArgs)
+		// The id is unregistered BEFORE the reply is published to the client:
+		// once the response bytes are visible the id must already be reusable,
+		// otherwise a client reusing the id right after seeing its reply would
+		// be refused as a duplicate (Q4). The deferred drop stays as a
+		// belt-and-braces cleanup and is idempotent — it only deletes the
+		// entry while it still points at this call, so it can never remove a
+		// newer registration that legitimately reused the freed id.
+		dropInFlight(key, call)
 		if call.cancelledByClient.Load() {
 			w.sendResult(id, toolErrorResult("jev_check failed: cancelled by MCP client"), framingMode)
 			return
@@ -565,9 +582,16 @@ func readLoop(in io.Reader, w *responseWriter) {
 			break
 		}
 	}
-	// EOF: any complete remainder is dispatched as one last line frame.
+	// EOF: the unterminated tail is dispatched as one last line frame, but
+	// the same body bound applies — an EOF cannot launder an oversized frame
+	// past the bound it would have hit mid-stream (a dangling \r at the
+	// bound is part of a terminator that never arrived).
 	if rest := strings.TrimSpace(string(carry)); rest != "" {
-		dispatchPayload(w, rest, "line")
+		if len(carry) > maxFrameBytes {
+			w.sendError(nil, -32700, "Frame too large", "line")
+		} else {
+			dispatchPayload(w, rest, "line")
+		}
 	}
 	// Bounded drain: give the in-flight calls the normal call budget plus a
 	// small margin, then cancel the stragglers and wait briefly for their
@@ -659,23 +683,31 @@ func drain(carry []byte, w *responseWriter) []byte {
 
 		nl := bytes.IndexByte(carry, '\n')
 		if nl < 0 {
-			if len(carry) > maxFrameBytes {
-				// A newline-less stream grew past the frame bound: it can only be
-				// memory pressure, never a deliverable frame.
+			// No terminator yet. The raw JSON body may be at most
+			// maxFrameBytes, and a CRLF terminator contributes a CR before
+			// the LF — so the buffer may legitimately reach
+			// maxFrameBytes+1 only while its last byte is that pending CR.
+			// Anything beyond that, or a non-CR byte in that slot, can never
+			// become a deliverable frame: reject it now instead of letting a
+			// dangling CR hold the buffer open forever (Q6).
+			if len(carry) > maxFrameBytes+1 ||
+				(len(carry) == maxFrameBytes+1 && carry[len(carry)-1] != '\r') {
 				carry = nil
 				w.sendError(nil, -32700, "Frame too large", "line")
 			}
 			break
 		}
-		// The same bound applies once the line terminator is in the buffer:
-		// a complete line frame whose body (nl bytes before the newline)
-		// exceeds maxFrameBytes must be refused before dispatch, not only
-		// while still incomplete. The bound mirrors the newline-less branch
-		// (body bytes ≤ maxFrameBytes is accepted; the newline itself is the
-		// terminator, not payload) and the Content-Length branch (bodyLen ≤
-		// maxFrameBytes). The whole buffered tail is dropped, matching those
-		// branches.
-		if nl+1 > maxFrameBytes+1 {
+		// A complete line frame: the raw JSON body ends before the LF, minus
+		// a CR when the terminator is CRLF — the terminator never counts
+		// toward the frame body. bodyLen == maxFrameBytes is accepted (the
+		// same bound the newline-less and Content-Length branches apply);
+		// one byte more is refused before dispatch and the buffered tail is
+		// dropped (Q6).
+		bodyLen := nl
+		if bodyLen > 0 && carry[bodyLen-1] == '\r' {
+			bodyLen--
+		}
+		if bodyLen > maxFrameBytes {
 			carry = nil
 			w.sendError(nil, -32700, "Frame too large", "line")
 			break

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -281,7 +282,10 @@ func TestClassifyBoolQuestionWireMapping(t *testing.T) {
 
 // TestClassifyRejectsUntrustedBaseUrl pins the credential guard: a model
 // baseUrl that is neither the configured endpoint nor a loopback gateway must
-// not be sent the resolved credential (and the request never happens).
+// not be sent the resolved credential (and the request never happens). The
+// loopback branch is proven with a second isolated httptest server that must
+// actually receive the request and return a legal answer — no branch may
+// reach a real gateway.
 func TestClassifyRejectsUntrustedBaseUrl(t *testing.T) {
 	server := jsonServer(t, http.StatusOK, `{"answers":{"risk":{"noul":0.5}}}`)
 	api := newTestAPI(server, 24000, 2*time.Second)
@@ -291,11 +295,24 @@ func TestClassifyRejectsUntrustedBaseUrl(t *testing.T) {
 		!strings.Contains(err.Error(), "refusing to send credentials to untrusted model baseUrl") {
 		t.Fatalf("untrusted baseUrl must be refused: %v", err)
 	}
-	// A loopback baseUrl is a local gateway: the request still runs.
+	// A loopback baseUrl is a local gateway: the request still runs. The
+	// endpoint is a second httptest server, so the assertion that the request
+	// really arrived (and got a legal answer through) is isolated from any
+	// gateway that may be listening on this host.
+	var loopbackSawRequest atomic.Bool
+	loopbackServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/systemone" {
+			loopbackSawRequest.Store(true)
+		}
+		_, _ = writer.Write([]byte(`{"answers":{"risk":{"noul":0.5},"kind":{"choice":"b_defers","probabilities":{"b_defers":0.9}}}}`))
+	}))
+	defer loopbackServer.Close()
 	loopback := classifierModel(server)
-	loopback["baseUrl"] = "http://127.0.0.1:3425/v1"
-	if _, err := classifyWith(api, loopback, classifierRequest(), sdk.ProviderOperationOptions{Signal: context.Background()}); err != nil &&
-		strings.Contains(err.Error(), "refusing to send credentials") {
-		t.Fatalf("loopback baseUrl must not be refused: %v", err)
+	loopback["baseUrl"] = loopbackServer.URL + "/v1"
+	if _, err := classifyWith(api, loopback, classifierRequest(), sdk.ProviderOperationOptions{Signal: context.Background()}); err != nil {
+		t.Fatalf("loopback baseUrl must not be refused or fail: %v", err)
+	}
+	if !loopbackSawRequest.Load() {
+		t.Fatal("the loopback endpoint never received the classification request")
 	}
 }

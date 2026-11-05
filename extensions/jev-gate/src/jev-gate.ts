@@ -114,8 +114,9 @@ export function isLocalGatewayUrl(rawUrl: string): boolean {
     // An empty-username userinfo (`http://@127.0.0.1`) is normalised away by
     // URL: username/password are both empty, so the authority is checked
     // directly for a userinfo separator before it could host a loopback
-    // fallback.
-    if (/^https?:\/\/[^/?#]*@/u.test(rawUrl.trim())) return false
+    // fallback. The scheme check is case-insensitive (`HTTP://@host` parses
+    // to http: but the raw string must still see the `@`).
+    if (/^https?:\/\/[^/?#]*@/iu.test(rawUrl.trim())) return false
     const h = u.hostname.toLowerCase()
     if (h === "localhost" || h === "localhost." || h === "::1" || h === "[::1]") return true
     if (isLoopbackIpv4(h)) return true

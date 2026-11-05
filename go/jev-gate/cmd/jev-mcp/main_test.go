@@ -105,30 +105,61 @@ func dispatchOne(t *testing.T, message map[string]any) map[string]any {
 }
 
 // TestIdentityResolverIsSharedCore pins the wiring fix (SF-4): the request
-// gate must call the shared jevgate S1–S4 resolver, not an inline variant.
+// gate inside handleRPC must call the shared jevgate S1–S4 resolver, not an
+// inline variant. The subtests dispatch real tools/list requests through
+// handleRPC (not a stubbed resolveAgentIdentity) and assert the gate's
+// observable behaviour, with every host-environment input explicitly
+// overridden so nothing leaks in from the test process's own environment.
 func TestIdentityResolverIsSharedCore(t *testing.T) {
+	// clearIdentityInputs removes every environment input the identity gate
+	// could read from this process so a test asserts its own setup only.
+	clearIdentityInputs := func(t *testing.T) {
+		t.Helper()
+		for _, name := range os.Environ() {
+			key, _, _ := strings.Cut(name, "=")
+			switch {
+			case strings.HasPrefix(key, "PIG_EXT_"), key == "CTXMODE_ROLE",
+				key == "PI_SUBAGENT", key == "PI_ROLE", key == "HERDR_PANE_ID",
+				key == "PIG_HARNESS_ARGV_FILE":
+				t.Setenv(key, "")
+			}
+		}
+	}
+	toolsListTools := func(t *testing.T, messageID int) []any {
+		t.Helper()
+		stubSchemaDirs(t)
+		reply := dispatchOne(t, map[string]any{"jsonrpc": "2.0", "id": messageID, "method": "tools/list"})
+		result, _ := reply["result"].(map[string]any)
+		tools, _ := result["tools"].([]any)
+		return tools
+	}
 	t.Run("ctxmode_role_is_denied", func(t *testing.T) {
+		clearIdentityInputs(t)
 		t.Setenv("CTXMODE_ROLE", "worker")
+		if tools := toolsListTools(t, 41); len(tools) != 0 {
+			t.Fatalf("CTXMODE_ROLE request must be denied by the real gate, tools=%v", tools)
+		}
 		isSubagent, reason := jevgate.ResolveMCPAgentIdentity()
 		if !isSubagent || !strings.Contains(reason, "CTXMODE_ROLE") {
 			t.Fatalf("shared resolver must deny CTXMODE_ROLE: %v %q", isSubagent, reason)
 		}
 	})
 	t.Run("non_p1_pane_is_denied_before_socket", func(t *testing.T) {
-		t.Setenv("CTXMODE_ROLE", "")
-		t.Setenv("PI_SUBAGENT", "")
-		t.Setenv("PI_ROLE", "")
+		clearIdentityInputs(t)
 		t.Setenv("HERDR_PANE_ID", "w66:p8")
+		if tools := toolsListTools(t, 42); len(tools) != 0 {
+			t.Fatalf("non-p1 pane request must be denied before the socket, tools=%v", tools)
+		}
 		isSubagent, reason := jevgate.ResolveMCPAgentIdentity()
 		if !isSubagent || !strings.Contains(reason, `no ":p1" suffix`) {
 			t.Fatalf("shared resolver must require :p1: %v %q", isSubagent, reason)
 		}
 	})
 	t.Run("missing_pane_is_denied", func(t *testing.T) {
-		t.Setenv("CTXMODE_ROLE", "")
-		t.Setenv("PI_SUBAGENT", "")
-		t.Setenv("PI_ROLE", "")
-		t.Setenv("HERDR_PANE_ID", "")
+		clearIdentityInputs(t)
+		if tools := toolsListTools(t, 43); len(tools) != 0 {
+			t.Fatalf("missing-pane request must be denied, tools=%v", tools)
+		}
 		isSubagent, reason := jevgate.ResolveMCPAgentIdentity()
 		if !isSubagent || !strings.HasPrefix(reason, "S1: HERDR_PANE_ID") {
 			t.Fatalf("shared resolver must require HERDR_PANE_ID: %v %q", isSubagent, reason)
@@ -258,37 +289,204 @@ func TestToolsListGate(t *testing.T) {
 	})
 }
 
-// TestLazySchemaNotWrittenWithoutToolsList pins the lazy schema write: a
-// server that answers anything but an allowed tools/list leaves the schema
-// dirs untouched (the startup write is gone — a denied subagent's binary
-// must not write the global schema).
+// TestHelperProcessMain is not a test: it is the real-entrypoint half of
+// TestLazySchemaNotWrittenWithoutToolsList, re-executed as a real OS process
+// so the no-write contract is observed through main() itself (stdin frames →
+// readLoop → EOF), not through handleRPC alone.
+func TestHelperProcessMain(t *testing.T) {
+	if os.Getenv("JEV_MAIN_HELPER") != "1" {
+		return
+	}
+	marker := os.Getenv("JEV_MAIN_HELPER_MARKER")
+	if marker == "" {
+		os.Exit(2)
+	}
+	// Redirect stdout so the ping reply cannot pollute the test's own output;
+	// record the schema-dir state both before and after main() ran.
+	dumpState := func(stage string) {
+		target := marker + "." + stage
+		var lines []string
+		for _, dir := range jevSchemaDirs {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				lines = append(lines, filepath.Join(dir, entry.Name()))
+			}
+		}
+		_ = os.WriteFile(target, []byte(strings.Join(lines, "\n")), 0o600)
+	}
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		os.Exit(3)
+	}
+	os.Stdout = devnull
+	dumpState("before")
+	main()
+	dumpState("after")
+	os.Exit(0)
+}
+
+// TestLazySchemaNotWrittenWithoutToolsList drives the real startup path: a
+// jev-mcp process that answers a ping and reaches EOF (the way agy would
+// spawn and probe it) must leave the schema dirs untouched — no startup
+// write. The helper is the test binary itself re-executed as main(); the
+// parent asserts the before/after state is empty.
 func TestLazySchemaNotWrittenWithoutToolsList(t *testing.T) {
-	t.Run("ping_writes_nothing", func(t *testing.T) {
-		stubIdentity(t, false, "S1-S4 hold")
-		schemaDir := stubSchemaDirs(t)
-		reply := dispatchOne(t, map[string]any{"jsonrpc": "2.0", "id": 11, "method": "ping"})
-		if _, ok := reply["result"]; !ok {
-			t.Fatalf("ping reply = %v", reply)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "state")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessMain$")
+	cmd.Env = append(os.Environ(),
+		"JEV_MAIN_HELPER=1",
+		"JEV_MAIN_HELPER_MARKER="+marker,
+		// Production-looking identity inputs: the gate denies everything, so
+		// even a tools/list inside this process would be the denied branch.
+		"CTXMODE_ROLE=verifier",
+	)
+	cmd.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper main() failed: %v\n%s", err, output)
+	}
+	for _, stage := range []string{"before", "after"} {
+		data, err := os.ReadFile(marker + "." + stage)
+		if err != nil {
+			t.Fatalf("helper did not record the %s state: %v", stage, err)
 		}
-		if entries, err := os.ReadDir(schemaDir); err != nil || len(entries) != 0 {
-			t.Fatalf("schema dir must stay untouched without tools/list: entries=%v err=%v", entries, err)
+		if names := strings.TrimSpace(string(data)); names != "" {
+			t.Fatalf("schema dirs must stay untouched on the real startup path, saw %q (%s)", names, stage)
 		}
-	})
-	t.Run("denied_tools_call_writes_nothing", func(t *testing.T) {
-		stubIdentity(t, true, "S4: nested second host runtime ancestor")
-		schemaDir := stubSchemaDirs(t)
-		reply := dispatchOne(t, map[string]any{
-			"jsonrpc": "2.0", "id": 12, "method": "tools/call",
-			"params": map[string]any{"name": "jev_check", "arguments": map[string]any{"task": "gate_scan", "payload": "x"}},
-		})
-		result, _ := reply["result"].(map[string]any)
-		if result["isError"] != true {
-			t.Fatalf("denial must be an error result: %v", result)
+	}
+	// The real paths under test are the constants main() uses; assert they
+	// name the two production dirs so a stubbed test cannot silently drift
+	// away from the real contract.
+	if len(jevSchemaDirs) != 2 || !strings.HasSuffix(jevSchemaDirs[0], "antigravity-cli/mcp/jev") {
+		t.Fatalf("jevSchemaDirs = %v, want the production mcp/jev dirs", jevSchemaDirs)
+	}
+}
+
+// TestInFlightDroppedBeforeResponseVisible pins Q4: a tools/call request id
+// is removed from the in-flight table before the response bytes reach the
+// client, so "client sees the response ⇒ id is reusable" always holds. The
+// controlled writer pauses mid-Write — at that instant the response is
+// already visible — and asserts the id is gone. The deferred cleanup stays
+// idempotent: it only deletes the entry while it still points at this call,
+// so it cannot remove a newer registration that reused the freed id.
+func TestInFlightDroppedBeforeResponseVisible(t *testing.T) {
+	stubIdentity(t, false, "S1-S4 hold")
+	stubSchemaDirs(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(writer, `{"model":"clef","answers":{"kind":{"choice":"normal_delivery","probabilities":{"normal_delivery":0.95},"confidence":0.9},"states_conclusion":{"type":"noul","noul":0.1}}}`)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("MAGPIE_BASE_URL", server.URL)
+	t.Setenv("MAGPIE_API_KEY", "test-key")
+
+	visible := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	spy := &spyBlockingWriter{onWrite: func() {
+		select {
+		case <-visible:
+		default:
+			close(visible)
 		}
-		if entries, err := os.ReadDir(schemaDir); err != nil || len(entries) != 0 {
-			t.Fatalf("denied tools/call must not write schema files: entries=%v err=%v", entries, err)
+		<-releaseWrite
+	}}
+	writer := &responseWriter{out: spy}
+	message := map[string]any{
+		"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+		"params": map[string]any{"name": "jev_check", "arguments": map[string]any{"task": "return_triage", "payload": "x"}},
+	}
+	handleRPC(writer, message, "line")
+	select {
+	case <-visible:
+	case <-time.After(15 * time.Second):
+		t.Fatal("response never became visible within 15s")
+	}
+	key := requestKey(float64(9))
+	inFlightMu.Lock()
+	_, stillRegistered := inFlight[key]
+	inFlightMu.Unlock()
+	if stillRegistered {
+		close(releaseWrite)
+		t.Fatal("response is visible to the client but id 9 is still registered in-flight")
+	}
+	close(releaseWrite)
+	inFlightWg.Wait()
+	// A fresh registration under the same id succeeds and the stale deferred
+	// drop cannot remove it (it only deletes entries that still point at the
+	// old call object).
+	stale := &inFlightCall{cancel: func() {}}
+	if !registerInFlight(key, stale) {
+		t.Fatal("id 9 must be reusable after the first call completed")
+	}
+	dropInFlight(key, &inFlightCall{cancel: func() {}}) // wrong call pointer: no-op
+	inFlightMu.Lock()
+	_, kept := inFlight[key]
+	inFlightMu.Unlock()
+	if !kept {
+		t.Fatal("a stale drop must not delete a newer registration under the same id")
+	}
+	dropInFlight(key, stale)
+}
+
+// spyBlockingWriter blocks inside Write so the test can observe the instant
+// the response is client-visible but the Write call has not returned. For
+// the schema-ordering test the onWrite hook instead inspects the schema dir
+// from inside Write — the instant the response bytes become visible.
+type spyBlockingWriter struct {
+	written bytes.Buffer
+	onWrite func()
+}
+
+func (s *spyBlockingWriter) Write(p []byte) (int, error) {
+	n, err := s.written.Write(p)
+	if s.onWrite != nil {
+		s.onWrite()
+	}
+	return n, err
+}
+
+// TestSchemaFilesWrittenBeforeToolsListResponse pins Q5: an allowed
+// tools/list finishes publishing the lazy schema before the response bytes
+// become visible. The spy writer inspects the injected schema dir from
+// inside Write — at that instant both files must already exist and parse.
+func TestSchemaFilesWrittenBeforeToolsListResponse(t *testing.T) {
+	stubIdentity(t, false, "S1-S4 hold")
+	schemaDir := stubSchemaDirs(t)
+	spy := &spyBlockingWriter{onWrite: func() {
+		for _, name := range []string{"jev_check.json", "instructions.md"} {
+			data, err := os.ReadFile(filepath.Join(schemaDir, name))
+			if err != nil {
+				t.Errorf("response visible but %s is missing: %v", name, err)
+				continue
+			}
+			if name == "jev_check.json" {
+				var schema map[string]any
+				if err := json.Unmarshal(data, &schema); err != nil || schema["name"] != "jev_check" {
+					t.Errorf("response visible but %s is not a legal schema doc: %v", name, err)
+				}
+			}
 		}
-	})
+	}}
+	writer := &responseWriter{out: spy}
+	handleRPC(writer, map[string]any{"jsonrpc": "2.0", "id": 5, "method": "tools/list"}, "line")
+	if spy.written.Len() == 0 {
+		t.Fatal("tools/list produced no response")
+	}
+	// The denied branch still writes nothing and gets an empty list.
+	stubIdentity(t, true, "S1: HERDR_PANE_ID unset or empty")
+	deniedDir := stubSchemaDirs(t)
+	spy.onWrite = func() {
+		if entries, err := os.ReadDir(deniedDir); err == nil && len(entries) != 0 {
+			t.Errorf("denied tools/list must not publish schema files, saw %v", entries)
+		}
+	}
+	handleRPC(writer, map[string]any{"jsonrpc": "2.0", "id": 6, "method": "tools/list"}, "line")
+	if entries, err := os.ReadDir(deniedDir); err != nil || len(entries) != 0 {
+		t.Fatalf("denied tools/list wrote schema files: entries=%v err=%v", entries, err)
+	}
 }
 
 // TestDuplicateInFlightRequestID pins F-3: two concurrent tools/call sharing
@@ -373,22 +571,23 @@ func TestRequestKeyTypeTags(t *testing.T) {
 	if !registerInFlight(requestKey(float64(1)), callA) {
 		t.Fatal("first registration must succeed")
 	}
-	defer dropInFlight(requestKey(float64(1)))
-	if !registerInFlight(requestKey("1"), &inFlightCall{cancel: func() {}}) {
+	defer dropInFlight(requestKey(float64(1)), callA)
+	callB := &inFlightCall{cancel: func() {}}
+	if !registerInFlight(requestKey("1"), callB) {
 		t.Fatal("a string id equal in text to a numeric id must register independently")
 	}
-	defer dropInFlight(requestKey("1"))
+	defer dropInFlight(requestKey("1"), callB)
 	if registerInFlight(requestKey(float64(1)), &inFlightCall{cancel: func() {}}) {
 		t.Fatal("a true duplicate in-flight id must be refused")
 	}
 }
 
-// TestDrainFrameBound pins the complete-line branch of the frame bound: a
-// line frame whose body fits maxFrameBytes is dispatched, one byte more is
-// refused before dispatch with -32700 Frame too large.
+// TestDrainFrameBound pins the complete-line and newline-less branches of
+// the frame bound (Q6): the raw JSON body may be at most maxFrameBytes and
+// the LF or CRLF terminator never counts toward it.
 func TestDrainFrameBound(t *testing.T) {
 	// A ping request padded to exactly maxFrameBytes: accepted and answered
-	// in line framing.
+	// in line framing, both under an LF and under a CRLF terminator.
 	fixedPrefix := `{"jsonrpc":"2.0","id":"big","method":"ping","params":{"pad":"`
 	fixedSuffix := `"}}`
 	padding := strings.Repeat("x", maxFrameBytes-len(fixedPrefix)-len(fixedSuffix))
@@ -396,33 +595,183 @@ func TestDrainFrameBound(t *testing.T) {
 	if len(frame) != maxFrameBytes {
 		t.Fatalf("fixture frame = %d bytes, want exactly %d", len(frame), maxFrameBytes)
 	}
-	buffer := &lockedBuffer{}
-	writer := &responseWriter{out: buffer}
-	rest := drain(append(frame, '\n'), writer)
-	if len(rest) != 0 {
-		t.Fatalf("accepted frame must be fully consumed, rest=%d bytes", len(rest))
-	}
-	if out := buffer.String(); !strings.Contains(out, `"big"`) || strings.Contains(out, "Frame too large") {
-		t.Fatalf("a maxFrameBytes body + newline must be accepted, got %q", out)
+	for _, terminator := range [][]byte{{'\n'}, {'\r', '\n'}} {
+		buffer := &lockedBuffer{}
+		writer := &responseWriter{out: buffer}
+		rest := drain(append(append([]byte{}, frame...), terminator...), writer)
+		if len(rest) != 0 {
+			t.Fatalf("accepted frame (term %q) must be fully consumed, rest=%d bytes", terminator, len(rest))
+		}
+		if out := buffer.String(); !strings.Contains(out, `"big"`) || strings.Contains(out, "Frame too large") {
+			t.Fatalf("a maxFrameBytes body + %q must be accepted, got %q", terminator, out)
+		}
 	}
 
-	// One byte more than maxFrameBytes before the newline: refused before
+	// One byte more than maxFrameBytes before the terminator: refused before
 	// dispatch and the buffered tail is dropped.
+	for _, input := range [][]byte{
+		append(bytes.Repeat([]byte("x"), maxFrameBytes+1), '\n'),
+		append(bytes.Repeat([]byte("x"), maxFrameBytes+2), '\r', '\n'),
+	} {
+		buffer := &lockedBuffer{}
+		writer := &responseWriter{out: buffer}
+		rest := drain(input, writer)
+		if len(rest) != 0 {
+			t.Fatalf("oversized frame must drop the buffered tail, rest=%d bytes", len(rest))
+		}
+		var reply map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(buffer.String())), &reply); err != nil {
+			t.Fatalf("rejection reply is not JSON: %v (%q)", err, buffer.String())
+		}
+		rpcErr, _ := reply["error"].(map[string]any)
+		if code, _ := rpcErr["code"].(float64); code != -32700 || rpcErr["message"] != "Frame too large" {
+			t.Fatalf("oversized frame must be refused with -32700 Frame too large, got %v", reply)
+		}
+	}
+
+	// A maxFrameBytes body + CR is exactly the boundary buffer: it waits for
+	// the LF instead of rejecting (a legal CRLF half), and the following LF
+	// completes the frame.
+	buffer := &lockedBuffer{}
+	writer := &responseWriter{out: buffer}
+	rest := drain(append(append([]byte{}, frame...), '\r'), writer)
+	if len(rest) != maxFrameBytes+1 {
+		t.Fatalf("body+CR must wait for the LF, rest=%d bytes", len(rest))
+	}
+	if strings.Contains(buffer.String(), "Frame too large") {
+		t.Fatalf("body+CR is not yet a rejection: %q", buffer.String())
+	}
+	rest = drain(append(rest, '\n'), writer)
+	if len(rest) != 0 || !strings.Contains(buffer.String(), `"big"`) {
+		t.Fatalf("the pending CR must complete a CRLF frame, rest=%d out=%q", len(rest), buffer.String())
+	}
+
+	// A maxFrameBytes+1 buffer whose last byte is NOT a CR is rejected
+	// immediately — no waiting on a terminator that can only make it worse.
 	buffer2 := &lockedBuffer{}
 	writer2 := &responseWriter{out: buffer2}
-	oversized := bytes.Repeat([]byte("x"), maxFrameBytes+1)
-	rest = drain(append(oversized, '\n'), writer2)
-	if len(rest) != 0 {
-		t.Fatalf("oversized frame must drop the buffered tail, rest=%d bytes", len(rest))
+	rest = drain(bytes.Repeat([]byte("x"), maxFrameBytes+1), writer2)
+	if len(rest) != 0 || !strings.Contains(buffer2.String(), "Frame too large") {
+		t.Fatalf("maxFrameBytes+1 non-CR buffer must be refused, rest=%d out=%q", len(rest), buffer2.String())
 	}
-	var reply map[string]any
-	if err := json.Unmarshal([]byte(strings.TrimSpace(buffer2.String())), &reply); err != nil {
-		t.Fatalf("rejection reply is not JSON: %v (%q)", err, buffer2.String())
+
+	// An accepted CRLF frame followed by more bytes: the trailing bytes stay
+	// buffered for the next frame.
+	buffer3 := &lockedBuffer{}
+	writer3 := &responseWriter{out: buffer3}
+	rest = drain([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`+"\r\n"+`{"jsonrpc":"2.0"`), writer3)
+	if !strings.Contains(buffer3.String(), `"id":1`) {
+		t.Fatalf("first CRLF frame must dispatch, out=%q", buffer3.String())
 	}
-	rpcErr, _ := reply["error"].(map[string]any)
-	if code, _ := rpcErr["code"].(float64); code != -32700 || rpcErr["message"] != "Frame too large" {
-		t.Fatalf("oversized frame must be refused with -32700 Frame too large, got %v", reply)
+	if string(rest) != `{"jsonrpc":"2.0"` {
+		t.Fatalf("trailing partial frame must stay buffered, rest=%q", rest)
 	}
+}
+
+// chunkedReader feeds a fixed script of chunks, then io.EOF — it stands in
+// for a pipe where a frame straddles several reads and a CR arrives alone.
+// Each Read returns at most len(p) bytes of the current chunk; the
+// unconsumed remainder is delivered by the next Read.
+type chunkedReader struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	for r.index < len(r.chunks) && len(r.chunks[r.index]) == 0 {
+		r.index++
+	}
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.chunks[r.index] = r.chunks[r.index][n:]
+	return n, nil
+}
+
+// TestReadLoopFrameBounds pins the same contract through the real readLoop
+// (the 64KiB read path): 16MiB bodies under LF/CRLF and a frame split across
+// body / CR / LF chunks all answer with the right id; the oversized shapes
+// are refused.
+func TestReadLoopFrameBounds(t *testing.T) {
+	fixedPrefix := `{"jsonrpc":"2.0","id":"big","method":"ping","params":{"pad":"`
+	fixedSuffix := `"}}`
+	padding := strings.Repeat("x", maxFrameBytes-len(fixedPrefix)-len(fixedSuffix))
+	frame := []byte(fixedPrefix + padding + fixedSuffix)
+
+	run := func(t *testing.T, chunks ...[]byte) string {
+		t.Helper()
+		buffer := &lockedBuffer{}
+		readLoop(&chunkedReader{chunks: chunks}, &responseWriter{out: buffer})
+		return buffer.String()
+	}
+
+	t.Run("body_plus_lf", func(t *testing.T) {
+		out := run(t, append(append([]byte{}, frame...), '\n'))
+		if !strings.Contains(out, `"big"`) || strings.Contains(out, "Frame too large") {
+			t.Fatalf("16MiB body + LF must answer, got %q", out)
+		}
+	})
+	t.Run("body_plus_crlf", func(t *testing.T) {
+		out := run(t, append(append([]byte{}, frame...), '\r', '\n'))
+		if !strings.Contains(out, `"big"`) || strings.Contains(out, "Frame too large") {
+			t.Fatalf("16MiB body + CRLF must answer, got %q", out)
+		}
+	})
+	t.Run("chunked_body_cr_lf", func(t *testing.T) {
+		// The body, the CR and the LF arrive in separate reads: the pending-CR
+		// boundary must hold the frame open instead of rejecting it.
+		out := run(t, frame, []byte{'\r'}, []byte{'\n'})
+		if !strings.Contains(out, `"big"`) || strings.Contains(out, "Frame too large") {
+			t.Fatalf("chunked body/CR/LF must answer, got %q", out)
+		}
+	})
+	t.Run("chunked_body_split_cr_lf_merged_then_more", func(t *testing.T) {
+		// body+CR+LF+next-frame-start in one chunk, then the rest of a second
+		// oversized frame: the first must still have answered correctly and
+		// the second must be refused.
+		out := run(t,
+			append(append(append([]byte{}, frame...), '\r', '\n'), []byte(`{"jsonrpc":"2.0","id":2,"method":"ping"}`)...),
+			[]byte{'\n'},
+		)
+		if !strings.Contains(out, `"big"`) || !strings.Contains(out, `"id":2`) {
+			t.Fatalf("CRLF frame + following JSON must both be handled, got %q", out)
+		}
+	})
+	t.Run("body_plus_one_lf_rejected", func(t *testing.T) {
+		out := run(t, append(append(append([]byte{}, frame...), 'x'), '\n'))
+		if strings.Contains(out, `"big"`) || !strings.Contains(out, "Frame too large") {
+			t.Fatalf("16MiB+1 body + LF must be refused, got %q", out)
+		}
+	})
+	t.Run("body_plus_one_eof_rejected", func(t *testing.T) {
+		out := run(t, append(append([]byte{}, frame...), 'x'))
+		if !strings.Contains(out, "Frame too large") {
+			t.Fatalf("16MiB+1 unterminated body must be refused, got %q", out)
+		}
+	})
+	t.Run("body_crlf_then_json_byte_rejected", func(t *testing.T) {
+		// A full-size body + CR + a JSON byte: the buffer past maxFrameBytes+1
+		// can never complete a frame, so it is refused without EOF.
+		out := run(t, append(append(append([]byte{}, frame...), '\r'), '{'))
+		if !strings.Contains(out, "Frame too large") {
+			t.Fatalf("body+CR+byte overflow must be refused, got %q", out)
+		}
+	})
+	t.Run("dangling_cr_at_eof_rejected", func(t *testing.T) {
+		out := run(t, append(append([]byte{}, frame...), 'x', '\r'))
+		if !strings.Contains(out, "Frame too large") {
+			t.Fatalf("dangling CR past the bound must be refused at EOF, got %q", out)
+		}
+	})
+	t.Run("pending_cr_hit_by_eof_rejected", func(t *testing.T) {
+		// A full-size body + CR waiting for its LF: EOF turns the pending CR
+		// into an over-bound tail — refused, never dispatched.
+		out := run(t, frame, []byte{'\r'})
+		if !strings.Contains(out, "Frame too large") {
+			t.Fatalf("a pending CR cut off by EOF must be refused, got %q", out)
+		}
+	})
 }
 
 // TestToolsCallGate covers the denial shape on tools/call.
@@ -450,7 +799,9 @@ func TestToolsCallGate(t *testing.T) {
 // TestHelperProcessSchemaWrite is not a test: it is the writer half of
 // TestWriteFileAtomicConcurrent, re-executed as a real OS process so the
 // atomicity claim is proven across processes (rename(2)), not just across
-// goroutines of one binary.
+// goroutines of one binary. Each writer publishes complete stale-schema
+// documents and drops a started marker after its first successful write so
+// the parent's reader barrier can anchor the measurement window.
 func TestHelperProcessSchemaWrite(t *testing.T) {
 	if os.Getenv("JEV_SCHEMA_WRITE_HELPER") != "1" {
 		return
@@ -463,21 +814,44 @@ func TestHelperProcessSchemaWrite(t *testing.T) {
 	}
 	for round := 0; round < rounds; round++ {
 		content, _ := json.Marshal(map[string]any{
-			"name":   "jev_check",
-			"writer": writer,
-			"round":  round,
+			"name":        "jev_check",
+			"description": fmt.Sprintf("stale-w%s-r%d", writer, round),
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
 		})
 		if err := writeFileAtomic(target, content, 0o644); err != nil {
 			os.Exit(3)
+		}
+		if round == 0 {
+			// The first successful write is done: the target file now exists
+			// and will never disappear again (rename only replaces it).
+			_ = os.WriteFile(target+".started."+writer, []byte("1"), 0o600)
 		}
 	}
 	os.Exit(0)
 }
 
+// staleSchemaDocOK reports whether data is one complete stale-schema
+// document the writers publish — a valid full JSON object with the schema
+// shape, not merely non-empty bytes.
+func staleSchemaDocOK(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return false
+	}
+	description, hasDescription := doc["description"].(string)
+	parameters, hasParameters := doc["parameters"].(map[string]any)
+	return doc["name"] == "jev_check" && hasDescription &&
+		strings.HasPrefix(description, "stale-") && hasParameters && parameters["type"] == "object"
+}
+
 // TestWriteFileAtomicConcurrent hammers one schema file from several real
-// child processes while parent-side readers race them. Every completed read
-// must be a non-empty, fully-parseable JSON object, and no temp file may be
-// left behind.
+// child processes while parent-side readers race them inside the measured
+// window (first successful write → last writer done). Every completed read
+// must be a complete, legal stale-schema document; read errors — including
+// ENOENT — are counted, and no temp file may be left behind.
 func TestWriteFileAtomicConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "jev_check.json")
@@ -487,42 +861,6 @@ func TestWriteFileAtomicConcurrent(t *testing.T) {
 		rounds  = 15
 		readers = 4
 	)
-
-	// Seed the file so the first reader already sees valid content.
-	seed, _ := json.Marshal(map[string]any{"name": "jev_check", "round": -1})
-	if err := writeFileAtomic(target, seed, 0o644); err != nil {
-		t.Fatalf("seed write: %v", err)
-	}
-
-	stop := make(chan struct{})
-	var emptyReads, parseErrors, readCount atomic.Int64
-	var wg sync.WaitGroup
-	for r := 0; r < readers; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				data, err := os.ReadFile(target)
-				if err != nil {
-					continue
-				}
-				readCount.Add(1)
-				if len(data) == 0 {
-					emptyReads.Add(1)
-					continue
-				}
-				var parsed map[string]any
-				if err := json.Unmarshal(data, &parsed); err != nil {
-					parseErrors.Add(1)
-				}
-			}
-		}()
-	}
 
 	var procs sync.WaitGroup
 	for i := 0; i < writers; i++ {
@@ -544,29 +882,73 @@ func TestWriteFileAtomicConcurrent(t *testing.T) {
 			}
 		}(cmd, i)
 	}
+
+	// Reader barrier: the window opens when the first writer reports its
+	// first successful write — from then on the target always exists and is
+	// always a complete document until the last writer finishes.
+	windowOpen := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			for i := 0; i < writers; i++ {
+				if _, err := os.Stat(fmt.Sprintf("%s.started.%d", target, i)); err == nil {
+					close(windowOpen)
+					return
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+		close(windowOpen) // still open the gate: the writers finishing below decide
+	}()
+
+	stop := make(chan struct{})
+	var overlapReads, emptyReads, parseErrors, schemaInvalid, readErrors atomic.Int64
+	var wg sync.WaitGroup
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-windowOpen
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				data, err := os.ReadFile(target)
+				if err != nil {
+					// Any error — ENOENT included — is a visibility violation:
+					// after the barrier the file must always exist and be whole.
+					readErrors.Add(1)
+					continue
+				}
+				overlapReads.Add(1)
+				if len(data) == 0 {
+					emptyReads.Add(1)
+					continue
+				}
+				var doc map[string]any
+				if err := json.Unmarshal(data, &doc); err != nil {
+					parseErrors.Add(1)
+					continue
+				}
+				if !staleSchemaDocOK(data) {
+					schemaInvalid.Add(1)
+				}
+			}
+		}()
+	}
+
 	procs.Wait()
 	close(stop)
 	wg.Wait()
 
-	if emptyReads.Load() != 0 {
-		t.Fatalf("readers saw %d empty reads: a torn write exposed an empty file", emptyReads.Load())
+	if overlapReads.Load() < 100 {
+		t.Fatalf("OVERLAP_READS=%d (<100): the window never exercised concurrent reads", overlapReads.Load())
 	}
-	if parseErrors.Load() != 0 {
-		t.Fatalf("readers saw %d JSON parse errors: a torn write exposed a partial file", parseErrors.Load())
-	}
-	if readCount.Load() == 0 {
-		t.Fatal("readers never observed the file")
-	}
-	final, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatalf("final read: %v", err)
-	}
-	var last map[string]any
-	if err := json.Unmarshal(final, &last); err != nil {
-		t.Fatalf("final content is not valid JSON: %v", err)
-	}
-	if last["name"] != "jev_check" {
-		t.Fatalf("final content = %v", last)
+	if emptyReads.Load() != 0 || parseErrors.Load() != 0 || schemaInvalid.Load() != 0 || readErrors.Load() != 0 {
+		t.Fatalf("EMPTY=%d PARSE_ERRORS=%d SCHEMA_INVALID=%d READ_ERRORS=%d (all must be 0)",
+			emptyReads.Load(), parseErrors.Load(), schemaInvalid.Load(), readErrors.Load())
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -576,5 +958,39 @@ func TestWriteFileAtomicConcurrent(t *testing.T) {
 		if strings.HasSuffix(entry.Name(), ".tmp") {
 			t.Fatalf("temp file left behind: %s", entry.Name())
 		}
+	}
+}
+
+// TestStaleSchemaDocValidation is the positive control of the concurrent
+// test's reader predicate: an empty file, a truncated document and a
+// structurally wrong document are each recognised as corrupt, while a legal
+// stale-schema document reads clean.
+func TestStaleSchemaDocValidation(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name    string
+		content []byte
+		wantOK  bool
+	}{
+		{"empty", nil, false},
+		{"truncated_json", []byte(`{"name":"jev_check","description":"stale-w0`), false},
+		{"wrong_shape", []byte(`{"name":"other","description":"stale-w0-r0","parameters":{"type":"object"}}`), false},
+		{"missing_parameters", []byte(`{"name":"jev_check","description":"stale-w0-r0"}`), false},
+		{"legal_stale_schema", []byte(`{"name":"jev_check","description":"stale-w0-r0","parameters":{"type":"object","properties":{}}}`), true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(dir, testCase.name+".json")
+			if err := os.WriteFile(path, testCase.content, 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if got := staleSchemaDocOK(data); got != testCase.wantOK {
+				t.Fatalf("staleSchemaDocOK(%q) = %v, want %v", testCase.content, got, testCase.wantOK)
+			}
+		})
 	}
 }

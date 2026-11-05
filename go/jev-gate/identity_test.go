@@ -519,6 +519,14 @@ func TestEnvArgv0Masking(t *testing.T) {
 		"env_dash_a":       "env -a mask-name /usr/local/bin/ctxmode",
 		"env_argv0_long":   "env --argv0 mask-name /usr/local/bin/ctxmode",
 		"env_argv0_inline": "env --argv0=mask-name /usr/local/bin/ctxmode",
+		// GNU long-option abbreviations and short-option clusters resolve to
+		// the same --argv0 argument consumption (verified on this host: all
+		// three forms of `env … mask-name cmd` exec cmd).
+		"env_argv_abbrev": "env --argv mask-name /usr/local/bin/ctxmode",
+		"env_arg_abbrev":  "env --arg mask-name /usr/local/bin/ctxmode",
+		"env_cluster_ia":  "env -ia mask-name /usr/local/bin/ctxmode",
+		"env_cluster_iam": "env -iamask-name /usr/local/bin/ctxmode",
+		"env_split_opts":  `env -S "-a mask-name /usr/local/bin/ctxmode"`,
 	}
 	t.Run("extension_mode", func(t *testing.T) {
 		for name, wrapper := range chains {
@@ -550,32 +558,128 @@ func TestEnvArgv0Masking(t *testing.T) {
 				}
 				environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
 				isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
-				if !isSubagent {
-					t.Fatalf("isSubagent=%v reason=%q, want rejection", isSubagent, reason)
+				if !isSubagent || !strings.Contains(reason, "S4") {
+					t.Fatalf("isSubagent=%v reason=%q, want S4 rejection", isSubagent, reason)
 				}
 			})
 		}
 	})
 }
 
-// TestPromptArgStrippingFlagBoundary pins F-2: -i/-p/--prompt only swallow the
-// next token when it is not itself a '-' flag, so a marker flag right after
-// -p stays visible to the launch-marker scan.
+// TestEnvCommandTokens covers the env hop's option parsing against the real
+// GNU coreutils 9.7 option table (verified on this host): required-argument
+// options and their abbreviations consume the next token, a missing trailing
+// argument yields no executable (never a panic), ambiguous or unknown options
+// yield no executable without touching the next token, and -S re-parses its
+// split value through the option phase.
+func TestEnvCommandTokens(t *testing.T) {
+	cases := []struct {
+		name   string
+		args   []string
+		want   string // executable token env would exec; "" = no executable
+		forbid bool   // whether the residual resolves to a forbidden runtime
+	}{
+		// argv0 mask forms: every one consumes the mask, never the command.
+		{"argv0", []string{"env", "--argv0", "mask", "cmd"}, "cmd", false},
+		{"argv0_inline", []string{"env", "--argv0=mask", "cmd"}, "cmd", false},
+		{"argv_abbrev", []string{"env", "--argv", "mask", "cmd"}, "cmd", false},
+		{"arg_abbrev", []string{"env", "--arg", "mask", "cmd"}, "cmd", false},
+		{"a_short", []string{"env", "-a", "mask", "cmd"}, "cmd", false},
+		{"cluster_ia", []string{"env", "-ia", "mask", "cmd"}, "cmd", false},
+		{"cluster_iam", []string{"env", "-iamask", "cmd"}, "cmd", false},
+		{"argv0_consumes_flag_token", []string{"env", "--argv0", "-i", "cmd"}, "cmd", false},
+		// Other required-argument options.
+		{"unset", []string{"env", "-u", "FOO", "cmd"}, "cmd", false},
+		{"unset_abbrev", []string{"env", "--un", "FOO", "cmd"}, "cmd", false},
+		{"unset_inline", []string{"env", "--unset=FOO", "cmd"}, "cmd", false},
+		{"chdir", []string{"env", "-C", "/tmp", "cmd"}, "cmd", false},
+		{"cluster_u", []string{"env", "-uFOO", "cmd"}, "cmd", false},
+		// Trailing missing arguments: env exits(125) — no executable, no panic.
+		{"trailing_a", []string{"env", "-a"}, "", false},
+		{"trailing_argv0", []string{"env", "--argv0"}, "", false},
+		{"trailing_u", []string{"env", "-u"}, "", false},
+		{"trailing_unset", []string{"env", "--unset"}, "", false},
+		{"trailing_chdir", []string{"env", "-C"}, "", false},
+		{"trailing_split", []string{"env", "-S"}, "", false},
+		{"trailing_cluster_ia", []string{"env", "-ia"}, "", false},
+		// Unknown / ambiguous / malformed options: env exits(125), the next
+		// token is neither an argument nor the executable.
+		{"unknown_long", []string{"env", "--zzz", "x", "cmd"}, "", false},
+		{"ambiguous_d", []string{"env", "--d", "x", "cmd"}, "", false},
+		{"ambiguous_ig", []string{"env", "--ig", "x", "cmd"}, "", false},
+		{"unknown_short", []string{"env", "-Z", "x", "cmd"}, "", false},
+		{"no_arg_option_with_value", []string{"env", "--debug=x", "cmd"}, "", false},
+		{"terminal_help", []string{"env", "--help", "cmd"}, "", false},
+		{"terminal_version_abbrev", []string{"env", "--vers", "cmd"}, "", false},
+		{"null_with_command", []string{"env", "-0", "cmd"}, "", false},
+		{"null_alone", []string{"env", "-0"}, "", false},
+		// Optional-argument options take their value only via `=`.
+		{"block_signal_optional", []string{"env", "--block-signal", "cmd"}, "cmd", false},
+		{"block_signal_inline", []string{"env", "--block-signal=PIPE", "cmd"}, "cmd", false},
+		{"block_signal_abbrev", []string{"env", "--b=PIPE", "cmd"}, "cmd", false},
+		// Operand phase: no permutation, `-` implies -i, `--` ends options.
+		{"assign_before_option", []string{"env", "FOO=1", "-a", "mask", "cmd"}, "-a", false},
+		{"ddash_assign", []string{"env", "--", "FOO=1", "cmd"}, "cmd", false},
+		{"ddash_command", []string{"env", "--", "cmd"}, "cmd", false},
+		{"lone_dash", []string{"env", "-", "FOO=1", "cmd"}, "cmd", false},
+		{"assigns_only", []string{"env", "FOO=1", "BAR=2"}, "", false},
+		// -S re-splits and re-parses through the option phase.
+		{"split_command", []string{"env", "-S", "cmd arg1"}, "cmd", false},
+		{"split_with_options", []string{"env", "-S", "-a mask cmd"}, "cmd", false},
+		{"split_inline", []string{"env", "-Scmd arg"}, "cmd", false},
+		{"split_long_abbrev", []string{"env", "--spl=cmd arg"}, "cmd", false},
+		{"split_rest_appended", []string{"env", "-S", "cmd", "rest"}, "cmd", false},
+		// Forbidden-runtime residuals through wrappers.
+		{"argv0_mask_ctxmode", []string{"env", "--argv0", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+		{"argv_abbrev_ctxmode", []string{"env", "--argv", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+		{"arg_abbrev_ctxmode", []string{"env", "--arg", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+		{"cluster_ia_ctxmode", []string{"env", "-ia", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+		{"split_opts_ctxmode", []string{"env", "-S", "-a mask /usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+		{"assign_ctxmode", []string{"env", "FOO=1", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := executableTokenOf(testCase.args, 0); got != testCase.want {
+				t.Fatalf("executableTokenOf(%v) = %q, want %q", testCase.args, got, testCase.want)
+			}
+			if got := checkExecutableTokens(testCase.args, 0); got != testCase.forbid {
+				t.Fatalf("checkExecutableTokens(%v) = %v, want %v", testCase.args, got, testCase.forbid)
+			}
+		})
+	}
+}
+
+// TestPromptArgStrippingFlagBoundary pins the prompt-consumption rule of
+// PiG (ref/PiG/coding/cli/args.go:258-270): -p/--print swallows the next
+// token only when it is not an @file and not flag-shaped (except
+// "---"-led text). Marker flags right after -p stay visible to the scan;
+// "---"-led prompt text is prompt, not a flag.
 func TestPromptArgStrippingFlagBoundary(t *testing.T) {
 	marked := [][]string{
 		{"agy", "-p", "--name", "role-x"},
 		{"agy", "-p", "--agent", "worker"},
 		{"prog", "-p", "x", "--agent", "worker"},
+		// An @file right after -p is PiG's file-inclusion form, not prompt
+		// text: it stays visible, and a marker-looking token is a marker.
+		{"pi", "-p", "@/tmp/dispatch-task.md"},
+		{"pi", "--print", "@/tmp/dispatch-task.md"},
 	}
 	for _, argv := range marked {
 		if !HasSubagentCliFlags(argv) {
-			t.Fatalf("argv=%v must stay a launch marker: -p may not swallow a flag token", argv)
+			t.Fatalf("argv=%v must stay a launch marker: -p may not swallow a structural token", argv)
 		}
 	}
-	// A prompt argument that does not start with '-' is still stripped: prompt
-	// text mentioning a marker is not launch evidence.
-	if HasSubagentCliFlags([]string{"pi", "-p", "contains --name role-x in prompt text"}) {
-		t.Fatal("prompt text must be stripped, not scanned")
+	// Prompt text that is legitimately consumed — plain text and "---"-led
+	// text — must never be scanned for markers.
+	clean := [][]string{
+		{"pi", "-p", "contains --name role-x in prompt text"},
+		{"pi", "-p", "--- review /tmp/dispatch-x.md"},
+		{"pi", "--print", "text /tmp/dispatch-task.md"},
+	}
+	for _, argv := range clean {
+		if HasSubagentCliFlags(argv) {
+			t.Fatalf("argv=%v prompt text must be stripped, not scanned", argv)
+		}
 	}
 }
 

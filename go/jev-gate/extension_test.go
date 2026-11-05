@@ -7,12 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
+	excludetoolsguard "github.com/dorokuma/pi-extensions/go/exclude-tools-guard"
 )
 
 // TestExecuteCheckInvalidTask pins the invalid-task branch and its shape.
@@ -464,5 +467,120 @@ func TestExecuteCheckRequestBodyIsSmall(t *testing.T) {
 		map[string]any{"task": "gate_scan", "payload": "plain text"})
 	if result.IsError {
 		t.Fatalf("unexpected error: %q", result.Content)
+	}
+}
+
+// ---- Cross-extension Packed Cell regression (MF-2) ------------------------
+//
+// PIG_HARNESS_ARGV_FILE is process-level state shared by every member of a
+// packed cell. An earlier implementation deleted the variable inside each
+// extension's argv bridge, so whichever extension resolved its identity first
+// blinded every sibling that read it later (e.g. at EventSessionStart). These
+// tests pin both init orders: whichever extension runs first must leave the
+// variable readable, and both must still hit the launch marker inside it.
+//
+// Each order isolates BOTH default argv caches with fresh injected caches
+// (jev-gate: IdentityEnv.ArgvCache; exclude-tools-guard:
+// IdentityEnv.ArgvCache + LoadEffectiveArgsWithCache) so the second order
+// cannot ride the first order's cached argv — the file must really be read
+// again. The role marker is unique per order for the same reason: stale
+// cache would still be a marker but never the CURRENT order's marker.
+
+// packedCellArgvFixture installs a PIG_HARNESS_ARGV_FILE carrying a
+// ["--name","role-<marker>"] launch marker and clears every other identity
+// input so the only reason either extension can return "subagent" is that
+// file. It returns the expected marker substring.
+func packedCellArgvFixture(t *testing.T, marker string) (string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "argv.json")
+	if err := os.WriteFile(path, []byte(`["--name","role-`+marker+`"]`), 0o600); err != nil {
+		t.Fatalf("write argv file: %v", err)
+	}
+	// Clear the real packed-cell environment this test process may run under
+	// (CTXMODE_ROLE/PIG_EXT_* are set inside a live cell): any of them would
+	// fail-closed for a different reason and hide what is being measured.
+	for _, key := range os.Environ() {
+		name, _, _ := strings.Cut(key, "=")
+		switch {
+		case strings.HasPrefix(name, "PIG_EXT_"):
+			t.Setenv(name, "")
+		case name == "CTXMODE_ROLE" || name == "PI_SUBAGENT" || name == "PI_ROLE" || name == "HERDR_PANE_ID":
+			t.Setenv(name, "")
+		}
+	}
+	t.Setenv("PIG_HARNESS_ARGV_FILE", path)
+	return path, "launch marker: argv has --name role-"
+}
+
+// assertPackedCellArgvHit asserts both extensions resolved as subagent
+// BECAUSE of the argv bridge marker (not for any unrelated fail-closed
+// reason), and that PIG_HARNESS_ARGV_FILE stayed readable afterwards.
+func assertPackedCellArgvHit(t *testing.T, path, want, jevReason, guardReason string) {
+	t.Helper()
+	if got := os.Getenv("PIG_HARNESS_ARGV_FILE"); got != path {
+		t.Fatalf("PIG_HARNESS_ARGV_FILE must stay readable for packed cell siblings, got %q", got)
+	}
+	if !strings.Contains(jevReason, want) {
+		t.Fatalf("jev-gate reason = %q, want the argv bridge launch marker", jevReason)
+	}
+	if !strings.Contains(guardReason, want) {
+		t.Fatalf("exclude-tools-guard reason = %q, want the argv bridge launch marker", guardReason)
+	}
+	// Negative-marker only: the file must never be able to elevate a session —
+	// both verdicts went subagent, verified by the reasons above.
+}
+
+// TestPackedCellArgvFileSharedAcrossExtensions runs both init orders with
+// each order's argv caches freshly isolated: whichever extension resolves
+// first must leave the shared file readable, and the sibling must hit the
+// CURRENT order's launch marker through its own fresh read.
+func TestPackedCellArgvFileSharedAcrossExtensions(t *testing.T) {
+	for _, order := range []struct {
+		name     string
+		jevFirst bool
+	}{
+		{"JevFirst", true},
+		{"GuardFirst", false},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			path, want := packedCellArgvFixture(t, "packed-"+order.name)
+
+			// Fresh caches per side per order — never the process defaults.
+			jevEnv := IdentityEnv{Getenv: os.Getenv, Args: []string{"runner"}, ArgvCache: &ArgvCache{}}
+			guardEnv := excludetoolsguard.IdentityEnv{Getenv: os.Getenv, Args: []string{"runner"}, ArgvCache: &excludetoolsguard.ArgvCache{}}
+
+			var jevSub, guardSub bool
+			var jevReason, guardReason string
+			if order.jevFirst {
+				extension := Extension()
+				if extension == nil || extension.Name() != "jev-gate" {
+					t.Fatalf("jev-gate Extension() = %v", extension)
+				}
+				jevSub, jevReason = resolveAgentIdentityWithEnv(jevEnv)
+				guardSub, guardReason = excludetoolsguard.ResolveAgentIdentityWithEnv(guardEnv)
+			} else {
+				guardSub, guardReason = excludetoolsguard.ResolveAgentIdentityWithEnv(guardEnv)
+				extension := Extension()
+				if extension == nil || extension.Name() != "jev-gate" {
+					t.Fatalf("jev-gate Extension() = %v", extension)
+				}
+				jevSub, jevReason = resolveAgentIdentityWithEnv(jevEnv)
+			}
+			if !jevSub || !guardSub {
+				t.Fatalf("both extensions must resolve subagent via the shared argv file: jev=%v guard=%v", jevSub, guardSub)
+			}
+
+			// A third fresh cache proves the bridge file itself is still
+			// readable after both resolutions (not merely served from cache).
+			args, err := excludetoolsguard.LoadEffectiveArgsWithCache(os.Getenv, []string{"runner"}, &excludetoolsguard.ArgvCache{})
+			if err != nil {
+				t.Fatalf("LoadEffectiveArgsWithCache: %v", err)
+			}
+			if joined := strings.Join(args, " "); joined != "runner --name role-packed-"+order.name {
+				t.Fatalf("effective args = %v, must still read the shared file", args)
+			}
+
+			assertPackedCellArgvHit(t, path, want, jevReason, guardReason)
+		})
 	}
 }

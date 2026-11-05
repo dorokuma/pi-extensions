@@ -28,8 +28,9 @@ package jevgate
 // a non-empty PI_ROLE, and the argv markers --agent, "--name role-",
 // "/tmp/herdr-role-sessions", "/tmp/dispatch-" — scanned on this process's
 // environment + bridged argv AND on every ancestor's /proc environ + cmdline.
-// The -i/-p/--prompt argument tokens are stripped before the argv scan so a
-// main-agent prompt that merely mentions a dispatch path is not a marker.
+// The -i/-p/--prompt/--print argument tokens are stripped before the argv
+// scan (PiG consumption rule: no @file, no flag token except "---"-led text)
+// so a main-agent prompt that merely mentions a dispatch path is not a marker.
 //
 // Two call modes share this core:
 //   - extension mode (IsSubagentSession): the host is the first pi/pig
@@ -420,6 +421,249 @@ func moduleValueFromToken(token string) (string, bool) {
 	return "", false
 }
 
+// ---------------------------------------------------------------------------
+// GNU env(1) option model (coreutils 9.7, verified against `env --help` /
+// `env --version` and live probes on this host).
+//
+// Token phases are strict: [options] [NAME=VALUE]* [command args...] — the
+// first non-option token switches to the operand phase for good, so
+// `env FOO=1 -a m cmd` runs `-a` as the command, and `env --` still parses
+// assignments after the terminator. `-S/--split-string` is the one exception
+// with real bite: its string is re-split and the pieces are prepended to the
+// remaining argv, then the whole thing is re-parsed through the same option
+// phase (a shebang line carries options inside it).
+//
+// Long options accept unambiguous prefix abbreviations (`--argv` → `--argv0`,
+// `--un` → `--unset`); ambiguous or unknown options make env(1) exit(125)
+// without running anything, so the scan must return "no executable" rather
+// than guessing — an ambiguous option must never consume the next token as
+// its argument, and that token must never be read as the wrapped executable
+// either (e.g. `env --argv mask-name ctxmode` resolves `--argv` → `--argv0`
+// and consumes mask-name; it must NOT leave mask-name as the executable).
+//
+// envArgClass is the GNU argument class of one env option.
+type envArgClass int
+
+const (
+	envArgNone     envArgClass = iota // takes no argument (`=value` → error 125)
+	envArgRequired                    // needs a value: `=v` or the next token
+	envArgOptional                    // only `=v` is a value; next token is free
+	envArgTerminal                    // prints and exits: --help / --version
+)
+
+// envLongOptions is the long-option table of coreutils 9.7 env.
+var envLongOptions = map[string]envArgClass{
+	"argv0":                envArgRequired,
+	"ignore-environment":   envArgNone,
+	"null":                 envArgNone,
+	"unset":                envArgRequired,
+	"chdir":                envArgRequired,
+	"split-string":         envArgRequired,
+	"block-signal":         envArgOptional,
+	"default-signal":       envArgOptional,
+	"ignore-signal":        envArgOptional,
+	"list-signal-handling": envArgNone,
+	"debug":                envArgNone,
+	"help":                 envArgTerminal,
+	"version":              envArgTerminal,
+}
+
+// resolveEnvLongOption resolves the name part of a `--name[=value]` token to
+// the full long option via GNU unambiguous-prefix matching (`--argv` →
+// `--argv0`, `--un` → `--unset`). ok=false means the token is not a valid
+// option — unknown or an ambiguous abbreviation (`--d`, `--ig`, `--a`): env
+// exits(125) without executing anything in that shape, so the caller treats
+// the whole hop as "no executable" and must not touch the following token.
+func resolveEnvLongOption(name string) (string, envArgClass, bool) {
+	if class, exact := envLongOptions[name]; exact {
+		return name, class, true
+	}
+	var match string
+	var class envArgClass
+	matches := 0
+	for candidate, candidateClass := range envLongOptions {
+		if strings.HasPrefix(candidate, name) {
+			match = candidate
+			class = candidateClass
+			matches++
+		}
+	}
+	if matches == 1 {
+		return match, class, true
+	}
+	return "", 0, false
+}
+
+// envOnlyOperands reports whether every remaining token is operand-phase
+// filler — `-` (which itself begins the operand phase), `--`, or an
+// assignment — i.e. env reaches the end without a command. Used only to
+// decide whether `-0/--null` saw a command; anything option-shaped that
+// remains is conservatively treated as a would-be command (env would error
+// on `-0` + command anyway).
+func envOnlyOperands(tail []string) bool {
+	operandPhase := false
+	for _, token := range tail {
+		if !operandPhase && (token == "--" || token == "-") {
+			operandPhase = true
+			continue
+		}
+		if isEnvAssignment(token) {
+			operandPhase = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// envCommandTokens unwraps the option/assignment phases of env's argv tail
+// (the tokens after `env` itself) and returns the command argv env would
+// exec. ok=false means env cannot produce an executable at all: a missing
+// required argument (`env -a`, `env --argv0`, cluster tail `-a`, `-u/-C/-S`
+// at the end), an unknown or ambiguous long option, `=`-values on
+// no-argument options, a terminal option, or `-0/--null` combined with a
+// command — env itself errors out (or prints) in every one of those shapes,
+// and pretending the hop resolves to anything would misclassify it. ok=true
+// with an empty result is a clean "no command" invocation (`env FOO=1`).
+//
+// Token phases are strict: [options] [NAME=VALUE]* [command args...] — the
+// first non-option token switches to the operand phase for good (verified:
+// `env FOO=1 -a m cmd` execs `-a` as the command; `env -- FOO=1 cmd` still
+// parses the assignment after `--`). `-S/--split-string` is the exception
+// with real bite: its string is re-split and the pieces replace its argument
+// slot, then the stream is re-parsed through the option phase (a shebang
+// line carries options inside it — verified: `-S '-a mask cmd'` honours the
+// argv0 mask).
+func envCommandTokens(tail []string, depth int) ([]string, bool) {
+	if depth > 8 {
+		return nil, false
+	}
+	optionsDone := false
+	for len(tail) > 0 {
+		token := tail[0]
+		if !optionsDone && (token == "-" || token == "--") {
+			// `--` ends the option phase; a lone `-` implies -i and — verified
+			// on this host — ALSO begins the operand phase (`env - -a m cmd`
+			// execs `-a`, `env - -` errors on the second `-`).
+			optionsDone = true
+			tail = tail[1:]
+			continue
+		}
+		if optionsDone || isEnvAssignment(token) || !strings.HasPrefix(token, "-") {
+			// Operand phase: assignments are consumed; the first other token
+			// is the command. An assignment permanently ends option parsing
+			// (env does not permute): `env FOO=1 -a m cmd` execs `-a`.
+			if isEnvAssignment(token) {
+				tail = tail[1:]
+				optionsDone = true
+				continue
+			}
+			return tail, true
+		}
+		if strings.HasPrefix(token, "--") {
+			name := token[2:]
+			inline := ""
+			hasInline := false
+			if eq := strings.Index(name, "="); eq >= 0 {
+				inline, name, hasInline = name[eq+1:], name[:eq], true
+			}
+			if name == "" {
+				return nil, false
+			}
+			resolved, class, ok := resolveEnvLongOption(name)
+			if !ok {
+				return nil, false
+			}
+			switch class {
+			case envArgTerminal:
+				// --help/--version print and exit: nothing is ever exec'd.
+				return nil, false
+			case envArgNone:
+				if hasInline {
+					// "option doesn't allow an argument" — env exits(125).
+					return nil, false
+				}
+				if resolved == "null" {
+					// --null prints the environment and refuses a command.
+					if envOnlyOperands(tail[1:]) {
+						return nil, true
+					}
+					return nil, false
+				}
+				tail = tail[1:]
+				continue
+			case envArgOptional:
+				// Optional-argument options take their value only via `=`;
+				// the next token stays free (it may be the command).
+				tail = tail[1:]
+				continue
+			default: // envArgRequired
+				if hasInline {
+					if resolved == "split-string" {
+						tail = append(strings.Fields(inline), tail[1:]...)
+						continue
+					}
+					tail = tail[1:]
+					continue
+				}
+				if len(tail) < 2 {
+					// Missing required argument: env exits(125), no exec.
+					return nil, false
+				}
+				if resolved == "split-string" {
+					tail = append(strings.Fields(tail[1]), tail[2:]...)
+					continue
+				}
+				tail = tail[2:]
+				continue
+			}
+		}
+		// Short-option cluster: -a/-u/-C/-S take an argument — the rest of
+		// the cluster when present, else the next token. The cluster loop
+		// resolves how far the tail advances before it is consumed.
+		cluster := token
+		consume := 1 // 1 = just this token, 2 = this token + its argument token
+		for pos := 1; pos < len(cluster); pos++ {
+			switch cluster[pos] {
+			case 'i', 'v':
+				continue
+			case '0':
+				if envOnlyOperands(tail[1:]) {
+					return nil, true
+				}
+				return nil, false
+			case 'a', 'u', 'C':
+				if pos+1 < len(cluster) {
+					// The rest of the cluster is this letter's argument.
+					pos = len(cluster)
+					continue
+				}
+				if len(tail) < 2 {
+					return nil, false // missing required argument
+				}
+				consume = 2
+				pos = len(cluster)
+			case 'S':
+				if pos+1 < len(cluster) {
+					tail = append(strings.Fields(cluster[pos+1:]), tail[1:]...)
+				} else if len(tail) >= 2 {
+					tail = append(strings.Fields(tail[1]), tail[2:]...)
+				} else {
+					return nil, false // missing required argument
+				}
+				// The split pieces re-enter the option phase in place.
+				optionsDone = false
+				consume = 0
+				pos = len(cluster)
+			default:
+				return nil, false // unknown short option
+			}
+		}
+		tail = tail[consume:]
+	}
+	return nil, true
+}
+
 // checkExecutableTokens reports whether the argv resolves — through env
 // wrappers and interpreters — to a forbidden agent/tool runtime.
 func checkExecutableTokens(tokens []string, depth int) bool {
@@ -429,70 +673,17 @@ func checkExecutableTokens(tokens []string, depth int) bool {
 	base := argv0Base(tokens)
 
 	if base == "env" {
-		// env KEY=VAL assignments and env's own flags are skipped before
-		// recursing into the wrapped executable; "--" ends env option parsing.
-		index := 1
-		afterDashDash := false
-		for index < len(tokens) {
-			token := tokens[index]
-			if isEnvAssignment(token) {
-				index++
-				continue
-			}
-			if !afterDashDash {
-				if token == "--" {
-					afterDashDash = true
-					index++
-					continue
-				}
-				if !strings.HasPrefix(token, "-") {
-					break
-				}
-				// env -S/--split-string: the value is re-split and prepended.
-				if token == "-S" || token == "--split-string" {
-					splitValue := ""
-					if index+1 < len(tokens) {
-						splitValue = tokens[index+1]
-					}
-					rest := append(strings.Fields(splitValue), tokens[index+2:]...)
-					if len(rest) == 0 {
-						return false
-					}
-					return checkExecutableTokens(rest, depth+1)
-				}
-				if inline := inlineSplitValue(token); inline != "" {
-					rest := append(strings.Fields(inline), tokens[index+1:]...)
-					if len(rest) == 0 {
-						return false
-					}
-					return checkExecutableTokens(rest, depth+1)
-				}
-				// -u/--unset, -C/--chdir and -a/--argv0 consume their own argument
-				// token: the argv0 mask name must never be read as the wrapped
-				// executable (F-1).
-				if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" ||
-					token == "-a" || token == "--argv0" {
-					index += 2
-					continue
-				}
-				if strings.HasPrefix(token, "--unset=") || strings.HasPrefix(token, "--chdir=") ||
-					strings.HasPrefix(token, "--argv0=") ||
-					(strings.HasPrefix(token, "-u") && len(token) > 2) ||
-					(strings.HasPrefix(token, "-C") && len(token) > 2) ||
-					(strings.HasPrefix(token, "-a") && len(token) > 2) {
-					index++
-					continue
-				}
-				// Any other env flag is boolean and takes no argument.
-				index++
-				continue
-			}
-			break
-		}
-		if index >= len(tokens) {
+		// Unwrap env's options and assignments down to the command it would
+		// exec (F-1/M1/M2): the -a/--argv0 mask value and every other option
+		// argument must never be mistaken for the wrapped executable, and an
+		// env invocation that can never exec (missing option argument,
+		// unknown/ambiguous option, terminal option) resolves to "no
+		// executable" instead of guessing.
+		residual, ok := envCommandTokens(tokens[1:], depth)
+		if !ok || len(residual) == 0 {
 			return false
 		}
-		return checkExecutableTokens(tokens[index:], depth+1)
+		return checkExecutableTokens(residual, depth+1)
 	}
 
 	if !isInterpreterBase(base) {
@@ -535,54 +726,22 @@ func checkExecutableTokens(tokens []string, depth int) bool {
 	return false
 }
 
-// inlineSplitValue extracts the embedded string of env's joined
-// --split-string=... / -S... forms ("" when the token is not one).
-func inlineSplitValue(token string) string {
-	if strings.HasPrefix(token, "--split-string=") {
-		return token[len("--split-string="):]
-	}
-	if strings.HasPrefix(token, "-S") && len(token) > 2 {
-		return token[2:]
-	}
-	return ""
-}
-
 // executableTokenOf unwraps env wrappers (KEY=VAL, flags, -S/--split-string,
-// -- terminator) and returns the token of the executable actually run.
+// -- terminator) and returns the token of the executable actually run. The
+// env hop shares envCommandTokens with checkExecutableTokens so the argv0
+// mask, abbreviations and no-exec shapes can never drift apart: an env
+// invocation that cannot exec resolves to "".
 func executableTokenOf(tokens []string, depth int) string {
 	if depth > 8 || len(tokens) == 0 {
 		return ""
 	}
 	base := argv0Base(tokens)
 	if base == "env" {
-		index := 1
-		for index < len(tokens) {
-			token := tokens[index]
-			if token == "--" {
-				index++
-				break
-			}
-			if isEnvAssignment(token) || !strings.HasPrefix(token, "-") {
-				break
-			}
-			if token == "-S" || token == "--split-string" {
-				splitValue := ""
-				if index+1 < len(tokens) {
-					splitValue = tokens[index+1]
-				}
-				rest := append(strings.Fields(splitValue), tokens[index+2:]...)
-				return executableTokenOf(rest, depth+1)
-			}
-			// -a/--argv0 (and -u/--unset, -C/--chdir) consume one argument
-			// token that must not be mistaken for the wrapped executable (F-1).
-			if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" ||
-				token == "-a" || token == "--argv0" {
-				index += 2
-				continue
-			}
-			index++
+		residual, ok := envCommandTokens(tokens[1:], depth)
+		if !ok || len(residual) == 0 {
+			return ""
 		}
-		return executableTokenOf(tokens[index:], depth+1)
+		return executableTokenOf(residual, depth+1)
 	}
 	return tokens[0]
 }
@@ -675,25 +834,40 @@ var agentRuntimePattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js`)
 // Negative launch markers (env + argv, prompt arguments stripped).
 // ---------------------------------------------------------------------------
 
-// StripPromptArgTokens removes -i, -p, --prompt and the one argument token
-// that follows each — only when the next token is not itself a '-' flag:
-// a dash-prefixed token is an option, not prompt text, so it stays visible
-// to the marker scan (F-2) — plus their = forms: a main agent's prompt text
-// may legitimately contain "--agent" or "/tmp/dispatch-..." as task
-// description, which is not launch evidence. Exported for the MCP layer and
-// tests.
+// StripPromptArgTokens removes the prompt-carrying flags and the one
+// argument token each may consume, so a main agent's prompt text that merely
+// mentions "--agent" or "/tmp/dispatch-..." is not mistaken for a launch
+// marker. Exported for the MCP layer and tests.
+//
+// Consumption rule (PiG, verified against ref/PiG/coding/cli/args.go:258-270,
+// the "--print" || "-p" case): the next token counts as prompt text only when
+// it does NOT start with "@" (an @file inclusion stays visible to the
+// marker scan) and is NOT flag-shaped — where a token starting with "---"
+// counts as prompt text, not a flag (PiG lets "---"-led positionals be
+// messages). A plain "-"-prefixed token is an option and stays visible, so
+// `pi -p --name role-x` still trips the marker scan (F-2).
+//
+// PiG's parser defines no -i/--prompt option (verified: no such case in
+// args.go); both remain in the strip set for the agy-side flag family whose
+// consumption semantics are unverified — the same conservative rule is
+// applied so neither can ever swallow a structural marker token. The
+// "=value" inline forms always carry their own argument.
 func StripPromptArgTokens(tokens []string) []string {
 	structural := make([]string, 0, len(tokens))
 	for index := 0; index < len(tokens); index++ {
 		token := tokens[index]
-		if token == "-i" || token == "-p" || token == "--prompt" {
-			if index+1 < len(tokens) && !strings.HasPrefix(tokens[index+1], "-") {
-				index++
+		if token == "-i" || token == "-p" || token == "--prompt" || token == "--print" {
+			if index+1 < len(tokens) {
+				next := tokens[index+1]
+				if !strings.HasPrefix(next, "@") &&
+					(!strings.HasPrefix(next, "-") || strings.HasPrefix(next, "---")) {
+					index++
+				}
 			}
 			continue
 		}
 		if strings.HasPrefix(token, "-i=") || strings.HasPrefix(token, "-p=") ||
-			strings.HasPrefix(token, "--prompt=") {
+			strings.HasPrefix(token, "--prompt=") || strings.HasPrefix(token, "--print=") {
 			continue
 		}
 		structural = append(structural, token)
