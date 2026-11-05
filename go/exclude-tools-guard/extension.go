@@ -499,35 +499,39 @@ func ResetDefaultArgvCache() {
 // or suppressing argv-based negative markers like --name role-).
 // Only when PIG_HARNESS_ARGV_FILE is completely unset/empty does it safely fall back to baseArgs.
 //
-// Post-use cleanup:
-// After reading, unsetenv is invoked to delete PIG_HARNESS_ARGV_FILE from the environment
-// (matching runtime-node/process-identity.mjs:22 `delete process.env.PIG_HARNESS_ARGV_FILE`),
-// preventing the path from leaking to processes spawned by the extension.
+// Post-use environment (packed cell):
+// PIG_HARNESS_ARGV_FILE is deliberately NOT deleted after the read. Extensions inside one
+// packed cell share the process environment, so a single-extension unset would destroy the
+// file path for every sibling that resolves its identity later (e.g. at EventSessionStart).
+// The variable stays readable and is only ever an additional NEGATIVE marker source: it can
+// push the verdict toward subagent, it can never elevate a session to main.
 //
 // Caching across turns:
-// Successful parse results are stored in the ArgvCache so subsequent turns within the same process
-// (where PIG_HARNESS_ARGV_FILE has been unset) still retain effective arguments.
+// Successful parse results are stored in the ArgvCache so subsequent turns within the same
+// process still retain effective arguments even if the variable disappears (harness cleanup,
+// a re-export pointing at a missing path, etc.).
 // Three states are distinguished deliberately:
 //  1. env unset and nothing cached (legitimate fallback to os.Args) - NOT cached, so a later turn
 //     that does see an env var still reads it.
-//  2. env set and parse succeeded - cached; later turns reuse it after the unsetenv cleanup.
+//  2. env set and parse succeeded - cached; later turns reuse it.
 //  3. env set but read/parse failed - error is returned and the failure is NOT cached, so
 //     fail-closed is re-evaluated on every call instead of being frozen into "always subagent".
-func LoadEffectiveArgs(getenv func(string) string, unsetenv func(string) error, baseArgs []string) ([]string, error) {
-	return LoadEffectiveArgsWithCache(getenv, unsetenv, baseArgs, defaultArgvCache)
+func LoadEffectiveArgs(getenv func(string) string, baseArgs []string) ([]string, error) {
+	return LoadEffectiveArgsWithCache(getenv, baseArgs, defaultArgvCache)
 }
 
 // LoadEffectiveArgsWithCache merges baseArgs with arguments read from PIG_HARNESS_ARGV_FILE,
 // utilizing the provided ArgvCache (or default package cache if nil).
-func LoadEffectiveArgsWithCache(getenv func(string) string, unsetenv func(string) error, baseArgs []string, cache *ArgvCache) ([]string, error) {
+//
+// The environment variable is kept after the read (see LoadEffectiveArgs): inside a packed
+// cell it is shared state that sibling extensions also consume; removing it from one
+// extension would silently blind the others to the launch markers it carries.
+func LoadEffectiveArgsWithCache(getenv func(string) string, baseArgs []string, cache *ArgvCache) ([]string, error) {
 	if cache == nil {
 		cache = defaultArgvCache
 	}
 	if getenv == nil {
 		getenv = os.Getenv
-	}
-	if unsetenv == nil {
-		unsetenv = os.Unsetenv
 	}
 	argvFile := strings.TrimSpace(getenv("PIG_HARNESS_ARGV_FILE"))
 	if argvFile == "" {
@@ -536,10 +540,6 @@ func LoadEffectiveArgsWithCache(getenv func(string) string, unsetenv func(string
 		}
 		return baseArgs, nil
 	}
-
-	defer func() {
-		_ = unsetenv("PIG_HARNESS_ARGV_FILE")
-	}()
 
 	data, err := os.ReadFile(argvFile)
 	if err != nil {
@@ -604,7 +604,6 @@ func SubagentLaunchMarker(getenv func(string) string, args []string) (string, bo
 // IdentityEnv encapsulates environmental inputs for testing and production identity resolution.
 type IdentityEnv struct {
 	Getenv      func(string) string
-	Unsetenv    func(string) error
 	Args        []string
 	PID         int
 	SocketPath  string
@@ -667,7 +666,6 @@ func DetectSubprocessForm(getenv func(string) string, environ func() []string) (
 func DefaultIdentityEnv() IdentityEnv {
 	return IdentityEnv{
 		Getenv:      os.Getenv,
-		Unsetenv:    os.Unsetenv,
 		Args:        os.Args,
 		PID:         os.Getpid(),
 		SocketPath:  HerdrSocketFile,
@@ -755,9 +753,6 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 	if env.Getenv == nil {
 		env.Getenv = os.Getenv
 	}
-	if env.Unsetenv == nil {
-		env.Unsetenv = os.Unsetenv
-	}
 	if env.ReadStat == nil {
 		env.ReadStat = ReadProcPpid
 	}
@@ -780,7 +775,7 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 	// Merge os.Args with PIG_HARNESS_ARGV_FILE arguments if present.
 	// Fail-closed policy (M2): if PIG_HARNESS_ARGV_FILE is set but read/parse fails,
 	// resolve as subagent immediately.
-	effectiveArgs, err := LoadEffectiveArgsWithCache(env.Getenv, env.Unsetenv, env.Args, env.ArgvCache)
+	effectiveArgs, err := LoadEffectiveArgsWithCache(env.Getenv, env.Args, env.ArgvCache)
 	if err != nil {
 		return true, fmt.Sprintf("argv bridge failed: %v", err)
 	}

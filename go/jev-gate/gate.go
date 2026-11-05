@@ -130,7 +130,9 @@ func jsNumberOr(raw string, fallback float64) float64 {
 
 // jsNumber reproduces JavaScript Number(string) for the inputs these variables
 // can carry: surrounding whitespace is ignored, empty is 0, the Infinity tokens
-// are infinite, a hex literal is its integer value, and anything else is NaN.
+// are infinite, a hex (0x), binary (0b) or octal (0o) literal is its integer
+// value, and anything else is NaN. A signed prefix on a radix literal is not a
+// literal in JavaScript either: "+0b10" is NaN here too.
 func jsNumber(raw string) float64 {
 	text := strings.TrimSpace(raw)
 	if text == "" {
@@ -145,9 +147,16 @@ func jsNumber(raw string) float64 {
 	if value, err := strconv.ParseFloat(text, 64); err == nil {
 		return value
 	}
-	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
-		if value, err := strconv.ParseUint(text[2:], 16, 64); err == nil {
-			return float64(value)
+	for _, prefix := range []struct {
+		token string
+		base  int
+	}{
+		{"0x", 16}, {"0X", 16}, {"0b", 2}, {"0B", 2}, {"0o", 8}, {"0O", 8},
+	} {
+		if strings.HasPrefix(text, prefix.token) {
+			if value, err := strconv.ParseUint(text[2:], prefix.base, 64); err == nil {
+				return float64(value)
+			}
 		}
 	}
 	return math.NaN()
@@ -155,12 +164,13 @@ func jsNumber(raw string) float64 {
 
 // nodeSetTimeout clamps a delay the way Node's setTimeout does: any value that
 // is not a usable delay (NaN, infinite, below 1ms, above the 32-bit limit) is
-// replaced by 1ms, and the timer fires with that 1ms warning-free budget.
+// replaced by 1ms, and a usable delay is truncated to whole milliseconds (the
+// sub-millisecond fraction is not a delay the timer can fire).
 func nodeSetTimeout(ms float64) time.Duration {
 	if math.IsNaN(ms) || math.IsInf(ms, 0) || ms < 1 || ms > 2147483647 {
 		return time.Millisecond
 	}
-	return time.Duration(ms * float64(time.Millisecond))
+	return time.Duration(math.Trunc(ms)) * time.Millisecond
 }
 
 // oneLine collapses runs of whitespace, trims, and truncates with an ellipsis

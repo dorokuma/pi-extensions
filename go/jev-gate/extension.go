@@ -97,7 +97,17 @@ func roleParam(params map[string]any) *Role {
 // ExecuteCheck runs one jev_check call against the production endpoint
 // (TS: executeCheck).
 func ExecuteCheck(params map[string]any) sdk.ToolResult {
-	return executeCheck(DefaultJevAPI(), context.Background(), params)
+	return ExecuteCheckContext(context.Background(), params)
+}
+
+// ExecuteCheckContext is ExecuteCheck with caller cancellation: ctx interrupts
+// the underlying HTTP request (MCP notifications/cancelled). A nil ctx falls
+// back to context.Background().
+func ExecuteCheckContext(ctx context.Context, params map[string]any) sdk.ToolResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return executeCheck(DefaultJevAPI(), ctx, params)
 }
 
 // executeCheck runs one call with the given endpoint and cancellation.
@@ -195,7 +205,9 @@ func executeCheck(api JevAPI, ctx context.Context, params map[string]any) sdk.To
 
 	summary := string(task)
 	if len(verdict.Verdict) > 0 {
-		summary = verdict.Verdict[0]
+		// The whole verdict is the summary: a UNCERTAIN band or a material
+		// disagreement that rides a second line must never be dropped.
+		summary = strings.Join(verdict.Verdict, " | ")
 	}
 	return toolResult(text, summary, structured, false)
 }
@@ -321,19 +333,27 @@ func toolDefinition(api JevAPI) sdk.ToolDefinition {
 // built-in `typesafe` classifier provider: no magpie-jev provider, no jev_check
 // tool, and no built-in classifier model to reach from codemode.
 func Extension() *sdk.Extension {
-	return newExtension(IsSubagentSession, DefaultJevAPI())
+	e := sdk.New("jev-gate")
+	wireExtension(e, IsSubagentSession, DefaultJevAPI())
+	return e
 }
 
-// newExtension wires the extension with an injected identity verdict and
-// endpoint, so the factory can be tested without the production herdr socket.
-func newExtension(isSubagent func() bool, api JevAPI) *sdk.Extension {
-	e := sdk.New("jev-gate")
+// registrar is the registration surface wireExtension needs (sdk.Extension
+// implements it; tests substitute a recording registrar to observe exactly
+// which providers and tools each branch registers).
+type registrar interface {
+	RegisterProvider(name string, config sdk.ProviderConfig)
+	RegisterTool(definition sdk.ToolDefinition)
+}
 
+// wireExtension wires the extension with an injected identity verdict and
+// endpoint, so the factory can be tested without the production herdr socket.
+func wireExtension(e registrar, isSubagent func() bool, api JevAPI) {
 	if isSubagent() {
 		// ProviderConfig with `models` replaces every model of that provider, so
 		// an empty list clears the built-in classifier models.
 		e.RegisterProvider(BuiltinClassifierProvider, sdk.ProviderConfig{"models": []any{}})
-		return e
+		return
 	}
 
 	resolution := ResolveAPIKey(api.Config.BaseURL, api.Lookup)
@@ -353,5 +373,4 @@ func newExtension(isSubagent func() bool, api JevAPI) *sdk.Extension {
 
 	e.RegisterProvider(ProviderID, providerConfig(api.Config, apiKey))
 	e.RegisterTool(toolDefinition(api))
-	return e
 }

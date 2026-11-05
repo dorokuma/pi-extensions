@@ -2,7 +2,7 @@
 PIG_HOME_DIR ?= $(or $(PIG_HOME),$(HOME)/.pig)
 PIG := ./bin/pig-test
 PIG_ISOLATED_DIR ?= $(PIG_HOME_DIR)/agent
-COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod)))
+COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod */cmd/*/go.mod)))
 
 .PHONY: all build test vet sdk-check install-test examples-smoke examples-run help
 

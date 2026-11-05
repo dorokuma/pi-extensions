@@ -453,11 +453,41 @@ func TestConfigFromEnv(t *testing.T) {
 	if got := ConfigFromEnv(env(map[string]string{"JEV_TIMEOUT_MS": "0"})); got.Timeout != time.Millisecond {
 		t.Fatalf("zero timeout = %s, want 1ms", got.Timeout)
 	}
+	if got := ConfigFromEnv(env(map[string]string{"JEV_TIMEOUT_MS": "1500.75"})); got.Timeout != 1500*time.Millisecond {
+		t.Fatalf("fractional timeout = %s, want the truncated 1.5s", got.Timeout)
+	}
 	if got := jsNumber("0x10"); got != 16 {
 		t.Fatalf("jsNumber(0x10) = %v", got)
 	}
+	if got := jsNumber("0b1000"); got != 8 {
+		t.Fatalf("jsNumber(0b1000) = %v", got)
+	}
+	if got := jsNumber("0o10"); got != 8 {
+		t.Fatalf("jsNumber(0o10) = %v", got)
+	}
+	if got := jsNumber("+0b10"); !math.IsNaN(got) {
+		t.Fatalf("jsNumber(+0b10) = %v, want NaN (a signed radix literal is not one)", got)
+	}
+	if got := jsNumber("0b012"); !math.IsNaN(got) {
+		t.Fatalf("jsNumber(0b012) = %v, want NaN", got)
+	}
 	if got := jsNumber("Infinity"); !math.IsInf(got, 1) {
 		t.Fatalf("jsNumber(Infinity) = %v", got)
+	}
+}
+
+// TestNodeSetTimeoutTruncates pins the whole-millisecond truncation of a usable
+// delay: Node's timer cannot fire a sub-millisecond fraction, so it is dropped
+// rather than rounded.
+func TestNodeSetTimeoutTruncates(t *testing.T) {
+	if got := nodeSetTimeout(1.9); got != time.Millisecond {
+		t.Fatalf("nodeSetTimeout(1.9) = %s, want 1ms", got)
+	}
+	if got := nodeSetTimeout(250.99); got != 250*time.Millisecond {
+		t.Fatalf("nodeSetTimeout(250.99) = %s, want 250ms", got)
+	}
+	if got := nodeSetTimeout(60000.5); got != 60*time.Second {
+		t.Fatalf("nodeSetTimeout(60000.5) = %s, want 1m0s", got)
 	}
 }
 

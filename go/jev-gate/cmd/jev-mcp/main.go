@@ -1,9 +1,9 @@
 // Command jev-mcp is the pure-Go MCP stdio server that replaces
 // jev-mcp.mjs for agy. It serves exactly one tool, jev_check, by calling
-// jevgate.ExecuteCheck directly — the main/subagent identity verdict lives in
-// jevgate.Extension(), which this entry point deliberately does not build;
-// instead it applies the .mjs-flavoured resolveAgentIdentity (launch markers
-// plus the ":p1" pane check) per tools/list and tools/call.
+// jevgate.ExecuteCheck directly; the main/subagent identity verdict is the
+// shared S1–S4 core of the jevgate package (jevgate.ResolveMCPAgentIdentity),
+// applied per tools/list and tools/call exactly where the .mjs applied its
+// resolveAgentIdentity.
 //
 // Protocol: JSON-RPC 2.0 over stdio, both newline-delimited frames and
 // Content-Length headers, mirroring jev-mcp.mjs's drainBuffer. Requests are
@@ -11,8 +11,9 @@
 // notifications/cancelled / $/cancelRequest through context cancellation.
 //
 // The lazy schema files agy reads before the first handshake
-// (~/.gemini/antigravity-cli/mcp/jev/) are written on startup, on every
-// tools/list, and (best effort) on a denial, exactly like the .mjs.
+// (~/.gemini/antigravity-cli/mcp/jev/) are written on the first allowed
+// tools/list — never at startup and never on a denial, so a rejected
+// subagent's server instance leaves the global dirs untouched.
 package main
 
 import (
@@ -22,9 +23,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	jevgate "github.com/dorokuma/pi-extensions/go/jev-gate"
 )
@@ -158,70 +162,108 @@ var jevSchemaDirs = []string{
 }
 
 // ensureLazySchemaFiles writes jev_check.json + instructions.md when missing or
-// stale (TS: ensureLazySchemaFiles). Best effort — every error is ignored.
+// stale (TS: ensureLazySchemaFiles). Every write is atomic (same-directory
+// temp file + rename) so a concurrent agy reader never sees a torn or empty
+// file; every error is ignored (best effort).
 func ensureLazySchemaFiles() {
 	schemaJSON := jevLazySchemaJSON()
 	for _, dir := range jevSchemaDirs {
-		func() {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return
-			}
-			schemaPath := dir + "/jev_check.json"
-			if data, err := os.ReadFile(schemaPath); err != nil || string(data) != schemaJSON {
-				_ = os.WriteFile(schemaPath, []byte(schemaJSON), 0o644)
-			}
-			instrPath := dir + "/instructions.md"
-			if data, err := os.ReadFile(instrPath); err != nil || string(data) != jevInstructions {
-				_ = os.WriteFile(instrPath, []byte(jevInstructions), 0o644)
-			}
-		}()
+		_ = writeFileAtomic(dir+"/jev_check.json", []byte(schemaJSON), 0o644)
+		_ = writeFileAtomic(dir+"/instructions.md", []byte(jevInstructions), 0o644)
 	}
+}
+
+// schemaWriteMu serialises the in-process writers of the lazy schema files
+// (the OS-level atomicity against other processes comes from rename(2)).
+var schemaWriteMu sync.Mutex
+
+// writeFileAtomic replaces targetPath with content atomically: a no-op when
+// the file already matches, otherwise a unique same-directory temp file is
+// fully written (with Close errors checked) and renamed over the target, so a
+// concurrent reader always sees either the old or the new complete file and a
+// crashed writer never leaves a torn target behind.
+func writeFileAtomic(targetPath string, content []byte, perm os.FileMode) error {
+	schemaWriteMu.Lock()
+	defer schemaWriteMu.Unlock()
+	if existing, err := os.ReadFile(targetPath); err == nil && bytes.Equal(existing, content) {
+		return nil
+	}
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".jev-schema-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, targetPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // JSON-RPC plumbing (TS: sendRawFrame / sendResult / sendError).
 // ---------------------------------------------------------------------------
 
+// responseWriter serialises every reply under one mutex. The framing of a
+// reply is the framing of the request it answers ("line" or
+// "content-length"), passed explicitly — a shared mutable "current mode"
+// would race once tools/call dispatches execute concurrently.
 type responseWriter struct {
 	mu  sync.Mutex
 	out io.Writer
-	// current is the framing of the message being dispatched; parse errors and
-	// notifications have no id, so it also answers "which framing do I reply in".
-	current string
 }
 
-func (w *responseWriter) send(payload map[string]any) {
+func (w *responseWriter) send(payload map[string]any, framingMode string) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.current == "content-length" {
+	if framingMode == "content-length" {
 		fmt.Fprintf(w.out, "Content-Length: %d\r\n\r\n%s", len(raw), raw)
 	} else {
 		w.out.Write(append(raw, '\n'))
 	}
 }
 
-func (w *responseWriter) sendResult(id any, result any) {
-	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+func (w *responseWriter) sendResult(id any, result any, framingMode string) {
+	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}, framingMode)
 }
 
-func (w *responseWriter) sendError(id any, code int, message string) {
-	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}})
+func (w *responseWriter) sendError(id any, code int, message string, framingMode string) {
+	w.send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}}, framingMode)
 }
 
-// requestKey normalises a JSON-RPC id (number or string) to the map key the
-// in-flight table uses (TS: String(id)).
+// requestKey normalises a JSON-RPC id to the in-flight table key. The id
+// carries a type tag so the numeric id 1 and the string id "1" — distinct
+// JSON-RPC ids — never collapse onto one map entry (F-3).
 func requestKey(id any) string {
 	switch v := id.(type) {
 	case string:
-		return v
+		return "s:" + v
 	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
+		return "n:" + strconv.FormatFloat(v, 'f', -1, 64)
 	default:
-		return fmt.Sprintf("%v", v)
+		return fmt.Sprintf("%T:%v", id, v)
 	}
 }
 
@@ -231,132 +273,86 @@ func requestKey(id any) string {
 
 var (
 	inFlightMu sync.Mutex
-	inFlight   = map[string]context.CancelFunc{}
+	inFlight   = map[string]*inFlightCall{}
+	// inFlightWg tracks the tools/call workers: readLoop can keep reading
+	// (and cancelling) while calls are in flight, and the EOF drain waits on
+	// it with a bounded budget.
+	inFlightWg sync.WaitGroup
 )
 
-func registerInFlight(key string, cancel context.CancelFunc) {
-	inFlightMu.Lock()
-	inFlight[key] = cancel
-	inFlightMu.Unlock()
+// inFlightCall is one cancellable tools/call: cancelledByClient distinguishes
+// a notifications/cancelled / $/cancelRequest abort (the client owns the
+// cancellation and gets the "cancelled by MCP client" result) from an
+// internal deadline or drain-cancel.
+type inFlightCall struct {
+	cancel            context.CancelFunc
+	cancelledByClient atomic.Bool
 }
 
-func dropInFlight(key string) {
+// registerInFlight records one call under key and reports whether the key
+// was free: a duplicate in-flight request id is refused by the caller so
+// register/cancel/drop stay one-to-one (F-3).
+func registerInFlight(key string, call *inFlightCall) bool {
 	inFlightMu.Lock()
-	delete(inFlight, key)
+	defer inFlightMu.Unlock()
+	if _, exists := inFlight[key]; exists {
+		return false
+	}
+	inFlight[key] = call
+	return true
+}
+
+// dropInFlight removes the registration for key only while it still points
+// at call: a stale cleanup path must never delete a newer registration that
+// reused the id after this call was already dropped (Q4).
+func dropInFlight(key string, call *inFlightCall) {
+	inFlightMu.Lock()
+	if inFlight[key] == call {
+		delete(inFlight, key)
+	}
 	inFlightMu.Unlock()
 }
 
 func cancelInFlight(key string) {
 	inFlightMu.Lock()
-	cancel, ok := inFlight[key]
+	call, ok := inFlight[key]
 	inFlightMu.Unlock()
-	if ok && cancel != nil {
-		cancel()
+	if ok && call != nil {
+		call.cancelledByClient.Store(true)
+		call.cancel()
+	}
+}
+
+// cancelAllInFlight cancels every in-flight call; used by the bounded EOF
+// drain so the process can never hang on a request that outlives stdin.
+func cancelAllInFlight() {
+	inFlightMu.Lock()
+	calls := make([]*inFlightCall, 0, len(inFlight))
+	for _, call := range inFlight {
+		calls = append(calls, call)
+	}
+	inFlightMu.Unlock()
+	for _, call := range calls {
+		call.cancel()
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Main-agent identity check (port of the .mjs resolveAgentIdentity).
+// Main-agent identity check (shared jevgate S1–S4 core, MCP mode).
 //
-// jevgate.IsSubagentSession is the pi-flavoured verdict: its S3/S4 require an
-// agent-runtime ancestor out of {pi, pig, ctxmode, pi-coding-agent,
-// bundle/cli.js}. agy/antigravity is not in that list, so under the real agy
-// main agent it fails closed — setting PIG_EXT_SOCKET would not help either
-// (the subprocess form still needs such an ancestor). The check below ports
-// the discriminating parts of the .mjs version instead: the negative launch
-// markers (CTXMODE_ROLE / PI_SUBAGENT / PI_ROLE / subagent argv flags) plus
-// the S1 ":p1" pane requirement. The S2-S4 socket/ancestry proof is not
-// ported: jev-mcp is a dedicated process the main agent spawns, and the tool
-// result stays advisory, never a security boundary.
+// jevgate.ResolveMCPAgentIdentity is the fail-closed verdict the .mjs applied
+// inline: negative launch markers on this process AND every ancestor (env +
+// argv, prompt tokens stripped), the S1 ":p1" pane requirement, the S2 herdr
+// socket query, and the S3/S4 ancestry proof with at most one host layer
+// (agy/antigravity or pi/pig) between jev-mcp and the pane shell. The Go
+// version ports the full socket/ancestry proof the .mjs comment deferred.
 // ---------------------------------------------------------------------------
 
-// stripPromptArgTokens drops `-i` / `--prompt` and their argument, and any
-// `--prompt=...` token: the main agent's prompt text may legitimately contain
-// words like "--agent" or "/tmp/dispatch-..." (TS: stripPromptArgTokens).
-func stripPromptArgTokens(tokens []string) []string {
-	structural := make([]string, 0, len(tokens))
-	for i := 0; i < len(tokens); i++ {
-		token := tokens[i]
-		if token == "-i" || token == "--prompt" {
-			i++
-			continue
-		}
-		if strings.HasPrefix(token, "--prompt=") {
-			continue
-		}
-		structural = append(structural, token)
-	}
-	return structural
-}
-
-// hasSubagentCliFlags reports whether argv carries a dispatch marker
-// (TS: hasSubagentCliFlags).
-func hasSubagentCliFlags(tokens []string) bool {
-	tokens = stripPromptArgTokens(tokens)
-	for i, token := range tokens {
-		if token == "--agent" {
-			if i+1 < len(tokens) {
-				return true
-			}
-			continue
-		}
-		if strings.HasPrefix(token, "--agent=") {
-			return true
-		}
-		if token == "--name" {
-			if i+1 < len(tokens) && strings.HasPrefix(tokens[i+1], "role-") {
-				return true
-			}
-			continue
-		}
-		if strings.HasPrefix(token, "--name=role-") {
-			return true
-		}
-		if strings.Contains(token, "/tmp/herdr-role-sessions") {
-			return true
-		}
-		if strings.Contains(token, "/tmp/dispatch-") {
-			return true
-		}
-	}
-	return false
-}
-
-// subagentLaunchMarker returns the first negative marker that matched
-// (TS: subagentLaunchMarker).
-func subagentLaunchMarker() (string, bool) {
-	if v := strings.TrimSpace(os.Getenv("CTXMODE_ROLE")); v != "" {
-		return "CTXMODE_ROLE=" + v, true
-	}
-	if os.Getenv("PI_SUBAGENT") == "1" {
-		return "PI_SUBAGENT=1", true
-	}
-	if v := strings.TrimSpace(os.Getenv("PI_ROLE")); v != "" {
-		return "PI_ROLE=" + v, true
-	}
-	if hasSubagentCliFlags(os.Args) {
-		return "argv has subagent flags", true
-	}
-	return "", false
-}
-
-// isSubagentNow evaluates the identity verdict for this call. ExecuteCheck
-// itself performs no identity check (that lives in Extension()); the gate is
-// applied here, per request, exactly where the .mjs applied
+// resolveAgentIdentity evaluates the identity verdict for this request.
+// ExecuteCheck itself performs no identity check (that lives in Extension());
+// the gate is applied here, per request, exactly where the .mjs applied
 // resolveAgentIdentity.
-func resolveAgentIdentity() (bool, string) {
-	if marker, hit := subagentLaunchMarker(); hit {
-		return true, "launch marker: " + marker
-	}
-	paneID := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
-	if paneID == "" {
-		return true, "S1: HERDR_PANE_ID unset or empty"
-	}
-	if !strings.HasSuffix(paneID, ":p1") {
-		return true, fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID)
-	}
-	return false, "main pane " + paneID + " (launch markers clear; S2-S4 not ported)"
-}
+var resolveAgentIdentity = jevgate.ResolveMCPAgentIdentity
 
 func toolErrorResult(text string) map[string]any {
 	return map[string]any{
@@ -384,14 +380,15 @@ func sdkResultToMCP(content string, details any, structured any, isError bool) m
 	return out
 }
 
-// handleRPC processes one decoded JSON-RPC object (TS: handleRpcObject).
-func handleRPC(w *responseWriter, msg map[string]any) {
+// handleRPC processes one decoded JSON-RPC object (TS: handleRpcObject). The
+// reply adopts the framing of the raw frame it was parsed from.
+func handleRPC(w *responseWriter, msg map[string]any, framingMode string) {
 	id, hasID := msg["id"]
 	method, _ := msg["method"].(string)
 
 	if method == "" {
 		if hasID {
-			w.sendError(id, -32600, "Invalid Request: missing method")
+			w.sendError(id, -32600, "Invalid Request: missing method", framingMode)
 		}
 		return
 	}
@@ -404,7 +401,7 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 	switch method {
 	case "notifications/initialized":
 		if hasID {
-			w.sendResult(id, map[string]any{})
+			w.sendResult(id, map[string]any{}, framingMode)
 		}
 		return
 	case "notifications/cancelled", "$/cancelRequest":
@@ -414,7 +411,7 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 			cancelInFlight(requestKey(target))
 		}
 		if hasID {
-			w.sendResult(id, map[string]any{})
+			w.sendResult(id, map[string]any{}, framingMode)
 		}
 		return
 	}
@@ -434,36 +431,41 @@ func handleRPC(w *responseWriter, msg map[string]any) {
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"instructions":    jevInstructions,
 			"serverInfo":      map[string]any{"name": "jev", "version": version},
-		})
+		}, framingMode)
 	case "ping":
-		w.sendResult(id, map[string]any{})
+		w.sendResult(id, map[string]any{}, framingMode)
 	case "tools/list":
 		if isSubagent, reason := resolveAgentIdentity(); isSubagent {
 			if os.Getenv("PI_IDENTITY_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "[jev-mcp] tools/list denied (%s)\n", reason)
 			}
-			w.sendResult(id, map[string]any{"tools": []any{}})
-			go ensureLazySchemaFiles()
+			// A denied subagent gets an empty list and nothing is written to the
+			// global schema dirs (no async fire-and-forget write either).
+			w.sendResult(id, map[string]any{"tools": []any{}}, framingMode)
 			return
 		}
-		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}})
+		// The lazy schema files must exist before the tools/list response is
+		// visible: agy reads them as soon as the list arrives, so the write
+		// cannot trail the reply (Q5). The denied branch above never reaches
+		// this — a rejected instance still writes nothing.
 		ensureLazySchemaFiles()
+		w.sendResult(id, map[string]any{"tools": []any{jevToolEntry()}}, framingMode)
 	case "tools/call":
-		handleToolsCall(w, id, params)
+		handleToolsCall(w, id, params, framingMode)
 	default:
-		w.sendError(id, -32601, "Method not found: "+method)
+		w.sendError(id, -32601, "Method not found: "+method, framingMode)
 	}
 }
 
-func handleToolsCall(w *responseWriter, id any, params map[string]any) {
+func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMode string) {
 	if isSubagent, reason := resolveAgentIdentity(); isSubagent {
 		deny := "jev_check denied: 仅限主代理（:p1）调用，子代理严禁自审自批。（" + reason + "）"
-		w.sendResult(id, toolErrorResult(deny))
+		w.sendResult(id, toolErrorResult(deny), framingMode)
 		return
 	}
 	name, _ := params["name"].(string)
 	if name != "jev_check" {
-		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: unknown tool %q", name)))
+		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: unknown tool %q", name)), framingMode)
 		return
 	}
 	rawArgs, _ := params["arguments"].(map[string]any)
@@ -471,77 +473,102 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any) {
 		rawArgs = map[string]any{}
 	}
 
+	// The call executes on its own goroutine so readLoop can keep reading
+	// stdin: a notifications/cancelled or $/cancelRequest that arrives while
+	// the HTTP call is in flight reaches cancelInFlight and interrupts the
+	// underlying request through ctx.
 	ctx, cancel := context.WithCancel(context.Background())
+	call := &inFlightCall{cancel: cancel}
 	key := requestKey(id)
-	registerInFlight(key, cancel)
-	defer func() {
-		dropInFlight(key)
+	if !registerInFlight(key, call) {
+		// A second request reusing an in-flight id is refused outright:
+		// registering it would overwrite the first entry, and the first
+		// worker's dropInFlight would then delete the new registration,
+		// leaving the second call unreachable for cancellation (F-3).
 		cancel()
-	}()
-
-	// jevgate.ExecuteCheck wraps executeCheck with context.Background(); to keep
-	// notifications/cancelled honoured we run it under a goroutine and race
-	// against ctx.Done(). The underlying HTTP call uses its own
-	// JEV_TIMEOUT_MS-bounded context internally, so a cancelled wait never
-	// leaks the process.
-	type outcome struct {
-		content    string
-		details    any
-		structured any
-		isError    bool
+		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: duplicate in-flight request id %v", id)), framingMode)
+		return
 	}
-	done := make(chan outcome, 1)
+	inFlightWg.Add(1)
 	go func() {
-		result := jevgate.ExecuteCheck(rawArgs)
-		done <- outcome{
-			content:    result.Content,
-			details:    result.Details,
-			structured: result.StructuredContent,
-			isError:    result.IsError,
+		defer inFlightWg.Done()
+		defer func() {
+			dropInFlight(key, call)
+			cancel()
+		}()
+		result := jevgate.ExecuteCheckContext(ctx, rawArgs)
+		// The id is unregistered BEFORE the reply is published to the client:
+		// once the response bytes are visible the id must already be reusable,
+		// otherwise a client reusing the id right after seeing its reply would
+		// be refused as a duplicate (Q4). The deferred drop stays as a
+		// belt-and-braces cleanup and is idempotent — it only deletes the
+		// entry while it still points at this call, so it can never remove a
+		// newer registration that legitimately reused the freed id.
+		dropInFlight(key, call)
+		if call.cancelledByClient.Load() {
+			w.sendResult(id, toolErrorResult("jev_check failed: cancelled by MCP client"), framingMode)
+			return
 		}
+		w.sendResult(id, sdkResultToMCP(result.Content, result.Details, result.StructuredContent, result.IsError), framingMode)
 	}()
-
-	select {
-	case r := <-done:
-		w.sendResult(id, sdkResultToMCP(r.content, r.details, r.structured, r.isError))
-	case <-ctx.Done():
-		text := "jev_check failed: cancelled by MCP client"
-		w.sendResult(id, toolErrorResult(text))
-	}
 }
 
 // ---------------------------------------------------------------------------
 // Framing / read loop (TS: drainBuffer).
 // ---------------------------------------------------------------------------
 
-const maxHeaderBytes = 1 << 20
+const (
+	// maxHeaderBytes bounds one Content-Length header block while it is still
+	// incomplete: an unterminated header stream stops here, not at EOF.
+	maxHeaderBytes = 1 << 20
+	// maxFrameBytes bounds one raw JSON-RPC frame (and one newline-less line
+	// buffer) before it is parsed. This is the protocol-layer OOM guard: the
+	// JEV_MAX_STATE_CHARS budget only truncates the state text *inside* a
+	// decoded frame, so a frame bigger than this is rejected outright — the
+	// refusal is deliberate, not a truncation.
+	maxFrameBytes = 16 << 20
+)
 
 // dispatchPayload parses one raw JSON-RPC frame (TS: dispatchRawPayload).
-func dispatchPayload(w *responseWriter, raw string) {
+func dispatchPayload(w *responseWriter, raw string, framingMode string) {
 	var parsed any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		w.sendError(nil, -32700, "Parse error")
+		w.sendError(nil, -32700, "Parse error", framingMode)
 		return
 	}
 	if batch, ok := parsed.([]any); ok {
 		for _, item := range batch {
 			if msg, ok := item.(map[string]any); ok {
-				handleRPC(w, msg)
+				handleRPC(w, msg, framingMode)
 			} else {
-				w.sendError(nil, -32600, "Invalid Request")
+				w.sendError(nil, -32600, "Invalid Request", framingMode)
 			}
 		}
 		return
 	}
 	if msg, ok := parsed.(map[string]any); ok {
-		handleRPC(w, msg)
+		handleRPC(w, msg, framingMode)
 		return
 	}
-	w.sendError(nil, -32600, "Invalid Request")
+	w.sendError(nil, -32600, "Invalid Request", framingMode)
 }
 
-// readLoop consumes stdin frame by frame. Content-Length frames switch the
-// reply framing; everything else stays newline-delimited (TS: framingMode).
+// callTimeout is the per-request JEV_TIMEOUT_MS budget (the .mjs default for
+// the MCP server is 15000ms).
+func callTimeout() time.Duration {
+	timeout := jevgate.ConfigFromEnv(os.Getenv).Timeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	return timeout
+}
+
+// readLoop consumes stdin frame by frame. Content-Length frames answer in
+// Content-Length framing; everything else stays newline-delimited
+// (TS: framingMode). At EOF the process does not cancel in-flight calls — a
+// client that wrote its request and half-closed stdin must still get its
+// reply — it waits for them inside one bounded drain budget, then cancels
+// whatever is left and exits.
 func readLoop(in io.Reader, w *responseWriter) {
 	var carry []byte
 	buf := make([]byte, 64*1024)
@@ -555,10 +582,35 @@ func readLoop(in io.Reader, w *responseWriter) {
 			break
 		}
 	}
-	// EOF: any complete remainder is dispatched as one last line frame.
+	// EOF: the unterminated tail is dispatched as one last line frame, but
+	// the same body bound applies — an EOF cannot launder an oversized frame
+	// past the bound it would have hit mid-stream (a dangling \r at the
+	// bound is part of a terminator that never arrived).
 	if rest := strings.TrimSpace(string(carry)); rest != "" {
-		w.current = "line"
-		dispatchPayload(w, rest)
+		if len(carry) > maxFrameBytes {
+			w.sendError(nil, -32700, "Frame too large", "line")
+		} else {
+			dispatchPayload(w, rest, "line")
+		}
+	}
+	// Bounded drain: give the in-flight calls the normal call budget plus a
+	// small margin, then cancel the stragglers and wait briefly for their
+	// cleanup so the process exit is always finite.
+	drainTimeout := callTimeout() + 2*time.Second
+	done := make(chan struct{})
+	go func() {
+		inFlightWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(drainTimeout):
+		cancelAllInFlight()
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -590,8 +642,7 @@ func drain(carry []byte, w *responseWriter) []byte {
 			}
 			if headerEnd < 0 {
 				if len(carry) > maxHeaderBytes {
-					w.current = "content-length"
-					w.sendError(nil, -32700, "Header too large")
+					w.sendError(nil, -32700, "Header too large", "content-length")
 					return nil
 				}
 				break
@@ -608,29 +659,63 @@ func drain(carry []byte, w *responseWriter) []byte {
 			}
 			if bodyLen < 0 {
 				carry = carry[headerEnd+sepLen:]
-				w.current = "content-length"
-				w.sendError(nil, -32700, "Invalid Content-Length header")
+				w.sendError(nil, -32700, "Invalid Content-Length header", "content-length")
 				continue
 			}
-			if len(carry) < headerEnd+sepLen+bodyLen {
+			if bodyLen > maxFrameBytes {
+				// The declared body alone is over the frame bound: drop the whole
+				// buffered tail so a bogus length cannot pin a giant allocation or
+				// poison the next frame.
+				carry = nil
+				w.sendError(nil, -32700, "Invalid Content-Length header", "content-length")
+				break
+			}
+			// Subtraction, not addition: the missing-bytes comparison cannot
+			// overflow no matter what bodyLen says.
+			if len(carry)-headerEnd-sepLen < bodyLen {
 				break
 			}
 			body := string(carry[headerEnd+sepLen : headerEnd+sepLen+bodyLen])
 			carry = carry[headerEnd+sepLen+bodyLen:]
-			w.current = "content-length"
-			dispatchPayload(w, body)
+			dispatchPayload(w, body, "content-length")
 			continue
 		}
 
 		nl := bytes.IndexByte(carry, '\n')
 		if nl < 0 {
+			// No terminator yet. The raw JSON body may be at most
+			// maxFrameBytes, and a CRLF terminator contributes a CR before
+			// the LF — so the buffer may legitimately reach
+			// maxFrameBytes+1 only while its last byte is that pending CR.
+			// Anything beyond that, or a non-CR byte in that slot, can never
+			// become a deliverable frame: reject it now instead of letting a
+			// dangling CR hold the buffer open forever (Q6).
+			if len(carry) > maxFrameBytes+1 ||
+				(len(carry) == maxFrameBytes+1 && carry[len(carry)-1] != '\r') {
+				carry = nil
+				w.sendError(nil, -32700, "Frame too large", "line")
+			}
+			break
+		}
+		// A complete line frame: the raw JSON body ends before the LF, minus
+		// a CR when the terminator is CRLF — the terminator never counts
+		// toward the frame body. bodyLen == maxFrameBytes is accepted (the
+		// same bound the newline-less and Content-Length branches apply);
+		// one byte more is refused before dispatch and the buffered tail is
+		// dropped (Q6).
+		bodyLen := nl
+		if bodyLen > 0 && carry[bodyLen-1] == '\r' {
+			bodyLen--
+		}
+		if bodyLen > maxFrameBytes {
+			carry = nil
+			w.sendError(nil, -32700, "Frame too large", "line")
 			break
 		}
 		line := strings.TrimSpace(string(carry[:nl]))
 		carry = carry[nl+1:]
 		if line != "" {
-			w.current = "line"
-			dispatchPayload(w, line)
+			dispatchPayload(w, line, "line")
 		}
 	}
 	return carry
@@ -648,7 +733,9 @@ func main() {
 	if strings.TrimSpace(os.Getenv("JEV_TIMEOUT_MS")) == "" {
 		_ = os.Setenv("JEV_TIMEOUT_MS", "15000")
 	}
-	ensureLazySchemaFiles()
-	w := &responseWriter{out: os.Stdout, current: "line"}
+	// The lazy schema files are written on the first allowed tools/list only:
+	// a server that is launched but never lists tools (e.g. a denied
+	// subagent's probe) must not touch the global schema dirs.
+	w := &responseWriter{out: os.Stdout}
 	readLoop(os.Stdin, w)
 }

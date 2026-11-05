@@ -18,8 +18,9 @@ package jevgate
 // Wire parity with PiG's ai.ClassifyTypesafeSystemOne
 // (ref/PiG/ai/system_one.go: typesafeSystemOneTransport):
 //   - URL: <baseUrl with trailing slashes removed>/systemone
-//   - body: { model, state, questions } (public bool questions are sent as noul
-//     by the caller's own table; this extension never sends `type:"bool"`)
+//   - body: { model, state, questions }; a public `type:"bool"` question is
+//     sent as `type:"noul"` (the literal "bool" is rejected downstream), its
+//     criteria ({true,false} object) carried through unchanged
 //   - response: { answers, usage } either directly or inside `result`.
 //
 // jev_check itself never uses this path: it calls the endpoint directly
@@ -52,16 +53,25 @@ func classifyWith(api JevAPI, model map[string]any, request sdk.ClassifierContex
 	if baseURL == "" {
 		baseURL = api.Config.BaseURL
 	}
+	// A model baseUrl that is neither the configured endpoint nor a local
+	// loopback gateway must never receive the resolved credential: forwarding
+	// the Authorization header to an untrusted host is a credential leak.
+	if baseURL != api.Config.BaseURL && !IsLocalGatewayURL(baseURL) {
+		return sdk.ClassifierResult{}, fmt.Errorf(
+			"refusing to send credentials to untrusted model baseUrl %q (expected %q or a loopback gateway)",
+			baseURL, api.Config.BaseURL)
+	}
 
 	questions := request.Questions
 	if questions == nil {
 		questions = sdk.NewOrderedObject()
 	}
+	wireQuestions, boolIDs := systemOneWireQuestions(questions)
 	payload, err := json.Marshal(struct {
 		Model     string `json:"model"`
 		State     any    `json:"state"`
 		Questions any    `json:"questions"`
-	}{Model: modelID, State: request.State, Questions: questions})
+	}{Model: modelID, State: request.State, Questions: wireQuestions})
 	if err != nil {
 		return sdk.ClassifierResult{}, err
 	}
@@ -85,11 +95,7 @@ func classifyWith(api JevAPI, model map[string]any, request sdk.ClassifierContex
 	httpRequest.Header.Set("authorization", "Bearer "+key)
 	httpRequest.Header.Set("content-type", "application/json")
 	httpRequest.Header.Set("user-agent", userAgent)
-	client := api.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	response, err := client.Do(httpRequest)
+	response, err := noRedirectDoer(api.Client).Do(httpRequest)
 	if err != nil {
 		return sdk.ClassifierResult{}, transportError(err, api.Config)
 	}
@@ -130,6 +136,16 @@ func classifyWith(api JevAPI, model map[string]any, request sdk.ClassifierContex
 		if !exists || answer == nil {
 			return sdk.ClassifierResult{}, fmt.Errorf("incomplete answers: missing key %q", id)
 		}
+		if boolIDs[id] {
+			// The caller declared a public bool question: hand back the
+			// ClassifierBoolAnswer shape, not the wire-level noul.
+			probability, _ := probOf(answer)
+			pairs = append(pairs, id, map[string]any{
+				"type":        "bool",
+				"probability": probability,
+			})
+			continue
+		}
 		pairs = append(pairs, id, answer)
 	}
 
@@ -156,12 +172,55 @@ func classifyWith(api JevAPI, model map[string]any, request sdk.ClassifierContex
 	return result, nil
 }
 
+// systemOneWireQuestions rebuilds the request's question table for the wire
+// without mutating it: every `type:"bool"` question is copied with
+// `type:"noul"` (the upstream wire name), and the ids of those questions are
+// returned so the caller can translate their answers back to the public bool
+// shape.
+func systemOneWireQuestions(questions *sdk.OrderedObject) (*sdk.OrderedObject, map[string]bool) {
+	boolIDs := map[string]bool{}
+	pairs := make([]any, 0, len(questions.Keys())*2)
+	for _, id := range questions.Keys() {
+		question, _ := questions.Get(id)
+		rawType, _ := questionMember(question, "type")
+		questionType, _ := rawType.(string)
+		if questionType != "bool" {
+			pairs = append(pairs, id, question)
+			continue
+		}
+		boolIDs[id] = true
+		switch typed := question.(type) {
+		case map[string]any:
+			clone := make(map[string]any, len(typed))
+			for key, value := range typed {
+				clone[key] = value
+			}
+			clone["type"] = "noul"
+			pairs = append(pairs, id, clone)
+		case *sdk.OrderedObject:
+			members := make([]any, 0, len(typed.Keys())*2)
+			for _, key := range typed.Keys() {
+				value, _ := typed.Get(key)
+				if key == "type" {
+					value = "noul"
+				}
+				members = append(members, key, value)
+			}
+			pairs = append(pairs, id, sdk.NewOrderedObject(members...))
+		default:
+			pairs = append(pairs, id, map[string]any{"type": "noul"})
+		}
+	}
+	return sdk.NewOrderedObject(pairs...), boolIDs
+}
+
 // validateClassifierAnswers applies the same fail-closed answer validation as
 // the direct JEV call to the questions of a host classification request. The
 // questions arrive as the wire objects the TS extension sends
 // (`{type, instructions, criteria}`), so the type and the choice/score labels
-// come from the request itself; a question of unknown type, or an answer that
-// does not match its question's shape, is an error.
+// come from the request itself; only "noul", "bool", "choice" and "score"
+// are valid — an unknown type or an answer that does not match its question's
+// shape is an error.
 func validateClassifierAnswers(questions *sdk.OrderedObject, answers map[string]any) error {
 	for _, id := range questions.Keys() {
 		answer, exists := answers[id]
@@ -201,8 +260,9 @@ func questionMember(question any, key string) (any, bool) {
 	}
 }
 
-// criteriaLabels lists the labels of a choice/score question's criteria object,
-// in request order.
+// criteriaLabels lists the labels of a choice/score question's criteria, in
+// request order. The choice shape is an object whose keys are the labels; the
+// score shape is an array of non-empty label strings (lowest to highest).
 func criteriaLabels(criteria any) ([]string, bool) {
 	switch typed := criteria.(type) {
 	case map[string]any:
@@ -213,6 +273,23 @@ func criteriaLabels(criteria any) ([]string, bool) {
 		return labels, true
 	case *sdk.OrderedObject:
 		return typed.Keys(), true
+	case []string:
+		for _, label := range typed {
+			if label == "" {
+				return nil, false
+			}
+		}
+		return append([]string(nil), typed...), true
+	case []any:
+		labels := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			label, ok := raw.(string)
+			if !ok || label == "" {
+				return nil, false
+			}
+			labels = append(labels, label)
+		}
+		return labels, true
 	default:
 		return nil, false
 	}

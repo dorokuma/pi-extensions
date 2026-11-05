@@ -10,8 +10,9 @@ package jevgate
 //   - the Cloudflare Workers AI envelope `{ result: { ... } }` and the
 //     third-party double envelope `{ result: { state: "Completed", result: {...} } }`
 //     are accepted as well;
-//   - question types `noul`, `choice` and `score` are accepted; the literal
-//     `type: "bool"` is rejected downstream (400 AiError code 5006), so this
+//   - question types `noul`, `choice` and `score` are accepted; the public
+//     `bool` question type rides the wire as `noul` (the literal
+//     `type: "bool"` is rejected downstream, 400 AiError code 5006), so this
 //     extension never sends it.
 //
 // Every malformed response fails closed: the answers must cover exactly the
@@ -83,6 +84,35 @@ type HTTPDoer interface {
 	Do(request *http.Request) (*http.Response, error)
 }
 
+// noRedirectClient is the production HTTP client: every 3xx is returned as a
+// response, never followed — a redirect must not silently carry the payload
+// or the Authorization header to a different host.
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// noRedirectDoer guarantees the no-redirect policy: a nil client becomes the
+// noRedirectClient, an *http.Client without its own CheckRedirect is cloned
+// with the policy applied (the clone shares its Transport), and any other
+// doer is used as is.
+func noRedirectDoer(client HTTPDoer) HTTPDoer {
+	if client == nil {
+		return noRedirectClient()
+	}
+	if raw, ok := client.(*http.Client); ok && raw.CheckRedirect == nil {
+		clone := *raw
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		return &clone
+	}
+	return client
+}
+
 // JevAPI is one configured System One endpoint plus its credential source.
 type JevAPI struct {
 	Config Config
@@ -95,7 +125,7 @@ func DefaultJevAPI() JevAPI {
 	return JevAPI{
 		Config: ConfigFromEnv(os.Getenv),
 		Lookup: DefaultKeyLookup(),
-		Client: &http.Client{},
+		Client: noRedirectClient(),
 	}
 }
 
@@ -167,9 +197,11 @@ func validateAnswers(questions Questions, answers map[string]any) error {
 // accepted on one path and rejected on the other. An unknown type fails closed.
 func validateAnswer(questionType, id string, answer any, criteria []string) error {
 	switch questionType {
-	case "noul":
+	case "noul", "bool":
+		// A public bool question rides the wire as noul; its answer is the
+		// same finite probability inside the closed interval [0, 1].
 		if _, ok := probOf(answer); !ok {
-			return fmt.Errorf("invalid noul answer for %q", id)
+			return fmt.Errorf("invalid %s answer for %q", questionType, id)
 		}
 	case "choice":
 		choice, ok := choiceOf(answer)
@@ -191,9 +223,9 @@ func validateAnswer(questionType, id string, answer any, criteria []string) erro
 	case "score":
 		object, isObject := isRecord(answer)
 		score, hasScore := numberValue(object["score"])
-		valid := isObject && hasScore && !math.IsNaN(score) && !math.IsInf(score, 0)
+		valid := isObject && hasScore && !math.IsNaN(score) && !math.IsInf(score, 0) && score >= 0
 		if valid && len(criteria) > 0 {
-			valid = score >= 0 && score <= float64(len(criteria)-1)
+			valid = score <= float64(len(criteria)-1)
 		}
 		if !valid {
 			return fmt.Errorf("invalid score answer for %q", id)
@@ -249,10 +281,7 @@ func (api JevAPI) Call(ctx context.Context, payload string, questions Questions)
 	request.Header.Set("content-type", "application/json")
 	request.Header.Set("user-agent", userAgent)
 
-	client := api.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := noRedirectDoer(api.Client)
 	response, err := client.Do(request)
 	if err != nil {
 		return JevCall{}, transportError(err, api.Config)

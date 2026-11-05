@@ -2,33 +2,50 @@ package jevgate
 
 // ===== SUBAGENT-IDENTITY (fail-closed) =====
 //
-// Port of the reviewed Go block of go/exclude-tools-guard/extension.go, which
-// the TS authority shares byte-for-byte between exclude-tools-guard.ts and
-// jev-gate.ts (TS: `SUBAGENT-IDENTITY-BEGIN .. END`). The semantics are the ones
-// already accepted for the Go family; README.md lists where they differ from
-// the TS block.
+// Shared S1–S4 identity core for the PiG extension and the jev-mcp MCP server.
+// The extension-facing rules are the Go-family port of the TS
+// SUBAGENT-IDENTITY block that exclude-tools-guard.ts and jev-gate.ts share;
+// the MCP-facing rules mirror jev-mcp.mjs (token-boundary argv, interpreter
+// penetration, one-layer host cap). README.md lists where they differ.
 //
 // A session is the main agent only when every positive proof holds; any proof
 // that is missing, unverifiable, failed or timed out resolves as subagent:
-//   S1: HERDR_PANE_ID is non-empty. It is only the lookup key for the herdr
-//       query — pane naming is deliberately NOT an identity criterion (the TS
-//       version also required the ":p1" suffix; see README).
+//   S1: HERDR_PANE_ID is non-empty AND ends with ":p1" — the herdr lookup key
+//       plus the necessary main-pane condition a subagent pane cannot claim
+//       (its pane id never carries the :p1 suffix).
 //   S2: the running herdr server answers the pane query with a matching
-//       shell_pid > 0. The socket path is a hard-coded constant, never read from
-//       HERDR_SOCKET_PATH, which would be one more forgeable variable.
-//   S3: the shell_pid is a strict ancestor of the host process. The host is the
-//       first agent-runtime ancestor of an out-of-process extension, or the
-//       process itself when the extension runs fused inside the host.
-//   S4: no other agent runtime sits between the host and the pane shell.
+//       shell_pid > 0. The socket path is a hard-coded constant, never read
+//       from HERDR_SOCKET_PATH, which would be one more forgeable variable.
+//   S3: the shell_pid is a strict ancestor of this process, and every
+//       ancestor's /proc cmdline is readable — an empty argv is fail-closed,
+//       it can never sneak past the S4 scans.
+//   S4: no negative launch marker (env or argv) and no second agent/tool
+//       runtime sits on the ancestry between this process and the pane
+//       shell, except — extension mode only — the one resolved host.
 //
-// Negative launch markers can only push the verdict toward subagent (there is no
-// "fake it into main" direction): PI_SUBAGENT=1, a non-empty PI_ROLE, and the
-// argv markers "--name role-", "/tmp/herdr-role-sessions", "/tmp/dispatch-".
+// Negative launch markers can only push the verdict toward subagent (there is
+// no "fake it into main" direction): CTXMODE_ROLE non-empty, PI_SUBAGENT=1,
+// a non-empty PI_ROLE, and the argv markers --agent, "--name role-",
+// "/tmp/herdr-role-sessions", "/tmp/dispatch-" — scanned on this process's
+// environment + bridged argv AND on every ancestor's /proc environ + cmdline.
+// The -i/-p/--prompt/--print argument tokens are stripped before the argv
+// scan (PiG consumption rule: no @file, no flag token except "---"-led text)
+// so a main-agent prompt that merely mentions a dispatch path is not a marker.
+//
+// Two call modes share this core:
+//   - extension mode (IsSubagentSession): the host is the first pi/pig
+//     ancestor below the pane shell (subprocess form) or self (fused form);
+//     nothing else agent-runtime-like may sit between hop 0 and the shell.
+//   - MCP mode (ResolveMCPAgentIdentity): at most one host layer
+//     (agy/antigravity or pi/pig) may appear in hop 1..shellIndex-1 and every
+//     other hop must be that host — a second host layer or any unknown
+//     intermediate (ctxmode, dispatch-agent, an extra shell, ...) is
+//     fail-closed, mirroring jev-mcp.mjs.
 //
 // Residual surface (known, not covered here): anything that can put another
-// process into pane p1's shell makes the tree look like "shell starts an agent
-// directly". Closing that needs herdr to inject a non-inheritable credential at
-// pane start.
+// process into pane p1's shell makes the tree look like "shell starts an
+// agent directly". Closing that needs herdr to inject a non-inheritable
+// credential at pane start.
 
 import (
 	"bufio"
@@ -68,6 +85,14 @@ type AncestorProcess struct {
 	PID     int
 	PPID    int
 	Cmdline string
+	// Argv keeps the \0 token boundaries of /proc/<pid>/cmdline so task text
+	// cannot smuggle marker words across what a space-joined cmdline would
+	// read as one token. resolveIdentity fills it from splitCmdlineTokens when
+	// a test only injects Cmdline.
+	Argv []string
+	// Env is the process's own environment as parsed from /proc/<pid>/environ
+	// (nil when unreadable); tests may inject it directly.
+	Env map[string]string
 }
 
 // queryPaneShellPid asks the herdr server for a pane's shell pid. Any failure
@@ -162,24 +187,51 @@ func readProcPpid(pid int) (int, bool) {
 	return ppid, true
 }
 
-// readProcCmdline reads /proc/<pid>/cmdline (NUL separated) as one line.
-func readProcCmdline(pid int) string {
+// readProcArgv reads /proc/<pid>/cmdline as the \0-separated argv, dropping
+// empty tokens ([] on error or for a kernel thread's empty cmdline).
+func readProcArgv(pid int) []string {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
-		return ""
+		return nil
 	}
 	parts := strings.Split(string(data), "\x00")
-	kept := make([]string, 0, len(parts))
+	argv := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if part != "" {
-			kept = append(kept, part)
+			argv = append(argv, part)
 		}
 	}
-	return strings.Join(kept, " ")
+	return argv
 }
 
-// readAncestorChain walks from pid outward, stopping at the first unreadable hop.
-func readAncestorChain(pid, maxHops int, readStat func(int) (int, bool), readCmdline func(int) string) []AncestorProcess {
+// readProcCmdline reads /proc/<pid>/cmdline (NUL separated) as one line.
+func readProcCmdline(pid int) string {
+	return strings.Join(readProcArgv(pid), " ")
+}
+
+// readProcEnviron parses /proc/<pid>/environ (NUL separated KEY=VALUE); nil on
+// error (permission, exited process, kernel thread).
+func readProcEnviron(pid int) map[string]string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return nil
+	}
+	env := make(map[string]string)
+	for _, entry := range strings.Split(string(data), "\x00") {
+		eq := strings.Index(entry, "=")
+		if eq <= 0 {
+			continue
+		}
+		env[entry[:eq]] = entry[eq+1:]
+	}
+	return env
+}
+
+// readAncestorChain walks from pid outward, stopping at the first unreadable
+// hop. readArgv/readEnviron are optional: a nil reader leaves Argv/Env empty so
+// resolveIdentity can fall back to splitCmdlineTokens(Cmdline) or skip the
+// ancestor env scan for that hop.
+func readAncestorChain(pid, maxHops int, readStat func(int) (int, bool), readCmdline func(int) string, readArgv func(int) []string, readEnviron func(int) map[string]string) []AncestorProcess {
 	var chain []AncestorProcess
 	seen := map[int]bool{}
 	current := pid
@@ -192,7 +244,14 @@ func readAncestorChain(pid, maxHops int, readStat func(int) (int, bool), readCmd
 		if !ok {
 			break
 		}
-		chain = append(chain, AncestorProcess{PID: current, PPID: ppid, Cmdline: readCmdline(current)})
+		entry := AncestorProcess{PID: current, PPID: ppid, Cmdline: readCmdline(current)}
+		if readArgv != nil {
+			entry.Argv = readArgv(current)
+		}
+		if readEnviron != nil {
+			entry.Env = readEnviron(current)
+		}
+		chain = append(chain, entry)
 		if ppid == 0 || ppid == current {
 			break
 		}
@@ -201,34 +260,934 @@ func readAncestorChain(pid, maxHops int, readStat func(int) (int, bool), readCmd
 	return chain
 }
 
-var agentRuntimePattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js`)
+// ---------------------------------------------------------------------------
+// Token-aware cmdline classification (port of jev-mcp.mjs: splitCmdlineTokens,
+// env/interpreter penetration, executable and runtime predicates).
+// ---------------------------------------------------------------------------
 
-// isAgentRuntimeCmdline reports whether a cmdline belongs to an agent runtime
-// (pi, pig, ctxmode or a wrapper).
-func isAgentRuntimeCmdline(cmdline string) bool {
+var (
+	// forbiddenExecutableBases is the set of executable basenames that must
+	// never appear between this process and the pane shell. pi/pig are NOT
+	// here: they are the host-runtime set (isPiPigTokens), which the MCP mode
+	// counts separately and the extension mode resolves as the host anchor.
+	forbiddenExecutableBases = map[string]bool{
+		"ctxmode":        true,
+		"dispatch-agent": true,
+		"grok":           true,
+	}
+	// interpreterBases are executable basenames penetrated to find the script
+	// actually being run (node/foo.js, env wrappers, versioned pythons/shells).
+	interpreterBases = map[string]bool{
+		"node": true, "nodejs": true, "bun": true, "deno": true,
+		"python": true, "python3": true,
+		"sh": true, "bash": true, "env": true,
+	}
+	// inlineTextFlags end the interpreter script-path scan: what follows is
+	// inline text, not a script to classify.
+	inlineTextFlags = map[string]bool{
+		"-e": true, "--eval": true, "-c": true, "--command": true,
+		"-p": true, "--print": true,
+	}
+	// flagsWithArgument consume one following token during the interpreter
+	// script-path scan (the flag's own argument, not the script).
+	flagsWithArgument = map[string]bool{
+		"-r": true, "--require": true, "--import": true, "--loader": true,
+		"--experimental-loader": true, "--conditions": true, "-C": true,
+		"--input-type": true, "--watch-path": true,
+		"--env-file": true, "--env-file-if-exists": true,
+	}
+)
+
+var (
+	// versionedPythonPattern matches python3.12-style interpreter names.
+	versionedPythonPattern = regexp.MustCompile(`^python\d+(?:\.\d+)*$`)
+	// shellVariantPattern matches bash/dash/zsh/ksh/ash-style shells.
+	shellVariantPattern = regexp.MustCompile(`^(?:ba|da|z|k|a)?sh$`)
+	// forbiddenPathPattern matches forbidden runtimes reached by path or
+	// module name (mirrors jev-mcp.mjs FORBIDDEN_PATH_PATTERN).
+	forbiddenPathPattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js|(?:^|/)dispatch-agent$`)
+	// agyPathPattern matches the antigravity-cli agy entry reached via a
+	// node-wrapped script path.
+	agyPathPattern = regexp.MustCompile(`/antigravity-cli/bin/agy$`)
+)
+
+// splitCmdlineTokens splits a literal cmdline on \0 and unquoted whitespace,
+// honouring single/double quotes (a real /proc cmdline is already \0-separated
+// and unquoted; this keeps a space-joined test cmdline's token semantics).
+func splitCmdlineTokens(cmdline string) []string {
 	if cmdline == "" {
+		return nil
+	}
+	var tokens []string
+	for _, chunk := range strings.Split(cmdline, "\x00") {
+		var current strings.Builder
+		started := false
+		var quote rune
+		for _, ch := range chunk {
+			if quote != 0 {
+				if ch == quote {
+					quote = 0
+					continue
+				}
+				current.WriteRune(ch)
+				continue
+			}
+			if ch == '"' || ch == '\'' {
+				quote = ch
+				started = true
+				continue
+			}
+			if ch == ' ' || ch == '\t' {
+				if started {
+					tokens = append(tokens, current.String())
+					current.Reset()
+					started = false
+				}
+				continue
+			}
+			current.WriteRune(ch)
+			started = true
+		}
+		if started {
+			tokens = append(tokens, current.String())
+		}
+	}
+	return tokens
+}
+
+// argv0Base is the basename of the first cmdline token ("" on empty input).
+func argv0Base(tokens []string) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	argv0 := tokens[0]
+	if slash := strings.LastIndex(argv0, "/"); slash >= 0 {
+		return argv0[slash+1:]
+	}
+	return argv0
+}
+
+func isForbiddenExecutablePath(token string) bool {
+	if token == "" {
 		return false
 	}
-	argv0 := strings.Split(cmdline, " ")[0]
-	base := argv0
-	if slash := strings.LastIndex(argv0, "/"); slash >= 0 {
-		base = argv0[slash+1:]
-	}
-	if base == "pi" || base == "pig" || base == "ctxmode" {
+	if forbiddenExecutableBases[argv0Base([]string{token})] {
 		return true
 	}
-	return agentRuntimePattern.MatchString(cmdline)
+	return forbiddenPathPattern.MatchString(token)
+}
+
+func isInterpreterBase(base string) bool {
+	if base == "" {
+		return false
+	}
+	if interpreterBases[base] {
+		return true
+	}
+	return versionedPythonPattern.MatchString(base) || shellVariantPattern.MatchString(base)
+}
+
+func isEnvAssignment(token string) bool {
+	if token == "" {
+		return false
+	}
+	eq := strings.Index(token, "=")
+	if eq <= 0 {
+		return false
+	}
+	for index, ch := range token[:eq] {
+		if ch == '_' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (index > 0 && ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isModuleFlagToken(token string) bool {
+	return token == "-m" || token == "--module"
+}
+
+func moduleValueFromToken(token string) (string, bool) {
+	if strings.HasPrefix(token, "--module=") {
+		return token[len("--module="):], true
+	}
+	if strings.HasPrefix(token, "-m=") {
+		return token[len("-m="):], true
+	}
+	if strings.HasPrefix(token, "-m") && len(token) > 2 {
+		return token[2:], true
+	}
+	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// GNU env(1) option model (coreutils 9.7, verified against `env --help` /
+// `env --version` and live probes on this host).
+//
+// Token phases are strict: [options] [NAME=VALUE]* [command args...] — the
+// first non-option token switches to the operand phase for good, so
+// `env FOO=1 -a m cmd` runs `-a` as the command, and `env --` still parses
+// assignments after the terminator. `-S/--split-string` is the one exception
+// with real bite: its string is re-split and the pieces are prepended to the
+// remaining argv, then the whole thing is re-parsed through the same option
+// phase (a shebang line carries options inside it).
+//
+// Long options accept unambiguous prefix abbreviations (`--argv` → `--argv0`,
+// `--un` → `--unset`); ambiguous or unknown options make env(1) exit(125)
+// without running anything, so the scan must return "no executable" rather
+// than guessing — an ambiguous option must never consume the next token as
+// its argument, and that token must never be read as the wrapped executable
+// either (e.g. `env --argv mask-name ctxmode` resolves `--argv` → `--argv0`
+// and consumes mask-name; it must NOT leave mask-name as the executable).
+//
+// envArgClass is the GNU argument class of one env option.
+type envArgClass int
+
+const (
+	envArgNone     envArgClass = iota // takes no argument (`=value` → error 125)
+	envArgRequired                    // needs a value: `=v` or the next token
+	envArgOptional                    // only `=v` is a value; next token is free
+	envArgTerminal                    // prints and exits: --help / --version
+)
+
+// envLongOptions is the long-option table of coreutils 9.7 env.
+var envLongOptions = map[string]envArgClass{
+	"argv0":                envArgRequired,
+	"ignore-environment":   envArgNone,
+	"null":                 envArgNone,
+	"unset":                envArgRequired,
+	"chdir":                envArgRequired,
+	"split-string":         envArgRequired,
+	"block-signal":         envArgOptional,
+	"default-signal":       envArgOptional,
+	"ignore-signal":        envArgOptional,
+	"list-signal-handling": envArgNone,
+	"debug":                envArgNone,
+	"help":                 envArgTerminal,
+	"version":              envArgTerminal,
+}
+
+// resolveEnvLongOption resolves the name part of a `--name[=value]` token to
+// the full long option via GNU unambiguous-prefix matching (`--argv` →
+// `--argv0`, `--un` → `--unset`). ok=false means the token is not a valid
+// option — unknown or an ambiguous abbreviation (`--d`, `--ig`, `--a`): env
+// exits(125) without executing anything in that shape, so the caller treats
+// the whole hop as "no executable" and must not touch the following token.
+func resolveEnvLongOption(name string) (string, envArgClass, bool) {
+	if class, exact := envLongOptions[name]; exact {
+		return name, class, true
+	}
+	var match string
+	var class envArgClass
+	matches := 0
+	for candidate, candidateClass := range envLongOptions {
+		if strings.HasPrefix(candidate, name) {
+			match = candidate
+			class = candidateClass
+			matches++
+		}
+	}
+	if matches == 1 {
+		return match, class, true
+	}
+	return "", 0, false
+}
+
+// envOnlyOperands reports whether every remaining token is operand-phase
+// filler — `-` (which itself begins the operand phase), `--`, or an
+// assignment — i.e. env reaches the end without a command. Used only to
+// decide whether `-0/--null` saw a command; anything option-shaped that
+// remains is conservatively treated as a would-be command (env would error
+// on `-0` + command anyway).
+func envOnlyOperands(tail []string) bool {
+	operandPhase := false
+	for _, token := range tail {
+		if !operandPhase && (token == "--" || token == "-") {
+			operandPhase = true
+			continue
+		}
+		if isEnvAssignment(token) {
+			operandPhase = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// envCommandTokens unwraps the option/assignment phases of env's argv tail
+// (the tokens after `env` itself) and returns the command argv env would
+// exec. ok=false means env cannot produce an executable at all: a missing
+// required argument (`env -a`, `env --argv0`, cluster tail `-a`, `-u/-C/-S`
+// at the end), an unknown or ambiguous long option, `=`-values on
+// no-argument options, a terminal option, or `-0/--null` combined with a
+// command — env itself errors out (or prints) in every one of those shapes,
+// and pretending the hop resolves to anything would misclassify it. ok=true
+// with an empty result is a clean "no command" invocation (`env FOO=1`).
+//
+// Token phases are strict: [options] [NAME=VALUE]* [command args...] — the
+// first non-option token switches to the operand phase for good (verified:
+// `env FOO=1 -a m cmd` execs `-a` as the command; `env -- FOO=1 cmd` still
+// parses the assignment after `--`). `-S/--split-string` is the exception
+// with real bite: its string is re-split by envSplitString (the GNU
+// build_argv quote/escape rules, not strings.Fields) and the pieces replace
+// its argument slot, then the stream is re-parsed through the option phase
+// (a shebang line carries options inside it — verified: `-S '-a mask cmd'`
+// honours the argv0 mask).
+func envCommandTokens(tail []string, depth int) ([]string, bool) {
+	if depth > 8 {
+		return nil, false
+	}
+	optionsDone := false
+	for len(tail) > 0 {
+		token := tail[0]
+		if !optionsDone && (token == "-" || token == "--") {
+			// `--` ends the option phase; a lone `-` implies -i and — verified
+			// on this host — ALSO begins the operand phase (`env - -a m cmd`
+			// execs `-a`, `env - -` errors on the second `-`).
+			optionsDone = true
+			tail = tail[1:]
+			continue
+		}
+		if optionsDone || isEnvAssignment(token) || !strings.HasPrefix(token, "-") {
+			// Operand phase: assignments are consumed; the first other token
+			// is the command. An assignment permanently ends option parsing
+			// (env does not permute): `env FOO=1 -a m cmd` execs `-a`.
+			if isEnvAssignment(token) {
+				tail = tail[1:]
+				optionsDone = true
+				continue
+			}
+			return tail, true
+		}
+		if strings.HasPrefix(token, "--") {
+			name := token[2:]
+			inline := ""
+			hasInline := false
+			if eq := strings.Index(name, "="); eq >= 0 {
+				inline, name, hasInline = name[eq+1:], name[:eq], true
+			}
+			if name == "" {
+				return nil, false
+			}
+			resolved, class, ok := resolveEnvLongOption(name)
+			if !ok {
+				return nil, false
+			}
+			switch class {
+			case envArgTerminal:
+				// --help/--version print and exit: nothing is ever exec'd.
+				return nil, false
+			case envArgNone:
+				if hasInline {
+					// "option doesn't allow an argument" — env exits(125).
+					return nil, false
+				}
+				if resolved == "null" {
+					// --null prints the environment and refuses a command.
+					if envOnlyOperands(tail[1:]) {
+						return nil, true
+					}
+					return nil, false
+				}
+				tail = tail[1:]
+				continue
+			case envArgOptional:
+				// Optional-argument options take their value only via `=`;
+				// the next token stays free (it may be the command).
+				tail = tail[1:]
+				continue
+			default: // envArgRequired
+				if hasInline {
+					if resolved == "split-string" {
+						pieces, ok := envSplitString(inline)
+						if !ok {
+							return nil, false
+						}
+						tail = append(pieces, tail[1:]...)
+						continue
+					}
+					tail = tail[1:]
+					continue
+				}
+				if len(tail) < 2 {
+					// Missing required argument: env exits(125), no exec.
+					return nil, false
+				}
+				if resolved == "split-string" {
+					pieces, ok := envSplitString(tail[1])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[2:]...)
+					continue
+				}
+				tail = tail[2:]
+				continue
+			}
+		}
+		// Short-option cluster: -a/-u/-C/-S take an argument — the rest of
+		// the cluster when present, else the next token. The cluster loop
+		// resolves how far the tail advances before it is consumed.
+		cluster := token
+		consume := 1 // 1 = just this token, 2 = this token + its argument token
+		for pos := 1; pos < len(cluster); pos++ {
+			switch cluster[pos] {
+			case 'i', 'v':
+				continue
+			case '0':
+				if envOnlyOperands(tail[1:]) {
+					return nil, true
+				}
+				return nil, false
+			case 'a', 'u', 'C':
+				if pos+1 < len(cluster) {
+					// The rest of the cluster is this letter's argument.
+					pos = len(cluster)
+					continue
+				}
+				if len(tail) < 2 {
+					return nil, false // missing required argument
+				}
+				consume = 2
+				pos = len(cluster)
+			case 'S':
+				if pos+1 < len(cluster) {
+					pieces, ok := envSplitString(cluster[pos+1:])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[1:]...)
+				} else if len(tail) >= 2 {
+					pieces, ok := envSplitString(tail[1])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[2:]...)
+				} else {
+					return nil, false // missing required argument
+				}
+				// The split pieces re-enter the option phase in place.
+				optionsDone = false
+				consume = 0
+				pos = len(cluster)
+			default:
+				return nil, false // unknown short option
+			}
+		}
+		tail = tail[consume:]
+	}
+	return nil, true
+}
+
+// envSplitString splits one -S/--split-string value into argument tokens
+// with the quote/escape rules of GNU coreutils build_argv (verified against
+// `env --debug` on coreutils 9.7). ok=false mirrors an env error(125): a
+// malformed -S string can never reach exec, so the env hop resolves to no
+// executable instead of tokenising it wrongly.
+//
+// Verified semantics: single and double quotes group one argument and can
+// abut (a'x'"y" = ax"y"...); unclosed quotes error; C-locale whitespace
+// separates outside quotes; `#` starts a comment only where a separator
+// precedes it (never inside quotes); `\c` truncates the rest of the string;
+// outside quotes `\_` separates while inside double quotes it is a space;
+// `\\`, `\"`, `\'`, `\#`, `\$` are literal and `\f \n \r \t \v` map to
+// their control characters anywhere outside single quotes (single quotes
+// additionally honour `\\` and `\'`, every other backslash stays
+// literal); any other escape is an env error. `${VAR}` outside single
+// quotes is GNU's expansion syntax: the model keeps the literal text as one
+// opaque argument — the ancestor's environment is unavailable, and the
+// token can never be mistaken for an option argument it masks. A bare `$`
+// GNU rejects outright is a parse error here too.
+func envSplitString(str string) ([]string, bool) {
+	var args []string
+	var cur strings.Builder
+	// sep is true when no argument is in progress: at the start, after a
+	// whitespace run or a `\_` separator, and right after an opening or
+	// closing quote at an argument boundary.
+	sep := true
+	dq, sq := false, false
+	for i := 0; i < len(str); {
+		switch ch := str[i]; {
+		case ch == '\'':
+			if dq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			sq = !sq
+			sep = false
+			i++
+			continue
+		case ch == '"':
+			if sq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			dq = !dq
+			sep = false
+			i++
+			continue
+		case ch == ' ' || ch == '\t' || ch == '\n' || ch == '\v' || ch == '\f' || ch == '\r':
+			if sq || dq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if !sep {
+				args = append(args, cur.String())
+				cur.Reset()
+				sep = true
+			}
+			i++
+			continue
+		case ch == '#':
+			// '#' as first char after a separator terminates the string
+			// (a comment); anywhere else it is literal.
+			if sep {
+				return args, true
+			}
+			cur.WriteByte(ch)
+			i++
+			continue
+		case ch == '\\':
+			// Backslash inside single quotes is literal unless it precedes
+			// `\` or `'`, which GNU still escapes.
+			if sq && i+1 < len(str) && str[i+1] != '\\' && str[i+1] != '\'' {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if i+1 >= len(str) {
+				return nil, false // invalid backslash at end of string
+			}
+			switch next := str[i+1]; next {
+			case '"', '#', '$', '\'', '\\':
+				sep = false
+				cur.WriteByte(next)
+				i += 2
+				continue
+			case '_':
+				if !dq {
+					// `\_` outside double quotes is an argument separator.
+					if !sep {
+						args = append(args, cur.String())
+						cur.Reset()
+						sep = true
+					}
+					i += 2
+					continue
+				}
+				sep = false
+				cur.WriteByte(' ')
+				i += 2
+				continue
+			case 'c':
+				if dq {
+					return nil, false // '\c' must not appear in double quotes
+				}
+				// '\c' truncates the rest of the -S string.
+				if !sep {
+					args = append(args, cur.String())
+				}
+				return args, true
+			case 'f':
+				sep = false
+				cur.WriteByte('\f')
+				i += 2
+				continue
+			case 'n':
+				sep = false
+				cur.WriteByte('\n')
+				i += 2
+				continue
+			case 'r':
+				sep = false
+				cur.WriteByte('\r')
+				i += 2
+				continue
+			case 't':
+				sep = false
+				cur.WriteByte('\t')
+				i += 2
+				continue
+			case 'v':
+				sep = false
+				cur.WriteByte('\v')
+				i += 2
+				continue
+			default:
+				return nil, false // invalid escape sequence
+			}
+		case ch == '$':
+			// ${VAR} is not expanded inside single quotes; outside them GNU
+			// expands it into the current argument (an unset variable adds
+			// nothing). The ancestor's environment is out of reach, so the
+			// model keeps the `${...}` text as one opaque argument — the
+			// same token count GNU produces for a set variable, and it can
+			// never be mistaken for a masked option argument. A `$` GNU
+			// rejects (not `${NAME}`) is a parse error here too.
+			if sq {
+				sep = false
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if i+2 < len(str) && str[i+1] == '{' &&
+				(str[i+2] == '_' || (str[i+2] >= 'A' && str[i+2] <= 'Z') || (str[i+2] >= 'a' && str[i+2] <= 'z')) {
+				end := i + 3
+				for end < len(str) && (str[end] == '_' ||
+					(str[end] >= '0' && str[end] <= '9') ||
+					(str[end] >= 'A' && str[end] <= 'Z') ||
+					(str[end] >= 'a' && str[end] <= 'z')) {
+					end++
+				}
+				if end < len(str) && str[end] == '}' {
+					sep = false
+					cur.WriteString(str[i : end+1])
+					i = end + 1
+					continue
+				}
+			}
+			return nil, false // unsupported $ form: env errors out
+		default:
+			sep = false
+			cur.WriteByte(ch)
+			i++
+		}
+	}
+	if dq || sq {
+		return nil, false // no terminating quote in -S string
+	}
+	if !sep {
+		args = append(args, cur.String())
+	}
+	return args, true
+}
+
+// checkExecutableTokens reports whether the argv resolves — through env
+// wrappers and interpreters — to a forbidden agent/tool runtime.
+func checkExecutableTokens(tokens []string, depth int) bool {
+	if depth > 8 || len(tokens) == 0 {
+		return false
+	}
+	base := argv0Base(tokens)
+
+	if base == "env" {
+		// Unwrap env's options and assignments down to the command it would
+		// exec (F-1/M1/M2): the -a/--argv0 mask value and every other option
+		// argument must never be mistaken for the wrapped executable, and an
+		// env invocation that can never exec (missing option argument,
+		// unknown/ambiguous option, terminal option) resolves to "no
+		// executable" instead of guessing.
+		residual, ok := envCommandTokens(tokens[1:], depth)
+		if !ok || len(residual) == 0 {
+			return false
+		}
+		return checkExecutableTokens(residual, depth+1)
+	}
+
+	if !isInterpreterBase(base) {
+		return isForbiddenExecutablePath(tokens[0])
+	}
+
+	// An interpreter: scan forward for the first script-path token.
+	for index := 1; index < len(tokens); index++ {
+		token := tokens[index]
+		if token == "--" {
+			if index+1 < len(tokens) {
+				return isForbiddenExecutablePath(tokens[index+1])
+			}
+			return false
+		}
+		if isModuleFlagToken(token) {
+			if index+1 < len(tokens) {
+				return isForbiddenExecutablePath(tokens[index+1])
+			}
+			return false
+		}
+		if value, ok := moduleValueFromToken(token); ok {
+			return isForbiddenExecutablePath(value)
+		}
+		if inlineTextFlags[token] {
+			return false
+		}
+		if flagsWithArgument[token] {
+			index++
+			continue
+		}
+		if strings.HasPrefix(token, "--") && strings.Contains(token, "=") {
+			continue
+		}
+		if strings.HasPrefix(token, "-") {
+			continue
+		}
+		return isForbiddenExecutablePath(token)
+	}
+	return false
+}
+
+// executableTokenOf unwraps env wrappers (KEY=VAL, flags, -S/--split-string,
+// -- terminator) and returns the token of the executable actually run. The
+// env hop shares envCommandTokens with checkExecutableTokens so the argv0
+// mask, abbreviations and no-exec shapes can never drift apart: an env
+// invocation that cannot exec resolves to "".
+func executableTokenOf(tokens []string, depth int) string {
+	if depth > 8 || len(tokens) == 0 {
+		return ""
+	}
+	base := argv0Base(tokens)
+	if base == "env" {
+		residual, ok := envCommandTokens(tokens[1:], depth)
+		if !ok || len(residual) == 0 {
+			return ""
+		}
+		return executableTokenOf(residual, depth+1)
+	}
+	return tokens[0]
+}
+
+// isForbiddenTokens reports whether tokens run a forbidden agent/tool runtime
+// (pi, ctxmode, dispatch-agent, grok, pi-coding-agent, bundle/cli.js).
+func isForbiddenTokens(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	return checkExecutableTokens(tokens, 0)
+}
+
+func isAgyExecutableToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	base := token
+	if slash := strings.LastIndex(token, "/"); slash >= 0 {
+		base = token[slash+1:]
+	}
+	if base == "agy" || base == "antigravity" {
+		return true
+	}
+	return agyPathPattern.MatchString(token)
+}
+
+// isAgyTokens reports whether tokens run agy/antigravity (directly, env-wrapped
+// or interpreter-wrapped). The interpreter branch honours the same flag table
+// as checkExecutableTokens: "--" and -m/--module take their following token,
+// inline-text flags (-c/-e/-p ...) end the script scan so `bash -c "agy"` can
+// never pass off its command string as the agy host, and flags that consume an
+// argument skip that argument.
+func isAgyTokens(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	if isAgyExecutableToken(executableTokenOf(tokens, 0)) {
+		return true
+	}
+	if isInterpreterBase(argv0Base(tokens)) {
+		for index := 1; index < len(tokens); index++ {
+			token := tokens[index]
+			if token == "--" {
+				if index+1 < len(tokens) {
+					return isAgyExecutableToken(tokens[index+1])
+				}
+				return false
+			}
+			if isModuleFlagToken(token) {
+				if index+1 < len(tokens) {
+					return isAgyExecutableToken(tokens[index+1])
+				}
+				return false
+			}
+			if value, ok := moduleValueFromToken(token); ok {
+				return isAgyExecutableToken(value)
+			}
+			if inlineTextFlags[token] {
+				return false
+			}
+			if flagsWithArgument[token] {
+				index++
+				continue
+			}
+			if strings.HasPrefix(token, "--") && strings.Contains(token, "=") {
+				continue
+			}
+			if strings.HasPrefix(token, "-") {
+				continue
+			}
+			return isAgyExecutableToken(token)
+		}
+	}
+	return false
+}
+
+// tokensOf prefers a hop's \0-separated Argv and falls back to the
+// quote-aware tokenisation of its joined cmdline.
+func tokensOf(entry AncestorProcess) []string {
+	if len(entry.Argv) > 0 {
+		return entry.Argv
+	}
+	return splitCmdlineTokens(entry.Cmdline)
+}
+
+var agentRuntimePattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js`)
+
+// ---------------------------------------------------------------------------
+// Negative launch markers (env + argv, prompt arguments stripped).
+// ---------------------------------------------------------------------------
+
+// StripPromptArgTokens removes the prompt-carrying flags and the one
+// argument token each may consume, so a main agent's prompt text that merely
+// mentions "--agent" or "/tmp/dispatch-..." is not mistaken for a launch
+// marker. Exported for the MCP layer and tests.
+//
+// Consumption rule (PiG, verified against ref/PiG/coding/cli/args.go:258-270,
+// the "--print" || "-p" case): the next token counts as prompt text only when
+// it does NOT start with "@" (an @file inclusion stays visible to the
+// marker scan) and is NOT flag-shaped — where a token starting with "---"
+// counts as prompt text, not a flag (PiG lets "---"-led positionals be
+// messages). A plain "-"-prefixed token is an option and stays visible, so
+// `pi -p --name role-x` still trips the marker scan (F-2).
+//
+// PiG's parser defines no -i/--prompt option (verified: no such case in
+// args.go); both remain in the strip set for the agy-side flag family whose
+// consumption semantics are unverified — the same conservative rule is
+// applied so neither can ever swallow a structural marker token. The
+// "=value" inline forms always carry their own argument.
+func StripPromptArgTokens(tokens []string) []string {
+	structural := make([]string, 0, len(tokens))
+	for index := 0; index < len(tokens); index++ {
+		token := tokens[index]
+		if token == "-i" || token == "-p" || token == "--prompt" || token == "--print" {
+			if index+1 < len(tokens) {
+				next := tokens[index+1]
+				if !strings.HasPrefix(next, "@") &&
+					(!strings.HasPrefix(next, "-") || strings.HasPrefix(next, "---")) {
+					index++
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(token, "-i=") || strings.HasPrefix(token, "-p=") ||
+			strings.HasPrefix(token, "--prompt=") || strings.HasPrefix(token, "--print=") {
+			continue
+		}
+		structural = append(structural, token)
+	}
+	return structural
+}
+
+// HasSubagentCliFlags reports whether argv carries a dispatch launch marker:
+// --agent <val> / --agent=*, "--name role-*" (separate or = form), or a token
+// containing /tmp/herdr-role-sessions or /tmp/dispatch-. Prompt argument
+// tokens are stripped first. Exported for the MCP layer and tests.
+func HasSubagentCliFlags(tokens []string) bool {
+	tokens = StripPromptArgTokens(tokens)
+	for index, token := range tokens {
+		if token == "--agent" {
+			if index+1 < len(tokens) {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(token, "--agent=") {
+			return true
+		}
+		if token == "--name" {
+			if index+1 < len(tokens) && strings.HasPrefix(tokens[index+1], "role-") {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(token, "--name=role-") {
+			return true
+		}
+		if strings.Contains(token, "/tmp/herdr-role-sessions") {
+			return true
+		}
+		if strings.Contains(token, "/tmp/dispatch-") {
+			return true
+		}
+	}
+	return false
+}
+
+// negativeEnvMarker returns the first negative environment marker in env
+// (nil-safe): CTXMODE_ROLE non-empty, PI_SUBAGENT=1, or PI_ROLE non-empty.
+func negativeEnvMarker(env map[string]string) (string, bool) {
+	if strings.TrimSpace(env["CTXMODE_ROLE"]) != "" {
+		return "CTXMODE_ROLE=" + env["CTXMODE_ROLE"], true
+	}
+	if env["PI_SUBAGENT"] == "1" {
+		return "PI_SUBAGENT=1", true
+	}
+	if strings.TrimSpace(env["PI_ROLE"]) != "" {
+		return "PI_ROLE=" + env["PI_ROLE"], true
+	}
+	return "", false
+}
+
+// subagentLaunchMarker returns the first negative marker that matched on this
+// process (environment + bridged argv). The argv half uses the token-boundary
+// scan so prompt text is not mistaken for a launch flag.
+func subagentLaunchMarker(getenv func(string) string, args []string) (string, bool) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if marker, hit := negativeEnvMarker(map[string]string{
+		"CTXMODE_ROLE": getenv("CTXMODE_ROLE"),
+		"PI_SUBAGENT":  getenv("PI_SUBAGENT"),
+		"PI_ROLE":      getenv("PI_ROLE"),
+	}); hit {
+		return marker, true
+	}
+	if marker, hit := argvMarkerDescription(args); hit {
+		return marker, true
+	}
+	return "", false
+}
+
+// argvMarkerDescription mirrors HasSubagentCliFlags and reports a stable
+// reason fragment per marker kind (kept identical to the previous join-based
+// wording so diagnostics stay greppable).
+func argvMarkerDescription(args []string) (string, bool) {
+	tokens := StripPromptArgTokens(args)
+	for index, token := range tokens {
+		if token == "--agent" && index+1 < len(tokens) {
+			return "argv has --agent", true
+		}
+		if strings.HasPrefix(token, "--agent=") {
+			return "argv has --agent", true
+		}
+		if token == "--name" && index+1 < len(tokens) && strings.HasPrefix(tokens[index+1], "role-") {
+			return "argv has --name role-", true
+		}
+		if strings.HasPrefix(token, "--name=role-") {
+			return "argv has --name role-", true
+		}
+		if strings.Contains(token, "/tmp/herdr-role-sessions") {
+			return "argv has /tmp/herdr-role-sessions", true
+		}
+		if strings.Contains(token, "/tmp/dispatch-") {
+			return "argv has /tmp/dispatch-", true
+		}
+	}
+	return "", false
 }
 
 // ArgvCache keeps the argv read from PIG_HARNESS_ARGV_FILE across turns of one
-// process (the variable is unset after the first read).
+// process. The variable is deliberately NOT unset after the first read: inside
+// one packed cell several extensions share the environment, and a sibling that
+// resolves its identity later (e.g. at EventSessionStart) must still be able
+// to read the file. The cache stays as defence in depth for a caller that
+// arrives after the file variable was removed by the harness or a restart.
 type ArgvCache struct {
 	// mu guards the cached argv itself.
 	mu sync.Mutex
 	// loadMu serialises one whole bridge load (cache probe, environment read,
-	// file read, unset, cache fill): without it a concurrent caller can observe
-	// the variable already unset while the cache is not yet filled, and would
-	// silently fall back to the base argv, losing every negative launch marker.
+	// file read, cache fill): concurrent callers all observe either the
+	// still-set variable or the filled cache, never a torn middle state.
 	loadMu   sync.Mutex
 	cached   bool
 	fileArgs []string
@@ -274,25 +1233,22 @@ var defaultArgvCache = &ArgvCache{}
 
 // loadEffectiveArgs merges os.Args-style base arguments with the harness argv
 // file. PiG starts a Go extension subprocess with no arguments and points
-// PIG_HARNESS_ARGV_FILE at the harness CLI arguments; the file is unset after
-// being read so the path cannot leak to child processes.
+// PIG_HARNESS_ARGV_FILE at the harness CLI arguments.
+//
+// The variable is deliberately left in the environment after the read: packed
+// cell members share the process environment, and a sibling extension must be
+// able to read the same file whenever it resolves its identity. It is only an
+// additional NEGATIVE marker source — it never elevates a session to main.
 //
 // Fail-closed: a set but unreadable/unparseable file is an error, so the caller
 // resolves as subagent instead of silently losing the argv markers.
-func loadEffectiveArgs(getenv func(string) string, unsetenv func(string) error, baseArgs []string, cache *ArgvCache) ([]string, error) {
+func loadEffectiveArgs(getenv func(string) string, baseArgs []string, cache *ArgvCache) ([]string, error) {
 	if cache == nil {
 		cache = defaultArgvCache
 	}
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	if unsetenv == nil {
-		unsetenv = os.Unsetenv
-	}
-	// The whole bridge runs as one critical section, including the cache probe: a
-	// caller that probes outside the lock could read PIG_HARNESS_ARGV_FILE after a
-	// first caller unset it but before that caller cached the argv, and would
-	// return the base args (empty for a PiG subprocess) as if no bridge existed.
 	cache.loadMu.Lock()
 	defer cache.loadMu.Unlock()
 	if cached, ok := cache.Get(); ok {
@@ -302,7 +1258,6 @@ func loadEffectiveArgs(getenv func(string) string, unsetenv func(string) error, 
 	if argvFile == "" {
 		return baseArgs, nil
 	}
-	defer func() { _ = unsetenv("PIG_HARNESS_ARGV_FILE") }()
 
 	data, err := os.ReadFile(argvFile)
 	if err != nil {
@@ -339,38 +1294,21 @@ func mergeArgs(baseArgs, fileArgs []string) []string {
 	return merged
 }
 
-// subagentLaunchMarker returns the first negative marker that matched.
-func subagentLaunchMarker(getenv func(string) string, args []string) (string, bool) {
-	if getenv("PI_SUBAGENT") == "1" {
-		return "PI_SUBAGENT=1", true
-	}
-	if getenv("PI_ROLE") != "" {
-		return "PI_ROLE is set", true
-	}
-	argv := strings.Join(args, " ")
-	if strings.Contains(argv, "--name role-") {
-		return "argv has --name role-", true
-	}
-	if strings.Contains(argv, "/tmp/herdr-role-sessions") {
-		return "argv has /tmp/herdr-role-sessions", true
-	}
-	if strings.Contains(argv, "/tmp/dispatch-") {
-		return "argv has /tmp/dispatch-", true
-	}
-	return "", false
-}
-
 // IdentityEnv is every input of one identity resolution. Tests fill it in;
 // defaultIdentityEnv is the production value.
 type IdentityEnv struct {
 	Getenv      func(string) string
-	Unsetenv    func(string) error
 	Args        []string
 	PID         int
 	SocketPath  string
 	Timeout     time.Duration
 	ReadStat    func(int) (int, bool)
 	ReadCmdline func(int) string
+	// ReadArgv reads /proc/<pid>/cmdline as tokens (nil keeps a hop's Argv as
+	// injected, or derives it from Cmdline via splitCmdlineTokens).
+	ReadArgv func(int) []string
+	// ReadEnviron reads /proc/<pid>/environ (nil keeps a hop's injected Env).
+	ReadEnviron func(int) map[string]string
 	// Environ enumerates the environment for the PIG_EXT_SOCKET_<NAME> keys,
 	// whose names are not known in advance.
 	Environ     func() []string
@@ -382,13 +1320,14 @@ type IdentityEnv struct {
 func defaultIdentityEnv() IdentityEnv {
 	return IdentityEnv{
 		Getenv:      os.Getenv,
-		Unsetenv:    os.Unsetenv,
 		Args:        os.Args,
 		PID:         os.Getpid(),
 		SocketPath:  herdrSocketFile,
 		Timeout:     identityQueryTimeout,
 		ReadStat:    readProcPpid,
 		ReadCmdline: readProcCmdline,
+		ReadArgv:    readProcArgv,
+		ReadEnviron: readProcEnviron,
 		Environ:     os.Environ,
 		QuerySocket: queryPaneShellPid,
 		ArgvCache:   defaultArgvCache,
@@ -461,20 +1400,28 @@ func describeAncestorChain(chain []AncestorProcess) string {
 	return strings.Join(parts, " <- ")
 }
 
-// resolveAgentIdentityWithEnv performs the fail-closed resolution and returns
-// (isSubagent, reason).
-func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
+// fillIdentityDefaults installs the production readers for every field the
+// caller left unset. ReadArgv/ReadEnviron default to the real /proc readers
+// only when the caller did not inject its own ReadStat/ReadCmdline: a test
+// chain built from synthetic pids must never reach out to the host's real
+// /proc/<synthetic_pid>/cmdline or environ — a nil reader leaves the hop's
+// injected Argv/Env (or the Cmdline fallback) authoritative instead.
+func fillIdentityDefaults(env *IdentityEnv) {
+	customProcReaders := env.ReadStat != nil || env.ReadCmdline != nil
 	if env.Getenv == nil {
 		env.Getenv = os.Getenv
-	}
-	if env.Unsetenv == nil {
-		env.Unsetenv = os.Unsetenv
 	}
 	if env.ReadStat == nil {
 		env.ReadStat = readProcPpid
 	}
 	if env.ReadCmdline == nil {
 		env.ReadCmdline = readProcCmdline
+	}
+	if env.ReadArgv == nil && !customProcReaders {
+		env.ReadArgv = readProcArgv
+	}
+	if env.ReadEnviron == nil && !customProcReaders {
+		env.ReadEnviron = readProcEnviron
 	}
 	if env.Environ == nil {
 		env.Environ = os.Environ
@@ -488,8 +1435,15 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 	if env.SocketPath == "" {
 		env.SocketPath = herdrSocketFile
 	}
+}
 
-	effectiveArgs, err := loadEffectiveArgs(env.Getenv, env.Unsetenv, env.Args, env.ArgvCache)
+// resolveIdentity is the shared S1–S4 walk. Negative markers (environment and
+// argv) and the S1/S2/S3 positive proofs run identically for both modes; the
+// ancestor scan then branches on extension vs MCP host topology.
+func resolveIdentity(env IdentityEnv, mcpMode bool) (bool, string) {
+	fillIdentityDefaults(&env)
+
+	effectiveArgs, err := loadEffectiveArgs(env.Getenv, env.Args, env.ArgvCache)
 	if err != nil {
 		return true, fmt.Sprintf("argv bridge failed: %v", err)
 	}
@@ -497,10 +1451,15 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 		return true, "launch marker: " + marker
 	}
 
-	// S1: the pane id is the herdr lookup key, not an identity criterion.
+	// S1: the pane id is both the herdr lookup key and a necessary condition —
+	// a main agent's pane id always ends with ":p1"; anything else cannot be
+	// the main pane and is rejected before the socket query.
 	paneID := strings.TrimSpace(env.Getenv("HERDR_PANE_ID"))
 	if paneID == "" {
 		return failClosed("S1: HERDR_PANE_ID unset or empty")
+	}
+	if !strings.HasSuffix(paneID, ":p1") {
+		return failClosed(fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID))
 	}
 
 	// S2: ask the running herdr server.
@@ -509,10 +1468,16 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 		return failClosed(fmt.Sprintf("S2: herdr pane query for %s failed, timed out or mismatched", paneID))
 	}
 
-	// S3a: the pane shell must be in this ancestry.
-	chain := readAncestorChain(env.PID, identityAncestorMaxHops, env.ReadStat, env.ReadCmdline)
+	// S3: the pane shell must be in this ancestry, and every hop's argv must be
+	// readable — an empty cmdline fails closed, it must not slip past S4.
+	chain := readAncestorChain(env.PID, identityAncestorMaxHops, env.ReadStat, env.ReadCmdline, env.ReadArgv, env.ReadEnviron)
 	if len(chain) == 0 {
 		return failClosed("S3: /proc ancestry for this process is unreadable")
+	}
+	for index := range chain {
+		if len(chain[index].Argv) == 0 {
+			chain[index].Argv = splitCmdlineTokens(chain[index].Cmdline)
+		}
 	}
 	shellIndex := -1
 	for index, entry := range chain {
@@ -524,14 +1489,152 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 	if shellIndex < 0 {
 		return failClosed(fmt.Sprintf("S3: pane %s shell_pid=%d is not in this process ancestry [%s]", paneID, shellPID, describeAncestorChain(chain)))
 	}
+	for hop := 0; hop <= shellIndex; hop++ {
+		entry := chain[hop]
+		if len(entry.Argv) == 0 && strings.TrimSpace(entry.Cmdline) == "" {
+			return failClosed(fmt.Sprintf("S3: ancestor pid=%d at hop=%d has an empty or unreadable cmdline", entry.PID, hop))
+		}
+	}
 
-	// S3b: anchor the host on process topology. Out of process, the first
-	// agent-runtime ancestor is the host; fused, the process itself is the host.
+	// The negative-marker scan covers this process's own environment + bridged
+	// argv (done above) and every ancestor hop 0..shellIndex-1: the environ and
+	// cmdline of an ancestor can reveal the launch just as well.
+	for hop := 0; hop < shellIndex; hop++ {
+		entry := chain[hop]
+		// Hop 0's own process environment is already checked above via env.Getenv;
+		// its /proc environ adds nothing new but an injected Env is honoured.
+		ancestorEnv := entry.Env
+		if ancestorEnv == nil && hop == 0 {
+			ancestorEnv = map[string]string{
+				"CTXMODE_ROLE": env.Getenv("CTXMODE_ROLE"),
+				"PI_SUBAGENT":  env.Getenv("PI_SUBAGENT"),
+				"PI_ROLE":      env.Getenv("PI_ROLE"),
+			}
+		}
+		if marker, hit := negativeEnvMarker(ancestorEnv); hit {
+			return failClosed(fmt.Sprintf("S4: ancestor pid=%d at hop=%d has %s", entry.PID, hop, marker))
+		}
+		tokens := tokensOf(entry)
+		if HasSubagentCliFlags(tokens) {
+			cmd := entry.Cmdline
+			if len(cmd) > 60 {
+				cmd = cmd[:60]
+			}
+			return failClosed(fmt.Sprintf("S4: subagent CLI flag in ancestor pid=%d %q", entry.PID, cmd))
+		}
+	}
+
+	if mcpMode {
+		return resolveMCPHostTopology(chain, shellIndex, paneID, shellPID)
+	}
+	return resolveExtensionHostTopology(env, chain, shellIndex, paneID, shellPID)
+}
+
+// resolveMCPHostTopology is the MCP-mode S4: between jev-mcp and the pane
+// shell, at most one host layer (agy/antigravity or pi/pig) is allowed and
+// every other hop must be that host. Forbidden tool runtimes, a second host
+// layer, or any unknown intermediate fail closed (jev-mcp.mjs behaviour).
+func resolveMCPHostTopology(chain []AncestorProcess, shellIndex int, paneID string, shellPID int) (bool, string) {
+	hostLayers := 0
+	for hop := 1; hop < shellIndex; hop++ {
+		entry := chain[hop]
+		tokens := tokensOf(entry)
+		cmd := entry.Cmdline
+		if len(cmd) > 60 {
+			cmd = cmd[:60]
+		}
+		if isAgyTokens(tokens) || isPiPigTokens(tokens) {
+			hostLayers++
+			if hostLayers > 1 {
+				return failClosed(fmt.Sprintf("S4: nested second host runtime ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+			}
+			continue
+		}
+		if isForbiddenTokens(tokens) {
+			return failClosed(fmt.Sprintf("S4: agent/tool runtime ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+		}
+		return failClosed(fmt.Sprintf("S4: unexpected intermediate ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+	}
+	return false, fmt.Sprintf("S1-S4 hold: pane=%s shell_pid=%d hop=%d host_layers=%d", paneID, shellPID, shellIndex, hostLayers)
+}
+
+// isPiPigTokens reports whether tokens run pi or pig (directly or
+// env/interpreter-wrapped) — the host-runtime half the MCP mode counts apart
+// from agy/antigravity.
+func isPiPigTokens(tokens []string) bool {
+	if len(tokens) == 0 {
+		return false
+	}
+	executable := executableTokenOf(tokens, 0)
+	base := executable
+	if slash := strings.LastIndex(executable, "/"); slash >= 0 {
+		base = executable[slash+1:]
+	}
+	if base == "pi" || base == "pig" {
+		return true
+	}
+	if isInterpreterBase(argv0Base(tokens)) {
+		for index := 1; index < len(tokens); index++ {
+			token := tokens[index]
+			if token == "--" {
+				if index+1 < len(tokens) {
+					return isPiPigOrAgentRuntimeToken(tokens[index+1])
+				}
+				return false
+			}
+			if isModuleFlagToken(token) {
+				if index+1 < len(tokens) {
+					return isPiPigOrAgentRuntimeToken(tokens[index+1])
+				}
+				return false
+			}
+			if value, ok := moduleValueFromToken(token); ok {
+				return isPiPigOrAgentRuntimeToken(value)
+			}
+			if inlineTextFlags[token] {
+				return false
+			}
+			if flagsWithArgument[token] {
+				index++
+				continue
+			}
+			if strings.HasPrefix(token, "--") && strings.Contains(token, "=") {
+				continue
+			}
+			if strings.HasPrefix(token, "-") {
+				continue
+			}
+			return isPiPigOrAgentRuntimeToken(token)
+		}
+	}
+	return agentRuntimePattern.MatchString(executable)
+}
+
+// isPiPigOrAgentRuntimeToken reports whether a script-path token names pi/pig
+// (by basename) or a forbidden agent runtime path.
+func isPiPigOrAgentRuntimeToken(token string) bool {
+	tokenBase := token
+	if slash := strings.LastIndex(token, "/"); slash >= 0 {
+		tokenBase = token[slash+1:]
+	}
+	if tokenBase == "pi" || tokenBase == "pig" {
+		return true
+	}
+	return agentRuntimePattern.MatchString(token)
+}
+
+// resolveExtensionHostTopology is the extension-mode host anchoring + S4: the
+// host is the first pi/pig ancestor below the pane shell (subprocess form) or
+// self (fused form), and no other agent/tool runtime may sit between hop 0
+// and the shell except the host itself.
+func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shellIndex int, paneID string, shellPID int) (bool, string) {
 	subprocessForm, subprocessProof := detectSubprocessForm(env.Getenv, env.Environ)
 	hostIndex := -1
 	if subprocessForm {
+		// The host is the first pi/pig (main-agent) runtime below the pane
+		// shell; ctxmode/dispatch-agent/grok are never a legitimate host.
 		for index := 0; index < shellIndex; index++ {
-			if isAgentRuntimeCmdline(chain[index].Cmdline) {
+			if isPiPigTokens(tokensOf(chain[index])) {
 				hostIndex = index
 				break
 			}
@@ -541,8 +1644,8 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 				chain[0].PID, shellPID, subprocessProof, describeAncestorChain(chain)))
 		}
 	} else {
-		if !isAgentRuntimeCmdline(chain[0].Cmdline) {
-			return failClosed(fmt.Sprintf("S3: fused form but self pid=%d cmdline %q is not an agent runtime [%s]",
+		if !isPiPigTokens(tokensOf(chain[0])) {
+			return failClosed(fmt.Sprintf("S3: fused form but self pid=%d cmdline %q is not a pi/pig agent runtime [%s]",
 				chain[0].PID, chain[0].Cmdline, describeAncestorChain(chain)))
 		}
 		hostIndex = 0
@@ -556,30 +1659,62 @@ func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 			shellPID, shellIndex, chain[hostIndex].PID))
 	}
 
-	// S4: no agent runtime between host and pane shell.
-	for hop := hostIndex + 1; hop < shellIndex; hop++ {
-		ancestor := chain[hop]
-		if isAgentRuntimeCmdline(ancestor.Cmdline) {
-			cmd := ancestor.Cmdline
+	// S4: no agent/tool runtime between hop 0 and the pane shell other than the
+	// resolved host (pi/pig/ctxmode/dispatch-agent/grok/agy/antigravity,
+	// interpreter-penetrated).
+	for hop := 0; hop < shellIndex; hop++ {
+		if hop == hostIndex {
+			continue
+		}
+		entry := chain[hop]
+		tokens := tokensOf(entry)
+		if isForbiddenTokens(tokens) || isAgyTokens(tokens) || isPiPigTokens(tokens) {
+			cmd := entry.Cmdline
 			if len(cmd) > 60 {
 				cmd = cmd[:60]
 			}
-			return failClosed(fmt.Sprintf("S4: agent runtime ancestor pid=%d %q between host and pane shell", ancestor.PID, cmd))
+			return failClosed(fmt.Sprintf("S4: agent runtime ancestor pid=%d %q between host and pane shell", entry.PID, cmd))
 		}
 	}
 
 	return false, fmt.Sprintf("S1-S4 hold: pane=%s shell_pid=%d hop=%d", paneID, shellPID, shellIndex)
 }
 
-// resolveAgentIdentity resolves against the production environment.
-func resolveAgentIdentity() (bool, string) {
-	return resolveAgentIdentityWithEnv(defaultIdentityEnv())
+// resolveAgentIdentityWithEnv resolves against the given environment in
+// extension mode (kept for the identity tests).
+func resolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
+	return resolveIdentity(env, false)
+}
+
+// ResolveAgentIdentity resolves against the production environment in
+// extension mode and returns (isSubagent, reason).
+func ResolveAgentIdentity() (bool, string) {
+	return resolveIdentity(defaultIdentityEnv(), false)
+}
+
+// ResolveAgentIdentityWithEnv is the exported extension-mode resolver so
+// sibling packages and cross-extension tests can exercise the same verdict
+// with an injected environment.
+func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
+	return resolveIdentity(env, false)
+}
+
+// ResolveMCPAgentIdentity resolves the fail-closed identity for the jev-mcp
+// MCP server against the production environment (MCP mode).
+func ResolveMCPAgentIdentity() (bool, string) {
+	return resolveIdentity(defaultIdentityEnv(), true)
+}
+
+// ResolveMCPAgentIdentityWithEnv is the MCP-mode resolver with an injected
+// environment (tests).
+func ResolveMCPAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
+	return resolveIdentity(env, true)
 }
 
 // IsSubagentSession reports whether this session is a subagent, or cannot be
 // proven to be the main agent (fail-closed).
 func IsSubagentSession() bool {
-	isSubagent, reason := resolveAgentIdentity()
+	isSubagent, reason := ResolveAgentIdentity()
 	if os.Getenv("PI_IDENTITY_DEBUG") == "1" {
 		status := "main"
 		if isSubagent {

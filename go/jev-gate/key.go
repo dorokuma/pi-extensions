@@ -83,14 +83,10 @@ func IsLocalGatewayURL(rawURL string) bool {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return false
 	}
-	// A URL that carries credentials can never use the local-gateway fallback.
+	// A URL that carries any userinfo — including the empty-username
+	// `http://@127.0.0.1` spelling — can never use the local-gateway fallback.
 	if parsed.User != nil {
-		if parsed.User.Username() != "" {
-			return false
-		}
-		if _, hasPassword := parsed.User.Password(); hasPassword {
-			return false
-		}
+		return false
 	}
 	host := strings.ToLower(parsed.Hostname())
 	if host == "" {
@@ -162,7 +158,14 @@ func ResolveAPIKey(baseURL string, lookup KeyLookup) KeyResolution {
 
 	directory := resolveAgentDirFor(lookup.Getenv, lookup.HomeDir)
 	if directory == "" {
-		directory = filepath.Join(".pig", "agent")
+		// No agent directory resolves (no HOME, no agent-dir environment):
+		// do not silently fall back to a relative ".pig/agent" path — a
+		// remote gateway fails closed, a loopback gateway still resolves
+		// to the local token.
+		if IsLocalGatewayURL(baseURL) {
+			return KeyResolution{Key: LocalGatewayKey, OK: true}
+		}
+		return KeyResolution{Detail: "cannot resolve agent config directory (HOME unset)"}
 	}
 	file := filepath.Join(directory, "settings.json")
 	data, err := lookup.ReadFile(file)

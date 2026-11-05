@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,7 +161,23 @@ func TestClassifyRejectsMalformedAnswers(t *testing.T) {
 	unknownType := sdk.ClassifierContext{
 		State: map[string]any{"text": "report body"},
 		Questions: sdk.NewOrderedObject(
+			"flag", map[string]any{"type": "invalid_type", "instructions": "Flag."},
+		),
+	}
+	boolType := sdk.ClassifierContext{
+		State: map[string]any{"text": "report body"},
+		Questions: sdk.NewOrderedObject(
 			"flag", map[string]any{"type": "bool", "instructions": "Flag."},
+		),
+	}
+	scoreArrayCriteria := sdk.ClassifierContext{
+		State: map[string]any{"text": "report body"},
+		Questions: sdk.NewOrderedObject(
+			"band", map[string]any{
+				"type":         "score",
+				"instructions": "Band.",
+				"criteria":     []any{"low", "mid", "high"},
+			},
 		),
 	}
 	validChoice := `"kind":{"choice":"b_defers","probabilities":{"b_defers":0.9}}`
@@ -180,8 +197,13 @@ func TestClassifyRejectsMalformedAnswers(t *testing.T) {
 		{"choice_label_outside_criteria", choiceWithCriteria, `{"answers":{"kind":{"choice":"unknown_label","probabilities":{"unknown_label":0.9}}}}`, `invalid choice answer for "kind"`},
 		{"score_above_range", scoreWithCriteria, `{"answers":{"band":{"score":3}}}`, `invalid score answer for "band"`},
 		{"score_is_string", scoreWithCriteria, `{"answers":{"band":{"score":"1"}}}`, `invalid score answer for "band"`},
-		{"unknown_question_type", unknownType, `{"answers":{"flag":{"noul":0.5}}}`, `unsupported question type "bool" for "flag"`},
+		{"score_negative", scoreWithCriteria, `{"answers":{"band":{"score":-1}}}`, `invalid score answer for "band"`},
+		{"score_array_criteria_above_range", scoreArrayCriteria, `{"answers":{"band":{"score":3}}}`, `invalid score answer for "band"`},
+		{"unknown_question_type", unknownType, `{"answers":{"flag":{"noul":0.5}}}`, `unsupported question type "invalid_type" for "flag"`},
+		{"bool_answer_above_one", boolType, `{"answers":{"flag":{"noul":1.5}}}`, `invalid bool answer for "flag"`},
 		{"valid_choice_inside_criteria", choiceWithCriteria, `{"answers":{"kind":{"choice":"provider_error","probabilities":{"provider_error":0.93},"confidence":0.9}}}`, ""},
+		{"valid_bool_answer", boolType, `{"answers":{"flag":{"noul":0.8}}}`, ""},
+		{"valid_score_array_criteria", scoreArrayCriteria, `{"answers":{"band":{"score":2}}}`, ""},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -207,5 +229,90 @@ func TestClassifyRejectsMalformedAnswers(t *testing.T) {
 				t.Fatalf("malformed answer reported stopReason=%q", result.StopReason)
 			}
 		})
+	}
+}
+
+// TestClassifyBoolQuestionWireMapping pins the public bool ↔ wire noul mapping:
+// a `type:"bool"` question leaves the caller's table untouched, goes out as
+// `type:"noul"`, and comes back as the public bool answer shape.
+func TestClassifyBoolQuestionWireMapping(t *testing.T) {
+	var body map[string]any
+	sentNoul := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		_ = json.Unmarshal(raw, &body)
+		questions, _ := body["questions"].(map[string]any)
+		flag, _ := questions["flag"].(map[string]any)
+		if flag["type"] == "noul" {
+			sentNoul = true
+		}
+		_, _ = writer.Write([]byte(`{"answers":{"flag":{"noul":0.8}}}`))
+	}))
+	defer server.Close()
+
+	request := sdk.ClassifierContext{
+		State: map[string]any{"text": "report body"},
+		Questions: sdk.NewOrderedObject(
+			"flag", map[string]any{
+				"type":         "bool",
+				"instructions": "Flag.",
+				"criteria":     map[string]any{"true": "Yes.", "false": "No."},
+			},
+		),
+	}
+	api := newTestAPI(server, 24000, 2*time.Second)
+	result, err := classifyWith(api, classifierModel(server), request, sdk.ProviderOperationOptions{Signal: context.Background()})
+	if err != nil {
+		t.Fatalf("classifyWith: %v", err)
+	}
+	if !sentNoul {
+		t.Fatalf("the wire question must be noul, got %v", body["questions"])
+	}
+	// The caller's own question table keeps the declared type.
+	question, _ := request.Questions.Get("flag")
+	if typed, _ := question.(map[string]any); typed["type"] != "bool" {
+		t.Fatalf("caller question mutated: %v", question)
+	}
+	answer, _ := result.Answers.Get("flag")
+	boolAnswer, ok := answer.(map[string]any)
+	if !ok || boolAnswer["type"] != "bool" || boolAnswer["probability"] != 0.8 {
+		t.Fatalf("bool answer = %v", answer)
+	}
+}
+
+// TestClassifyRejectsUntrustedBaseUrl pins the credential guard: a model
+// baseUrl that is neither the configured endpoint nor a loopback gateway must
+// not be sent the resolved credential (and the request never happens). The
+// loopback branch is proven with a second isolated httptest server that must
+// actually receive the request and return a legal answer — no branch may
+// reach a real gateway.
+func TestClassifyRejectsUntrustedBaseUrl(t *testing.T) {
+	server := jsonServer(t, http.StatusOK, `{"answers":{"risk":{"noul":0.5}}}`)
+	api := newTestAPI(server, 24000, 2*time.Second)
+	model := classifierModel(server)
+	model["baseUrl"] = "https://evil.example/v1"
+	if _, err := classifyWith(api, model, classifierRequest(), sdk.ProviderOperationOptions{Signal: context.Background()}); err == nil ||
+		!strings.Contains(err.Error(), "refusing to send credentials to untrusted model baseUrl") {
+		t.Fatalf("untrusted baseUrl must be refused: %v", err)
+	}
+	// A loopback baseUrl is a local gateway: the request still runs. The
+	// endpoint is a second httptest server, so the assertion that the request
+	// really arrived (and got a legal answer through) is isolated from any
+	// gateway that may be listening on this host.
+	var loopbackSawRequest atomic.Bool
+	loopbackServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/systemone" {
+			loopbackSawRequest.Store(true)
+		}
+		_, _ = writer.Write([]byte(`{"answers":{"risk":{"noul":0.5},"kind":{"choice":"b_defers","probabilities":{"b_defers":0.9}}}}`))
+	}))
+	defer loopbackServer.Close()
+	loopback := classifierModel(server)
+	loopback["baseUrl"] = loopbackServer.URL + "/v1"
+	if _, err := classifyWith(api, loopback, classifierRequest(), sdk.ProviderOperationOptions{Signal: context.Background()}); err != nil {
+		t.Fatalf("loopback baseUrl must not be refused or fail: %v", err)
+	}
+	if !loopbackSawRequest.Load() {
+		t.Fatal("the loopback endpoint never received the classification request")
 	}
 }

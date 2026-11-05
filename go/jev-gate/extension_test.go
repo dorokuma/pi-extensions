@@ -7,12 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
+	excludetoolsguard "github.com/dorokuma/pi-extensions/go/exclude-tools-guard"
 )
 
 // TestExecuteCheckInvalidTask pins the invalid-task branch and its shape.
@@ -121,9 +124,58 @@ func TestExecuteCheckSuccess(t *testing.T) {
 		t.Fatalf("structured usage = %v", structured["usage"])
 	}
 	details, _ := result.Details.(map[string]any)
-	if details["summary"] != verdict[0] {
-		t.Fatalf("details summary = %v", result.Details)
+	if want := strings.Join(verdict, " | "); details["summary"] != want {
+		t.Fatalf("details summary = %v, want %q", result.Details, want)
 	}
+}
+
+// TestExecuteCheckSummaryKeepsEveryVerdictLine pins SF-2: the details summary
+// must carry the whole verdict, never only the first line — a UNCERTAIN band
+// with no FLAGGED gate, and a material disagreement, must survive in it.
+func TestExecuteCheckSummaryKeepsEveryVerdictLine(t *testing.T) {
+	t.Run("gate_scan_uncertain_only", func(t *testing.T) {
+		// No gate reaches 0.8, so the only line is the UNCERTAIN band: the
+		// summary must still name the field a human has to confirm.
+		body := `{"answers":{` +
+			`"g1_evidence_missing_fields":{"noul":0.2},` +
+			`"g1_criterion_not_executed":{"noul":0.02},` +
+			`"g2_unresolved_must_fix":{"noul":0.5},` +
+			`"g3_unresolved_fatal_doubt":{"noul":0.03},` +
+			`"g4_leftovers_unrecorded":{"noul":0.04}},` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`
+		server := jsonServer(t, http.StatusOK, body)
+		result := executeCheck(newTestAPI(server, 24000, 2*time.Second), context.Background(),
+			map[string]any{"task": "gate_scan", "payload": "report body"})
+		if result.IsError {
+			t.Fatalf("unexpected error: %q", result.Content)
+		}
+		details, _ := result.Details.(map[string]any)
+		summary, _ := details["summary"].(string)
+		if !strings.Contains(summary, "UNCERTAIN") || !strings.Contains(summary, "g2_unresolved_must_fix") {
+			t.Fatalf("summary must keep the UNCERTAIN band: %q", summary)
+		}
+		if strings.Contains(summary, "FLAGGED") {
+			t.Fatalf("no gate was flagged: %q", summary)
+		}
+	})
+	t.Run("disagreement_keeps_material_line", func(t *testing.T) {
+		body := `{"answers":{` +
+			`"has_material_disagreement":{"noul":0.9},` +
+			`"same_finding_set":{"noul":0.2},` +
+			`"relation":{"choice":"b_raises_new","probabilities":{"b_raises_new":0.9,"agrees":0.05,"b_refutes_a":0.05,"both_raise_different":0.0,"b_defers":0.0},"confidence":0.9}},` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`
+		server := jsonServer(t, http.StatusOK, body)
+		result := executeCheck(newTestAPI(server, 24000, 2*time.Second), context.Background(),
+			map[string]any{"task": "disagreement", "payload": "A\n---\nB"})
+		if result.IsError {
+			t.Fatalf("unexpected error: %q", result.Content)
+		}
+		details, _ := result.Details.(map[string]any)
+		summary, _ := details["summary"].(string)
+		if !strings.Contains(summary, "material disagreement: YES") || !strings.Contains(summary, "relation: b_raises_new") {
+			t.Fatalf("summary must keep both verdict lines: %q", summary)
+		}
+	})
 }
 
 // TestExecuteCheckContractLintSuccess pins the role echo and missing-field n/a.
@@ -282,8 +334,29 @@ func TestProviderConfig(t *testing.T) {
 	}
 }
 
+// recordingRegistrar captures every RegisterProvider/RegisterTool call so the
+// branch assertions observe real registrations instead of trusting a returned
+// handle (MF-6: the previous test only checked Name() and could not fail).
+type recordingRegistrar struct {
+	providers map[string][]sdk.ProviderConfig
+	tools     []sdk.ToolDefinition
+}
+
+func newRecordingRegistrar() *recordingRegistrar {
+	return &recordingRegistrar{providers: map[string][]sdk.ProviderConfig{}}
+}
+
+func (r *recordingRegistrar) RegisterProvider(name string, config sdk.ProviderConfig) {
+	r.providers[name] = append(r.providers[name], config)
+}
+
+func (r *recordingRegistrar) RegisterTool(definition sdk.ToolDefinition) {
+	r.tools = append(r.tools, definition)
+}
+
 // TestNewExtensionBranches drives both factory branches without a host and
-// without the production herdr socket (the identity verdict is injected).
+// without the production herdr socket (the identity verdict is injected), and
+// asserts the registrations each branch must perform.
 func TestNewExtensionBranches(t *testing.T) {
 	api := JevAPI{
 		Config: Config{BaseURL: "http://127.0.0.1:3425/v1", ModelID: DefaultModelID, MaxStateChars: 24000, TimeoutMs: 2000, Timeout: 2 * time.Second},
@@ -296,14 +369,60 @@ func TestNewExtensionBranches(t *testing.T) {
 		Client: &http.Client{},
 	}
 
-	mainAgent := newExtension(func() bool { return false }, api)
-	if mainAgent == nil || mainAgent.Name() != "jev-gate" {
-		t.Fatalf("main-agent extension = %v", mainAgent)
-	}
-	subagent := newExtension(func() bool { return true }, api)
-	if subagent == nil || subagent.Name() != "jev-gate" {
-		t.Fatalf("subagent extension = %v", subagent)
-	}
+	t.Run("main_agent_registers_tool_and_provider", func(t *testing.T) {
+		registrar := newRecordingRegistrar()
+		wireExtension(registrar, func() bool { return false }, api)
+
+		// The jev_check tool must be registered exactly once.
+		if len(registrar.tools) != 1 || registrar.tools[0].Name != "jev_check" {
+			t.Fatalf("tools = %+v, want exactly jev_check", registrar.tools)
+		}
+
+		// Exactly the magpie-jev provider must be registered, with the
+		// group/classifier model and the typesafe-system-one classifier callback.
+		magpie, ok := registrar.providers[ProviderID]
+		if !ok || len(magpie) != 1 {
+			t.Fatalf("providers = %v, want exactly one %q registration", registrar.providers, ProviderID)
+		}
+		config := magpie[0]
+		models, _ := config["models"].([]any)
+		if len(models) != 1 {
+			t.Fatalf("models = %v", config["models"])
+		}
+		model, _ := models[0].(map[string]any)
+		if model["id"] != "group/classifier" || model["api"] != "typesafe-system-one" {
+			t.Fatalf("model = %v", model)
+		}
+		classifiers, _ := config["classifiers"].(map[string]sdk.ProviderClassifyFunc)
+		if classifiers["typesafe-system-one"] == nil {
+			t.Fatalf("classifiers = %v", config["classifiers"])
+		}
+
+		// The built-in typesafe provider must not be touched on the main agent.
+		if _, cleared := registrar.providers[BuiltinClassifierProvider]; cleared {
+			t.Fatalf("main agent must not re-register %q", BuiltinClassifierProvider)
+		}
+	})
+
+	t.Run("subagent_registers_nothing_but_clears_typesafe", func(t *testing.T) {
+		registrar := newRecordingRegistrar()
+		wireExtension(registrar, func() bool { return true }, api)
+
+		if len(registrar.tools) != 0 {
+			t.Fatalf("subagent must not register tools, got %+v", registrar.tools)
+		}
+		if _, ok := registrar.providers[ProviderID]; ok {
+			t.Fatalf("subagent must not register %q", ProviderID)
+		}
+		typesafe, ok := registrar.providers[BuiltinClassifierProvider]
+		if !ok || len(typesafe) != 1 {
+			t.Fatalf("subagent must clear %q exactly once, providers = %v", BuiltinClassifierProvider, registrar.providers)
+		}
+		models, _ := typesafe[0]["models"].([]any)
+		if models == nil || len(models) != 0 {
+			t.Fatalf("typesafe models = %v, want empty []any{}", typesafe[0]["models"])
+		}
+	})
 }
 
 // TestExecuteCheckConcurrent hammers one endpoint from several goroutines; run
@@ -348,5 +467,120 @@ func TestExecuteCheckRequestBodyIsSmall(t *testing.T) {
 		map[string]any{"task": "gate_scan", "payload": "plain text"})
 	if result.IsError {
 		t.Fatalf("unexpected error: %q", result.Content)
+	}
+}
+
+// ---- Cross-extension Packed Cell regression (MF-2) ------------------------
+//
+// PIG_HARNESS_ARGV_FILE is process-level state shared by every member of a
+// packed cell. An earlier implementation deleted the variable inside each
+// extension's argv bridge, so whichever extension resolved its identity first
+// blinded every sibling that read it later (e.g. at EventSessionStart). These
+// tests pin both init orders: whichever extension runs first must leave the
+// variable readable, and both must still hit the launch marker inside it.
+//
+// Each order isolates BOTH default argv caches with fresh injected caches
+// (jev-gate: IdentityEnv.ArgvCache; exclude-tools-guard:
+// IdentityEnv.ArgvCache + LoadEffectiveArgsWithCache) so the second order
+// cannot ride the first order's cached argv — the file must really be read
+// again. The role marker is unique per order for the same reason: stale
+// cache would still be a marker but never the CURRENT order's marker.
+
+// packedCellArgvFixture installs a PIG_HARNESS_ARGV_FILE carrying a
+// ["--name","role-<marker>"] launch marker and clears every other identity
+// input so the only reason either extension can return "subagent" is that
+// file. It returns the expected marker substring.
+func packedCellArgvFixture(t *testing.T, marker string) (string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "argv.json")
+	if err := os.WriteFile(path, []byte(`["--name","role-`+marker+`"]`), 0o600); err != nil {
+		t.Fatalf("write argv file: %v", err)
+	}
+	// Clear the real packed-cell environment this test process may run under
+	// (CTXMODE_ROLE/PIG_EXT_* are set inside a live cell): any of them would
+	// fail-closed for a different reason and hide what is being measured.
+	for _, key := range os.Environ() {
+		name, _, _ := strings.Cut(key, "=")
+		switch {
+		case strings.HasPrefix(name, "PIG_EXT_"):
+			t.Setenv(name, "")
+		case name == "CTXMODE_ROLE" || name == "PI_SUBAGENT" || name == "PI_ROLE" || name == "HERDR_PANE_ID":
+			t.Setenv(name, "")
+		}
+	}
+	t.Setenv("PIG_HARNESS_ARGV_FILE", path)
+	return path, "launch marker: argv has --name role-"
+}
+
+// assertPackedCellArgvHit asserts both extensions resolved as subagent
+// BECAUSE of the argv bridge marker (not for any unrelated fail-closed
+// reason), and that PIG_HARNESS_ARGV_FILE stayed readable afterwards.
+func assertPackedCellArgvHit(t *testing.T, path, want, jevReason, guardReason string) {
+	t.Helper()
+	if got := os.Getenv("PIG_HARNESS_ARGV_FILE"); got != path {
+		t.Fatalf("PIG_HARNESS_ARGV_FILE must stay readable for packed cell siblings, got %q", got)
+	}
+	if !strings.Contains(jevReason, want) {
+		t.Fatalf("jev-gate reason = %q, want the argv bridge launch marker", jevReason)
+	}
+	if !strings.Contains(guardReason, want) {
+		t.Fatalf("exclude-tools-guard reason = %q, want the argv bridge launch marker", guardReason)
+	}
+	// Negative-marker only: the file must never be able to elevate a session —
+	// both verdicts went subagent, verified by the reasons above.
+}
+
+// TestPackedCellArgvFileSharedAcrossExtensions runs both init orders with
+// each order's argv caches freshly isolated: whichever extension resolves
+// first must leave the shared file readable, and the sibling must hit the
+// CURRENT order's launch marker through its own fresh read.
+func TestPackedCellArgvFileSharedAcrossExtensions(t *testing.T) {
+	for _, order := range []struct {
+		name     string
+		jevFirst bool
+	}{
+		{"JevFirst", true},
+		{"GuardFirst", false},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			path, want := packedCellArgvFixture(t, "packed-"+order.name)
+
+			// Fresh caches per side per order — never the process defaults.
+			jevEnv := IdentityEnv{Getenv: os.Getenv, Args: []string{"runner"}, ArgvCache: &ArgvCache{}}
+			guardEnv := excludetoolsguard.IdentityEnv{Getenv: os.Getenv, Args: []string{"runner"}, ArgvCache: &excludetoolsguard.ArgvCache{}}
+
+			var jevSub, guardSub bool
+			var jevReason, guardReason string
+			if order.jevFirst {
+				extension := Extension()
+				if extension == nil || extension.Name() != "jev-gate" {
+					t.Fatalf("jev-gate Extension() = %v", extension)
+				}
+				jevSub, jevReason = resolveAgentIdentityWithEnv(jevEnv)
+				guardSub, guardReason = excludetoolsguard.ResolveAgentIdentityWithEnv(guardEnv)
+			} else {
+				guardSub, guardReason = excludetoolsguard.ResolveAgentIdentityWithEnv(guardEnv)
+				extension := Extension()
+				if extension == nil || extension.Name() != "jev-gate" {
+					t.Fatalf("jev-gate Extension() = %v", extension)
+				}
+				jevSub, jevReason = resolveAgentIdentityWithEnv(jevEnv)
+			}
+			if !jevSub || !guardSub {
+				t.Fatalf("both extensions must resolve subagent via the shared argv file: jev=%v guard=%v", jevSub, guardSub)
+			}
+
+			// A third fresh cache proves the bridge file itself is still
+			// readable after both resolutions (not merely served from cache).
+			args, err := excludetoolsguard.LoadEffectiveArgsWithCache(os.Getenv, []string{"runner"}, &excludetoolsguard.ArgvCache{})
+			if err != nil {
+				t.Fatalf("LoadEffectiveArgsWithCache: %v", err)
+			}
+			if joined := strings.Join(args, " "); joined != "runner --name role-packed-"+order.name {
+				t.Fatalf("effective args = %v, must still read the shared file", args)
+			}
+
+			assertPackedCellArgvHit(t, path, want, jevReason, guardReason)
+		})
 	}
 }
