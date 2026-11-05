@@ -88,7 +88,7 @@
    - 原 TS 注释明确拒绝依赖可被伪造的环境变量；但由于 PiG 派生 Go 扩展子进程时为无参（`os.Args` 仅包含自身二进制路径），不得不通过宿主写入的 `PIG_HARNESS_ARGV_FILE` 文件桥接宿主参数（aligned with `runtime-node/process-identity.mjs:21-22` 及 `harness_identity.go:24`）。
    - **Fail-closed 防御策略**：若 `PIG_HARNESS_ARGV_FILE` 环境变量存在但文件缺失或包含坏 JSON，立即 fail-closed 判定为子代理（防止攻击者通过篡改环境变量屏蔽 `--name role-` 等负向标记）；仅当该环境变量完全未设置时，才安全退化为仅使用 `os.Args`。
    - **packed cell 共享保留（MF-2 语义反转）**：`PIG_HARNESS_ARGV_FILE` 在读取后**刻意保留、不 unset**——同一 packed cell 内的兄弟扩展共享进程环境，单个扩展 unset 会致盲后续解析身份的兄弟（如在 EventSessionStart 时机）。该变量只是额外的负向标记来源：它只能把判据推向 subagent，永远无法把会话抬升为 main。（历史：此前按 TS `delete process.env.PIG_HARNESS_ARGV_FILE` 对齐做 unset，packed-cell 回归证明会破坏兄弟读取，已反转。）
-   - **进程内 argv 缓存（M2 回归修复）**：`ResolveAgentIdentityWithEnv` 每个 turn 都会调用身份判定；缓存只在变量已读成功后生效，保证宿主清理或重指变量后，后续 turn 仍能复用已桥接的 argv。缓存只区分三种情形：① env 未设且无缓存 → 合法回落 `os.Args`，**不写入缓存**（避免把合法回落误当成缓存事实）；② env 已设且解析成功 → 缓存结果，供变量消失后的 turn 复用；③ env 已设但读/解析失败 → 返回错误并 fail-closed 判子代理，**不缓存失败**，因此每次调用都会重新判定，不会把一次故障永久固化成「永远子代理」。
+   - **进程内 argv 缓存（M2 回归修复）**：`ResolveAgentIdentityWithEnv` 每个 turn 都会调用身份判定；缓存只在变量已读成功后生效，保证宿主清理变量（置空/未设）后，后续 turn 仍能复用已桥接的 argv。缓存只区分三种情形：① env 未设且无缓存 → 合法回落 `os.Args`，**不写入缓存**（避免把合法回落误当成缓存事实）；② env 已设且解析成功 → 缓存结果，供变量消失后的 turn 复用；③ env 已设但读/解析失败 → 返回错误并 fail-closed 判子代理，**不缓存失败**，因此每次调用都会重新判定，不会把一次故障永久固化成「永远子代理」。注意：**变量非空时总是重新读文件、不走缓存**——宿主把变量重指到另一路径时会按新路径读取，重指到坏路径会按 ③ 报错，而非复用旧缓存。
 3. **`shell_pid` 类型解析与严格校验**：
    - TS 原版使用 `Number(info?.shell_pid)`，对于 JSON 字符串形式（如 `"4242"`）会宽松转换为数字并通过验证。
    - Go 移植版严格遵循 JSON-RPC 类型规范，只认 JSON number（float64 整数或 int），对字符串形式的 pid 一律拒绝（fail-closed 判子代理）。

@@ -530,10 +530,11 @@ func envOnlyOperands(tail []string) bool {
 // first non-option token switches to the operand phase for good (verified:
 // `env FOO=1 -a m cmd` execs `-a` as the command; `env -- FOO=1 cmd` still
 // parses the assignment after `--`). `-S/--split-string` is the exception
-// with real bite: its string is re-split and the pieces replace its argument
-// slot, then the stream is re-parsed through the option phase (a shebang
-// line carries options inside it — verified: `-S '-a mask cmd'` honours the
-// argv0 mask).
+// with real bite: its string is re-split by envSplitString (the GNU
+// build_argv quote/escape rules, not strings.Fields) and the pieces replace
+// its argument slot, then the stream is re-parsed through the option phase
+// (a shebang line carries options inside it — verified: `-S '-a mask cmd'`
+// honours the argv0 mask).
 func envCommandTokens(tail []string, depth int) ([]string, bool) {
 	if depth > 8 {
 		return nil, false
@@ -600,7 +601,11 @@ func envCommandTokens(tail []string, depth int) ([]string, bool) {
 			default: // envArgRequired
 				if hasInline {
 					if resolved == "split-string" {
-						tail = append(strings.Fields(inline), tail[1:]...)
+						pieces, ok := envSplitString(inline)
+						if !ok {
+							return nil, false
+						}
+						tail = append(pieces, tail[1:]...)
 						continue
 					}
 					tail = tail[1:]
@@ -611,7 +616,11 @@ func envCommandTokens(tail []string, depth int) ([]string, bool) {
 					return nil, false
 				}
 				if resolved == "split-string" {
-					tail = append(strings.Fields(tail[1]), tail[2:]...)
+					pieces, ok := envSplitString(tail[1])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[2:]...)
 					continue
 				}
 				tail = tail[2:]
@@ -645,9 +654,17 @@ func envCommandTokens(tail []string, depth int) ([]string, bool) {
 				pos = len(cluster)
 			case 'S':
 				if pos+1 < len(cluster) {
-					tail = append(strings.Fields(cluster[pos+1:]), tail[1:]...)
+					pieces, ok := envSplitString(cluster[pos+1:])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[1:]...)
 				} else if len(tail) >= 2 {
-					tail = append(strings.Fields(tail[1]), tail[2:]...)
+					pieces, ok := envSplitString(tail[1])
+					if !ok {
+						return nil, false
+					}
+					tail = append(pieces, tail[2:]...)
 				} else {
 					return nil, false // missing required argument
 				}
@@ -662,6 +679,192 @@ func envCommandTokens(tail []string, depth int) ([]string, bool) {
 		tail = tail[consume:]
 	}
 	return nil, true
+}
+
+// envSplitString splits one -S/--split-string value into argument tokens
+// with the quote/escape rules of GNU coreutils build_argv (verified against
+// `env --debug` on coreutils 9.7). ok=false mirrors an env error(125): a
+// malformed -S string can never reach exec, so the env hop resolves to no
+// executable instead of tokenising it wrongly.
+//
+// Verified semantics: single and double quotes group one argument and can
+// abut (a'x'"y" = ax"y"...); unclosed quotes error; C-locale whitespace
+// separates outside quotes; `#` starts a comment only where a separator
+// precedes it (never inside quotes); `\c` truncates the rest of the string;
+// outside quotes `\_` separates while inside double quotes it is a space;
+// `\\`, `\"`, `\'`, `\#`, `\$` are literal and `\f \n \r \t \v` map to
+// their control characters anywhere outside single quotes (single quotes
+// additionally honour `\\` and `\'`, every other backslash stays
+// literal); any other escape is an env error. `${VAR}` outside single
+// quotes is GNU's expansion syntax: the model keeps the literal text as one
+// opaque argument — the ancestor's environment is unavailable, and the
+// token can never be mistaken for an option argument it masks. A bare `$`
+// GNU rejects outright is a parse error here too.
+func envSplitString(str string) ([]string, bool) {
+	var args []string
+	var cur strings.Builder
+	// sep is true when no argument is in progress: at the start, after a
+	// whitespace run or a `\_` separator, and right after an opening or
+	// closing quote at an argument boundary.
+	sep := true
+	dq, sq := false, false
+	for i := 0; i < len(str); {
+		switch ch := str[i]; {
+		case ch == '\'':
+			if dq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			sq = !sq
+			sep = false
+			i++
+			continue
+		case ch == '"':
+			if sq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			dq = !dq
+			sep = false
+			i++
+			continue
+		case ch == ' ' || ch == '\t' || ch == '\n' || ch == '\v' || ch == '\f' || ch == '\r':
+			if sq || dq {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if !sep {
+				args = append(args, cur.String())
+				cur.Reset()
+				sep = true
+			}
+			i++
+			continue
+		case ch == '#':
+			// '#' as first char after a separator terminates the string
+			// (a comment); anywhere else it is literal.
+			if sep {
+				return args, true
+			}
+			cur.WriteByte(ch)
+			i++
+			continue
+		case ch == '\\':
+			// Backslash inside single quotes is literal unless it precedes
+			// `\` or `'`, which GNU still escapes.
+			if sq && i+1 < len(str) && str[i+1] != '\\' && str[i+1] != '\'' {
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if i+1 >= len(str) {
+				return nil, false // invalid backslash at end of string
+			}
+			switch next := str[i+1]; next {
+			case '"', '#', '$', '\'', '\\':
+				sep = false
+				cur.WriteByte(next)
+				i += 2
+				continue
+			case '_':
+				if !dq {
+					// `\_` outside double quotes is an argument separator.
+					if !sep {
+						args = append(args, cur.String())
+						cur.Reset()
+						sep = true
+					}
+					i += 2
+					continue
+				}
+				sep = false
+				cur.WriteByte(' ')
+				i += 2
+				continue
+			case 'c':
+				if dq {
+					return nil, false // '\c' must not appear in double quotes
+				}
+				// '\c' truncates the rest of the -S string.
+				if !sep {
+					args = append(args, cur.String())
+				}
+				return args, true
+			case 'f':
+				sep = false
+				cur.WriteByte('\f')
+				i += 2
+				continue
+			case 'n':
+				sep = false
+				cur.WriteByte('\n')
+				i += 2
+				continue
+			case 'r':
+				sep = false
+				cur.WriteByte('\r')
+				i += 2
+				continue
+			case 't':
+				sep = false
+				cur.WriteByte('\t')
+				i += 2
+				continue
+			case 'v':
+				sep = false
+				cur.WriteByte('\v')
+				i += 2
+				continue
+			default:
+				return nil, false // invalid escape sequence
+			}
+		case ch == '$':
+			// ${VAR} is not expanded inside single quotes; outside them GNU
+			// expands it into the current argument (an unset variable adds
+			// nothing). The ancestor's environment is out of reach, so the
+			// model keeps the `${...}` text as one opaque argument — the
+			// same token count GNU produces for a set variable, and it can
+			// never be mistaken for a masked option argument. A `$` GNU
+			// rejects (not `${NAME}`) is a parse error here too.
+			if sq {
+				sep = false
+				cur.WriteByte(ch)
+				i++
+				continue
+			}
+			if i+2 < len(str) && str[i+1] == '{' &&
+				(str[i+2] == '_' || (str[i+2] >= 'A' && str[i+2] <= 'Z') || (str[i+2] >= 'a' && str[i+2] <= 'z')) {
+				end := i + 3
+				for end < len(str) && (str[end] == '_' ||
+					(str[end] >= '0' && str[end] <= '9') ||
+					(str[end] >= 'A' && str[end] <= 'Z') ||
+					(str[end] >= 'a' && str[end] <= 'z')) {
+					end++
+				}
+				if end < len(str) && str[end] == '}' {
+					sep = false
+					cur.WriteString(str[i : end+1])
+					i = end + 1
+					continue
+				}
+			}
+			return nil, false // unsupported $ form: env errors out
+		default:
+			sep = false
+			cur.WriteByte(ch)
+			i++
+		}
+	}
+	if dq || sq {
+		return nil, false // no terminating quote in -S string
+	}
+	if !sep {
+		args = append(args, cur.String())
+	}
+	return args, true
 }
 
 // checkExecutableTokens reports whether the argv resolves — through env

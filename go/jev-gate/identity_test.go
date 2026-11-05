@@ -527,6 +527,12 @@ func TestEnvArgv0Masking(t *testing.T) {
 		"env_cluster_ia":  "env -ia mask-name /usr/local/bin/ctxmode",
 		"env_cluster_iam": "env -iamask-name /usr/local/bin/ctxmode",
 		"env_split_opts":  `env -S "-a mask-name /usr/local/bin/ctxmode"`,
+		// GNU -S quoting: the quoted mask is ONE argv0 argument, so the
+		// wrapped ctxmode is still what env execs (verified: env --debug
+		// splits `-a 'mask ctxmode' …` into -a + the single mask token).
+		"env_split_opts_quoted_mask":     `env -S "-a 'mask-name ctxmode extra' /usr/local/bin/ctxmode"`,
+		"env_split_opts_dq_mask":         `env -S '-a "mask name" /usr/local/bin/ctxmode'`,
+		"env_split_opts_adjacent_quotes": `env -S "-a 'ma''sk' /usr/local/bin/ctxmode"`,
 	}
 	t.Run("extension_mode", func(t *testing.T) {
 		for name, wrapper := range chains {
@@ -629,6 +635,64 @@ func TestEnvCommandTokens(t *testing.T) {
 		{"split_inline", []string{"env", "-Scmd arg"}, "cmd", false},
 		{"split_long_abbrev", []string{"env", "--spl=cmd arg"}, "cmd", false},
 		{"split_rest_appended", []string{"env", "-S", "cmd", "rest"}, "cmd", false},
+		// GNU -S quote/escape rules (coreutils 9.7 build_argv, verified with
+		// env --debug): quotes group ONE argument and may abut; whitespace
+		// inside quotes never splits; `\_` separates outside double quotes;
+		// `\c` truncates; `#` starts a comment only at an argument boundary
+		// (inside quotes it is literal); `$` inside single quotes is literal
+		// while a bare unquoted `$x` is an env error; unclosed quotes and
+		// invalid escapes are env errors — no executable.
+		{"split_sq_mask_multiword", []string{"env", "-S", "-a 'mask ctxmode extra' /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_sq_mask", []string{"env", "-S", "-a 'mask' /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_dq_mask", []string{"env", "-S", `-a "m x" /usr/bin/true`}, "/usr/bin/true", false},
+		{"split_adjacent_quotes", []string{"env", "-S", "-a 'ma''sk' /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_mixed_quotes", []string{"env", "-S", "-a 'm'\"x\"'y' /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_empty_quoted_cmd", []string{"env", "-S", "'' /usr/bin/true"}, "", false},
+		{"split_quoted_space_cmd", []string{"env", "-S", "'x z' /usr/bin/true"}, "x z", false},
+		{"split_escaped_space_sep", []string{"env", "-S", "a\\_b /usr/bin/true"}, "a", false},
+		{"split_escaped_space_in_dq", []string{"env", "-S", "-a \"m\\_x\" /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_backslash_literal", []string{"env", "-S", "-a x\\\\y /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_escape_tab", []string{"env", "-S", "a\\tb /usr/bin/true"}, "a\tb", false},
+		{"split_escaped_hash", []string{"env", "-S", "a\\#b /usr/bin/true"}, "a#b", false},
+		// `#` at an argument boundary opens a comment that swallows the rest
+		// of the -S string: the string contributes no pieces, so the
+		// executable falls through to the next argv token `cmd`. A literal-#
+		// implementation would exec `#x` instead of `cmd`.
+		{"split_comment_word_boundary", []string{"env", "-S", "#x y", "cmd"}, "cmd", false},
+		{"split_comment_mid_word_literal", []string{"env", "-S", "a#b c /usr/bin/true"}, "a#b", false},
+		// `#` inside quotes is literal: the quoted text IS the executable.
+		// An always-comment implementation would see empty args → no
+		// executable; a boundary-only implementation yields `#x`.
+		{"split_hash_inside_quotes", []string{"env", "-S", "'#x' trailing"}, "#x", false},
+		{"split_backslash_c_truncates", []string{"env", "-S", "a\\cb /usr/bin/true"}, "a", false},
+		{"split_sq_backslash_literal", []string{"env", "-S", "'a\\qb' /usr/bin/true"}, "a\\qb", false},
+		{"split_sq_escaped_quote", []string{"env", "-S", "-a 'm\\'x' /usr/bin/true"}, "/usr/bin/true", false},
+		{"split_dq_escaped_quote", []string{"env", "-S", `-a "m\"x" /usr/bin/true`}, "/usr/bin/true", false},
+		{"split_var_opaque_arg", []string{"env", "-S", "-a ${MASK} /usr/bin/true"}, "/usr/bin/true", false},
+		// `$` inside single quotes is literal text, not expansion: the quoted
+		// token is the executable verbatim. Contrasts split_dollar_bad_form
+		// (unquoted `$x` → env error → no executable).
+		{"split_var_sq_literal", []string{"env", "-S", "'$x' trailing"}, "$x", false},
+		{"split_dollar_bad_form", []string{"env", "-S", "a $x /usr/bin/true"}, "", false},
+		// `${MASK` has no closing brace: GNU env errors out on the split
+		// string itself (verified: env(9.7) exits 125, "只支持 ${变量名}
+		// 扩展"), so the appended `cmd` operand never runs and the want is
+		// "no executable". A wrong implementation that accepts `${MASK` as
+		// literal text instead lets -a consume it as the argv0 mask and
+		// would yield executable `cmd` — the trailing operand is what makes
+		// the two outcomes diverge and this case fail instead of passing
+		// vacuously.
+		{"split_dollar_bad_brace", []string{"env", "-S", "-a ${MASK", "cmd"}, "", false},
+		{"split_unclosed_sq", []string{"env", "-S", "-a 'unclosed /usr/bin/true"}, "", false},
+		{"split_unclosed_dq", []string{"env", "-S", `-a "unclosed /usr/bin/true`}, "", false},
+		{"split_invalid_escape", []string{"env", "-S", "-a a\\ b /usr/bin/true"}, "", false},
+		{"split_invalid_escape_q", []string{"env", "-S", "a\\qb /usr/bin/true"}, "", false},
+		{"split_trailing_backslash", []string{"env", "-S", "a\\"}, "", false},
+		// `\$` outside quotes is an escaped literal dollar (the GNU "#,$,'
+		// literal" escape class), so the escaped token is the executable.
+		// An implementation that errors on `\$` or expands `$x` yields no
+		// executable instead of `$x`.
+		{"split_escaped_dollar_literal", []string{"env", "-S", "\\$x trailing"}, "$x", false},
 		// Forbidden-runtime residuals through wrappers.
 		{"argv0_mask_ctxmode", []string{"env", "--argv0", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},
 		{"argv_abbrev_ctxmode", []string{"env", "--argv", "mask", "/usr/local/bin/ctxmode"}, "/usr/local/bin/ctxmode", true},

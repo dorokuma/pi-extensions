@@ -292,24 +292,33 @@ func TestToolsListGate(t *testing.T) {
 // TestHelperProcessMain is not a test: it is the real-entrypoint half of
 // TestLazySchemaNotWrittenWithoutToolsList, re-executed as a real OS process
 // so the no-write contract is observed through main() itself (stdin frames →
-// readLoop → EOF), not through handleRPC alone.
+// readLoop → EOF), not through handleRPC alone. Before calling main() it
+// points jevSchemaDirs at the temp dir the parent injected via
+// JEV_MAIN_HELPER_SCHEMA_DIR (same family as stubSchemaDirs): the helper can
+// never touch — or even read — the two production mcp dirs, whatever the
+// code under test decides to write.
 func TestHelperProcessMain(t *testing.T) {
 	if os.Getenv("JEV_MAIN_HELPER") != "1" {
 		return
 	}
 	marker := os.Getenv("JEV_MAIN_HELPER_MARKER")
-	if marker == "" {
+	schemaDir := os.Getenv("JEV_MAIN_HELPER_SCHEMA_DIR")
+	if marker == "" || schemaDir == "" {
 		os.Exit(2)
 	}
+	jevSchemaDirs = []string{schemaDir}
 	// Redirect stdout so the ping reply cannot pollute the test's own output;
-	// record the schema-dir state both before and after main() ran.
+	// record the schema-dir state both before and after main() ran. A ReadDir
+	// error is not an empty dir: it is recorded and fails the helper so the
+	// parent never mistakes an unreadable dir for "nothing written".
 	dumpState := func(stage string) {
 		target := marker + "." + stage
 		var lines []string
 		for _, dir := range jevSchemaDirs {
 			entries, err := os.ReadDir(dir)
 			if err != nil {
-				continue
+				_ = os.WriteFile(target+".error", []byte(err.Error()), 0o600)
+				os.Exit(4)
 			}
 			for _, entry := range entries {
 				lines = append(lines, filepath.Join(dir, entry.Name()))
@@ -335,11 +344,16 @@ func TestHelperProcessMain(t *testing.T) {
 // parent asserts the before/after state is empty.
 func TestLazySchemaNotWrittenWithoutToolsList(t *testing.T) {
 	dir := t.TempDir()
+	schemaDir := t.TempDir()
 	marker := filepath.Join(dir, "state")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessMain$")
 	cmd.Env = append(os.Environ(),
 		"JEV_MAIN_HELPER=1",
 		"JEV_MAIN_HELPER_MARKER="+marker,
+		// The helper redirects jevSchemaDirs at this temp dir before calling
+		// main(): even if the code under test regains a startup write, it can
+		// only write here — never the production mcp dirs.
+		"JEV_MAIN_HELPER_SCHEMA_DIR="+schemaDir,
 		// Production-looking identity inputs: the gate denies everything, so
 		// even a tools/list inside this process would be the denied branch.
 		"CTXMODE_ROLE=verifier",
@@ -357,11 +371,15 @@ func TestLazySchemaNotWrittenWithoutToolsList(t *testing.T) {
 			t.Fatalf("schema dirs must stay untouched on the real startup path, saw %q (%s)", names, stage)
 		}
 	}
-	// The real paths under test are the constants main() uses; assert they
-	// name the two production dirs so a stubbed test cannot silently drift
-	// away from the real contract.
+	// The production constants stay what they are (main() cannot have drifted
+	// into asserting a stub); the helper alone redirected them.
 	if len(jevSchemaDirs) != 2 || !strings.HasSuffix(jevSchemaDirs[0], "antigravity-cli/mcp/jev") {
 		t.Fatalf("jevSchemaDirs = %v, want the production mcp/jev dirs", jevSchemaDirs)
+	}
+	// The injected dir itself stays empty too: the real startup path wrote
+	// nothing even at its (redirected) destination.
+	if entries, err := os.ReadDir(schemaDir); err != nil || len(entries) != 0 {
+		t.Fatalf("injected schema dir must stay empty on the real startup path: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -404,7 +422,7 @@ func TestInFlightDroppedBeforeResponseVisible(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("response never became visible within 15s")
 	}
-	key := requestKey(float64(9))
+	key := requestKey(message["id"])
 	inFlightMu.Lock()
 	_, stillRegistered := inFlight[key]
 	inFlightMu.Unlock()
@@ -799,18 +817,40 @@ func TestToolsCallGate(t *testing.T) {
 // TestHelperProcessSchemaWrite is not a test: it is the writer half of
 // TestWriteFileAtomicConcurrent, re-executed as a real OS process so the
 // atomicity claim is proven across processes (rename(2)), not just across
-// goroutines of one binary. Each writer publishes complete stale-schema
-// documents and drops a started marker after its first successful write so
-// the parent's reader barrier can anchor the measurement window.
+// goroutines of one binary. Each writer waits for the parent's readers-ready
+// barrier before it writes anything, publishes complete stale-schema
+// documents, drops a started marker after its first successful write, and
+// drops a done marker carrying its PID when it finishes — the started marker
+// opens the parent's admission window, the done markers bound each reader's
+// measured phase, before every writeFileAtomic call the writer drops a
+// write-begin marker (target + ".wb.<writer>.<round>") and right after it
+// succeeds a write-end marker (target + ".we.<writer>.<round>") so a parent
+// reader can prove a write started inside one read's lifetime bracket while
+// write activity was still live (a completion had reached the filesystem by
+// that bracket's end).
 func TestHelperProcessSchemaWrite(t *testing.T) {
 	if os.Getenv("JEV_SCHEMA_WRITE_HELPER") != "1" {
 		return
 	}
 	target := os.Getenv("JEV_SCHEMA_WRITE_TARGET")
 	writer := os.Getenv("JEV_SCHEMA_WRITE_WRITER")
+	readyGate := os.Getenv("JEV_SCHEMA_WRITE_READERS_READY")
 	rounds, _ := strconv.Atoi(os.Getenv("JEV_SCHEMA_WRITE_ROUNDS"))
-	if target == "" || rounds <= 0 {
+	if target == "" || readyGate == "" || rounds <= 0 {
 		os.Exit(2)
+	}
+	// Writer barrier: do not enter the write phase until the parent reports
+	// every reader goroutine armed. Bounded so a wedged parent can never pin
+	// the child (and the child's own Wait is bounded on the parent side).
+	readyDeadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(readyGate); err == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			os.Exit(4)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	for round := 0; round < rounds; round++ {
 		content, _ := json.Marshal(map[string]any{
@@ -818,14 +858,28 @@ func TestHelperProcessSchemaWrite(t *testing.T) {
 			"description": fmt.Sprintf("stale-w%s-r%d", writer, round),
 			"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
 		})
+		// The write-begin marker lands BEFORE the atomic write and the write-end
+		// marker lands right after it: a parent reader sees a NEW .wb.* file
+		// between the wbBefore and wbAfter globs bracketing one os.ReadFile only
+		// while a write began inside that bracket, and sees at least one .we.*
+		// file only once a write has completed — together they keep pure
+		// pre/post-phase static reads out of OVERLAP_READS. Cheap: empty files
+		// are enough.
+		_ = os.WriteFile(fmt.Sprintf("%s.wb.%s.%d", target, writer, round), nil, 0o600)
 		if err := writeFileAtomic(target, content, 0o644); err != nil {
 			os.Exit(3)
 		}
+		_ = os.WriteFile(fmt.Sprintf("%s.we.%s.%d", target, writer, round), nil, 0o600)
 		if round == 0 {
 			// The first successful write is done: the target file now exists
 			// and will never disappear again (rename only replaces it).
 			_ = os.WriteFile(target+".started."+writer, []byte("1"), 0o600)
 		}
+	}
+	// The done marker carries this process's real PID: the parent asserts the
+	// writers were 4+ distinct OS processes, not threads of one binary.
+	if err := os.WriteFile(target+".done."+writer, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(5)
 	}
 	os.Exit(0)
 }
@@ -849,100 +903,244 @@ func staleSchemaDocOK(data []byte) bool {
 
 // TestWriteFileAtomicConcurrent hammers one schema file from several real
 // child processes while parent-side readers race them inside the measured
-// window (first successful write → last writer done). Every completed read
-// must be a complete, legal stale-schema document; read errors — including
-// ENOENT — are counted, and no temp file may be left behind.
+// window. The window opens at the first writer's started marker (first
+// successful write) as an admission ticket only; its end is not a watcher
+// notification — each reader rechecks the done markers at every completed
+// read and leaves the measured phase once done == writers. A read counts
+// toward OVERLAP_READS only when a NEW write-begin marker (.wb.*) appears
+// inside its marker bracket (wbBefore → wbAfter globs) AND at least one
+// write-end marker (.we.*) is present at that bracket's end: proof a write
+// began inside the read's lifetime while write activity was still live —
+// never the done-lag approximation of static post-write reads, and no
+// counted read can start strictly after the last write began (no new .wb.*
+// can appear inside its bracket) or be counted before the first write
+// completed (no .we.* exists yet). Writers hold on a readers-ready barrier before their
+// first write, so every counted read intersects the live write phase; this
+// is phase-level liveness, not per-call proof that one os.ReadFile raced
+// one writeFileAtomic. Every completed counted read must be a complete,
+// legal stale-schema document; read errors — including ENOENT — are
+// counted, and no temp file may be left behind.
 func TestWriteFileAtomicConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "jev_check.json")
+	readyGate := filepath.Join(dir, "readers.ready")
 
 	const (
 		writers = 4
-		rounds  = 15
-		readers = 4
+		// The marker-diff window (wbBefore glob → ReadFile → wbAfter/we globs)
+		// is microseconds-narrow and each write marker is created in an
+		// instant, so only a small fraction of the write phase's reads land on
+		// a marker boundary. rounds is sized so the marker stream still
+		// crosses ≥100 bracketed reads under -race.
+		rounds = 800
+		// Reader count scales the bracket samples per unit of write phase;
+		// 12 targets ≥150 OVERLAP_READS/round (~1.5× the 100 threshold).
+		readers = 12
 	)
 
-	var procs sync.WaitGroup
+	// windowStart closes when the first writer reports its first successful
+	// write; it is only the readers' admission ticket — a read's overlap is
+	// proven per-iteration by the write-begin/-end markers it diffs itself,
+	// never by watcher timing or done-lag. windowStart also closes on procsDone (a
+	// writer that died early) so a failed writer can never pin the readers
+	// or the test.
+	windowStart := make(chan struct{})
+	procsDone := make(chan struct{})
+	var onceProcsDone sync.Once
+	closeProcsDone := func() { onceProcsDone.Do(func() { close(procsDone) }) }
+
+	var watchers, wg, procs sync.WaitGroup
+	var startedCmds []*exec.Cmd
+	// Unified cleanup for every early-return path (t.Fatalf included),
+	// registered before any background activity starts. Order matters:
+	//  1. close procsDone once — unblocks the watcher and every reader even
+	//     when the writers were never started or died mid-run;
+	//  2. join watcher and readers so no goroutine keeps touching the temp
+	//     dir t.TempDir removes;
+	//  3. reap children: kill any still-running writer (idempotent once it
+	//     exited — the per-writer reaper already called Wait, so we must
+	//     never Wait here ourselves), then bound-join the reapers.
+	defer func() {
+		closeProcsDone()
+		watchers.Wait()
+		wg.Wait()
+		for _, cmd := range startedCmds {
+			_ = cmd.Process.Kill()
+		}
+		// The reapers are internally bounded (90s + kill), so procs.Wait
+		// terminates; child Wait has already been issued by each reaper.
+		procs.Wait()
+	}()
+
+	watchers.Add(1)
+	go func() {
+		defer watchers.Done()
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			for i := 0; i < writers; i++ {
+				if _, err := os.Stat(fmt.Sprintf("%s.started.%d", target, i)); err == nil {
+					close(windowStart)
+					return
+				}
+			}
+			select {
+			case <-procsDone:
+				close(windowStart)
+				return
+			default:
+			}
+			if time.Now().After(deadline) {
+				close(windowStart) // open anyway: the assertions below decide
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	var overlapReads, emptyReads, parseErrors, schemaInvalid, readErrors atomic.Int64
+	var readersReady sync.WaitGroup
+	readersReady.Add(readers)
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			readersReady.Done()
+			<-windowStart
+			for {
+				// A writer that died without its done marker must never pin a
+				// reader; the done==writers exit below is the normal way out.
+				select {
+				case <-procsDone:
+					return
+				default:
+				}
+				// Bracket the read with the write markers: only a NEW .wb.* file
+				// appearing between wbBefore and wbAfter proves a write began inside
+				// this read's lifetime bracket, and at least one .we.* file present
+				// at the bracket's end proves write activity had already produced a
+				// completion — the read therefore cannot be a pure pre-first-write
+				// or post-last-write static read. Both conditions are what
+				// OVERLAP_READS counts (phase-level liveness: a write began in the
+				// bracket while write activity was live; not per-call proof that
+				// this os.ReadFile raced one writeFileAtomic).
+				wbBefore, _ := filepath.Glob(target + ".wb.*")
+				data, err := os.ReadFile(target)
+				wbAfter, _ := filepath.Glob(target + ".wb.*")
+				weNow, _ := filepath.Glob(target + ".we.*")
+				// Classify THIS read before checking the done markers: a read that
+				// completed while the last writers finished must still land in its
+				// bucket (error / overlap+content check / uncounted) instead of
+				// escaping classification when done == writers happens to go up
+				// between the snapshots above and the check below.
+				if err != nil {
+					// Any error — ENOENT included — is a visibility violation:
+					// inside the write phase the file must always exist and be
+					// whole. Errors are not overlap evidence; they classify as
+					// READ_ERRORS regardless of the wb/we diff.
+					readErrors.Add(1)
+				} else if len(wbAfter) <= len(wbBefore) || len(weNow) == 0 {
+					// No write began inside this read's bracket — or none had
+					// completed by its end — so it is a static read of a stable
+					// file, not overlap.
+				} else {
+					overlapReads.Add(1)
+					switch {
+					case len(data) == 0:
+						emptyReads.Add(1)
+					default:
+						var doc map[string]any
+						if err := json.Unmarshal(data, &doc); err != nil {
+							parseErrors.Add(1)
+						} else if !staleSchemaDocOK(data) {
+							schemaInvalid.Add(1)
+						}
+					}
+				}
+				// The measured phase ends when every writer has dropped its done
+				// marker; the check runs AFTER this read's classification so the
+				// final in-flight reads are counted, never silently skipped.
+				doneMarkers, _ := filepath.Glob(target + ".done.*")
+				if len(doneMarkers) == writers {
+					return
+				}
+			}
+		}()
+	}
+
+	// Readers armed: release the writers' start barrier. The barrier file
+	// being a regular file in the same temp dir keeps the protocol on the
+	// filesystem the child processes can see.
+	readersReady.Wait()
+	if err := os.WriteFile(readyGate, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write readers-ready barrier: %v", err)
+	}
+
+	pids := make(map[int]int, writers)
+	var pidsMu sync.Mutex
 	for i := 0; i < writers; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessSchemaWrite$")
 		cmd.Env = append(os.Environ(),
 			"JEV_SCHEMA_WRITE_HELPER=1",
 			"JEV_SCHEMA_WRITE_TARGET="+target,
+			"JEV_SCHEMA_WRITE_READERS_READY="+readyGate,
 			fmt.Sprintf("JEV_SCHEMA_WRITE_WRITER=%d", i),
 			fmt.Sprintf("JEV_SCHEMA_WRITE_ROUNDS=%d", rounds),
 		)
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start writer %d: %v", i, err)
 		}
+		startedCmds = append(startedCmds, cmd)
+		pidsMu.Lock()
+		pids[cmd.Process.Pid] = i
+		pidsMu.Unlock()
 		procs.Add(1)
 		go func(cmd *exec.Cmd, i int) {
 			defer procs.Done()
-			if err := cmd.Wait(); err != nil {
-				t.Errorf("writer %d exited with error: %v", i, err)
+			// Bounded reap: a wedged child is killed after the deadline so the
+			// test can never hang; the kill turns into an error either way.
+			waitDone := make(chan error, 1)
+			go func() { waitDone <- cmd.Wait() }()
+			select {
+			case err := <-waitDone:
+				if err != nil {
+					t.Errorf("writer %d exited with error: %v", i, err)
+				}
+			case <-time.After(90 * time.Second):
+				_ = cmd.Process.Kill()
+				<-waitDone
+				t.Errorf("writer %d exceeded the reap deadline and was killed", i)
 			}
 		}(cmd, i)
 	}
 
-	// Reader barrier: the window opens when the first writer reports its
-	// first successful write — from then on the target always exists and is
-	// always a complete document until the last writer finishes.
-	windowOpen := make(chan struct{})
-	go func() {
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			for i := 0; i < writers; i++ {
-				if _, err := os.Stat(fmt.Sprintf("%s.started.%d", target, i)); err == nil {
-					close(windowOpen)
-					return
-				}
-			}
-			time.Sleep(time.Millisecond)
-		}
-		close(windowOpen) // still open the gate: the writers finishing below decide
-	}()
-
-	stop := make(chan struct{})
-	var overlapReads, emptyReads, parseErrors, schemaInvalid, readErrors atomic.Int64
-	var wg sync.WaitGroup
-	for r := 0; r < readers; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-windowOpen
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				data, err := os.ReadFile(target)
-				if err != nil {
-					// Any error — ENOENT included — is a visibility violation:
-					// after the barrier the file must always exist and be whole.
-					readErrors.Add(1)
-					continue
-				}
-				overlapReads.Add(1)
-				if len(data) == 0 {
-					emptyReads.Add(1)
-					continue
-				}
-				var doc map[string]any
-				if err := json.Unmarshal(data, &doc); err != nil {
-					parseErrors.Add(1)
-					continue
-				}
-				if !staleSchemaDocOK(data) {
-					schemaInvalid.Add(1)
-				}
-			}
-		}()
-	}
-
 	procs.Wait()
-	close(stop)
+	// Same close the deferred cleanup performs on early exits — the Once
+	// makes the two paths share one close, never a double-close panic.
+	closeProcsDone()
+	// The readers bound the measured phase themselves: each exits on its own
+	// per-iteration done==writers check (or the procsDone failsafe). Join the
+	// started-marker watcher and the readers.
+	watchers.Wait()
 	wg.Wait()
 
+	if got := len(pids); got != writers {
+		t.Fatalf("expected %d distinct writer PIDs, saw %d (%v)", writers, got, pids)
+	}
+	for i := 0; i < writers; i++ {
+		// Every writer must have completed at least one real write (started
+		// marker) and its full round budget (done marker + exit 0, asserted
+		// by the reaper above).
+		if _, err := os.Stat(fmt.Sprintf("%s.started.%d", target, i)); err != nil {
+			t.Fatalf("writer %d never completed a write: %v", i, err)
+		}
+		data, err := os.ReadFile(fmt.Sprintf("%s.done.%d", target, i))
+		if err != nil {
+			t.Fatalf("writer %d left no done marker: %v", i, err)
+		}
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err != nil || pid <= 0 {
+			t.Fatalf("writer %d done marker carries no real PID: %q", i, data)
+		}
+	}
+	t.Logf("OVERLAP_READS=%d (reads whose bracket gained a write-begin marker while a write-end marker proved live write activity)", overlapReads.Load())
 	if overlapReads.Load() < 100 {
 		t.Fatalf("OVERLAP_READS=%d (<100): the window never exercised concurrent reads", overlapReads.Load())
 	}
@@ -958,39 +1156,5 @@ func TestWriteFileAtomicConcurrent(t *testing.T) {
 		if strings.HasSuffix(entry.Name(), ".tmp") {
 			t.Fatalf("temp file left behind: %s", entry.Name())
 		}
-	}
-}
-
-// TestStaleSchemaDocValidation is the positive control of the concurrent
-// test's reader predicate: an empty file, a truncated document and a
-// structurally wrong document are each recognised as corrupt, while a legal
-// stale-schema document reads clean.
-func TestStaleSchemaDocValidation(t *testing.T) {
-	dir := t.TempDir()
-	cases := []struct {
-		name    string
-		content []byte
-		wantOK  bool
-	}{
-		{"empty", nil, false},
-		{"truncated_json", []byte(`{"name":"jev_check","description":"stale-w0`), false},
-		{"wrong_shape", []byte(`{"name":"other","description":"stale-w0-r0","parameters":{"type":"object"}}`), false},
-		{"missing_parameters", []byte(`{"name":"jev_check","description":"stale-w0-r0"}`), false},
-		{"legal_stale_schema", []byte(`{"name":"jev_check","description":"stale-w0-r0","parameters":{"type":"object","properties":{}}}`), true},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			path := filepath.Join(dir, testCase.name+".json")
-			if err := os.WriteFile(path, testCase.content, 0o644); err != nil {
-				t.Fatalf("write fixture: %v", err)
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read fixture: %v", err)
-			}
-			if got := staleSchemaDocOK(data); got != testCase.wantOK {
-				t.Fatalf("staleSchemaDocOK(%q) = %v, want %v", testCase.content, got, testCase.wantOK)
-			}
-		})
 	}
 }

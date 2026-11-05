@@ -208,10 +208,11 @@ packed cell 兄弟进程共享该文件。
 20. **全局 schema 原子写入（惰性、先于响应）**：`cmd/jev-mcp` 的懒加载 schema
     （`~/.gemini/antigravity-cli/mcp/jev/`）由 `writeFileAtomic`（同目录 `CreateTemp` + 完整写入 +
     `Chmod` + **显式检查 `Close()`** + `Rename` 原子替换，进程内 `schemaWriteMu` 串行化）落盘，
-    并发 agy 读者永远看到完整文件；写入只在**首个 `tools/list` 允许分支**触发（MCP init 必然调
-    `tools/list`，惰性不损功能）且**在 tools/list 响应发出之前完成**——agy 拿到列表时 schema
-    必然已存在；启动路径与被拒分支一律不写全局 schema（子代理被拒时连后台 fire-and-forget
-    写都不起）。多进程并发写 + 并发读实测见 `TestWriteFileAtomicConcurrent`（真实 OS 子进程）。
+    并发 agy 读者永远看到完整文件；写入在**每个 `tools/list` 允许分支**触发（`writeFileAtomic`
+    内容一致时幂等跳写）且**在 tools/list 响应发出之前完成 best-effort 写入尝试**——写失败不
+    阻断响应（`ensureLazySchemaFiles` 忽略写入错误），故不保证 schema 必然已存在；启动路径与
+    被拒分支一律不写全局 schema（子代理被拒时连后台 fire-and-forget 写都不起）。多进程并发写 +
+    并发读实测见 `TestWriteFileAtomicConcurrent`（真实 OS 子进程）。
 21. **`jsNumber` 二进制/八进制与超时整数化**：`jsNumber` 在 `0x` 之外支持 `0b`/`0B`（基数 2）与
     `0o`/`0O`（基数 8）；带符号前缀（`+0b10`）仍为 NaN。`nodeSetTimeout` 对 `[1, maxTimeoutMs]`
     内的浮点数执行 `math.Trunc` 整数毫秒化（`1500.75` → `1.5s`）。
@@ -299,7 +300,7 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
 16MiB+1、悬挂 CR、EOF 前悬挂 CR 拒绝）、`TestToolsCallGate`、
 `TestWriteFileAtomicConcurrent`（读者 barrier + 4 个真实 OS 写进程，仅统计首个成功写到
 末位写完成间读：OVERLAP_READS≥100、EMPTY=PARSE_ERRORS=SCHEMA_INVALID=READ_ERRORS=0、
-无 .tmp 残留）+ `TestStaleSchemaDocValidation` 正控制。
+无 .tmp 残留）；正控制已移交 verifier 探针 `TestProbeSchemaReaderDetectsCorruption` 覆盖。
 
 ## 隔离 PiG 实测记录（2026-10-24）
 
