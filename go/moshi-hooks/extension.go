@@ -107,7 +107,7 @@ func sessionIsHeadless(event map[string]any) bool {
 	if event == nil {
 		return false
 	}
-	if mode, _ := event["mode"].(string); mode != "" {
+	if mode, ok := event["mode"].(string); ok {
 		return mode != "tui"
 	}
 	if hasUI, ok := event["hasUI"].(bool); ok {

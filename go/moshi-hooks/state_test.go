@@ -896,6 +896,8 @@ func TestSessionIsHeadless(t *testing.T) {
 		{"hasUI false is headless", map[string]any{"hasUI": false}, true},
 		{"has_ui false is headless", map[string]any{"has_ui": false}, true},
 		{"mode wins over hasUI", map[string]any{"mode": "tui", "hasUI": false}, false},
+		{"empty mode ignores hasUI", map[string]any{"mode": "", "hasUI": true}, true},
+		{"empty mode is headless", map[string]any{"mode": ""}, true},
 	}
 	for _, test := range cases {
 		if got := sessionIsHeadless(test.event); got != test.want {
