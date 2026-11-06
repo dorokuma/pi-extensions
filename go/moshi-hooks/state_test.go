@@ -879,3 +879,29 @@ func TestPromptSequenceForSubmit(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionIsHeadless covers the ported headless gate (TS L680): a headless
+// run (mode != tui, or hasUI false) must not announce itself to moshi.
+func TestSessionIsHeadless(t *testing.T) {
+	cases := []struct {
+		name  string
+		event map[string]any
+		want  bool
+	}{
+		{"nil event", nil, false},
+		{"empty event", map[string]any{}, false},
+		{"tui mode", map[string]any{"mode": "tui"}, false},
+		{"json mode is headless", map[string]any{"mode": "json"}, true},
+		{"hasUI true", map[string]any{"hasUI": true}, false},
+		{"hasUI false is headless", map[string]any{"hasUI": false}, true},
+		{"has_ui false is headless", map[string]any{"has_ui": false}, true},
+		{"mode wins over hasUI", map[string]any{"mode": "tui", "hasUI": false}, false},
+		{"empty mode ignores hasUI", map[string]any{"mode": "", "hasUI": true}, true},
+		{"empty mode is headless", map[string]any{"mode": ""}, true},
+	}
+	for _, test := range cases {
+		if got := sessionIsHeadless(test.event); got != test.want {
+			t.Errorf("%s: sessionIsHeadless = %v, want %v", test.name, got, test.want)
+		}
+	}
+}

@@ -97,6 +97,28 @@ func agentKind(event map[string]any) string {
 	return firstString(event["agent_kind"], event["agentKind"])
 }
 
+// sessionIsHeadless mirrors the generated TS's sessionIsHeadless (L680-685):
+// a headless Pi session (pi --mode json -p, subagent children, or an
+// embedded headless run) announces nothing — the terminal UI owns the pane,
+// and a headless session claiming it would repoint Chat View at the subagent.
+// PiG's SDK does not expose ctx.mode/ctx.hasUI, so the check runs off the
+// event payload keys a host may publish (`mode`, `hasUI`, `has_ui`).
+func sessionIsHeadless(event map[string]any) bool {
+	if event == nil {
+		return false
+	}
+	if mode, ok := event["mode"].(string); ok {
+		return mode != "tui"
+	}
+	if hasUI, ok := event["hasUI"].(bool); ok {
+		return !hasUI
+	}
+	if hasUI, ok := event["has_ui"].(bool); ok {
+		return !hasUI
+	}
+	return false
+}
+
 // sessionID reads the session identity, preferring the host's session manager
 // (TS: sessionID, L260).
 func sessionID(event map[string]any, ctx sdk.Context) string {
@@ -108,6 +130,9 @@ func sessionID(event map[string]any, ctx sdk.Context) string {
 // interrupt the user's Pi turn.
 func Send(eventName string, event map[string]any, ctx sdk.Context, extra map[string]any) {
 	defer func() { _ = recover() }()
+	if sessionIsHeadless(event) {
+		return
+	}
 
 	id := sessionID(event, ctx)
 	cwd := firstString(safeCwd(ctx), processCwd())
