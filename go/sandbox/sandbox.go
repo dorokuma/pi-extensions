@@ -50,7 +50,7 @@ type Policy struct {
 	// 或 seccomp 守卫无法安装，或部分路径不存在，将输出告警并降级执行而非返回错误。
 	BestEffort bool
 
-	// EntryAgents 列出允许出现在 Exec 白名单中的代理二进制绝对路径（agy/pig/pi 及其
+	// EntryAgents 列出允许出现在 Exec 白名单中的代理二进制绝对路径（agy/pig/pi/claude 及其
 	// 符号链接解析目标）。这些路径的 basename 通常命中 ForbiddenExecNames，但
 	// ReviewerAgent 预设需要顶层启动它们。Landlock 按路径放行，无法做到「只允许
 	// 第一次 exec」；嵌套再起同名代理仍会被 Landlock 允许，需靠角色工具白名单兜底。

@@ -715,7 +715,7 @@ func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string, entryAgents [
 	// 1. 检查发起可执行映射的进程主程序是否为 ld-linux 等动态链接器或禁止执行的二进制。
 	// 当通过内核 PT_INTERP 正常启动白名单程序时，/proc/<pid>/exe 指向该白名单程序本身；
 	// 当用户直接执行 `/lib64/ld-linux-x86-64.so.2 <target>` 时，/proc/<pid>/exe 指向 ld-linux，在此直接拒绝。
-	// ReviewerAgent 顶层放行的 EntryAgents（agy/pig/pi）作为 exe 时不得一律拒绝 PROT_EXEC，
+	// ReviewerAgent 顶层放行的 EntryAgents（agy/pig/pi/claude）作为 exe 时不得一律拒绝 PROT_EXEC，
 	// 否则代理进程自身的合法内存映射会被误杀。
 	if exeTarget, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeTarget != "" {
 		exeTarget = strings.TrimSuffix(exeTarget, " (deleted)")
