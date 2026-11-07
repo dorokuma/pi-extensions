@@ -132,7 +132,7 @@ func TestRuntimeLifecycleAndCommands(t *testing.T) {
 	}
 }
 func TestRuntimeLazyConcurrentAndDecisionFrozen(t *testing.T) {
-	c, count := helperClient(t)
+	c, count, _ := helperClient(t)
 	r := newRuntime()
 	r.register = func() {}
 	r.decision = &WorkdirDecision{OK: true, Workdir: "/decided-root", Note: "fixture note"}
@@ -173,7 +173,7 @@ func TestRuntimeLazyConcurrentAndDecisionFrozen(t *testing.T) {
 	r.shutdown()
 }
 func TestRuntimeToolError(t *testing.T) {
-	c, _ := helperClient(t, "error")
+	c, _, _ := helperClient(t, "error")
 	r := newRuntime()
 	r.client = c
 	result, err := r.execute(map[string]any{"action": "search"})
@@ -181,6 +181,39 @@ func TestRuntimeToolError(t *testing.T) {
 	if err != nil || text != "codegraph error: invalid argument" {
 		t.Fatal(result, err)
 	}
+}
+
+// A daemon that dies during startup surfaces the bounded diagnostic through
+// getClient's 启动失败 wrap; the decision stays cached so the next lazy
+// acquisition retries the same workdir and recovers.
+func TestRuntimeStartDiagPropagates(t *testing.T) {
+	c, _, _ := helperClient(t, "exit-init", "normal")
+	r := newRuntime()
+	r.register = func() {}
+	r.decision = &WorkdirDecision{OK: true, Workdir: "/decided-root", Note: "fixture note"}
+	r.startAt = func(w, n string) (*CodeGraphClient, error) {
+		if w != "/decided-root" || n != "fixture note" {
+			return nil, errors.New("decision changed")
+		}
+		if err := c.start(); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	got, msg := r.getClient()
+	if got != nil {
+		t.Fatal("dead daemon accepted")
+	}
+	for _, want := range []string{"codegraph-go 启动失败", "phase=initialize", "exit=3", "workdir=/decided-root", "EACCES", "TOKEN=REDACTED"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("missing %q in %q", want, msg)
+		}
+	}
+	got, msg = r.getClient()
+	if got == nil || msg != "" {
+		t.Fatal(msg)
+	}
+	r.shutdown()
 }
 func TestProjectHints(t *testing.T) {
 	h := isolated(t)
