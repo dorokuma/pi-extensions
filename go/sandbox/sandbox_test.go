@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -832,6 +833,19 @@ func TestReviewerAgentPreset(t *testing.T) {
 		t.Fatal("expected EntryAgents to be populated when agy/pig exist on host")
 	}
 
+	// EntryAgents 白名单必须含 claude（含符号链接解析后的真实路径），
+	// 但 dispatch-agent 仍不得在列——嵌套派发刻意保持禁止（无条件断言）。
+	// claude 断言依赖宿主真实存在 claude，否则跳过。
+	if sandbox.IsEntryAgentPath(policy.EntryAgents, "dispatch-agent") {
+		t.Fatalf("dispatch-agent must stay out of EntryAgents, got %v", policy.EntryAgents)
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skipf("claude not installed on host (LookPath: %v), skipping claude EntryAgents assertion", err)
+	}
+	if !sandbox.IsEntryAgentPath(policy.EntryAgents, "claude") {
+		t.Fatalf("expected claude in EntryAgents, got %v", policy.EntryAgents)
+	}
+
 	// 原 reviewer 不含的辅助工具应在 Exec 中
 	foundMkdir := false
 	for _, ep := range policy.Exec {
@@ -1038,7 +1052,9 @@ func TestIsEntryAgentPath(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	agents := []string{link}
+	// EntryAgents 清单是权威名单：ResolveEntryAgentPaths 会把过身份校验的软链目标
+	// 以字面路径一并列入；集合构建不再二次解析软链（否则被拦截的毒软链目标复活）。
+	agents := []string{link, real}
 	if !sandbox.IsEntryAgentPath(agents, link) {
 		t.Fatal("expected link path to match EntryAgents")
 	}
@@ -1050,6 +1066,10 @@ func TestIsEntryAgentPath(t *testing.T) {
 	}
 	if sandbox.IsEntryAgentPath(agents, "dispatch-agent") {
 		t.Fatal("dispatch-agent must not match")
+	}
+	// 解析目标未列入清单时不得靠集合内二次解析放行。
+	if sandbox.IsEntryAgentPath([]string{link}, real) {
+		t.Fatal("resolved target not listed in EntryAgents must not match")
 	}
 }
 
@@ -1750,4 +1770,183 @@ func TestReviewerAgentPrivateXDGRuntimeDir(t *testing.T) {
 	if got := parseEnvMap(ro.Env)["XDG_RUNTIME_DIR"]; got != "" {
 		t.Fatalf("ReadOnlyReviewer must not inject XDG_RUNTIME_DIR, got %q", got)
 	}
+}
+
+// captureStderr 临时把 os.Stderr 换成管道，调用 fn 后返回其写出的全部内容。
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	// defer 恢复：fn panic 时不得泄漏替换后的 os.Stderr。
+	defer func() { os.Stderr = orig }()
+	fn()
+	os.Stderr = orig
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read stderr pipe: %v", err)
+	}
+	_ = r.Close()
+	return string(out)
+}
+
+// TestResolveEntryAgentPathsSkipsPoisonedSymlink 覆盖软链目标身份校验：
+// PATH 前缀目录里放 claude → dispatch-agent 毒软链，毒软链 norm 与
+// dispatch-agent 解析目标都不得并入 EntryAgents（整个候选丢弃），且 stderr 打出 WARN。
+func TestResolveEntryAgentPathsSkipsPoisonedSymlink(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	// 目标：宿主真实 dispatch-agent（软链解析后形态）；宿主缺失时退化造假文件。
+	target, err := exec.LookPath("dispatch-agent")
+	if err != nil {
+		target = filepath.Join(tmp, "dispatch-agent")
+		if werr := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); werr != nil {
+			t.Fatalf("write fake dispatch-agent: %v", werr)
+		}
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("EvalSymlinks dispatch-agent: %v", err)
+	}
+	if abs, err := filepath.Abs(resolvedTarget); err == nil {
+		resolvedTarget = filepath.Clean(abs)
+	}
+
+	poison := filepath.Join(binDir, "claude")
+	if err := os.Symlink(target, poison); err != nil {
+		t.Fatalf("symlink poison claude: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+	var paths []string
+	warnOut := captureStderr(t, func() {
+		paths = sandbox.ResolveEntryAgentPaths()
+	})
+
+	// 毒软链 norm 与其解析目标都不得进 EntryAgents：目标被拒时整个
+	// 候选丢弃，否则 Landlock O_PATH 跟随软链仍会按目标 inode 授 EXECUTE。
+	if containsPath(paths, poison) {
+		t.Fatalf("poison symlink %s must not enter EntryAgents, got %v", poison, paths)
+	}
+	if containsPath(paths, resolvedTarget) {
+		t.Fatalf("dispatch-agent resolved target %s must not enter EntryAgents, got %v", resolvedTarget, paths)
+	}
+	for _, p := range paths {
+		if filepath.Base(p) == "dispatch-agent" || filepath.Base(p) == "dispatch-agent-go" {
+			t.Fatalf("dispatch-agent binary must not enter EntryAgents, got %v", paths)
+		}
+	}
+	if !strings.Contains(warnOut, "forbidden exec name, skipped") {
+		t.Fatalf("expected forbidden-name WARN about skipped symlink target, got %q", warnOut)
+	}
+	t.Logf("captured WARN: %s", warnOut)
+}
+
+// TestResolveEntryAgentPathsRejectsSegmentCoincidence 覆盖路径段巧合反例：
+// pi → /tmp/<rand>/claude/evil 形态目标，路径含 /claude/ 段但 basename 非白名单、
+// 也不在已知安装根前缀之下，整个候选（软链 norm 与目标 rn）必须被拒并打 WARN。
+func TestResolveEntryAgentPathsRejectsSegmentCoincidence(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	evil := filepath.Join(tmp, "claude", "evil")
+	if err := os.MkdirAll(filepath.Dir(evil), 0o755); err != nil {
+		t.Fatalf("mkdir evil dir: %v", err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.WriteFile(evil, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatalf("write evil: %v", err)
+	}
+	link := filepath.Join(binDir, "pi")
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatalf("symlink pi→evil: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+	var paths []string
+	warnOut := captureStderr(t, func() {
+		paths = sandbox.ResolveEntryAgentPaths()
+	})
+
+	resolvedEvil, err := filepath.EvalSymlinks(evil)
+	if err != nil {
+		t.Fatalf("EvalSymlinks evil: %v", err)
+	}
+	if containsPath(paths, link) {
+		t.Fatalf("poison symlink %s must not enter EntryAgents, got %v", link, paths)
+	}
+	if containsPath(paths, resolvedEvil) {
+		t.Fatalf("segment-coincidence target %s must not enter EntryAgents, got %v", resolvedEvil, paths)
+	}
+	if !strings.Contains(warnOut, "missing /pi/ path segment, skipped") {
+		t.Fatalf("expected missing-segment WARN about skipped segment-coincidence target, got %q", warnOut)
+	}
+	if !strings.Contains(warnOut, "evil") {
+		t.Fatalf("expected WARN naming rejected target %s, got %q", resolvedEvil, warnOut)
+	}
+}
+
+// TestResolveEntryAgentPathsVersionedClaudeTarget 覆盖版本化安装形态：
+// claude → <安装根>/claude/versions/<ver>（basename 是版本号，路径含 /claude/ 段
+	// 且位于已知安装根前缀之下）的软链目标须正常并入 EntryAgents。
+func TestResolveEntryAgentPathsVersionedClaudeTarget(t *testing.T) {
+	tmp := t.TempDir()
+	// 版本化目标必须位于已知安装根前缀之下；伪造 HOME 让
+	// <fakeHome>/.local/share/ 成为合法安装根。
+	fakeHome := filepath.Join(tmp, "home")
+	t.Setenv("HOME", fakeHome)
+	binDir := filepath.Join(tmp, "bin")
+	verDir := filepath.Join(fakeHome, ".local", "share", "claude", "versions")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		t.Fatalf("mkdir versions: %v", err)
+	}
+
+	verTarget := filepath.Join(verDir, "2.1.319")
+	if err := os.WriteFile(verTarget, []byte("#!/bin/sh\necho 2.1.319\n"), 0o755); err != nil {
+		t.Fatalf("write versioned claude: %v", err)
+	}
+	link := filepath.Join(binDir, "claude")
+	if err := os.Symlink(verTarget, link); err != nil {
+		t.Fatalf("symlink claude: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+	paths := sandbox.ResolveEntryAgentPaths()
+	resolvedLink, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatalf("EvalSymlinks claude link: %v", err)
+	}
+	if !containsPath(paths, link) {
+		t.Fatalf("claude symlink %s should be in EntryAgents, got %v", link, paths)
+	}
+	if !containsPath(paths, resolvedLink) {
+		t.Fatalf("versioned target %s should be in EntryAgents, got %v", resolvedLink, paths)
+	}
+}
+
+func containsPath(list []string, want string) bool {
+	for _, p := range list {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }

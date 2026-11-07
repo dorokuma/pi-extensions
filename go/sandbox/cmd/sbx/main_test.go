@@ -103,6 +103,45 @@ func TestBuildPolicyRepinsPigHome(t *testing.T) {
 	}
 }
 
+// TestBuildPolicyRepinsClaudeConfigDir 验证 reviewer-agent 预设下 mergeEnv 之后
+// CLAUDE_CONFIG_DIR 被回钉为 ReviewerAgentWithEnv 注入的 <privateTmpDir>/claude：
+// --env CLAUDE_CONFIG_DIR=<其他路径> 覆盖不得把 CC 写面指回宿主或与 ReadWrite 脱配，
+// 且同名键只保留一个条目（与 PIG_HOME 回钉同型）。
+func TestBuildPolicyRepinsClaudeConfigDir(t *testing.T) {
+	t.Setenv("PIG_HOME", t.TempDir()) // 隔离宿主 pig home，防预热/策略构造读真实缓存
+	overrideDir := t.TempDir()
+	workdir := t.TempDir()
+
+	policy, err := buildPolicy(cliConfig{
+		Preset:  "reviewer-agent",
+		WorkDir: workdir,
+		Env:     []string{"CLAUDE_CONFIG_DIR=" + overrideDir, "CLAUDE_CONFIG_DIR=" + overrideDir},
+	})
+	if err != nil {
+		t.Fatalf("buildPolicy: %v", err)
+	}
+	defer cleanupPresetTempDirsFromPolicy(policy)
+
+	got := envListValue(policy.Env, "CLAUDE_CONFIG_DIR")
+	if got == overrideDir || got == "" {
+		t.Fatalf("CLAUDE_CONFIG_DIR must be re-pinned to <privateTmpDir>/claude, got %q (env=%v)", got, policy.Env)
+	}
+	want := filepath.Join(envListValue(policy.Env, "TMPDIR"), "claude")
+	if got != want {
+		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want %q", got, want)
+	}
+	// 同名键只保留一个条目。
+	count := 0
+	for _, kv := range policy.Env {
+		if strings.HasPrefix(kv, "CLAUDE_CONFIG_DIR=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one CLAUDE_CONFIG_DIR entry in Policy.Env, got %d (%v)", count, policy.Env)
+	}
+}
+
 func TestCleanupPresetTempDirsFallbackPath(t *testing.T) {
 	customTmpParent := t.TempDir()
 	t.Setenv("TMPDIR", customTmpParent)

@@ -167,6 +167,7 @@ func parseArgs(args []string) (cliConfig, error) {
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	var policy sandbox.Policy
 	var pigHome string
+	var claudeConfigDir string
 	if cfg.Preset != "" {
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
@@ -185,6 +186,12 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// 记下来供 mergeEnv 之后回钉（--env PIG_HOME= 空覆盖会把空串写进
 			// 最终 env，导致沙盒内 pig 按外部 HOME 另算缓存根打穿预热对齐）。
 			pigHome = envListValue(policy.Env, "PIG_HOME")
+			// CLAUDE_CONFIG_DIR 同理：ReviewerAgentWithEnv 把 CC 私有配置根
+			// （<privateTmpDir>/claude，随 privateTmpDir 清理、无跨会话状态）
+			// 固定注入 Policy.Env；记下来供 mergeEnv 之后回钉，防止
+			// --env CLAUDE_CONFIG_DIR=<其他路径或空> 把 CC 写面指回宿主
+			// ~/.claude 或与 ReadWrite 策略脱配。
+			claudeConfigDir = envListValue(policy.Env, "CLAUDE_CONFIG_DIR")
 		default:
 			return sandbox.Policy{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer, reviewer-agent)", cfg.Preset)
 		}
@@ -196,6 +203,12 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	policy.Env = mergeEnv(policy.Env, cfg.Env)
 	if cfg.Preset == "reviewer-agent" && pigHome != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PIG_HOME=" + pigHome})
+	}
+	// 仅 reviewer-agent 预设回钉 CLAUDE_CONFIG_DIR：把最终 env 中该键强制
+	// 回写为 ReviewerAgentWithEnv 注入的每会话私有目录（<privateTmpDir>/claude），
+	// 仿照 PIG_HOME 回钉，防 --env 覆盖把写面指回宿主或与策略脱配。
+	if cfg.Preset == "reviewer-agent" && claudeConfigDir != "" {
+		policy.Env = mergeEnv(policy.Env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir})
 	}
 	if cfg.DenyNet {
 		policy.DenyNet = true
@@ -323,7 +336,7 @@ func runMain(args []string) int {
 	}()
 
 	// 当启用了 Exec 白名单时，在启动受限子进程前双重校验目标命令是否属于被禁用的代理或动态链接器。
-	// reviewer-agent 预设允许顶层 EntryAgents（agy/pig/pi）；其余 ForbiddenExec 仍拒绝。
+	// reviewer-agent 预设允许顶层 EntryAgents（agy/pig/pi/claude）；其余 ForbiddenExec 仍拒绝。
 	if len(policy.Exec) > 0 {
 		if sandbox.IsELFInterpreter(cfg.Command[0]) {
 			fmt.Fprintf(os.Stderr, "sbx: execution of %q is forbidden by sandbox policy\n", cfg.Command[0])

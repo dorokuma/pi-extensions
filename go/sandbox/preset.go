@@ -22,12 +22,26 @@ const (
 )
 
 // ForbiddenExecNames 定义严禁在只读审查子代理中执行的嵌套代理与调度器二进制名称。
+// 除顶层 wrapper 名外同时包含 ELF 本体名（dispatch-agent-go / herdr / herdr-core /
+// herdr-mobile-bridge）：顶层 IsForbiddenExec 与 seccomp shouldDenyExecMmap 都按
+// resolved basename 精确匹配判定，名单不含本体名会让本体二进制穿透三层拦截
+//（Policy.Validate / BuildExecWhitelist 过滤、Landlock Exec 白名单、seccomp
+// PROT_EXEC 守卫）；禁名+"-" 前缀派生拦阻只在软链目标身份校验层生效，故
+// herdr-core / herdr-mobile-bridge 必须逐个精确列入。
+// 本体名只列宿主实测存在的部署形态，不泛化；既有成员语义只增不删。
 var ForbiddenExecNames = []string{
 	"pig",
 	"pi",
 	"agy",
 	"grok",
 	"dispatch-agent",
+	// 本体名均为宿主实测存在形态（ls /root/.local/bin + file 复核，均为静态 ELF）：
+	// /root/.local/bin/dispatch-agent-go、herdr（herdr 本体）、herdr-core、
+	// herdr-mobile-bridge。不存在的派生名（如 herdr-go）不入名单。
+	"dispatch-agent-go",
+	"herdr",
+	"herdr-core",
+	"herdr-mobile-bridge",
 }
 
 // DefaultReviewerTools 定义只读审查子代理默认允许执行的常用只读检查与开发工具列表。
@@ -388,15 +402,18 @@ var ReviewerAgentTools = append(append([]string{}, DefaultReviewerTools...),
 	"mkdir", "cp", "touch",
 )
 
-// agentLookupDirs 是解析 agy/pig/pi 时除 PATH 与 standardBinDirs 外额外搜索的目录。
+// agentLookupDirs 是解析 agy/pig/pi/claude 时除 PATH 与 standardBinDirs 外额外搜索的目录。
 var agentLookupDirs = []string{
 	"/root/.local/bin",
 	"/root/.pig/bin",
 }
 
-// entryAgentPathSet 将 EntryAgents 路径规范化（含符号链接目标）为集合，供 Validate / seccomp 使用。
+// entryAgentPathSet 将 EntryAgents 路径规范化为集合，供 Validate / seccomp 使用。
+// 只收录清单原文路径，不再二次 EvalSymlinks：软链解析目标由
+// ResolveEntryAgentPaths 在并入前过身份校验后直接列入清单；这里再解析会把
+// 被校验拦截的毒软链目标（如 claude → dispatch-agent）重新放回有效白名单。
 func entryAgentPathSet(paths []string) map[string]struct{} {
-	out := make(map[string]struct{}, len(paths)*2)
+	out := make(map[string]struct{}, len(paths))
 	for _, raw := range paths {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -407,11 +424,6 @@ func entryAgentPathSet(paths []string) map[string]struct{} {
 			continue
 		}
 		out[norm] = struct{}{}
-		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
-			if rn, err := NormalizePath(resolved); err == nil {
-				out[rn] = struct{}{}
-			}
-		}
 	}
 	return out
 }
@@ -617,12 +629,80 @@ func ResolveMCPServerPaths() []string {
 	return out
 }
 
-// ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi 及其符号链接目标，供 ReviewerAgent 顶层启动。
+// ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi / claude 及其符号链接目标，供 ReviewerAgent 顶层启动。
 // 不把 dispatch-agent / grok 纳入；嵌套禁止无法靠 Landlock 一次性放行实现，见 ReviewerAgent 注释。
 func ResolveEntryAgentPaths() []string {
+	// entryAgentAllowedNames 是软链目标身份白名单：names 成员外加 agy 状态目录下的
+	// agentapi / webm_encoder（它们是 agy 本体经软链解析后可能命中的真实文件名）。
+	// 已知边界：身份校验第 1 档（allowedTargets basename 命中）无条件放行、不看路径
+	// 根——如 claude → /tmp/x/pi 这类 basename 巧合目标会被收编进 EntryAgents。真实
+	// 可达需宿主 PATH 前置目录对调用者可写（接近已妥协场景），作为已知弱面记录在案。
+	names := []string{"agy", "pig", "pi", "claude"}
+	allowedTargets := make(map[string]struct{}, len(names)+2)
+	for _, n := range names {
+		allowedTargets[n] = struct{}{}
+	}
+	allowedTargets["agentapi"] = struct{}{}
+	allowedTargets["webm_encoder"] = struct{}{}
+
+	// entryAgentInstallRoots 枚举已知安装根前缀（含尾部分隔符）：软链
+	// 解析目标只有位于这些根之下，才可经「含 /<查找名>/ 路径段」判定放行。
+	entryAgentInstallRoots := func() []string {
+		sep := string(filepath.Separator)
+		roots := []string{
+			filepath.Join(homeDir(), ".local", "share") + sep,
+			filepath.Join(homeDir(), ".local", "opt") + sep,
+			filepath.Join(homeDir(), ".gemini") + sep,
+			filepath.Join(homeDir(), ".agy-pro-home") + sep,
+		}
+		for _, d := range standardBinDirs {
+			roots = append(roots, d+sep)
+		}
+		for _, d := range agentLookupDirs {
+			roots = append(roots, d+sep)
+		}
+		return roots
+	}()
+
+	// entryAgentTargetRejectReason 校验 EvalSymlinks 解析出的目标 rn 的身份，
+	// name 为当前候选的查找名（不是任意白名单名），三层判定：
+	//  1) basename(rn) 属于白名单名集合（names + agentapi/webm_encoder）→ 放行；
+	//  2) 否则 basename(rn) 命中禁名守卫——等于 ForbiddenExecNames 成员或以
+	//     「禁名+"-"」为前缀（如 dispatch-agent-go、herdr-core 这类派生本体名）→ 一律拒；
+	//  3) 否则仅当 rn 含 "/"+name+"/" 路径段且 rn 位于已知安装根前缀之下
+	//     → 放行。
+	// 禁名守卫置于路径段判定之前：basename 属于白名单的合法目标（如
+	// pi → …/bin/pi、agy → …/pig 这类名字同被 ForbiddenExecNames 覆盖的
+	// 入口）不受影响，而 dispatch-agent / dispatch-agent-go 本体即使落在
+	// 含 /<name>/ 段的安装根下也被第 2 档挡死。版本化安装
+	// claude → <root>/.local/share/claude/versions/<ver>（basename 是版本号）
+	// 过第 3 档；/tmp/claude/evil 这类路径段巧合因不在安装根前缀内被拒。
+	// 返回空串表示放行，否则返回分档拒绝原因（调用方按原因打 WARN，便于排障）。
+	entryAgentTargetRejectReason := func(name, rn string) string {
+		base := filepath.Base(rn)
+		if _, ok := allowedTargets[base]; ok {
+			return ""
+		}
+		for _, f := range ForbiddenExecNames {
+			if base == f || strings.HasPrefix(base, f+"-") {
+				return "forbidden exec name"
+			}
+		}
+		sep := string(filepath.Separator)
+		if !strings.Contains(rn, sep+name+sep) {
+			return "missing /" + name + "/ path segment"
+		}
+		for _, root := range entryAgentInstallRoots {
+			if strings.HasPrefix(rn, root) {
+				return ""
+			}
+		}
+		return "not in allowed roots"
+	}
+
 	seen := make(map[string]struct{})
 	var out []string
-	add := func(candidate string) {
+	add := func(name, candidate string) {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
 			return
@@ -638,43 +718,63 @@ func ResolveEntryAgentPaths() []string {
 		if info.Mode()&0o111 == 0 {
 			return
 		}
+		// 毒软链封堵必须在收录前闭合：先 EvalSymlinks 解析目标并做身份
+		// 校验，只有目标通过才把软链本身（norm）与目标（rn）一并并入；
+		// 目标不通过、解析失败或目标 Stat 失败（断链）时整个候选丢弃——
+		// 否则 norm 进 EntryAgents→Exec 后 Landlock addPathRule 经 O_PATH
+		// 跟随软链按目标 inode 授 EXECUTE，封堵形同虚设。
+		// 普通文件 EvalSymlinks 返回自身，rn == norm 走同一路径收录。
+		resolved, err := filepath.EvalSymlinks(norm)
+		if err != nil || resolved == "" {
+			fmt.Fprintf(os.Stderr, "sbx: entry-agent candidate %s symlink resolution failed, skipped\n", norm)
+			return
+		}
+		rn, err := NormalizePath(resolved)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sbx: entry-agent candidate %s symlink resolution failed, skipped\n", norm)
+			return
+		}
+		st, err := os.Stat(rn)
+		if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+			fmt.Fprintf(os.Stderr, "sbx: entry-agent symlink target %s for %s not executable, skipped\n", rn, norm)
+			return
+		}
+		if reason := entryAgentTargetRejectReason(name, rn); reason != "" {
+			fmt.Fprintf(os.Stderr, "sbx: entry-agent symlink target %s for %s %s, skipped\n", rn, norm, reason)
+			return
+		}
 		if _, ok := seen[norm]; !ok {
 			seen[norm] = struct{}{}
 			out = append(out, norm)
 		}
-		if resolved, err := filepath.EvalSymlinks(norm); err == nil && resolved != "" {
-			if rn, err := NormalizePath(resolved); err == nil {
-				if st, err := os.Stat(rn); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
-					if _, ok := seen[rn]; !ok {
-						seen[rn] = struct{}{}
-						out = append(out, rn)
-					}
-				}
+		if rn != norm {
+			if _, ok := seen[rn]; !ok {
+				seen[rn] = struct{}{}
+				out = append(out, rn)
 			}
 		}
 	}
 
-	names := []string{"agy", "pig", "pi"}
 	for _, name := range names {
 		if lp, err := exec.LookPath(name); err == nil {
-			add(lp)
+			add(name, lp)
 		}
 		for _, dir := range standardBinDirs {
-			add(filepath.Join(dir, name))
+			add(name, filepath.Join(dir, name))
 		}
 		for _, dir := range agentLookupDirs {
-			add(filepath.Join(dir, name))
+			add(name, filepath.Join(dir, name))
 		}
 	}
 	if matches, err := filepath.Glob("/root/.local/opt/pig/*/pig"); err == nil {
 		for _, m := range matches {
-			add(m)
+			add("pig", m)
 		}
 	}
 	// agy stub (/root/.local/bin/agy) 会再 exec 到 antigravity-cli/bin/agy（动态链接真实本体）
 	agyStateBin := filepath.Join(homeDir(), ".gemini", "antigravity-cli", "bin")
 	for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
-		add(filepath.Join(agyStateBin, name))
+		add(name, filepath.Join(agyStateBin, name))
 	}
 	return out
 }
@@ -744,11 +844,12 @@ func appendAgyStateReadWrite(p *Policy) {
 	}
 }
 
-// ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig，
+// ReviewerAgent 构造「只读审查员代理」预设：在 ReadOnlyReviewer 基础上允许顶层启动 agy/pig/claude，
 // 并开放代理会话状态目录写权限。
 //
 // 额外能力：
-//   - Exec：agy、pig、pi（及符号链接目标）+ mkdir/cp/touch；
+//   - Exec：agy、pig、pi、claude（及符号链接目标；目标须过身份校验——basename 或路径段
+//     命中白名单名，防 PATH 前置毒软链混入）+ mkdir/cp/touch；
 //     agy 生命周期钩子二进制（herdsman 及其 herdsman-go ELF 本体、agy-rules-hook、moshi-hook、
 //     agy-recover-400、agy-recall，含软链目标），否则 SessionStart/PreInvocation/PreToolUse/
 //     PostToolUse/PreCompress/Stop 钩子在沙盒内被 Landlock 拦截，只读子代理无法向 Herdsman
@@ -780,6 +881,16 @@ func appendAgyStateReadWrite(p *Policy) {
 //   - ReadWrite/Exec（Cell 缓存 W^X）：宿主态预刷新 <pigHome>/cache 下缓存单元 usage.json
 //     （TouchUsage <1h 只读短路）；仅 cells/<lang>/.locks、ext/.locks 与 toolchains 锁文件
 //     可写，仅已构建 <digest>/runner 与 cache/ext 下可执行产物可执行；
+//   - Env/ReadWrite（claude 私有配置目录）：CC（claude）会话启动必写配置目录。
+//     注入 CLAUDE_CONFIG_DIR=<privateTmpDir>/claude（0700，每会话私有
+//     目录，加入 ReadWrite）后 CC 的配置根整体切到私有目录，写面随之
+//     收敛；目录随 privateTmpDir 清理、无跨会话状态——CC 会话状态本
+//     就不需跨会话持久，固定共享目录会让沙盒内 claude 写的
+//     settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道）；
+//     与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 privateTmpDir 的
+//     每会话隔离口径一致。宿主 ~/.claude 与 ~/.claude.json 仅随通用
+//     只读根顺带可读、CC 并不消费其中配置（其内容也属不可信面，
+//     不能放给沙盒内写）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
 //   - CTXMODE_* / HERDR_* 由 sbx 继承 os.Environ 透传，本预设不剥离。
 //
@@ -827,6 +938,19 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 
 	// privateTmpDir 由 ReadOnlyReviewer 创建并记录在 Policy.Env 的 TMPDIR 中。
 	privateTmpDir := lookupEnvValue(p.Env, "TMPDIR")
+
+	// claude 私有配置目录：CC 会话必写配置目录；注入 CLAUDE_CONFIG_DIR 后
+	// CC 配置根整体切到该私有目录，写面随之收敛。目录落在
+	// <privateTmpDir>/claude（0700，每会话私有）：CC 会话状态本就不需
+	// 跨会话持久，固定共享目录会让沙盒内 claude 写的
+	// settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道），
+	// 与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 privateTmpDir 的每会话
+	// 隔离口径一致；目录随 privateTmpDir 清理、无跨会话状态。宿主
+	// ~/.claude 与 ~/.claude.json 仅随通用只读根顺带可读、CC 不消费其
+	// 配置，且其内容属不可信面，不能放给沙盒内写。
+	claudeConfigDir := preparePrivateClaudeConfigDir(privateTmpDir)
+	p.ReadWrite = append(p.ReadWrite, claudeConfigDir)
+	p.Env = overrideEnvKey(p.Env, "CLAUDE_CONFIG_DIR", claudeConfigDir)
 
 	// 安全细则一：pig / agy MCP 生态的服务二进制（ctxmode / codegraph-go / jev-mcp /
 	// jev-mcp-go / agy-recall）按名字逐个点名放行，含软链解析目标。
@@ -969,6 +1093,18 @@ func resolveSourcePigAgentDir(pigHome string, cfgEnv []string) (srcAgentDir stri
 // 所以这里先预建为 0700。
 func preparePrivateCtxmodeDir(privateTmpDir string) string {
 	dir := filepath.Join(privateTmpDir, "ctxmode")
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		_ = os.Chmod(dir, 0o700)
+	}
+	return dir
+}
+
+// preparePrivateClaudeConfigDir 创建 <privateTmpDir>/claude（0700）并返回路径。
+// CC 配置根落在每会话私有的 privateTmpDir 下：随 privateTmpDir 清理、
+// 无跨会话状态，防止沙盒内 claude 写入的 settings/hooks/mcpServers 被
+// 下一次会话原样继承（跨会话投毒通道）。
+func preparePrivateClaudeConfigDir(privateTmpDir string) string {
+	dir := filepath.Join(privateTmpDir, "claude")
 	if err := os.MkdirAll(dir, 0o700); err == nil {
 		_ = os.Chmod(dir, 0o700)
 	}
