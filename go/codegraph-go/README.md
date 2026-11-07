@@ -119,6 +119,37 @@ PIG_HOME**。
 - Go 项目名按字典序排列（任务指定）；TS 使用 localeCompare。MCP JSON 对象键序与
   HTML 转义可能不同，服务器按 JSON 字段解码，协议语义相同。
 - stdio 单行读取上限为 64 MiB（Go scanner 的防护边界）；超出结束读取。
+- 子进程非预期退出时不再只投裸 `disconnected`：pending 请求与 `start()` 返回
+  `exitError`（phase=spawn|initialize|tools/list|running、exit/signal、workdir、
+  `wait=` 的 Wait 错误原文；无法取得真实退出码时如实 `exit=unknown`，不伪造）。
+  嵌入错误的 stderr tail 取「有趣行优先、无则原样尾部」，**严格 ≤8 行 / ≤512 字节**
+  （含分隔符，超出从头部截断并加 `…`），单行 200 rune。stderr 按行切割：
+  未换行 carry 存**原始未脱敏**片段（上限 4 KiB，超限提交已脱敏头部并丢弃行尾），
+  脱敏只在完整记录提交点执行——跨 chunk 秘密、引号含空格、未闭合单/双引号、
+  零宽/双向控制符拼接都不能重组出未脱敏键（控制符先于凭据匹配剔除）。
+  脱敏为已知样式口径：`KEY=VALUE`/`KEY:VALUE`/JSON `"key":"v"`、
+  `Authorization: Bearer|Basic`、URL userinfo；workdir/bin 等结构化字段
+  保持原值，不宣称能识别任意未知密文。daemon RPC error 文本同口径脱敏。
+  文案保留 `disconnected` 字样，callTool 的重试正则不受影响；静默 exit 0
+  与信号退出同样生成诊断。stdin 写入经单 writer goroutine + 有界队列（64 项）：
+  请求 deadline 同时覆盖排队与实际写入（`SetWriteDeadline`），满管道/写失败
+  立即退役所属进程并返回其诊断，不再让调用方停在无人投递的 pending 上；
+  marshal 失败同样移除自己的 pending。spawn 失败包装为
+  `spawn failed (phase=spawn workdir=… bin=…)`。属第一阶段诊断增强，非 TS
+  对齐偏差而是有意增强。
+- 退出监视不再依赖管道 EOF：monitor goroutine 直接 `Wait()`（os.Pipe 手写
+  管道，Wait 不关闭父进程持有的读端，读者在 300ms drain 窗口内取回子进程
+  末段输出），随后有界 detach；后代持有管道不会挂死 reap/诊断。stdout/stderr
+  任一提前结束而子进程仍活时按同一有界收尾退役（200ms nudge → TERM/KILL）。
+  `stop()`、启动失败的 `abortStart`、写失败的 `writeFailed` 同一有界收尾：
+  先关 stdin+写队列（不取 writeMu，正被 Write 阻塞的写入立即释放）、
+  SIGTERM 1s 内不退则 SIGKILL、reap 再等 2s；只对本 client 拥有的 PID 发信号
+  （不建进程组），调用方无需手动 stop。monitor 是唯一 `Wait()` 责任人，
+  proc 已 nil 时由 `p.exitErr`/`lastExitErr` 保留该进程真实退出报告，
+  `not running` 不再掩盖真实退出原因；主动 stop 清除该报告。
+- 诊断日志走单 sink goroutine + 有界队列（256 条，写满丢最旧并计数上报）：
+  DEBUG 镜像与 stderr 环内记录同源（已脱敏、已截断），父进程 stderr 不被
+  关闭或改写，sink 反压不会阻塞请求/读端/stop——日志不承诺无损。
 - 当前进程实现使用 Unix SIGTERM，验证平台为 Linux；不宣称 Windows 支持。
 
 ## 测试与验证
@@ -142,7 +173,12 @@ go test -count=1 -race -v ./...
 溢出的回归）、路径与 config 决议、js-trim 的 YAML 项清洗（BOM 与引号/注释顺序）、
 授权拒绝、UTF-16 截断、清洗、握手、多请求并发、16 路启动单 spawn、20 路惰性获取、
 M4 决议冻结、断连恢复、超时/业务错误/一次重试、首次启动失败不重试与随后恢复、
-stderr carry 与环缓冲、HOME 不可解析的 `/tmp` 回退、事件及 3 个命令。
+stderr carry 与环缓冲、HOME 不可解析的 `/tmp` 回退、进程退出诊断
+（phase/exit/signal/workdir/stderr tail）与凭据样式掩码、跨 chunk 秘密与
+未闭合引号/零宽拼接脱敏、无换行洪流中途上界、stdin 写失败与重复清理、
+stdout 协议纯净、启动超时回收子进程、写 deadline 覆盖满管道、孤儿进程
+退役（stdout 关闭/stdin 关断而子进程仍活）、DEBUG sink 反压有界、
+reader→monitor→doStart 身份竞态确定性回归、事件及 3 个命令。
 
 MCP 台架为真实测试子进程（`TestMCPProcess`），使用实际 stdin/stdout/stderr/timer；
 无需真实索引服务器或 provider。SDK 台架调用实际 factory 注册的事件/命令，通过

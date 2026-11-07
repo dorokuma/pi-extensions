@@ -33,6 +33,9 @@ func isolated(t *testing.T) string {
 	t.Setenv("CODEGRAPH_GO_ALLOW_BROAD", "")
 	t.Setenv("CODEGRAPH_GO_DEBUG", "")
 	t.Chdir(dir)
+	// The diagnostic sink writes asynchronously; flush queued records before
+	// TempDir removal so a late write cannot recreate the log inside it.
+	t.Cleanup(diagFlush)
 	return dir
 }
 func TestPaths(t *testing.T) {
