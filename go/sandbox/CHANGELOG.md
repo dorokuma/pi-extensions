@@ -4,21 +4,19 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-07
+
+PATCH：加固 `reviewer-agent` 预设并并入 `claude`（CC）入口支持——软链目标
+身份校验封堵 PATH 前置毒软链混入白名单、`ForbiddenExecNames` 补 ELF
+本体名堵三层拦截穿透、`CLAUDE_CONFIG_DIR` 每会话私有写面并回钉防
+`--env` 脱配、软链校验 WARN 按拒绝原因分档。
+
 ### Added
 
 - **`claude` 加入 `ReviewerAgent` 入口白名单**：`ResolveEntryAgentPaths`
   的查找名集合增加 `claude`（PATH、`standardBinDirs`、
   `agentLookupDirs`），沙盒内可经 `sbx --preset reviewer-agent` 顶层
   启动 `claude`（CC）。
-- **软链目标身份校验**：`EvalSymlinks` 解析出的目标并入 `EntryAgents`
-  前校验身份——basename 须命中白名单名（`agy`/`pig`/`pi`/
-  `claude`/`agentapi`/`webm_encoder`），或路径含 `/<查找名>/` 段且位于
-  已知安装根前缀之下；basename 命中禁名（含 `-` 前缀派生名如
-  `dispatch-agent-go`）一律拒。目标不通过时整个候选（含软链自身）
-  丢弃并打 `WARN`，封堵 PATH 前置毒软链（如 `claude → dispatch-agent`）
-  把禁用二进制混入白名单；`/tmp/claude/evil` 这类路径段巧合同样被拒。
-  版本化安装（`claude → ~/.local/share/claude/versions/<ver>`，
-  basename 为版本号但路径含 `/claude/` 段且在安装根内）正常放行。
 - **claude 私有配置写面**：`ReviewerAgentWithEnv` 预建 `<privateTmpDir>/claude`
   （0700，每会话私有），加入 `ReadWrite` 并经 `overrideEnvKey` 注入
   `CLAUDE_CONFIG_DIR`。CC 会话必写配置目录；注入后 CC 配置根整体切到
@@ -29,12 +27,18 @@
   settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道），
   与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 `privateTmpDir` 的每会话
   隔离口径一致。
-- **`CLAUDE_CONFIG_DIR` 回钉**：`buildPolicy` 在
-  `mergeEnv(policy.Env, cfg.Env)` 之后（与 PIG_HOME 回钉同位置）把最终
-  env 中该键强制回写为 `ReviewerAgentWithEnv` 注入的
-  `<privateTmpDir>/claude`（仅 reviewer-agent 预设），防
-  `--env CLAUDE_CONFIG_DIR=<其他路径或空>` 把 CC 写面指回宿主或与
-  `ReadWrite` 策略脱配。
+
+### Changed
+
+- **软链目标身份校验 WARN 分档**：目标被拒时 stderr WARN 按拒绝原因
+  分档——禁名命中打 `forbidden exec name, skipped`、缺 `/<查找名>/`
+  路径段打 `missing /<name>/ path segment, skipped`、不在安装根前缀
+  保留 `not in allowed roots, skipped`，不再把三种原因混在同一文案
+  下误导排障。判定逻辑本身不变（`entryAgentTargetAllowed` 重构为
+  返回原因串的 `entryAgentTargetRejectReason`）。
+
+### Fixed
+
 - **`ForbiddenExecNames` 补 ELF 本体名（宿主实测纠偏）**：新增
   `dispatch-agent-go`、`herdr`、`herdr-core`、`herdr-mobile-bridge`——
   顶层 `IsForbiddenExec` 与 seccomp `shouldDenyExecMmap` 都按 resolved
@@ -46,18 +50,27 @@
   精确列入。早期推断名 `herdr-go` 宿主不存在，不入名单。上述成员
   均不在 `ResolveEntryAgentPaths` 白名单名（agy/pig/pi/claude/
   agentapi/webm_encoder）内，不冲突。既有成员语义只增不删。
+
+### Security
+
+- **软链目标身份校验**：`EvalSymlinks` 解析出的目标并入 `EntryAgents`
+  前校验身份——basename 须命中白名单名（`agy`/`pig`/`pi`/
+  `claude`/`agentapi`/`webm_encoder`），或路径含 `/<查找名>/` 段且位于
+  已知安装根前缀之下；basename 命中禁名（含 `-` 前缀派生名如
+  `dispatch-agent-go`）一律拒。目标不通过时整个候选（含软链自身）
+  丢弃并打 `WARN`，封堵 PATH 前置毒软链（如 `claude → dispatch-agent`）
+  把禁用二进制混入白名单；`/tmp/claude/evil` 这类路径段巧合同样被拒。
+  版本化安装（`claude → ~/.local/share/claude/versions/<ver>`，
+  basename 为版本号但路径含 `/claude/` 段且在安装根内）正常放行。
+- **`CLAUDE_CONFIG_DIR` 回钉**：`buildPolicy` 在
+  `mergeEnv(policy.Env, cfg.Env)` 之后（与 PIG_HOME 回钉同位置）把最终
+  env 中该键强制回写为 `ReviewerAgentWithEnv` 注入的
+  `<privateTmpDir>/claude`（仅 reviewer-agent 预设），防
+  `--env CLAUDE_CONFIG_DIR=<其他路径或空>` 把 CC 写面指回宿主或与
+  `ReadWrite` 策略脱配。
 - **已声明接受的嵌套面**：沙盒内 `claude` 可再 exec 白名单内
   `agy`/`pig`/`pi` 同路径（Landlock 路径级放行，无一次性 execve 计数）；
   `dispatch-agent`/`grok` 仍不在白名单，兜底依赖角色工具白名单。
-
-### Changed
-
-- **软链目标身份校验 WARN 分档**：目标被拒时 stderr WARN 按拒绝原因
-  分档——禁名命中打 `forbidden exec name, skipped`、缺 `/<查找名>/`
-  路径段打 `missing /<name>/ path segment, skipped`、不在安装根前缀
-  保留 `not in allowed roots, skipped`，不再把三种原因混在同一文案
-  下误导排障。判定逻辑本身不变（`entryAgentTargetAllowed` 重构为
-  返回原因串的 `entryAgentTargetRejectReason`）。
 
 ## [0.3.2] - 2026-11-04
 
@@ -346,7 +359,10 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.3...HEAD
+[0.3.3]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.2...go/sandbox/v0.3.3
+[0.3.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.1...go/sandbox/v0.3.2
+[0.3.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...go/sandbox/v0.3.1
 [0.3.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.2...go/sandbox/v0.3.0
 [0.2.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.1...go/sandbox/v0.2.2
 [0.2.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.2.0...go/sandbox/v0.2.1
