@@ -1899,6 +1899,56 @@ func TestResolveEntryAgentPathsRejectsSegmentCoincidence(t *testing.T) {
 	}
 }
 
+// TestResolveEntryAgentPathsRejectsNotInAllowedRoots 覆盖「not in allowed roots」
+// 分档：claude → /tmp/<rand>/claude/evil，目标 basename 非白名单也非禁名、路径含
+// /claude/ 段（过路径段判定）但不在任何已知安装根前缀之下，须打
+// not in allowed roots WARN 且软链 norm 与目标 rn 都不入 EntryAgents。
+// 与 missing-segment 档互补：该档挡路径段都含不齐的目标，本档挡路径段齐了但
+// 安装根前缀不合的目标。
+func TestResolveEntryAgentPathsRejectsNotInAllowedRoots(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	evil := filepath.Join(tmp, "claude", "evil")
+	if err := os.MkdirAll(filepath.Dir(evil), 0o755); err != nil {
+		t.Fatalf("mkdir evil dir: %v", err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.WriteFile(evil, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatalf("write evil: %v", err)
+	}
+	link := filepath.Join(binDir, "claude")
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatalf("symlink claude→evil: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+	var paths []string
+	warnOut := captureStderr(t, func() {
+		paths = sandbox.ResolveEntryAgentPaths()
+	})
+
+	resolvedEvil, err := filepath.EvalSymlinks(evil)
+	if err != nil {
+		t.Fatalf("EvalSymlinks evil: %v", err)
+	}
+	if containsPath(paths, link) {
+		t.Fatalf("rejected symlink %s must not enter EntryAgents, got %v", link, paths)
+	}
+	if containsPath(paths, resolvedEvil) {
+		t.Fatalf("not-in-roots target %s must not enter EntryAgents, got %v", resolvedEvil, paths)
+	}
+	if !strings.Contains(warnOut, "not in allowed roots, skipped") {
+		t.Fatalf("expected not-in-allowed-roots WARN about skipped target, got %q", warnOut)
+	}
+	if !strings.Contains(warnOut, "evil") {
+		t.Fatalf("expected WARN naming rejected target %s, got %q", resolvedEvil, warnOut)
+	}
+}
+
 // TestResolveEntryAgentPathsVersionedClaudeTarget 覆盖版本化安装形态：
 // claude → <安装根>/claude/versions/<ver>（basename 是版本号，路径含 /claude/ 段
 	// 且位于已知安装根前缀之下）的软链目标须正常并入 EntryAgents。

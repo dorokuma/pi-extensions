@@ -24,10 +24,12 @@ const (
 // ForbiddenExecNames 定义严禁在只读审查子代理中执行的嵌套代理与调度器二进制名称。
 // 除顶层 wrapper 名外同时包含 ELF 本体名（dispatch-agent-go / herdr / herdr-core /
 // herdr-mobile-bridge）：顶层 IsForbiddenExec 与 seccomp shouldDenyExecMmap 都按
-// resolved basename 精确匹配判定，名单不含本体名会让本体二进制穿透三层拦截
-//（Policy.Validate / BuildExecWhitelist 过滤、Landlock Exec 白名单、seccomp
-// PROT_EXEC 守卫）；禁名+"-" 前缀派生拦阻只在软链目标身份校验层生效，故
-// herdr-core / herdr-mobile-bridge 必须逐个精确列入。
+// resolved basename 精确匹配 +「禁名+"-"/"."」前缀派生判定，名单不含本体名
+// 会让本体二进制穿透三层拦截（Policy.Validate / BuildExecWhitelist 过滤、
+// Landlock Exec 白名单、seccomp PROT_EXEC 守卫）；前缀派生仅对长度 ≥ 5 的
+// 禁名生效（见 forbiddenNameDeriveMinLen），且只覆盖分隔符起始的形态（如
+// dispatch-agent-go.bak-*、herdr-core），故 agy-recall / pig-agent /
+// pi-reviewer-* 这类合法短名前缀工件不受影响。
 // 本体名只列宿主实测存在的部署形态，不泛化；既有成员语义只增不删。
 var ForbiddenExecNames = []string{
 	"pig",
@@ -71,7 +73,9 @@ var standardBinDirs = []string{
 }
 
 // IsForbiddenExec 判断给定的命令名或路径是否属于禁止执行的代理/执行器。
-// 同时检查原始路径的基名（basename）以及符号链接解析后的真实文件基名。
+// 同时检查原始路径的基名（basename）以及符号链接解析后的真实文件基名；
+// 基名命中按 isForbiddenBaseName：等于禁名即中，长度 ≥ 5 的禁名再以
+// 「禁名+"-"」「禁名+"."」前缀派生（如 dispatch-agent-go.bak-*）也算命中。
 func IsForbiddenExec(pathOrName string) bool {
 	trimmed := strings.TrimSpace(pathOrName)
 	if trimmed == "" {
@@ -89,9 +93,19 @@ func IsForbiddenExec(pathOrName string) bool {
 	return false
 }
 
+// forbiddenNameDeriveMinLen 是参与「禁名+"-"/"."」前缀派生判定的禁名最短长度。
+// 短禁名（pi/agy/pig/grok）是大量合法工件名的前缀——pi-reviewer-* 受控
+// 执行目录、pig-agent 私有配置目录、agy-recall / agy-rules-hook 等——若对
+// 短名也做前缀派生，这些合法 Exec 路径会被误判禁名而击穿全部预设。
+const forbiddenNameDeriveMinLen = 5
+
 func isForbiddenBaseName(name string) bool {
 	for _, forbidden := range ForbiddenExecNames {
 		if name == forbidden {
+			return true
+		}
+		if len(forbidden) >= forbiddenNameDeriveMinLen &&
+			(strings.HasPrefix(name, forbidden+"-") || strings.HasPrefix(name, forbidden+".")) {
 			return true
 		}
 	}
@@ -667,8 +681,9 @@ func ResolveEntryAgentPaths() []string {
 	// entryAgentTargetRejectReason 校验 EvalSymlinks 解析出的目标 rn 的身份，
 	// name 为当前候选的查找名（不是任意白名单名），三层判定：
 	//  1) basename(rn) 属于白名单名集合（names + agentapi/webm_encoder）→ 放行；
-	//  2) 否则 basename(rn) 命中禁名守卫——等于 ForbiddenExecNames 成员或以
-	//     「禁名+"-"」为前缀（如 dispatch-agent-go、herdr-core 这类派生本体名）→ 一律拒；
+	//  2) 否则 basename(rn) 命中禁名守卫（isForbiddenBaseName：等于
+	//     ForbiddenExecNames 成员，或长禁名的「禁名+"-"/"."」前缀派生，
+	//     如 dispatch-agent-go.bak-* 这类备份形态）→ 一律拒；
 	//  3) 否则仅当 rn 含 "/"+name+"/" 路径段且 rn 位于已知安装根前缀之下
 	//     → 放行。
 	// 禁名守卫置于路径段判定之前：basename 属于白名单的合法目标（如
@@ -683,10 +698,8 @@ func ResolveEntryAgentPaths() []string {
 		if _, ok := allowedTargets[base]; ok {
 			return ""
 		}
-		for _, f := range ForbiddenExecNames {
-			if base == f || strings.HasPrefix(base, f+"-") {
-				return "forbidden exec name"
-			}
+		if isForbiddenBaseName(base) {
+			return "forbidden exec name"
 		}
 		sep := string(filepath.Separator)
 		if !strings.Contains(rn, sep+name+sep) {

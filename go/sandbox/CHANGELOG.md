@@ -4,6 +4,35 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **禁名后缀闭合：`.` 与 `-` 双分隔符前缀派生**：`isForbiddenBaseName`
+  的派生判定从仅 `禁名+"-"` 扩为 `禁名+"-"` 与 `禁名+"."` 两种前缀
+  （`basename == 禁名` 或以其前缀开头即命中），此前
+  `dispatch-agent-go.bak-*` 这类「禁名 + `.` + 任意后缀」形态不被
+  `IsForbiddenExec`（含 `EvalSymlinks` 解析后判定）、`Policy.Validate`、
+  Landlock Exec 白名单、seccomp `shouldDenyExecMmap` 及软链目标身份校验
+  层任何一层拦阻——软链指到 `.bak` 备份二进制的命令名即可绕穿透。
+  身份校验层 `entryAgentTargetRejectReason` 改直接复用
+  `isForbiddenBaseName`，两层语义保持一致；`allowedTargets` 白名单优先于
+  禁名档，合法入口（agy/pig/pi/claude 版本化安装等）不受影响。
+- **入口代理身份校验「not in allowed roots」档补测试**：新增
+  `TestResolveEntryAgentPathsRejectsNotInAllowedRoots`，覆盖
+  `claude → /tmp/<rand>/claude/evil`（含 `/claude/` 段但不在任何安装根
+  前缀下）反例，断言 WARN 命中 `not in allowed roots, skipped` 且
+  软链 norm 与目标 rn 均不入 `EntryAgents`，与既有
+  `missing /<name>/ path segment` 档互补。
+
+### Changed
+
+- **短禁名不再参与「禁名+`-`」前缀派生**：前缀派生增加
+  `forbiddenNameDeriveMinLen`（=5）门槛——`pi`/`agy`/`pig`/`grok` 是大量
+  合法工件名前缀（`pi-reviewer-*` 受控执行目录、`pig-agent` 私有配置目录、
+  `agy-recall`/`agy-rules-hook`/`agy-pro-home` 等），短名无门槛派生会把
+  预设自建的合法 `Exec` 路径误判禁名、击穿全部预设。短禁名仍按精确匹配
+  判定；长度 ≥ 5 的禁名（`dispatch-agent`、`dispatch-agent-go`、`herdr`、
+  `herdr-core`、`herdr-mobile-bridge`）继续 `-` 派生并新增 `.` 派生。
+
 ## [0.3.3] - 2026-11-07
 
 PATCH：加固 `reviewer-agent` 预设并并入 `claude`（CC）入口支持——软链目标
