@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -441,4 +443,273 @@ func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (strin
 
 	err = cmd.Run()
 	return out.String(), exitCodeFromWaitErr(err)
+}
+
+// TestReportRelayValidation 表驱动覆盖中继校验链路：非父地址拒绝、控制字符
+// 剔除、UTF-8 边界截断、限流拒绝/恢复、慢连接读超时。
+func TestReportRelayValidation(t *testing.T) {
+	t.Run("sanitize_strips_control_chars", func(t *testing.T) {
+		in := "a\x1b[31m\r\nb\x07\tend"
+		got := sanitizeReportText(in)
+		want := "a[31m\nb\tend"
+		if got != want {
+			t.Fatalf("sanitizeReportText = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("sanitize_truncates_at_rune_boundary", func(t *testing.T) {
+		pad := strings.Repeat("a", reportMaxTextBytes-1)
+		got := sanitizeReportText(pad + "尾tail")
+		// 「尾」占字节 7999-8001 跨 8000 边界，回退到字符边界后整字剔除。
+		want := pad + reportTruncSuffix
+		if got != want {
+			t.Fatalf("truncated = %q (len %d), want len %d", got[len(got)-40:], len(got), len(want))
+		}
+	})
+
+	t.Run("non_parent_address_rejected", func(t *testing.T) {
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now()}
+		status, _ := r.process(reportRequest{To: "tOTHER", Text: "hi"})
+		if status != reportStatusRejected {
+			t.Fatalf("status = %d, want reject(%d)", status, reportStatusRejected)
+		}
+	})
+
+	t.Run("rate_limit_burst_and_session_cap", func(t *testing.T) {
+		var calls int32
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now()}
+		fake := writeFakeHc(t, "#!/bin/sh\nexit 0\n")
+		r.hcPath = fake
+		for i := 0; i < reportBurstTokens; i++ {
+			status, _ := r.process(reportRequest{To: "tTEST", Text: "x"})
+			if status != reportStatusOK {
+				t.Fatalf("send %d status = %d, want ok", i, status)
+			}
+			calls++
+		}
+		if status, reason := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected || !strings.Contains(reason, "rate") {
+			t.Fatalf("burst exhausted: status=%d reason=%q", status, reason)
+		}
+		// 时间前进一格 refill 周期后恢复。
+		r.mu.Lock()
+		r.lastRef = time.Now().Add(-reportRefillEvery)
+		r.mu.Unlock()
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusOK {
+			t.Fatalf("after refill status = %d, want ok", status)
+		}
+		// 会话上限：耗尽 sent 计数后拒绝。
+		r.mu.Lock()
+		r.sent = reportSessionMax
+		r.tokens = reportBurstTokens
+		r.mu.Unlock()
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected {
+			t.Fatalf("session cap: status = %d, want reject", status)
+		}
+		_ = calls
+	})
+
+	t.Run("delivery_failure_maps_status2", func(t *testing.T) {
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now()}
+		r.hcPath = writeFakeHc(t, "#!/bin/sh\nexit 3\n")
+		status, reason := r.process(reportRequest{To: "tTEST", Text: "x"})
+		if status != reportStatusFailed || !strings.Contains(reason, "delivery") {
+			t.Fatalf("status=%d reason=%q, want failed", status, reason)
+		}
+	})
+
+	t.Run("dash_prefixed_text_gets_leading_space", func(t *testing.T) {
+		logFile := filepath.Join(t.TempDir(), "hc.log")
+		fake := writeFakeHc(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+logFile+"\n")
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now(), hcPath: fake}
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "-dash"}); status != reportStatusOK {
+			t.Fatalf("status = %d, want ok", status)
+		}
+		data, err := os.ReadFile(logFile)
+		if err != nil {
+			t.Fatalf("read hc log: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != 3 || lines[0] != "send" || lines[1] != "tTEST" || lines[2] != " -dash" {
+			t.Fatalf("hc argv lines = %v, want [send tTEST ' -dash']", lines)
+		}
+	})
+
+	t.Run("slow_connection_times_out", func(t *testing.T) {
+		sockDir := t.TempDir()
+		ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+		if err != nil {
+			t.Skipf("unix listen: %v", err)
+		}
+		defer ln.Close()
+		r := &reportRelay{parent: "tTEST", ln: ln, tokens: 1, lastRef: time.Now()}
+		old := reportConnReadTimeout
+		reportConnReadTimeout = 200 * time.Millisecond
+		defer func() { reportConnReadTimeout = old }()
+		go r.serve()
+		conn, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		// 永不写字节：服务端读超时应主动关连接并回拒绝帧。
+		deadline := time.After(3 * time.Second)
+		reply := make(chan []byte, 1)
+		go func() {
+			buf := make([]byte, 256)
+			n, _ := conn.Read(buf)
+			reply <- buf[:n]
+		}()
+		select {
+		case b := <-reply:
+			if len(b) == 0 || b[0] != reportStatusRejected {
+				t.Fatalf("reply = %v, want reject frame", b)
+			}
+		case <-deadline:
+			t.Fatal("server did not close slow connection within read timeout")
+		}
+	})
+}
+
+func writeFakeHc(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fake-hc")
+	if err := os.WriteFile(p, []byte(body), 0o700); err != nil {
+		t.Fatalf("write fake hc: %v", err)
+	}
+	return p
+}
+
+// captureRunMain 在本进程内调用 runMain 并捕获其 stdout/stderr（受限子进程
+// 经 os.Executable() 复用测试二进制，TestMain 的 envSbxChildSpecKey 分支进入
+// runChildFromEnv）。
+func captureRunMain(t *testing.T, args []string) (string, int) {
+	t.Helper()
+	origOut, origErr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	outCh := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(rOut); outCh <- b }()
+	errCh := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(rErr); errCh <- b }()
+
+	os.Stdout, os.Stderr = wOut, wErr
+	code := runMain(args)
+	os.Stdout, os.Stderr = origOut, origErr
+	_ = wOut.Close()
+	_ = wErr.Close()
+	out := append(<-outCh, <-errCh...)
+	return string(out), code
+}
+
+// TestSbxReportRelayIntegration 集成回归：reviewer-agent + --report-to 下
+// 沙盒内 hc 受限客户端经 report.sock 中继回报，同时验证 socket 白名单视图与
+// 环境剥离。假 hc 路径经 hcPathOverride 注入（等价于构建期 -ldflags -X，
+// 生产不可经环境覆盖）。
+func TestSbxReportRelayIntegration(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mount namespace isolation requires CAP_SYS_ADMIN (euid 0)")
+	}
+	workdir := t.TempDir()
+	logFile := filepath.Join(t.TempDir(), "hc.log")
+	fake := writeFakeHc(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+logFile+"\nexit 0\n")
+
+	oldOverride := hcPathOverride
+	hcPathOverride = fake
+	defer func() { hcPathOverride = oldOverride }()
+	// 外层 HC_TERMINAL_ID 与 --report-to 不同：不禁用中继，且应透传进沙盒。
+	t.Setenv("HC_TERMINAL_ID", "t999")
+
+	moshiPresent := false
+	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
+		moshiPresent = true
+	}
+
+	script := `
+hc send tTEST hello
+printf 'send_hi_rc=%d\n' "$?"
+hc run true
+printf 'hc_run_rc=%d\n' "$?"
+hc send tOTHER x
+printf 'send_other_rc=%d\n' "$?"
+"$FAKE_HC_ABS" ls
+printf 'abs_hc_rc=%d\n' "$?"
+[ -S /run/user/0/systemd/private ] && echo systemd_sock=visible || echo systemd_sock=hidden
+[ -S /run/user/0/bus ] && echo bus_sock=visible || echo bus_sock=hidden
+[ -S /run/user/0/herdr-core/default.sock ] && echo hc_sock=visible || echo hc_sock=hidden
+[ -S /run/user/0/moshi-hook.sock ] && echo moshi_sock=visible || echo moshi_sock=absent
+[ -n "$HC_TERMINAL_SOCKET" ] && echo hc_term_sock=set || echo hc_term_sock=empty
+[ -n "$HC_SCOPE" ] && echo hc_scope=set || echo hc_scope=empty
+[ -n "$SSH_AUTH_SOCK" ] && echo ssh_sock=set || echo ssh_sock=empty
+[ -n "$DBUS_SESSION_BUS_ADDRESS" ] && echo dbus_addr=set || echo dbus_addr=empty
+echo "xdg_rt=$XDG_RUNTIME_DIR"
+[ -n "$HC_TERMINAL_ID" ] && echo hc_term_id=kept || echo hc_term_id=empty
+`
+	out, code := captureRunMain(t, []string{
+		"--preset", "reviewer-agent", "--workdir", workdir,
+		"--report-to", "tTEST",
+		"--env", "HC_TERMINAL_SOCKET=/run/user/0/herdr-core/default.sock",
+		"--env", "FAKE_HC_ABS=" + fake,
+		"--", "/bin/sh", "-c", script,
+	})
+	if code != 0 {
+		t.Fatalf("sbx exit = %d, want 0; output:\n%s", code, out)
+	}
+
+	assertOut := func(key, want string) {
+		t.Helper()
+		if !strings.Contains(out, key+"="+want) {
+			t.Fatalf("missing %q; output:\n%s", key+"="+want, out)
+		}
+	}
+	assertOut("send_hi_rc", "0")
+	assertOut("hc_run_rc", "126")
+	assertOut("send_other_rc", "1")
+	assertOut("abs_hc_rc", "126")
+	assertOut("systemd_sock", "hidden")
+	assertOut("bus_sock", "hidden")
+	assertOut("hc_sock", "hidden")
+	if moshiPresent {
+		assertOut("moshi_sock", "visible")
+	}
+	assertOut("hc_term_sock", "empty")
+	assertOut("hc_scope", "empty")
+	assertOut("ssh_sock", "empty")
+	assertOut("dbus_addr", "empty")
+	assertOut("hc_term_id", "kept")
+
+	// XDG_RUNTIME_DIR 由预设回钉为私有目录（非宿主 /run/user/0）。
+	sawXDG := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "xdg_rt="); ok {
+			sawXDG = true
+			if v == "" || v == "/run/user/0" {
+				t.Fatalf("XDG_RUNTIME_DIR = %q, want private runtime dir", v)
+			}
+		}
+	}
+	if !sawXDG {
+		t.Fatalf("missing xdg_rt line; output:\n%s", out)
+	}
+
+	// 假 hc 收到的 argv 必须是 send tTEST hello。
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("fake hc log missing (delivery never happened): %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"send", "tTEST", "hello"}
+	if len(got) != len(want) {
+		t.Fatalf("fake hc argv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fake hc argv = %v, want %v", got, want)
+		}
+	}
 }

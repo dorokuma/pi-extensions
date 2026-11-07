@@ -968,6 +968,21 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// 仅本预设放行；不改全局 defaultNullDevices，避免扩大其他预设攻击面。
 	p.ReadWrite = append(p.ReadWrite, "/dev/tty")
 
+	// 只读角色回报通道：在 goExecDir/bin 下建指向 sbx 本体的 hc 软链，
+	// 经 landlock_linux.go init 分发进入受限客户端（仅接受 hc send <addr> <text>，
+	// 提交给沙盒外 report.sock 中继）。仅本预设；ReadOnlyReviewer 与 --preset reviewer
+	// 不建此链接。真 /root/.local/bin/hc 不进任何 Exec 白名单。
+	if goExecDir := lookupEnvValue(p.Env, envGoExecDirKey); goExecDir != "" {
+		if selfExe, err := os.Executable(); err == nil && selfExe != "" {
+			if resolvedExe, err := filepath.EvalSymlinks(selfExe); err == nil && resolvedExe != "" {
+				selfExe = resolvedExe
+			}
+			if normExe, err := NormalizePath(selfExe); err == nil && !IsForbiddenExec(normExe) && !IsELFInterpreter(normExe) {
+				_ = os.Symlink(normExe, filepath.Join(goExecDir, "bin", "hc"))
+			}
+		}
+	}
+
 	// privateTmpDir 由 ReadOnlyReviewer 创建并记录在 Policy.Env 的 TMPDIR 中。
 	privateTmpDir := lookupEnvValue(p.Env, "TMPDIR")
 

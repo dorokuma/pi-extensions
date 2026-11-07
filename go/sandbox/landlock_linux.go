@@ -179,6 +179,11 @@ func init() {
 		runHelperProcess()
 		os.Exit(0)
 	}
+	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "hc" {
+		// hc 受限客户端：ReviewerAgent 在 <goExecDir>/bin/hc 建软链指向 sbx 本体。
+		// 分发先于 envGoExecDirKey 判空，保证 env 缺失时客户端以 75 报告而非落到 runMain。
+		os.Exit(runReportClient(os.Getenv(envGoExecDirKey)))
+	}
 	if goExecDir := os.Getenv(envGoExecDirKey); goExecDir != "" && len(os.Args) > 0 {
 		switch filepath.Base(os.Args[0]) {
 		case "go":

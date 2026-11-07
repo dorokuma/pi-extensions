@@ -33,6 +33,59 @@
   判定；长度 ≥ 5 的禁名（`dispatch-agent`、`dispatch-agent-go`、`herdr`、
   `herdr-core`、`herdr-mobile-bridge`）继续 `-` 派生并新增 `.` 派生。
 
+## [0.4.0] - 2026-11-07
+
+MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视图 +
+环境剥离。Landlock ABI 6 不管 pathname unix socket 的 `connect()`，
+此前沙盒内任意代码可直连 `/run/user/0/herdr-core/*`（hc 控制面）、
+`systemd/private`/`bus`（驱动 root systemd，等价沙盒外任意命令执行）、
+`/tmp/tmux-0/*`（终端按键注入）、gnupg/openssh_agent（凭据代理）。
+
+### Added
+
+- **`--report-to ID`**：父终端地址（如 `t28`，由派发方取外层
+  `HC_TERMINAL_ID` 传入）。仅 `--preset reviewer-agent` 且地址合法且可信
+  hc 存在时，sbx 外层父进程（在 Landlock 规则集外）在
+  `<goExecDir>/report.sock`（0600）起回报中继，先于受限子进程就绪：
+  4 字节大端长度前缀 + JSON `{"to","text"}`（整包上限 64KiB），每连接 5s
+  读 deadline，校验顺序为 `to` 必须等于父地址 → UTF-8 规范化并剔除除
+  `\n`/`\t` 外 C0/C1 控制字符 → 超 8000 字节按字符边界截断并追加
+  `…[truncated by sbx]` → 令牌桶（容量 3，每 30 秒补 1，每会话 20 条）→
+  `exec.CommandContext` 固定 argv `hc send <parent> <text>`（不经 shell，
+  超时 5s，文本以 `-` 开头时前置空格——hc 的 clap 参数解析不接受 `-`
+  开头的 TEXT 操作数）。回包 1 字节状态（0 成功 / 1 拒绝 / 2 投递失败）
+  + 简短原因；退出时先关监听再在途等待最多 6 秒。hc 仅在固定可信位置
+  解析（`/root/.local/bin/hc` 与 trustedHome 同路径，绝不走 PATH）；
+  外层 `HC_TERMINAL_ID` 存在且等于 `--report-to` 时拒绝启用（防发给自己）。
+- **沙盒内 `hc` 受限客户端**：`ReviewerAgentWithEnv` 在
+  `<goExecDir>/bin/hc` 建指向 sbx 本体的软链（仅此预设），`init` 分发按
+  argv[0]==`hc` 进入 `runReportClient`：仅放行 `hc send <addr> <text>`
+  精确两操作数经 report.sock 提交；`hc --help`/`hc --version` 打印受限
+  说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
+  时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
+- **socket 白名单视图（Linux，CLONE_NEWNS）**：受限子进程进入独立挂载
+  命名空间（Go runtime 自动把 `/` 置 rprivate），在 `sandbox.Apply` 之前：
+  `/run/user/0` 被 tmpfs 覆盖并只回绑 `moshi-hook.sock`（agy 钩子遥测），
+  随后覆盖层 remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。
+  覆盖路径不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
+  `--best-effort` 下仅告警。unshare 失败在 `--best-effort` 下回退不
+  unshare（此时跳过全部覆盖，绝不动宿主挂载命名空间）。
+- **环境剥离**：沙盒内剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、
+  `GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS`、
+  `XDG_RUNTIME_DIR`；作用于宿主继承环境（`runSandboxedChild` 的 cmd.Env
+  与 `runChildFromEnv` 的 mergeEnv 基底）与 `--env` 传入值（`buildPolicy`
+  同口径过滤）。预设自身注入的 `XDG_RUNTIME_DIR`（reviewer-agent 私有
+  0700 目录）不属于外部指针，不受影响。
+
+### Known Risks
+
+- 已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman
+  扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、
+  goExecDir 内 `broker.sock` 与 `report.sock`。
+- 沙盒内进程为 root（本机无 user-ns 包装）时理论上可自行 umount 覆盖层；
+  白名单视图收敛的是 pathname connect 直通面，不承诺抵抗沙盒内主动
+  特权操作。
+
 ## [0.3.3] - 2026-11-07
 
 PATCH：加固 `reviewer-agent` 预设并并入 `claude`（CC）入口支持——软链目标
@@ -388,7 +441,8 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.3...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.4.0...HEAD
+[0.4.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.3...go/sandbox/v0.4.0
 [0.3.3]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.2...go/sandbox/v0.3.3
 [0.3.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.1...go/sandbox/v0.3.2
 [0.3.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...go/sandbox/v0.3.1

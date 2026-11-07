@@ -53,6 +53,7 @@ type cliConfig struct {
 	BestEffort  bool
 	CheckOnly   bool
 	ShowVersion bool
+	ReportTo    string
 	Command     []string
 }
 
@@ -67,9 +68,13 @@ type childExecSpec struct {
 	Env         []string `json:"env"`
 	BestEffort  bool     `json:"best_effort"`
 	EntryAgents []string `json:"entry_agents"`
+	// MountNS 记录父进程是否以 CLONE_NEWNS 派生子进程；仅当为 true 时
+	// 子进程才执行挂载命名空间内的 socket 白名单视图（--best-effort 下
+	// unshare 失败回退不 unshare 时绝不碰宿主挂载命名空间）。
+	MountNS bool `json:"mount_ns"`
 }
 
-const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] -- COMMAND [ARGS...]"
+const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] [--report-to ID] -- COMMAND [ARGS...]"
 
 // parseArgs 解析命令行参数（不含 os.Args[0]），支持 `--reviewer WORKDIR` 作为 `--preset reviewer --workdir DIR` 的兼容别名。
 func parseArgs(args []string) (cliConfig, error) {
@@ -85,6 +90,7 @@ func parseArgs(args []string) (cliConfig, error) {
 		bestEffort  bool
 		checkOnly   bool
 		showVersion bool
+		reportTo    string
 	)
 
 	fs := flag.NewFlagSet("sbx", flag.ContinueOnError)
@@ -101,6 +107,7 @@ func parseArgs(args []string) (cliConfig, error) {
 	fs.BoolVar(&bestEffort, "best-effort", false, "当内核不支持或路径缺失时告警降级而非报错退出")
 	fs.BoolVar(&checkOnly, "check", false, "仅检测当前内核 Landlock 支持状态并退出")
 	fs.BoolVar(&showVersion, "version", false, "打印版本号并退出")
+	fs.StringVar(&reportTo, "report-to", "", "只读角色回报中继的父终端地址（如 t28；仅 reviewer-agent 预设生效）")
 
 	if err := fs.Parse(args); err != nil {
 		return cliConfig{}, err
@@ -159,12 +166,47 @@ func parseArgs(args []string) (cliConfig, error) {
 		BestEffort:  bestEffort,
 		CheckOnly:   checkOnly,
 		ShowVersion: showVersion,
+		ReportTo:    strings.TrimSpace(reportTo),
 		Command:     cmdArgs,
 	}, nil
 }
 
+// sandboxEnvStripKeys 是从沙盒子进程环境中剔除的外部指针类变量：
+// 除 HC_TERMINAL_ID（保留给角色识别父终端）外所有 HC_ 前缀变量
+// （HC_TERMINAL_SOCKET/HC_SCOPE/HC_SOCKET/HC_SESSION 等），以及凭据与
+// 会话 socket 指针。--env 显式传入这些键同样被剔除（buildPolicy 对
+// cfg.Env 同口径过滤）；预设自身注入的值（如 reviewer-agent 私有
+// XDG_RUNTIME_DIR 指向沙盒内 0700 目录）不属于外部指针，不剔除。
+var sandboxEnvStripKeys = map[string]bool{
+	"GPG_AGENT_INFO":           true,
+	"SSH_AUTH_SOCK":            true,
+	"DBUS_SESSION_BUS_ADDRESS": true,
+	"XDG_RUNTIME_DIR":          true,
+}
+
+// stripSandboxEnv 剔除 env 列表中的外部指针类变量。
+func stripSandboxEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(k, "HC_") && k != "HC_TERMINAL_ID" {
+			continue
+		}
+		if sandboxEnvStripKeys[k] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // buildPolicy 根据解析后的命令行配置构造最终的 sandbox.Policy。
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
+	// 先剔除 --env 中的外部指针类变量，防止它们经 policy.Env 写回沙盒。
+	cfg.Env = stripSandboxEnv(cfg.Env)
 	var policy sandbox.Policy
 	var pigHome string
 	var claudeConfigDir string
@@ -366,13 +408,16 @@ func runMain(args []string) int {
 		}
 	}
 
-	return runSandboxedChild(bin, cfg.Command, policy)
+	return runSandboxedChild(bin, cfg, policy)
 }
 
 // runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与 syscall.Exec；
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
-func runSandboxedChild(bin string, command []string, policy sandbox.Policy) int {
+// Linux 下子进程以 CLONE_NEWNS 进入独立挂载命名空间（socket 白名单视图见 mountns_linux.go）；
+// --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
+// <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
+func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 	selfExe, err := os.Executable()
 	if err != nil || selfExe == "" {
 		fmt.Fprintf(os.Stderr, "sbx: resolve executable failed: %v\n", err)
@@ -382,9 +427,14 @@ func runSandboxedChild(bin string, command []string, policy sandbox.Policy) int 
 		selfExe = resolved
 	}
 
+	// 回报中继必须在 cmd.Start() 之前就绪：沙盒内 hc 客户端启动后即可连接。
+	relay := maybeStartReportRelay(cfg, policy.Env)
+	defer relay.close()
+
+	sysProcAttr := childSysProcAttr()
 	spec := childExecSpec{
 		Bin:         bin,
-		Command:     command,
+		Command:     cfg.Command,
 		ReadOnly:    policy.ReadOnly,
 		ReadWrite:   policy.ReadWrite,
 		Exec:        policy.Exec,
@@ -392,6 +442,7 @@ func runSandboxedChild(bin string, command []string, policy sandbox.Policy) int 
 		Env:         policy.Env,
 		BestEffort:  policy.BestEffort,
 		EntryAgents: policy.EntryAgents,
+		MountNS:     sysProcAttr != nil,
 	}
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
@@ -399,19 +450,41 @@ func runSandboxedChild(bin string, command []string, policy sandbox.Policy) int 
 		return 1
 	}
 
-	cmd := exec.Command(selfExe)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = mergeEnv(os.Environ(), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+	// 传入子进程的环境同样剔除外部指针类变量（子进程 Apply 前的辅助进程不继承 HC_*）。
+	childEnv := mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+
+	newChildCmd := func() *exec.Cmd {
+		cmd := exec.Command(selfExe)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = childEnv
+		cmd.SysProcAttr = sysProcAttr
+		return cmd
+	}
+	cmd := newChildCmd()
 
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(sigCh)
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "sbx: start sandboxed child failed: %v\n", err)
-		return 126
+		// --best-effort 且启用了挂载命名空间时，回退不 unshare 重启一次；
+		// 此时 spec.MountNS=false，子进程跳过 socket 覆盖，绝不动宿主挂载命名空间。
+		if policy.BestEffort && sysProcAttr != nil {
+			fmt.Fprintf(os.Stderr, "sbx: WARN mount namespace unavailable (%v); retrying without socket hiding\n", err)
+			sysProcAttr = nil
+			spec.MountNS = false
+			if specBytes, err = json.Marshal(spec); err == nil {
+				childEnv = mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+				cmd = newChildCmd()
+				err = cmd.Start()
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sbx: start sandboxed child failed: %v\n", err)
+			return 126
+		}
 	}
 
 	waitCh := make(chan error, 1)
@@ -459,12 +532,22 @@ func runChildFromEnv() int {
 		BestEffort:  spec.BestEffort,
 		EntryAgents: spec.EntryAgents,
 	}
+	// 仅当父进程确实以 CLONE_NEWNS 派生（MountNS）时收紧 socket 白名单视图；
+	// 挂载步骤失败默认拒绝启动（退出码 1），--best-effort 下仅告警。
+	if spec.MountNS {
+		if err := isolateRuntimeSockets(spec.BestEffort); err != nil {
+			fmt.Fprintf(os.Stderr, "sbx: %v\n", err)
+			return 1
+		}
+	}
 	if err := sandbox.Apply(policy); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: apply sandbox policy failed: %v\n", err)
 		return 1
 	}
 
-	execEnv := mergeEnv(os.Environ(), policy.Env)
+	// mergeEnv 只能覆盖不能删：对宿主继承部分剔除外部指针类变量后再合并，
+	// policy.Env 中预设注入的同名键（如私有 XDG_RUNTIME_DIR）不受影响。
+	execEnv := mergeEnv(stripSandboxEnv(os.Environ()), policy.Env)
 	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", spec.Bin, err)
 		return 126

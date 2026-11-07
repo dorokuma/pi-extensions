@@ -54,7 +54,18 @@ go run ./cmd/sbx --preset reviewer --workdir /path/to/repo -- go test ./...
 
 # 只读审查员代理（允许顶层 agy/pig/pi/claude，扩展会话 RW；嵌套再起同名代理 OS 层仍可能成功，见 CHANGELOG）
 go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo -- /root/.local/bin/agy --help
+
+# 只读角色回报中继：沙盒内 `hc send <父终端> <文本>` 经外层中继发送（仅 reviewer-agent）
+go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo --report-to t28 -- /root/.local/bin/agy
 ```
+
+### `--report-to`：只读角色回报中继
+
+`--report-to ID`（如 `t28`，派发方取外层 `HC_TERMINAL_ID` 传入）在 `reviewer-agent` 预设下启用回报通道：sbx 外层父进程（Landlock 规则集外）在 `<goExecDir>/report.sock`（0600）起中继，沙盒内 `hc` 是指向 sbx 本体的受限客户端软链，只接受 `hc send <addr> <text>` 精确两操作数（`hc --help`/`--version` 打受限说明退 0，其它形态退 126，中继不可用时退 75）。中继帧为 4 字节大端长度前缀 + JSON `{"to","text"}`（上限 64KiB），校验 `to` 必须等于父地址，文本经 UTF-8 规范化、剔除除 `\n`/`\t` 外控制字符、8000 字节字符边界截断，再受令牌桶（容量 3、每 30 秒补 1、每会话 20 条）限额；执行 `hc send` 时 argv 固定、不经 shell、超时 5 秒，文本以 `-` 开头时前置空格。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
+
+### 沙盒 socket 白名单视图与环境剥离（Linux，CLONE_NEWNS）
+
+受限子进程进入独立挂载命名空间，在 `sandbox.Apply` 之前收紧 pathname unix socket 面（Landlock ABI ≤6 不管 `connect()`）：`/run/user/0` 被 tmpfs 覆盖、仅回绑 `moshi-hook.sock`（agy 钩子遥测）后 remount 只读，`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖；同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。挂载步骤失败默认拒绝启动，`--best-effort` 下告警降级；unshare 失败在 `--best-effort` 下回退不 unshare（跳过全部覆盖）。已知边界：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `broker.sock`/`report.sock` 保持可达。
 
 ## 受控发布 `scripts/deploy.sh`
 
@@ -123,3 +134,5 @@ bash go/sandbox/scripts/deploy.sh
 9. **`/tmp/herdr-role-sessions` 为同会话共享写根**：同一沙盒会话内多个角色会话共享该目录，不保证互相隔离。
 10. **Landlock 路径级 `Exec` 无一次性 `execve` 计数器**：`EntryAgents`（agy/pig/pi/claude）顶层放行后，子进程在 OS 层仍可再 `execve` 同一路径；兜底依赖只读角色工具白名单（无 `bash`/`run_command`），`dispatch-agent`/`grok` 仍不在白名单。
 11. **`CLAUDE_CONFIG_DIR` 落在 `privateTmpDir` 下随会话清理、无跨会话持久化**：CC 配置根为每会话私有的 `<privateTmpDir>/claude`（0700），随 `privateTmpDir` 清理、无跨会话状态；`buildPolicy` 在 `mergeEnv` 之后回钉该键，`--env CLAUDE_CONFIG_DIR=` 覆盖不会把写面指回宿主或与策略脱配。
+12. **socket 白名单视图不承诺抵抗沙盒内主动特权操作**：沙盒内进程为 root（本机无 user-ns 包装）时理论上可自行 umount 覆盖层恢复 socket 面；该机制收敛的是 Landlock 管不到的 pathname `connect()` 直通面，不是特权行为边界。
+13. **回报中继只限文本回父终端**：沙盒内 `hc` 客户端只接受 `hc send <父地址> <text>`；向非父地址、`hc run/exec/file/keys` 等其它形态一律拒绝。中继以沙盒外 root 执行真实 `hc send`，其信任面仅限于「校验后的文本 + 固定 argv」。
