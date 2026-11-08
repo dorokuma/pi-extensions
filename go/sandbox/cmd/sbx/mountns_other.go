@@ -14,3 +14,8 @@ func childSysProcAttr() *syscall.SysProcAttr {
 func isolateRuntimeSockets(bestEffort bool) error {
 	return nil
 }
+
+// sealMountNamespace 非 Linux 平台无挂载命名空间 seccomp 封锁，为空操作。
+func sealMountNamespace() error {
+	return nil
+}

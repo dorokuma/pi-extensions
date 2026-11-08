@@ -3,22 +3,38 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
 
+// envTestMountProbe 让复用测试二进制的沙盒内进程进入 mount 探针模式：
+// 直接对 setns(/proc/1/ns/mnt) 与 umount2(/run, MNT_DETACH) 发 syscall 并
+// 打印 errno，验证 mount-seal seccomp 锁以 EPERM 拦截。
+const envTestMountProbe = "GO_WANT_SBX_MOUNT_PROBE"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(envSbxChildSpecKey) != "" {
 		os.Exit(runChildFromEnv())
+	}
+	if os.Getenv(envTestMountProbe) == "1" {
+		os.Exit(runMountNSProbe())
 	}
 	if os.Getenv(envTestWantSbxMain) == "1" {
 		_ = os.Unsetenv(envTestWantSbxMain)
@@ -26,6 +42,33 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+// runMountNSProbe 在受限沙盒内执行：对 setns 与 umount2 直接发 syscall，
+// 打印 errno 供父进程断言（seccomp 锁装好后二者必须均为 EPERM=1）。
+// 使用 syscall.Syscall 硬编码 amd64 系统调用号，避免平台依赖；非 amd64
+// Linux 下 setns=308/umount2=166 不命中过滤清单会走内核原生路径，测试层
+// 按 GOARCH 决定是否断言。
+func runMountNSProbe() int {
+	// setns：打开 /proc/self/ns/mnt 的 fd 发起 setns（跨进程 /proc/1/ns/*
+	// 在 Landlock 下不可读，用 self 足够触发 seccomp 拦截点：过滤器按
+	// 系统调用号拦截，EPERM 与目标无关；无过滤器时本调用返回 0/EINVAL）。
+	setnsErrno := -1
+	if f, err := os.Open("/proc/self/ns/mnt"); err == nil {
+		defer f.Close()
+		_, _, e := syscall.Syscall(308, f.Fd(), 0, 0) // amd64 SYS_SETNS
+		setnsErrno = int(e)
+	} else {
+		setnsErrno = -2
+	}
+	// umount2：直接对 /run 发 MNT_DETACH 卸载，撤销 socket 白名单视图。
+	umountErrno := -1
+	if p, err := syscall.BytePtrFromString("/run"); err == nil {
+		_, _, e := syscall.Syscall(166, uintptr(unsafe.Pointer(p)), unix.MNT_DETACH, 0) // amd64 SYS_UMOUNT2
+		umountErrno = int(e)
+	}
+	fmt.Printf("setns_errno=%d\numount_errno=%d\n", setnsErrno, umountErrno)
+	return 0
 }
 
 func TestParseArgsBasicAndReviewerAlias(t *testing.T) {
@@ -508,6 +551,139 @@ func TestReportRelayValidation(t *testing.T) {
 		_ = calls
 	})
 
+	t.Run("session_cap_via_injectable_clock", func(t *testing.T) {
+		var mu sync.Mutex
+		now := time.Now()
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: now,
+			hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			now:    func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+		advance := func(d time.Duration) {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+		}
+		// 真实走完 1..20 条成功：tokens 耗尽时推进一个 refill 周期补充。
+		for i := 1; i <= reportSessionMax; i++ {
+			if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusOK {
+				t.Fatalf("send %d status = %d, want ok", i, status)
+			}
+			if i < reportSessionMax {
+				advance(reportRefillEvery)
+			}
+		}
+		// 第 21 条：会话上限拒绝。
+		if status, reason := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected || !strings.Contains(reason, "rate") {
+			t.Fatalf("session cap 21st: status=%d reason=%q, want reject", status, reason)
+		}
+	})
+
+	t.Run("token_refill_preserves_remainder", func(t *testing.T) {
+		var mu sync.Mutex
+		t0 := time.Now()
+		now := t0
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: t0,
+			hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			now:    func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+		advance := func(d time.Duration) {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+		}
+		// 消耗 1 枚 → tokens=2；推进 30s+100ms：只进 1 个整周期，tokens 回满
+		// 3 且余数 100ms 保留（lastRef=t0+30s 而非 t0+30.1s）。
+		if !r.takeToken() {
+			t.Fatal("first takeToken rejected")
+		}
+		advance(reportRefillEvery + 100*time.Millisecond)
+		if !r.takeToken() {
+			t.Fatal("refill takeToken rejected")
+		}
+		if r.tokens != reportBurstTokens-1 {
+			t.Fatalf("tokens = %d, want %d after refill+take", r.tokens, reportBurstTokens-1)
+		}
+		// 再前进 30s：距 lastRef 已 30.1s（含保留余数）→ 仍可补 1 枚；
+		// 若实现丢弃余数（lastRef=now），此刻仅 29.9s 必然拒绝。
+		advance(reportRefillEvery)
+		if !r.takeToken() {
+			t.Fatal("remainder-preserved refill rejected: lastRef lost remainder")
+		}
+	})
+
+	t.Run("frame_size_boundary_64kib", func(t *testing.T) {
+		newPipe := func() (*reportRelay, net.Conn) {
+			srv, cli := net.Pipe()
+			r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now()}
+			go r.handleConn(srv)
+			return r, cli
+		}
+		sendFrame := func(cli net.Conn, n uint32) byte {
+			t.Helper()
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], n)
+			payload := make([]byte, n)
+			go func() {
+				_, _ = cli.Write(hdr[:])
+				_, _ = cli.Write(payload)
+			}()
+			_ = cli.SetReadDeadline(time.Now().Add(3 * time.Second))
+			status := make([]byte, 1)
+			if _, err := io.ReadFull(cli, status); err != nil {
+				t.Fatalf("read reply: %v", err)
+			}
+			return status[0]
+		}
+		// 恰好等于帧体上限（4B 头 + 64KiB-4 体 = 64KiB 整包）→ 进入 JSON 解析
+		// 而非超帧拒绝。
+		_, cli := newPipe()
+		if st := sendFrame(cli, reportMaxFrame); st != reportStatusRejected {
+			t.Fatalf("exact-limit frame status = %d, want reject(bad request)", st)
+		}
+		_ = cli.Close()
+		// 上限 +1 → 超帧拒绝。
+		_, cli = newPipe()
+		if st := sendFrame(cli, reportMaxFrame+1); st != reportStatusRejected {
+			t.Fatalf("over-limit frame status = %d, want reject", st)
+		}
+		_ = cli.Close()
+	})
+
+	t.Run("concurrent_dial_close_race", func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			sockDir := t.TempDir()
+			ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+			if err != nil {
+				t.Skipf("unix listen: %v", err)
+			}
+			rctx, rcancel := context.WithCancel(context.Background())
+			r := &reportRelay{
+				parent:    "tTEST",
+				ln:        ln,
+				ctx:       rctx,
+				cancel:    rcancel,
+				serveDone: make(chan struct{}),
+				conns:     make(map[net.Conn]struct{}),
+				tokens:    reportSessionMax,
+				lastRef:   time.Now(),
+				hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			}
+			go r.serve()
+			var wg sync.WaitGroup
+			for d := 0; d < 8; d++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if c, err := net.Dial("unix", ln.Addr().String()); err == nil {
+						_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+						_ = c.Close()
+					}
+				}()
+			}
+			// 与在途拨号并发关闭：旧实现 Add/Wait 竞态在 -race 下报警。
+			r.close()
+			wg.Wait()
+		}
+	})
+
 	t.Run("delivery_failure_maps_status2", func(t *testing.T) {
 		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now()}
 		r.hcPath = writeFakeHc(t, "#!/bin/sh\nexit 3\n")
@@ -624,12 +800,41 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 	defer func() { hcPathOverride = oldOverride }()
 	// 外层 HC_TERMINAL_ID 与 --report-to 不同：不禁用中继，且应透传进沙盒。
 	t.Setenv("HC_TERMINAL_ID", "t999")
+	// 父进程预置非空哨兵，验证外部指针类变量在沙盒内被全部剥离；
+	// --env 同口径校验（HC_TERMINAL_SOCKET 走 --env 显式注入）。
+	t.Setenv("HC_SCOPE", "leak")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/leak.sock")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/leak")
+	t.Setenv("GPG_AGENT_INFO", "leak")
 
 	moshiPresent := false
 	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
 		moshiPresent = true
 	}
+	// 宿主前置核验：/run 全权 socket 面在宿主上确实存在，沙盒内断言
+	// 才有隐藏语义（非假绿）；宿主不存在时记录跳过该断言。
+	type runSockCheck struct{ path, key string }
+	runSocks := []runSockCheck{
+		{"/run/systemd/private", "run_systemd_private"},
+		{"/run/docker.sock", "run_docker_sock"},
+		{"/run/containerd/containerd.sock", "run_containerd_sock"},
+		{"/run/dbus/system_bus_socket", "run_dbus_sock"},
+		{"/run/user/0/herdr-core/default.sock", "run_herdr_sock"},
+	}
+	var runSockScriptLines []string
+	var runSockAsserts []runSockCheck
+	for _, sc := range runSocks {
+		// 存在为 socket 或普通文件都算“宿主上可达对象存在”。
+		if st, err := os.Stat(sc.path); err == nil && (st.Mode()&os.ModeSocket != 0 || st.Mode().IsRegular()) {
+			runSockScriptLines = append(runSockScriptLines,
+				"[ -e "+sc.path+" ] && echo "+sc.key+"=visible || echo "+sc.key+"=hidden")
+			runSockAsserts = append(runSockAsserts, sc)
+		} else {
+			t.Logf("host %s absent (skip precondition): socket-hiding assertion not applicable", sc.path)
+		}
+	}
 
+	probeBin, _ := os.Executable()
 	script := `
 hc send tTEST hello
 printf 'send_hi_rc=%d\n' "$?"
@@ -639,6 +844,7 @@ hc send tOTHER x
 printf 'send_other_rc=%d\n' "$?"
 "$FAKE_HC_ABS" ls
 printf 'abs_hc_rc=%d\n' "$?"
+"$PROBE_BIN" 2>/dev/null
 [ -S /run/user/0/systemd/private ] && echo systemd_sock=visible || echo systemd_sock=hidden
 [ -S /run/user/0/bus ] && echo bus_sock=visible || echo bus_sock=hidden
 [ -S /run/user/0/herdr-core/default.sock ] && echo hc_sock=visible || echo hc_sock=hidden
@@ -647,14 +853,22 @@ printf 'abs_hc_rc=%d\n' "$?"
 [ -n "$HC_SCOPE" ] && echo hc_scope=set || echo hc_scope=empty
 [ -n "$SSH_AUTH_SOCK" ] && echo ssh_sock=set || echo ssh_sock=empty
 [ -n "$DBUS_SESSION_BUS_ADDRESS" ] && echo dbus_addr=set || echo dbus_addr=empty
+[ -n "$GPG_AGENT_INFO" ] && echo gpg_info=set || echo gpg_info=empty
 echo "xdg_rt=$XDG_RUNTIME_DIR"
 [ -n "$HC_TERMINAL_ID" ] && echo hc_term_id=kept || echo hc_term_id=empty
+echo "goexec_dir=$PI_SANDBOX_GO_EXEC_DIR"
+echo "gotmpdir=$GOTMPDIR"
 `
+	script += strings.Join(runSockScriptLines, "\n") + "\n"
 	out, code := captureRunMain(t, []string{
 		"--preset", "reviewer-agent", "--workdir", workdir,
 		"--report-to", "tTEST",
 		"--env", "HC_TERMINAL_SOCKET=/run/user/0/herdr-core/default.sock",
 		"--env", "FAKE_HC_ABS=" + fake,
+		"--env", "PROBE_BIN=" + probeBin,
+		"--env", "GO_WANT_SBX_MOUNT_PROBE=1",
+		"--env", "PI_SANDBOX_GO_EXEC_DIR=/tmp/hijack", // 必须被回钉回 pi-reviewer-exec-*
+		"--exec", filepath.Dir(probeBin),
 		"--", "/bin/sh", "-c", script,
 	})
 	if code != 0 {
@@ -674,6 +888,9 @@ echo "xdg_rt=$XDG_RUNTIME_DIR"
 	assertOut("systemd_sock", "hidden")
 	assertOut("bus_sock", "hidden")
 	assertOut("hc_sock", "hidden")
+	for _, sc := range runSockAsserts {
+		assertOut(sc.key, "hidden")
+	}
 	if moshiPresent {
 		assertOut("moshi_sock", "visible")
 	}
@@ -681,7 +898,34 @@ echo "xdg_rt=$XDG_RUNTIME_DIR"
 	assertOut("hc_scope", "empty")
 	assertOut("ssh_sock", "empty")
 	assertOut("dbus_addr", "empty")
+	assertOut("gpg_info", "empty")
 	assertOut("hc_term_id", "kept")
+
+	// mount-seal seccomp 锁：amd64 下探针的 setns/umount2 必须返回 EPERM。
+	if runtime.GOARCH == "amd64" {
+		assertOut("setns_errno", "1")
+		assertOut("umount_errno", "1")
+	} else {
+		t.Logf("GOARCH=%s: raw amd64 syscall numbers probe not asserted", runtime.GOARCH)
+	}
+
+	// PI_SANDBOX_GO_EXEC_DIR：--env 劫持值被回钉回预设注入的
+	// pi-reviewer-exec-*，且 GOTMPDIR 与其同根（gotmp 子目录）。
+	sawGoExec := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "goexec_dir="); ok {
+			sawGoExec = true
+			if !strings.HasPrefix(filepath.Base(v), "pi-reviewer-exec-") {
+				t.Fatalf("PI_SANDBOX_GO_EXEC_DIR = %q, want /tmp/pi-reviewer-exec-* (re-pin failed)", v)
+			}
+			if v == "/tmp/hijack" {
+				t.Fatalf("PI_SANDBOX_GO_EXEC_DIR hijack survived: %q", v)
+			}
+		}
+	}
+	if !sawGoExec {
+		t.Fatalf("missing goexec_dir line; output:\n%s", out)
+	}
 
 	// XDG_RUNTIME_DIR 由预设回钉为私有目录（非宿主 /run/user/0）。
 	sawXDG := false

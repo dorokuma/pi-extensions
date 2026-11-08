@@ -210,6 +210,7 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	var policy sandbox.Policy
 	var pigHome string
 	var claudeConfigDir string
+	var goExecDir string
 	if cfg.Preset != "" {
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
@@ -234,6 +235,12 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// --env CLAUDE_CONFIG_DIR=<其他路径或空> 把 CC 写面指回宿主
 			// ~/.claude 或与 ReadWrite 策略脱配。
 			claudeConfigDir = envListValue(policy.Env, "CLAUDE_CONFIG_DIR")
+			// PI_SANDBOX_GO_EXEC_DIR 同理：ReviewerAgentWithEnv 把受控执行目录
+			//（/tmp/pi-reviewer-exec-*，go 包装器/broker.sock/report.sock 所在）
+			// 注入 Policy.Env；记下来供 mergeEnv 之后回钉，防 --env
+			// PI_SANDBOX_GO_EXEC_DIR=<其他路径> 把回报中继监听路径与 go
+			// 包装器目录劫持到调用方指定的任意目录。
+			goExecDir = envListValue(policy.Env, "PI_SANDBOX_GO_EXEC_DIR")
 		default:
 			return sandbox.Policy{}, fmt.Errorf("sbx: unknown preset %q (supported: reviewer, reviewer-agent)", cfg.Preset)
 		}
@@ -251,6 +258,12 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// 仿照 PIG_HOME 回钉，防 --env 覆盖把写面指回宿主或与策略脱配。
 	if cfg.Preset == "reviewer-agent" && claudeConfigDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir})
+	}
+	// 仅 reviewer-agent 预设回钉 PI_SANDBOX_GO_EXEC_DIR：把最终 env 中该键
+	// 强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME 同口径），
+	// 防 --env 劫持回报中继监听路径或 go 包装器/broker 目录。
+	if cfg.Preset == "reviewer-agent" && goExecDir != "" {
+		policy.Env = mergeEnv(policy.Env, []string{"PI_SANDBOX_GO_EXEC_DIR=" + goExecDir})
 	}
 	if cfg.DenyNet {
 		policy.DenyNet = true

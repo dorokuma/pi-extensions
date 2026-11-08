@@ -41,6 +41,33 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
 `systemd/private`/`bus`（驱动 root systemd，等价沙盒外任意命令执行）、
 `/tmp/tmux-0/*`（终端按键注入）、gnupg/openssh_agent（凭据代理）。
 
+### Breaking Changes
+
+- **CLI 默认启用 `CLONE_NEWNS` 挂载命名空间隔离**：此前受限子进程与
+  父进程共享宿主挂载命名空间；现在子进程默认在独立 mount ns 内执行
+  （覆盖挂载不传播回宿主）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权
+  用户且内核未放行 unprivileged user-ns）下 `unshare` 会失败：严格
+  模式拒绝启动（退出码 1），`--best-effort` 下告警降级回旧行为
+  （不 unshare、跳过全部 socket 覆盖、不安装挂载锁）。
+- **socket 白名单视图从 `/run/user/0` 扩为整个 `/run`**：此前仅覆盖
+  `/run/user/0`；现在整个 `/run` 被空 tmpfs 覆盖，仅按原相对路径回绑
+  `/run/user/0/moshi-hook.sock` 与 `/run` 下的 `/etc/resolv.conf`
+  解析目标（普通文件）。沙盒内原可达的 `/run` 下其它对象——
+  `/run/systemd/private`、`/run/docker.sock`、
+  `/run/containerd/containerd.sock`、`/run/dbus/system_bus_socket`、
+  `/run/user/0/herdr-core/*` 等——全部不可见，依赖它们的沙盒内代码
+  将收到 `ENOENT`/`EACCES`。迁移方式：确有需求的对象只能经由新增
+  白名单回绑项放行（需改码并过审查）。
+- **沙盒内挂载族系统调用一律 `EPERM`**：全部覆盖/回绑与暂存清理完成
+  后、`sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` + seccomp-BPF
+  过滤器（支持 `linux/amd64` 与 `linux/arm64`，异构 ABI 直接
+  `KILL_PROCESS`），`mount`/`umount2`/`setns`/`unshare`/`pivot_root`/
+  `open_tree`/`move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/
+  `mount_setattr` 返回 `EPERM`；过滤器与 NNP 跨 `execve` 继承。此前
+  沙盒内 root 可 `setns` 跳回宿主挂载命名空间或 `umount2` 撤销覆盖层，
+  现在两条逃逸路径均被堵死；依赖挂载类系统调用的沙盒内代码将失败。
+  `--best-effort` 下锁安装失败仅告警降级。
+
 ### Added
 
 - **`--report-to ID`**：父终端地址（如 `t28`，由派发方取外层
@@ -63,13 +90,24 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
   精确两操作数经 report.sock 提交；`hc --help`/`hc --version` 打印受限
   说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
   时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
-- **socket 白名单视图（Linux，CLONE_NEWNS）**：受限子进程进入独立挂载
-  命名空间（Go runtime 自动把 `/` 置 rprivate），在 `sandbox.Apply` 之前：
-  `/run/user/0` 被 tmpfs 覆盖并只回绑 `moshi-hook.sock`（agy 钩子遥测），
-  随后覆盖层 remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。
-  覆盖路径不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
+- **socket 白名单视图（Linux，`CLONE_NEWNS`）**：受限子进程进入独立
+  挂载命名空间（Go runtime 自动把 `/` 置 rprivate），在 `sandbox.Apply`
+  之前：整个 `/run` 被 tmpfs 覆盖，只按原相对路径回绑白名单项——
+  `moshi-hook.sock`（agy 钩子遥测）与 `/run` 下的 `/etc/resolv.conf`
+  目标文件（DNS stub），文件回绑补只读 remount，随后覆盖层整体
+  remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。覆盖路径
+  不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
   `--best-effort` 下仅告警。unshare 失败在 `--best-effort` 下回退不
-  unshare（此时跳过全部覆盖，绝不动宿主挂载命名空间）。
+  unshare（此时跳过全部覆盖，绝不动宿主挂载命名空间）。全部挂载与
+  清理完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
+- **回报中继生命周期屏障**：`serve()` 在 `mu` 临界区内判 `closing` 并
+  同步 `conns` 登记 + `wg.Add`，消除 `Add`/`Wait` 竞态；非 `ErrClosed`
+  的 Accept 错误（EMFILE/ENFILE 等）退避 10ms 继续循环而非永久退出；
+  `close()` 先关监听、等 accept 循环退出，再以 6s drain 定时器收尾，
+  超时则取消根 `ctx`（回收在途 `hc send` 子进程）并强关残余连接。
+  `PI_SANDBOX_GO_EXEC_DIR` 与 `PIG_HOME`/`CLAUDE_CONFIG_DIR` 同口径
+  回钉，`--env` 不能劫持 relay 监听路径。帧体上限 64KiB-4（整包含 4B
+  头不超 64KiB），响应写 deadline 独立 5s，令牌桶 refill 保留余数。
 - **环境剥离**：沙盒内剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、
   `GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS`、
   `XDG_RUNTIME_DIR`；作用于宿主继承环境（`runSandboxedChild` 的 cmd.Env
@@ -82,9 +120,12 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
 - 已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman
   扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、
   goExecDir 内 `broker.sock` 与 `report.sock`。
-- 沙盒内进程为 root（本机无 user-ns 包装）时理论上可自行 umount 覆盖层；
-  白名单视图收敛的是 pathname connect 直通面，不承诺抵抗沙盒内主动
-  特权操作。
+- mount-seal seccomp 锁仅在受限子进程的 `CLONE_NEWNS` 路径安装：
+  `--best-effort` 下 unshare 失败回退不 unshare 时，既不施加 socket
+  覆盖也不安装挂载锁（与挂载步骤同口径告警降级），此时沙盒内 root
+  仍可执行挂载类系统调用——降级属可观察 WARN，不作静默承诺。
+- mount-seal 过滤器支持 `linux/amd64` 与 `linux/arm64`；其它 Linux
+  架构跳过安装（不拒绝启动），挂载逃逸面在该架构上保持旧行为。
 
 ## [0.3.3] - 2026-11-07
 

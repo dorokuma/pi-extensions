@@ -6,7 +6,12 @@
 
 - **操作系统**：启用了 Landlock LSM 的 Linux 内核（`Linux >= 5.13`，自适应支持 ABI v1 至 v5+）。
 - **构建方式**：纯 Go（`CGO_ENABLED=0`），不依赖 `libcap` 或任何 C 库。
-- **权限模型**：基于 `prctl(PR_SET_NO_NEW_PRIVS, 1)`、`landlock_restrict_self` 与 `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`，无需 `root` 或 `CAP_SYS_ADMIN` 权限。
+- **权限模型**：库级 `sandbox.Apply` 基于 `prctl(PR_SET_NO_NEW_PRIVS, 1)`、
+  `landlock_restrict_self` 与 `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`，无需 `root` 或 `CAP_SYS_ADMIN` 权限。
+  命令行 `sbx` 除 Landlock 外默认对受限子进程启用 `CLONE_NEWNS` 挂载命名空间
+  隔离（socket 白名单视图 + mount-seal seccomp 锁），该路径需要 `CAP_SYS_ADMIN`；
+  无此能力时严格模式拒绝启动，`--best-effort` 下降级为不 unshare 并跳过覆盖
+  （与旧版共享宿主挂载命名空间的行为一致，仅 Landlock 边界生效）。
 
 ## 核心接口与预设
 
