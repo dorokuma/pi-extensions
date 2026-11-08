@@ -19,22 +19,62 @@
   沙盒外任意命令执行。
 - **轻量 PID 1 init**：`MountNS` 路径下 `sbx` 不再以 `syscall.Exec` 顶替
   PID 1（PID 1 忽略默认未捕获信号且无人回收孤儿僵尸），改由
-  `runAsSandboxInit` 担任 init：派生目标命令为 PID 2，向它转发
-  `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH`，
-  每轮先 `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），PID 2 退出
+  `runAsSandboxInit` 担任 init：派生目标命令（记录其实际 PID 并向它转发
+  信号——`sandbox.Apply` 会先派生 helper/broker 辅助进程，业务进程 PID
+  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`，
+  容器内 init 另监听 `SIGUSR1`/`SIGUSR2`/`SIGWINCH`/`SIGCHLD`；每轮先
+  `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），目标子进程退出
   即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
   仍走原 `syscall.Exec`。
-- **mount-seal 扩展至 18 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
+- **mount-seal 扩展至 44/46 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
   新增 `chroot`（魔链越狱第二跳）、`ptrace`、`process_vm_readv`、
-  `process_vm_writev`、`pidfd_getfd`、`kcmp`（进程控制族），均返回
+  `process_vm_writev`、`pidfd_getfd`、`kcmp`（进程控制族），以及
+  capability 门控的宿主全局副作用/句柄/密钥环族 26 个（`reboot`/
+  `kexec_load`/`kexec_file_load`/`init_module`/`finit_module`/
+  `delete_module`/`bpf`/`perf_event_open`/`fanotify_init`/`syslog`/
+  `sethostname`/`setdomainname`/`settimeofday`/`clock_settime`/
+  `adjtimex`/`clock_adjtime`/`swapon`/`swapoff`/`quotactl`/`acct`/
+  `open_by_handle_at`/`name_to_handle_at`/`add_key`/`request_key`/
+  `keyctl`/`pidfd_send_signal`，amd64 另有 `ioperm`/`iopl`），均返回
   `EPERM`；amd64 过滤器在 `arch` 校验与 `nr` 比较链之间新增
   `JGE __X32_SYSCALL_BIT(0x40000000)`，封堵与原生 amd64 共享
   `AUDIT_ARCH` 的 x32 调用号绕过。`pidfd_open` 有意不封——Go 标准库
   管理沙盒内自身子进程需要，而宿主 PID 在新 PID ns 内本就 `ESRCH`。
+- **Linux capabilities 根治裁剪（`drop-capabilities`）**：全部覆盖挂载与
+  继承 cwd 重绑完成后、seal 之前，循环 `PR_CAPBSET_DROP` 收缩 bounding
+  set（`CAP_SETPCAP` 留到循环最后一步——内核要求调用时仍持该能力），
+  `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，`capset` 把
+  Effective/Permitted 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`）
+  Inheritable 置 0；helper/broker、目标命令与 `go test` 子孙经
+  fork/exec 继承同一已裁剪能力集，`reboot`/载模块/改时钟/`bpf` 等
+  capability 门控宿主副作用在能力校验层整体失效。优先
+  `syscall.AllThreadsSyscall` 全线程生效，`-race`/cgo 下 `ENOTSUP`
+  回退 `runChildFromEnv` 入口 `runtime.LockOSThread()` 锁定的线程。
+- **继承 cwd 重绑（`rebind-cwd`，闭环相对路径拨号旁路）**：tmpfs 覆盖只
+  改变其后的绝对路径解析，内核已持有的 `fs->pwd` 仍引用覆盖前的底层
+  目录项——调用方从 `/run/user/0` 启动 sbx 时，沙盒内相对路径
+  `herdr-core/default.sock` 可直拨覆盖前的宿主 socket。全部覆盖完成后
+  `os.Chdir` 回原 cwd 并 `os.Getwd()` 复核，强制从新挂载命名空间根
+  重解析 cwd；原 cwd 在新视图不存在（如 `/run/user/0/herdr-core` 未
+  回绑）时 `ENOENT`，默认 fail-closed 拒绝启动，不擅自切往
+  `--workdir`。
+- **PID-ns 硬校验前置到一切宿主可见变异之前**：`isolateRuntimeSockets`
+  首步即判 `os.Getpid()==1`，非独立 PID ns 时严格模式直接拒绝（绝不
+  先私有化宿主 `/` 再报错），`--best-effort` 下告警点名
+  `/proc/<hostPid>/root` 魔链仍可达并跳过全部覆盖挂载（仅降权+装锁）；
+  `private-propagation` 失败与 `mount-proc` 失败的 best-effort 告警同样
+  点名魔链残余面。
+- **回报中继在途连接硬上限**：`serve()` 对同时在途连接设上限
+  `reportMaxActiveConns=32`，超限连接立即以 100ms 写超时回
+  `reject + relay busy` 并丢弃——杜绝沙盒内廉价空拨号耗尽外层父进程
+  FD/内存并把 `consecErrs` 顶满杀死中继。
 - **回报中继 Accept 永久错误自旋保护**：`serve()` 维护连续非关闭
   `Accept` 错误计数，达到 `reportAcceptMaxConsecErrs`（100 次，约 1s
   退避）主动退出循环，防止监听器 fd 进入永久错误态时空转；成功
   `Accept` 清零。
+- **回报文本剔除 Unicode `Cf` 格式控制符**：`sanitizeReportText` 在剔除
+  除 `\n`/`\t` 外控制字符之上，同步剔除 `\u202e` 双向覆盖符、\u200b
+  零宽字符与 BOM 等 `Cf` 类别字符，防父终端渲染侧文本欺骗。
 
 ### Fixed
 
@@ -42,6 +82,17 @@
   权限不足等）严格模式实际退 `126`（`--best-effort` 下降级），子进程内
   挂载/封锁步骤失败才退 `1`；原文「严格模式拒绝启动（退出码 1）」描述
   的是后者，已更正为两类失败路径区分。
+- **init 文档口径修正**：README/CHANGELOG 中「派生目标命令为 PID 2」
+  更正为「记录的目标子进程 PID」——`sandbox.Apply` 先派生
+  helper/broker，业务进程 PID 不固定为 2；同时区分外层 `sbx` 仅转发
+  `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 与容器内 PID-1 init 监听的
+  七种信号，不再混述为同一端到端能力。
+- **drain 超时取消在途投递失效**：`deliver` 的 `cmd.Stdout/Stderr =
+  io.Discard` 非 `*os.File`，`exec` 会建管道并起 copy goroutine；`hc`
+  派生继承管道的孤儿子孙时，`cmd.Wait` 被拖到子孙退出才返回——
+  `close()` drain 超时 `cancel()` 杀死 `hc` 本体后 `Wait` 仍挂至其
+  孤儿子孙自然退出。改为 stdout/stderr 置 nil（走 `/dev/null`，不建
+  管道），drain 超时取消路径恢复即时生效。
 
 ### Changed
 
@@ -159,9 +210,9 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
   unshare（此时跳过全部覆盖，绝不动宿主命名空间）。全部挂载与清理
   完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
 - **轻量 PID 1 init 收尸与信号转发**：`MountNS` 路径下 `sbx` 本体作为
-  新 PID ns 的 PID 1 不直接 `exec` 业务命令，而是派生目标命令为 PID 2
-  并担任 init（转发信号、`Wait4(-1, WNOHANG)` 收尸），避免业务进程作
-  为 PID 1 忽略默认未捕获信号与残留孤儿僵尸。
+  新 PID ns 的 PID 1 不直接 `exec` 业务命令，而是派生目标命令并担任
+  init（记录目标子进程 PID、转发信号、`Wait4(-1, WNOHANG)` 收尸），
+  避免业务进程作为 PID 1 忽略默认未捕获信号与残留孤儿僵尸。
 - **回报中继生命周期屏障**：`serve()` 在 `mu` 临界区内判 `closing` 并
   同步 `conns` 登记 + `wg.Add`，消除 `Add`/`Wait` 竞态；非 `ErrClosed`
   的 Accept 错误（EMFILE/ENFILE 等）退避 10ms 继续循环而非永久退出；

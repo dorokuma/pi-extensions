@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -429,7 +430,9 @@ func runMain(args []string) int {
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
 // Linux 下子进程以 CLONE_NEWNS|CLONE_NEWPID 进入独立挂载与 PID 命名空间（子进程即新 PID ns
-// 的 PID 1，完成隔离后担任轻量 init 派生目标命令为 PID 2；socket 白名单视图见 mountns_linux.go）；
+// 的 PID 1，完成隔离后担任轻量 init 派生目标命令（记录目标子进程 PID——
+// sandbox.Apply 会先派生 helper/broker，业务进程 PID 不固定为 2；socket
+// 白名单视图见 mountns_linux.go）；
 // --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
 // <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
 func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
@@ -521,6 +524,14 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 
 // runChildFromEnv 在子进程内读取父进程传入的沙盒配置，清除内部环境变量，施加沙盒限制后调用 syscall.Exec。
 func runChildFromEnv() int {
+	// 入口即锁定 OS 线程（不解锁——本函数最终以 init 身份退进程）：
+	// -race/cgo 下 syscall.AllThreadsSyscall 返回 ENOTSUP 时，降权、封锁与
+	// Apply 会回退到「当前线程」口径，必须保证 isolateRuntimeSockets
+	//（drop-capabilities/seal-mount-namespace）→ sandbox.Apply（派生 helper
+	// 及后续 go test 子进程）→ runAsSandboxInit（派生目标子进程）全程跑在
+	// 同一个已降权/已封锁的 OS 线程上，子孙经 fork/exec 继承同一能力集。
+	runtime.LockOSThread()
+
 	raw := os.Getenv(envSbxChildSpecKey)
 	_ = os.Unsetenv(envSbxChildSpecKey)
 	if raw == "" {
@@ -565,7 +576,7 @@ func runChildFromEnv() int {
 	execEnv := mergeEnv(stripSandboxEnv(os.Environ()), policy.Env)
 	// MountNS 路径下本进程是新 PID 命名空间的 PID 1：不得直接 syscall.Exec
 	// 顶替 PID 1（业务进程作为 PID 1 会忽略默认未捕获信号，且无人回收孤儿
-	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生 PID 2。
+	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生目标子进程。
 	if spec.MountNS {
 		return runAsSandboxInit(spec.Bin, spec.Command, execEnv)
 	}
@@ -577,16 +588,18 @@ func runChildFromEnv() int {
 }
 
 // runAsSandboxInit 在新 PID 命名空间内以 PID 1 运行轻量 init：派生目标
-// 命令为 PID 2，转发信号并回收孤儿僵尸进程。PID 1 有特殊语义——默认未
-// 捕获的信号对它不生效（kill 不掉），且其退出的子孙会被内核转给它收尸；
-// 让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉并残留僵尸。
+// 命令并记录其子进程 PID（不固定为 2——sandbox.Apply 会先派生
+// helper/broker 辅助进程），转发信号并回收孤儿僵尸进程。PID 1 有特殊
+// 语义——默认未捕获的信号对它不生效（kill 不掉），且其退出的子孙会被
+// 内核转给它收尸；让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉
+// 并残留僵尸。
 //
 // 收尸与转发在同一循环内完成：每轮先以 Wait4(-1, WNOHANG) 排空全部已
-// 退出子孙（命中 PID 2 即返回其退出码/128+信号；PID 1 退出后内核自动
-// 清理命名空间内残余进程），无待收割子进程时阻塞等信号——SIGCHLD 继续
-// 排空，其余信号转发给 PID 2。Wait4 返回 EINTR 时重试，ECHILD（无任何
-// 子进程，含 PID 2 已被收割）时直接返回 0，绝不落入 <-sigCh 空转阻塞。
-// cmd.Process.Release() 避免 os/exec 的
+// 退出子孙（命中目标子进程 PID 即返回其退出码/128+信号；PID 1 退出后
+// 内核自动清理命名空间内残余进程），无待收割子进程时阻塞等信号——
+// SIGCHLD 继续排空，其余信号转发给目标子进程。Wait4 返回 EINTR 时重试，
+// ECHILD（无任何子进程，含目标子进程已被收割）时直接返回 0，绝不落入
+// <-sigCh 空转阻塞。cmd.Process.Release() 避免 os/exec 的
 // pidfd Wait 路径与 Wait4(-1) 竞争 ECHILD。
 func runAsSandboxInit(bin string, argv []string, env []string) int {
 	sigCh := make(chan os.Signal, 16)
@@ -647,7 +660,7 @@ func runAsSandboxInit(bin string, argv []string, env []string) int {
 			continue // 下轮循环开头重新排空
 		}
 		if s, ok := sig.(syscall.Signal); ok {
-			_ = unix.Kill(childPid, s) // PID 2 已退出时 ESRCH，无害
+			_ = unix.Kill(childPid, s) // 目标子进程已退出时 ESRCH，无害
 		}
 	}
 }

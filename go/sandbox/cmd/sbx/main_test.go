@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -53,7 +55,10 @@ func TestMain(m *testing.M) {
 // PID 在沙盒 /proc 下的可见性、以及 /proc/1/root 魔链是否穿透到宿主
 // /run。使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与
 // arm64 的过滤清单都能命中（过滤器按当前 GOARCH 生成）；amd64 另打 x32
-// 位探针。此外对 moshi-hook.sock 做一次 unix dial：只明确接受
+// 位探针。capabilities 断言读取 /proc/self/status 五组 Cap* 掩码（裁剪后
+// Eff/Prm/Bnd 应精确为 0x22、Inh/Amb 为 0），bpf/finit_module/
+// open_by_handle_at 三个非破坏探针验证宿主全局副作用族被 EPERM 拦截。
+// 此外对 moshi-hook.sock 做一次 unix dial：只明确接受
 // connected 与 ECONNREFUSED（socket 可达但无监听端），EROFS（回绑被
 // 只读 remount 覆盖）/ENOENT（未回绑）与 EACCES/超时等其它错误一律报
 // 具体值并在断言侧判失败。
@@ -138,6 +143,40 @@ func runMountNSProbe() int {
 	_, _, pidfdGetfdE := syscall.Syscall(unix.SYS_PIDFD_GETFD, ^uintptr(0), 0, 0) // fd=-1
 	fmt.Printf("chroot_errno=%d\nptrace_errno=%d\npidfd_getfd_errno=%d\n",
 		chrootErrno, int(ptraceE), int(pidfdGetfdE))
+
+	// capabilities 裁剪：/proc/self/status 五组掩码原样打印供父进程断言
+	// （裁剪后 CapEff/CapPrm/CapBnd 应精确为 0000000000000022，
+	// CapInh/CapAmb 为 0000000000000000）。
+	if st, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(st), "\n") {
+			key, val, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb":
+				fmt.Printf("%s=%s\n", strings.ToLower(key), strings.TrimSpace(val))
+			}
+		}
+	} else {
+		fmt.Printf("caps_status=error(%v)\n", err)
+	}
+
+	// 宿主全局副作用族 seccomp 探针（装锁时全部 EPERM=1，均非破坏）：
+	// bpf(BPF_MAP_CREATE) 未装锁且能力在位时返回 0/EINVAL；finit_module
+	// 与 open_by_handle_at 对 fd=-1 未装锁时返回 EBADF(9)（能力校验在前，
+	// 未装锁且有能力亦可能 EPERM，但装锁后必然 EPERM）。
+	bpfAttr := []byte{
+		1, 0, 0, 0, // map_type = BPF_MAP_TYPE_HASH
+		4, 0, 0, 0, // key_size
+		4, 0, 0, 0, // value_size
+		1, 0, 0, 0, // max_entries
+	}
+	_, _, bpfE := syscall.Syscall(unix.SYS_BPF, 0, uintptr(unsafe.Pointer(&bpfAttr[0])), 0)
+	_, _, finitE := syscall.Syscall(unix.SYS_FINIT_MODULE, ^uintptr(0), 0, 0) // fd=-1
+	_, _, obhE := syscall.Syscall(unix.SYS_OPEN_BY_HANDLE_AT, ^uintptr(0), 0, 0)
+	fmt.Printf("bpf_errno=%d\nfinit_module_errno=%d\nopen_by_handle_at_errno=%d\n",
+		int(bpfE), int(finitE), int(obhE))
 	// x32 ABI 探针（仅 amd64）：调用号带 __X32_SYSCALL_BIT(0x40000000)，
 	// 未封堵时内核按 x32 号表解释返回非 EPERM（如 getpid 成功或 ENOSYS），
 	// 装锁后 JGE 高位规则直接返回 EPERM(1)。
@@ -547,6 +586,13 @@ printf "%s\n%s\n%s\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR" "$auth_file"
 
 func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (string, int) {
 	t.Helper()
+	return invokeSbxSubprocessDir(t, "", extraEnv, args...)
+}
+
+// invokeSbxSubprocessDir 与 invokeSbxSubprocess 相同，另允许指定子进程
+// 启动目录 dir（空串保持继承），用于覆盖挂载后继承 cwd 重绑的回归。
+func invokeSbxSubprocessDir(t *testing.T, dir string, extraEnv []string, args ...string) (string, int) {
+	t.Helper()
 	selfExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -556,6 +602,9 @@ func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (strin
 	env := append(os.Environ(), envTestWantSbxMain+"=1")
 	env = append(env, extraEnv...)
 	cmd.Env = env
+	if dir != "" {
+		cmd.Dir = dir
+	}
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -574,6 +623,12 @@ func TestReportRelayValidation(t *testing.T) {
 		want := "a[31m\nb\tend"
 		if got != want {
 			t.Fatalf("sanitizeReportText = %q, want %q", got, want)
+		}
+		// Unicode Cf 格式控制符同样剔除：\u202e 双向覆盖符、\u200b 零宽
+		// 空格、\ufeff BOM——防父终端渲染侧文本欺骗。
+		inCf := "x\u202ey\u200bz\ufeffw"
+		if got := sanitizeReportText(inCf); got != "xyzw" {
+			t.Fatalf("sanitizeReportText(Cf) = %q, want %q", got, "xyzw")
 		}
 	})
 
@@ -821,11 +876,15 @@ func TestReportRelayValidation(t *testing.T) {
 		if err != nil {
 			t.Skipf("unix listen: %v", err)
 		}
-		defer ln.Close()
 		r := &reportRelay{parent: "tTEST", ln: ln, tokens: 1, lastRef: time.Now()}
 		old := reportConnReadTimeout
 		reportConnReadTimeout = 200 * time.Millisecond
-		defer func() { reportConnReadTimeout = old }()
+		// 先关停中继再恢复全局超时：全局变量的恢复期若排在 r.close() 之前，
+		// 高负载下 handler 可能按旧值再跑一轮，构成时序抖动源。
+		defer func() {
+			r.close()
+			reportConnReadTimeout = old
+		}()
 		go r.serve()
 		conn, err := net.Dial("unix", ln.Addr().String())
 		if err != nil {
@@ -849,7 +908,237 @@ func TestReportRelayValidation(t *testing.T) {
 			t.Fatal("server did not close slow connection within read timeout")
 		}
 	})
+
+	t.Run("drain_timeout_cancels_inflight_deliver", func(t *testing.T) {
+		// 假 hc 先落标记文件证明子进程确实启动，再阻塞 5s 制造在途投递。
+		marker := filepath.Join(t.TempDir(), "hc-started")
+		rctx, rcancel := context.WithCancel(context.Background())
+		sd := make(chan struct{})
+		close(sd) // 不经 serve()：预关闭 serveDone 让 close() 直走 drain 路径
+		r := &reportRelay{
+			parent:    "tTEST",
+			ctx:       rctx,
+			cancel:    rcancel,
+			serveDone: sd,
+			conns:     make(map[net.Conn]struct{}),
+			tokens:    1,
+			lastRef:   time.Now(),
+			hcPath:    writeFakeHc(t, "#!/bin/sh\ntouch "+marker+"\nsleep 5\n"),
+		}
+		// 在途 deliver 必须先于 close() 登记 wg，消除 Add/Wait 竞态。
+		r.wg.Add(1)
+		statusCh := make(chan byte, 1)
+		go func() {
+			defer r.wg.Done()
+			st, _ := r.process(reportRequest{To: "tTEST", Text: "x"})
+			statusCh <- st
+		}()
+		waitForFile(t, marker, 3*time.Second)
+
+		old := reportDrainTimeout
+		reportDrainTimeout = 80 * time.Millisecond
+		defer func() { reportDrainTimeout = old }()
+		start := time.Now()
+		r.close()
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Fatalf("close() took %v, want < 1s (drain timeout must cancel in-flight deliver)", elapsed)
+		}
+		select {
+		case st := <-statusCh:
+			if st == reportStatusOK {
+				t.Fatal("in-flight deliver reported ok after drain-timeout cancel")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("deliver goroutine did not return after drain-timeout cancel")
+		}
+	})
+
+	t.Run("active_conn_cap_prevents_dos", func(t *testing.T) {
+		sockDir := t.TempDir()
+		ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+		if err != nil {
+			t.Skipf("unix listen: %v", err)
+		}
+		rctx, rcancel := context.WithCancel(context.Background())
+		r := &reportRelay{
+			parent:    "tTEST",
+			ln:        ln,
+			ctx:       rctx,
+			cancel:    rcancel,
+			serveDone: make(chan struct{}),
+			conns:     make(map[net.Conn]struct{}),
+			tokens:    reportSessionMax,
+			lastRef:   time.Now(),
+			hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+		}
+		go r.serve()
+		defer r.close()
+
+		// 32 个空闲连接不写数据，占满在途上限。
+		idle := make([]net.Conn, 0, reportMaxActiveConns)
+		for i := 0; i < reportMaxActiveConns; i++ {
+			c, err := net.Dial("unix", ln.Addr().String())
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			idle = append(idle, c)
+		}
+		defer func() {
+			for _, c := range idle {
+				_ = c.Close()
+			}
+		}()
+		waitForConns(t, r, reportMaxActiveConns)
+
+		// 第 33 个连接立即收到拒绝帧（含 busy），不占名额。
+		extra, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial extra: %v", err)
+		}
+		_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 256)
+		n, err := extra.Read(buf)
+		_ = extra.Close()
+		if err != nil || n == 0 {
+			t.Fatalf("read reject frame: n=%d err=%v", n, err)
+		}
+		if buf[0] != reportStatusRejected || !strings.Contains(string(buf[1:n]), "busy") {
+			t.Fatalf("reject frame = %q, want status %d + busy", string(buf[:n]), reportStatusRejected)
+		}
+
+		// 释放一个名额后正常请求立即成功。
+		_ = idle[0].Close()
+		idle = idle[1:]
+		waitForConns(t, r, reportMaxActiveConns-1)
+		ok, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial after free: %v", err)
+		}
+		defer ok.Close()
+		st, reason := sendReportRequest(t, ok, "tTEST", "hi")
+		if st != reportStatusOK {
+			t.Fatalf("after freeing a slot status=%d reason=%q, want ok", st, reason)
+		}
+	})
+
+	t.Run("accept_consec_error_cap_exits", func(t *testing.T) {
+		l := &errListener{err: errors.New("boom")}
+		r := newTestReportRelay(t, l)
+		done := make(chan struct{})
+		go func() {
+			r.serve()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("serve() did not exit after %d consecutive accept errors", reportAcceptMaxConsecErrs)
+		}
+		if got := atomic.LoadInt32(&l.calls); got != int32(reportAcceptMaxConsecErrs) {
+			t.Fatalf("Accept called %d times, want exactly %d", got, reportAcceptMaxConsecErrs)
+		}
+		select {
+		case <-r.serveDone:
+		case <-time.After(time.Second):
+			t.Fatal("serveDone not closed after serve() exit")
+		}
+	})
 }
+
+// sendReportRequest 向中继连接发送一帧 {to,text} 并读取完整回包，返回
+// 1 字节状态与原因文本。
+func sendReportRequest(t *testing.T, c net.Conn, to, text string) (byte, string) {
+	t.Helper()
+	payload, err := json.Marshal(reportRequest{To: to, Text: text})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := c.Write(hdr[:]); err != nil {
+		t.Fatalf("write frame hdr: %v", err)
+	}
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("write frame body: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 512)
+	n, err := c.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("read reply: n=%d err=%v", n, err)
+	}
+	return buf[0], string(buf[1:n])
+}
+
+// waitForConns 轮询等待中继登记的活跃连接数达到 want（注册/注销都是
+// 异步的，固定 sleep 属时序抖动源）。
+func waitForConns(t *testing.T, r *reportRelay, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		r.mu.Lock()
+		n := len(r.conns)
+		r.mu.Unlock()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("active conns = %d, want %d", n, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForFile 轮询等待标记文件出现（子进程启动确认用）。
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("marker file %q did not appear within %v", path, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// newTestReportRelay 构造一个带假 hc 与后台 ctx 的中继实例。
+func newTestReportRelay(t *testing.T, ln net.Listener) *reportRelay {
+	t.Helper()
+	rctx, rcancel := context.WithCancel(context.Background())
+	t.Cleanup(rcancel)
+	return &reportRelay{
+		parent:    "tTEST",
+		ln:        ln,
+		ctx:       rctx,
+		cancel:    rcancel,
+		serveDone: make(chan struct{}),
+		conns:     make(map[net.Conn]struct{}),
+		tokens:    reportSessionMax,
+		lastRef:   time.Now(),
+		hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+	}
+}
+
+// errListener 是一个 Accept 永远返回固定错误的伪 net.Listener。
+type errListener struct {
+	calls int32
+	err   error
+}
+
+func (l *errListener) Accept() (net.Conn, error) {
+	atomic.AddInt32(&l.calls, 1)
+	return nil, l.err
+}
+func (l *errListener) Close() error   { return nil }
+func (l *errListener) Addr() net.Addr { return dummyAddr("err-listener") }
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "dummy" }
+func (d dummyAddr) String() string  { return string(d) }
 
 func writeFakeHc(t *testing.T, body string) string {
 	t.Helper()
@@ -950,6 +1239,45 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 	}
 
 	probeBin, _ := os.Executable()
+	// 沙盒内经 broker 的 go test 子进程 capabilities 证据：在 workdir 下
+	// 预置最小模块（go test 二进制经 pi-test-runner 降权后读取自身
+	// /proc/self/status 打印 CapEff）。
+	capTestDir := filepath.Join(workdir, "captest")
+	if err := os.MkdirAll(capTestDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll captest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(capTestDir, "go.mod"),
+		[]byte("module example.com/captest\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatalf("write captest go.mod: %v", err)
+	}
+	capTestSrc := `package captest
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestCaps(t *testing.T) {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "CapEff:\t"); ok {
+			t.Logf("gotest_capeff=%s", v)
+			if v != "0000000000000022" {
+				t.Fatalf("CapEff = %s, want 0000000000000022", v)
+			}
+			return
+		}
+	}
+	t.Fatal("CapEff line not found in /proc/self/status")
+}
+`
+	if err := os.WriteFile(filepath.Join(capTestDir, "cap_test.go"), []byte(capTestSrc), 0o644); err != nil {
+		t.Fatalf("write cap_test.go: %v", err)
+	}
 	// 宿主 /run 全权 socket 路径集同时用于两类断言：沙盒内直连路径 ENOENT
 	// （runSockAsserts），以及经 /proc/1/root 魔链访问 ENOENT
 	// （PROC1_ROOT_PROBE_PATHS 传给探针按路径逐个 stat）。
@@ -983,6 +1311,19 @@ echo "xdg_rt=$XDG_RUNTIME_DIR"
 [ -n "$HC_TERMINAL_ID" ] && echo hc_term_id=kept || echo hc_term_id=empty
 echo "goexec_dir=$PI_SANDBOX_GO_EXEC_DIR"
 echo "gotmpdir=$GOTMPDIR"
+# PID-1 孤儿收尸实证：双 fork 派生后台孤儿（纯 shell 自旋作延时——sleep
+# 不在执行白名单），孤儿退出后 reparent 到沙盒 init 被收割，再扫描
+# /proc 断言零僵尸。
+( (i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done) & )
+i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done
+i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done
+z=0; for s in /proc/[0-9]*/status; do grep -q 'State:.*Z' "$s" && z=$((z+1)); done
+printf 'zombie_count=%s\n' "$z"
+# 经 helper broker 的 go test 子孙同样须满足 CapEff=0x22（能力裁剪经
+# fork/exec 继承）。
+cd "$CAPTEST_DIR" && go test -v -count=1 . > "$TMPDIR/captest.out" 2>&1
+printf 'gotest_rc=%d\n' "$?"
+grep gotest_capeff "$TMPDIR/captest.out" || true
 `
 	script += strings.Join(runSockScriptLines, "\n") + "\n"
 	out, code := captureRunMain(t, []string{
@@ -991,6 +1332,7 @@ echo "gotmpdir=$GOTMPDIR"
 		"--env", "HC_TERMINAL_SOCKET=/run/user/0/herdr-core/default.sock",
 		"--env", "FAKE_HC_ABS=" + fake,
 		"--env", "PROBE_BIN=" + probeBin,
+		"--env", "CAPTEST_DIR=" + capTestDir,
 		"--env", "GO_WANT_SBX_MOUNT_PROBE=1",
 		"--env", "HOST_PARENT_PID=" + strconv.Itoa(os.Getpid()),
 		"--env", "PROC1_ROOT_PROBE_PATHS=" + strings.Join(proc1ProbePaths, " "),
@@ -1039,7 +1381,8 @@ echo "gotmpdir=$GOTMPDIR"
 	assertOut("hc_term_id", "kept")
 
 	// mount-seal seccomp 锁：amd64 与 arm64 下探针的 setns/umount2 与
-	// 越狱/进程控制族（chroot/ptrace/pidfd_getfd）必须全部返回 EPERM
+	// 越狱/进程控制族（chroot/ptrace/pidfd_getfd）及宿主全局副作用族
+	//（bpf/finit_module/open_by_handle_at）必须全部返回 EPERM
 	// （探针与过滤器同用 x/sys/unix 的架构相关调用号）。
 	switch runtime.GOARCH {
 	case "amd64", "arm64":
@@ -1048,12 +1391,30 @@ echo "gotmpdir=$GOTMPDIR"
 		assertOut("chroot_errno", "1")
 		assertOut("ptrace_errno", "1")
 		assertOut("pidfd_getfd_errno", "1")
+		assertOut("bpf_errno", "1")
+		assertOut("finit_module_errno", "1")
+		assertOut("open_by_handle_at_errno", "1")
 		if runtime.GOARCH == "amd64" {
 			assertOut("x32_getpid_errno", "1") // x32 ABI 位必须被 JGE 规则封堵
 		}
 	default:
 		t.Logf("GOARCH=%s: mount-seal filter not installed, probe not asserted", runtime.GOARCH)
 	}
+
+	// capabilities 根治裁剪：沙盒内 CapEff/CapPrm/CapBnd 精确为
+	// 0x22（CAP_DAC_OVERRIDE|CAP_KILL），CapInh/CapAmb 全零；经 helper
+	// broker 的 go test 子孙同样满足 CapEff=0x22（fork/exec 继承裁剪后
+	// 能力集）。
+	assertOut("capinh", "0000000000000000")
+	assertOut("capprm", "0000000000000022")
+	assertOut("capeff", "0000000000000022")
+	assertOut("capbnd", "0000000000000022")
+	assertOut("capamb", "0000000000000000")
+	assertOut("gotest_rc", "0")
+	assertOut("gotest_capeff", "0000000000000022")
+
+	// PID-1 孤儿收尸：后台孤儿退出后零僵尸残留。
+	assertOut("zombie_count", "0")
 
 	// 独立 PID 命名空间：PID 1 必须是 sbx init 本体（测试二进制自身；
 	// Apply 的 helper/broker 会合法占用 2..N，故不钉死受测命令为 PID 2，
@@ -1130,5 +1491,65 @@ echo "gotmpdir=$GOTMPDIR"
 		if got[i] != want[i] {
 			t.Fatalf("fake hc argv = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestSbxCwdRebindAfterCover 覆盖挂载后继承 cwd 重绑回归（reviewer #1）：
+// tmpfs 覆盖只改变其后的绝对路径解析，不迁移内核已持有的 fs->pwd——沙盒
+// 内相对路径仍可引用覆盖前的底层目录。修复后隔离流程在全部覆盖完成后
+// os.Chdir 回原 cwd 从新视图重解析：
+//   - 原 cwd 为 /run/user/0（宿主存在）：目录本身在回绑白名单项时被重建，
+//     重绑成功；相对路径 herdr-core/default.sock 必须 ENOENT（未回绑），
+//     moshi-hook.sock 回绑后相对路径可见；
+//   - 原 cwd 为 /run/user/0/herdr-core（宿主存在时）：新视图下该子目录未
+//     重建，rebind-cwd 返回 ENOENT，必须 fail-closed 非零退出。
+func TestSbxCwdRebindAfterCover(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mount namespace isolation requires CAP_SYS_ADMIN (euid 0)")
+	}
+	if _, err := os.Stat("/run/user/0"); err != nil {
+		t.Skipf("host /run/user/0 absent: %v", err)
+	}
+	workdir := t.TempDir()
+
+	moshiPresent := false
+	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
+		moshiPresent = true
+	}
+
+	out, code := invokeSbxSubprocessDir(t, "/run/user/0", nil,
+		"--preset", "reviewer-agent", "--workdir", workdir,
+		"--", "/bin/sh", "-c",
+		`[ -e herdr-core/default.sock ] && echo rel_herdr=visible || echo rel_herdr=hidden
+[ -e moshi-hook.sock ] && echo rel_moshi=visible || echo rel_moshi=absent`,
+	)
+	if !moshiPresent {
+		// 无回绑项时覆盖层不重建 /run/user/0：原 cwd 在新视图不存在，
+		// fail-closed 拒绝启动同样满足「不得静默继承旧目录项」的契约。
+		if code == 0 {
+			t.Fatalf("cwd under un-recreated /run/user/0 must fail closed, got 0; output:\n%s", out)
+		}
+		return
+	}
+	if code != 0 {
+		t.Fatalf("sbx exit = %d, want 0 (rebound cwd should resolve /run/user/0); output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "rel_herdr=hidden") {
+		t.Fatalf("relative herdr-core/default.sock must be ENOENT after cwd rebind; output:\n%s", out)
+	}
+	if !strings.Contains(out, "rel_moshi=visible") {
+		t.Fatalf("relative moshi-hook.sock must be visible via rebind; output:\n%s", out)
+	}
+
+	if _, err := os.Stat("/run/user/0/herdr-core"); err == nil {
+		out, code := invokeSbxSubprocessDir(t, "/run/user/0/herdr-core", nil,
+			"--preset", "reviewer-agent", "--workdir", workdir,
+			"--", "/bin/sh", "-c", "echo SHOULD_NOT_REACH",
+		)
+		if code == 0 || strings.Contains(out, "SHOULD_NOT_REACH") {
+			t.Fatalf("cwd inside covered /run/user/0/herdr-core must fail closed (exit=%d); output:\n%s", code, out)
+		}
+	} else {
+		t.Log("host /run/user/0/herdr-core absent; fail-closed case not applicable")
 	}
 }

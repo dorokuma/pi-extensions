@@ -26,8 +26,11 @@ import (
 // 在 <goExecDir>/report.sock（0600）监听，先于 cmd.Start() 就绪；沙盒对
 // goExecDir 只读，删不掉也换不掉该 socket。每连接设独立读写 deadline；
 // 帧格式为 4 字节大端长度前缀 + JSON {"to","text"}，整包上限 64KiB。
-// 校验顺序：to 必须等于父地址 → UTF-8 规范化并剔除除 \n\t 外控制字符 →
+// 校验顺序：to 必须等于父地址 → UTF-8 规范化并剔除除 \n\t 外控制字符与
+// 全部 Unicode Cf 格式控制符 →
 // 超 8000 字节在字符边界截断 → 令牌桶（容量 3，每 30 秒补 1，每会话 20 条）。
+// 同时在途连接硬上限 reportMaxActiveConns（32）：超限连接回 reject+relay
+// busy 即丢弃，杜绝沙盒内空拨号耗尽外层父进程 FD。
 // 执行 exec.CommandContext(hcPath,"send",parent,text)：不经 shell，超时 5s，
 // 文本以 "-" 开头时前置空格（hc send 的 clap 参数解析不接受 "-" 开头的
 // TEXT 操作数；hc 0.1.14 提示可用 "-- -x"，但按设计不依赖该特性）。
@@ -38,21 +41,23 @@ import (
 // ctx 取消在途 deliver 的 exec.CommandContext 并强关残余连接后回收。
 
 const (
-	reportSockName            = "report.sock"
-	reportMaxFrame            = 64*1024 - 4 // 帧体上限：含 4 字节长度头的整包不超 64KiB
-	reportMaxTextBytes        = 8000
-	reportTruncSuffix         = "…[truncated by sbx]"
-	reportBurstTokens         = 3
-	reportRefillEvery         = 30 * time.Second
-	reportSessionMax          = 20
-	reportHcTimeout           = 5 * time.Second
-	reportDrain               = 6 * time.Second // 大于 hc 超时，保证在途投递可收尾
-	reportReadTimeout         = 5 * time.Second
-	reportWriteTimeout        = 5 * time.Second // 响应写 deadline，独立于读窗口
-	reportMaxReasonLen        = 120
-	reportStatusOK       byte = 0
-	reportStatusRejected byte = 1
-	reportStatusFailed   byte = 2
+	reportSockName              = "report.sock"
+	reportMaxFrame              = 64*1024 - 4 // 帧体上限：含 4 字节长度头的整包不超 64KiB
+	reportMaxTextBytes          = 8000
+	reportTruncSuffix           = "…[truncated by sbx]"
+	reportBurstTokens           = 3
+	reportRefillEvery           = 30 * time.Second
+	reportSessionMax            = 20
+	reportHcTimeout             = 5 * time.Second
+	reportDrain                 = 6 * time.Second // 大于 hc 超时，保证在途投递可收尾
+	reportReadTimeout           = 5 * time.Second
+	reportWriteTimeout          = 5 * time.Second // 响应写 deadline，独立于读窗口
+	reportMaxReasonLen          = 120
+	reportMaxActiveConns        = 32                     // 同时在途连接硬上限：杜绝沙盒内廉价空拨号耗尽父进程 FD/顶满 consecErrs 杀死中继
+	reportBusyWriteTimeout      = 100 * time.Millisecond // 超限连接的拒绝回包写 deadline
+	reportStatusOK         byte = 0
+	reportStatusRejected   byte = 1
+	reportStatusFailed     byte = 2
 )
 
 // reportConnReadTimeout 为每连接读 deadline，单测可调小以覆盖慢连接超时。
@@ -60,6 +65,10 @@ var reportConnReadTimeout = reportReadTimeout
 
 // reportConnWriteTimeout 为每连接写 deadline（独立常量便于单测说明语义）。
 var reportConnWriteTimeout = reportWriteTimeout
+
+// reportDrainTimeout 为 close() 等待在途请求收尾的 drain 时长；包级变量
+// 以便单测缩小 drain 窗口直接命中「超时→取消在途 deliver」分支。
+var reportDrainTimeout = reportDrain
 
 // reportAcceptBackoff 为非致命 Accept 错误（EMFILE/ENFILE 等）后的短暂退避。
 const reportAcceptBackoff = 10 * time.Millisecond
@@ -234,6 +243,17 @@ func (r *reportRelay) serve() {
 		if r.conns == nil {
 			r.conns = make(map[net.Conn]struct{})
 		}
+		// 在途连接硬上限：沙盒内进程可无限循环 dial report.sock 且不写字节，
+		// 不设限会在外层父进程内堆积 handler goroutine+socket buffer 直至
+		// EMFILE——Accept 开始报错并把 consecErrs 顶到上限，中继被自己杀死。
+		// 超限时短暂写超时回拒绝帧即丢弃，不起处理 goroutine、不占 conns。
+		if len(r.conns) >= reportMaxActiveConns {
+			r.mu.Unlock()
+			_ = c.SetWriteDeadline(time.Now().Add(reportBusyWriteTimeout))
+			_, _ = c.Write([]byte{reportStatusRejected, 'r', 'e', 'l', 'a', 'y', ' ', 'b', 'u', 's', 'y'})
+			_ = c.Close()
+			continue
+		}
 		r.conns[c] = struct{}{}
 		r.wg.Add(1)
 		r.mu.Unlock()
@@ -276,7 +296,7 @@ func (r *reportRelay) close() {
 	select {
 	case <-done:
 		return
-	case <-time.After(reportDrain):
+	case <-time.After(reportDrainTimeout):
 	}
 	// drain 到期仍有在途请求：取消根 ctx 回收 hc 子进程，并强关残余连接
 	// 唤醒阻塞在 Read/Write 上的 handler。
@@ -380,7 +400,10 @@ func (r *reportRelay) takeToken() bool {
 }
 
 // deliver 以固定 argv 调用 hc send：不经 shell，环境为外层环境，
-// stdout/stderr 丢弃；文本以 "-" 开头时前置一个空格。
+// stdout/stderr 置 nil 走 /dev/null（不能用 io.Discard——非 *os.File
+// 会让 exec 建管道并起 copy goroutine，hc 若派生继承管道的孤儿子孙，
+// cmd.Wait 会被拖到子孙退出才返回，drain 超时取消随之失效）；
+// 文本以 "-" 开头时前置一个空格。
 func (r *reportRelay) deliver(text string) error {
 	if strings.HasPrefix(text, "-") {
 		text = " " + text
@@ -394,20 +417,22 @@ func (r *reportRelay) deliver(text string) error {
 	ctx, cancel := context.WithTimeout(base, reportHcTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, r.hcPath, "send", r.parent, text)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
 	return cmd.Run()
 }
 
 // sanitizeReportText 做 UTF-8 规范化（非法字节序列剔除）、剔除除 \n\t 外
-// 的 C0/C1 控制字符（含 ESC 与 \r），并在超过 reportMaxTextBytes 字节时按
-// 字符边界截断后追加截断标记。
+// 的 C0/C1 控制字符（含 ESC 与 \r）与全部 Unicode Cf 格式控制符（\u202e
+// 双向覆盖符、\u200b 零宽字符、\ufeff BOM 等，防父终端渲染侧文本欺骗），
+// 并在超过 reportMaxTextBytes 字节时按字符边界截断后追加截断标记。
 func sanitizeReportText(s string) string {
 	s = strings.ToValidUTF8(s, "")
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
 		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			continue
+		}
+		if unicode.Is(unicode.Cf, r) {
 			continue
 		}
 		b.WriteRune(r)
