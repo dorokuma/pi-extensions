@@ -14,6 +14,17 @@ import (
 // ReviewerReportSubdir 是 ReadOnlyReviewer 在 workdir 下默认开放写权限的报告目录名。
 const ReviewerReportSubdir = "reports"
 
+// herdrRoleSessionsRoot 是 herdr 角色会话的共享可写根，在 ReviewerAgent 预设
+// 的 ReadWrite 白名单内（见 ReviewerAgentWithEnv）。
+const herdrRoleSessionsRoot = "/tmp/herdr-role-sessions"
+
+// claudeSharedProjectsRoot 是 Claude Code 项目会话日志（projects/）的共享根。
+// 落在 herdrRoleSessionsRoot 之下，随其 ReadWrite 白名单天然可写，沙盒内
+// claude 经 <CLAUDE_CONFIG_DIR>/projects/<project-slug>/<uuid>.jsonl 写入的
+// 会话转录跨会话汇聚于此。提取为包级变量供包内测试覆盖根路径，避免单测
+// 污染真实 /tmp/herdr-role-sessions。
+var claudeSharedProjectsRoot = filepath.Join(herdrRoleSessionsRoot, "claude-projects")
+
 const (
 	envGoExecDirKey    = "PI_SANDBOX_GO_EXEC_DIR"
 	envRealGoBinKey    = "PI_SANDBOX_REAL_GO"
@@ -901,7 +912,11 @@ func appendAgyStateReadWrite(p *Policy) {
 //     就不需跨会话持久，固定共享目录会让沙盒内 claude 写的
 //     settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道）；
 //     与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 privateTmpDir 的
-//     每会话隔离口径一致。宿主 ~/.claude 与 ~/.claude.json 仅随通用
+//     每会话隔离口径一致。唯一例外：私有配置目录下预置
+//     projects → <herdrRoleSessionsRoot>/claude-projects（0700，该共享根
+//     已在 ReadWrite 白名单内）符号链接，projects/ 会话转录按既定口径
+//     跨会话汇聚共享写根；根级 .claude.json / settings.json 仍每会话私有。
+//     宿主 ~/.claude 与 ~/.claude.json 仅随通用
 //     只读根顺带可读、CC 并不消费其中配置（其内容也属不可信面，
 //     不能放给沙盒内写）；
 //   - DenyNet 仍为 false（LLM 走本机 Magpie）；
@@ -937,9 +952,13 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	p.Exec = append(p.Exec, agents...)
 	p.Exec = append(p.Exec, hooks...)
 
-	sessionRoot := "/tmp/herdr-role-sessions"
+	sessionRoot := herdrRoleSessionsRoot
 	_ = os.MkdirAll(sessionRoot, 0o700)
-	p.ReadWrite = append(p.ReadWrite, sessionRoot)
+	// Lstat 确认 sessionRoot 是真实目录而非预置符号链接后才放行写权，
+	// 防止软链指向宿主任意路径时把共享写面旁路过去（容忍降级）。
+	if st, lstatErr := os.Lstat(sessionRoot); lstatErr == nil && st.Mode().IsDir() {
+		p.ReadWrite = append(p.ReadWrite, sessionRoot)
+	}
 
 	// agy 状态：只开放数据子目录，不开放 bin/（真实 ELF 在 bin/agy，须保持只读+Exec，避免 W^X 被写穿）。
 	// 同时覆盖 homeDir() 与 agy 硬编码 HOME（/root/.agy-pro-home），否则派活路径写 log/token 会 EACCES。
@@ -958,9 +977,12 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// 跨会话持久，固定共享目录会让沙盒内 claude 写的
 	// settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道），
 	// 与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 privateTmpDir 的每会话
-	// 隔离口径一致；目录随 privateTmpDir 清理、无跨会话状态。宿主
-	// ~/.claude 与 ~/.claude.json 仅随通用只读根顺带可读、CC 不消费其
-	// 配置，且其内容属不可信面，不能放给沙盒内写。
+	// 隔离口径一致；目录随 privateTmpDir 清理、无跨会话状态。唯一例外：
+	// 其下预置 projects → claudeSharedProjectsRoot 符号链接（见
+	// preparePrivateClaudeConfigDir），projects/ 会话日志跨会话汇聚共享
+	// 可写根 /tmp/herdr-role-sessions/claude-projects；根级 .claude.json /
+	// settings.json 仍每会话私有。宿主 ~/.claude 与 ~/.claude.json 仅随通用
+	// 只读根顺带可读、CC 不消费其配置，且其内容属不可信面，不能放给沙盒内写。
 	claudeConfigDir := preparePrivateClaudeConfigDir(privateTmpDir)
 	p.ReadWrite = append(p.ReadWrite, claudeConfigDir)
 	p.Env = overrideEnvKey(p.Env, "CLAUDE_CONFIG_DIR", claudeConfigDir)
@@ -1069,6 +1091,7 @@ func cfgEnvLastValue(cfgEnv []string, key string) (val string, found bool) {
 //   - 有效 PIG_USE_PI_DIRS == "1"（cfgEnv 最后一项优先，显式空串/非 1 覆盖
 //     宿主）时按同规则查 PI_CODING_AGENT_DIR；
 //   - 均缺省返回 <pigHome>/agent，custom=false。
+//
 // 返回的自定义路径已绝对化；custom=true 时调用方须先做 validateTrustedPigDir
 // 同等校验（非软链、目录、属主、perm & 0o022 == 0）。
 func resolveSourcePigAgentDir(pigHome string, cfgEnv []string) (srcAgentDir string, custom bool) {
@@ -1113,13 +1136,45 @@ func preparePrivateCtxmodeDir(privateTmpDir string) string {
 }
 
 // preparePrivateClaudeConfigDir 创建 <privateTmpDir>/claude（0700）并返回路径。
-// CC 配置根落在每会话私有的 privateTmpDir 下：随 privateTmpDir 清理、
-// 无跨会话状态，防止沙盒内 claude 写入的 settings/hooks/mcpServers 被
-// 下一次会话原样继承（跨会话投毒通道）。
+// CC 配置根落在每会话私有的 privateTmpDir 下：.claude.json / settings.json
+// 等根级配置文件随 privateTmpDir 清理、无跨会话状态，防止沙盒内 claude
+// 写入的 settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道）。
+// 唯一例外是 projects/ 会话日志目录：项目转录需跨会话汇聚，预先以 0700
+// 创建共享根 claudeSharedProjectsRoot（<herdrRoleSessionsRoot>/claude-projects，
+// 该根已在 ReadWrite 白名单内），并在私有配置目录下预置
+// projects → claudeSharedProjectsRoot 符号链接；沙盒内 claude 经
+// <CLAUDE_CONFIG_DIR>/projects/<project-slug>/<uuid>.jsonl 创建的子目录与
+// 普通文件实际落盘到共享根，与每会话私有隔离口径互不影响。
+// 软链创建失败时容忍降级（该次会话 projects/ 回退为私有目录内自建路径），
+// 与同类 prepare* 辅助函数的错误处理口径一致。
 func preparePrivateClaudeConfigDir(privateTmpDir string) string {
 	dir := filepath.Join(privateTmpDir, "claude")
 	if err := os.MkdirAll(dir, 0o700); err == nil {
 		_ = os.Chmod(dir, 0o700)
+	}
+	// 先确认共享根的父目录（herdrRoleSessionsRoot）本体是真实目录：
+	// 父目录被预置为符号链接时，直接 MkdirAll(claudeSharedProjectsRoot) 会
+	// 跟随父软链在外部目标下创建 claude-projects 子目录。与
+	// ReviewerAgentWithEnv 对 sessionRoot 的 Lstat 口径一致：父目录
+	// 缺失或为软链/非目录时容忍降级直接返回，既不跟随父软链建目录，
+	// 也不预置 projects 软链。
+	parentDir := filepath.Dir(filepath.Clean(claudeSharedProjectsRoot))
+	_ = os.MkdirAll(parentDir, 0o700)
+	pst, lstatErr := os.Lstat(parentDir)
+	if lstatErr != nil || !pst.Mode().IsDir() {
+		return dir
+	}
+	if err := os.MkdirAll(claudeSharedProjectsRoot, 0o700); err == nil {
+		// Lstat 校验共享根本体是真实目录而非预置符号链接：被预置为软链时
+		// 绝不跟随其对外部目标 Chmod，也不预置 projects 软链，容忍降级
+		// （该次会话 projects/ 回退为私有目录内自建路径）。
+		if st, lstatErr := os.Lstat(claudeSharedProjectsRoot); lstatErr == nil && st.Mode().IsDir() {
+			_ = os.Chmod(claudeSharedProjectsRoot, 0o700)
+			linkPath := filepath.Join(dir, "projects")
+			if _, lstatErr := os.Lstat(linkPath); os.IsNotExist(lstatErr) {
+				_ = os.Symlink(claudeSharedProjectsRoot, linkPath)
+			}
+		}
 	}
 	return dir
 }

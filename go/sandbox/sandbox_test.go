@@ -42,6 +42,9 @@ func TestMain(m *testing.M) {
 	case "reviewer_agent_entry":
 		subprocReviewerAgentEntry()
 		return
+	case "reviewer_agent_claude_projects":
+		subprocReviewerAgentClaudeProjects()
+		return
 	}
 	os.Exit(m.Run())
 }
@@ -1951,7 +1954,7 @@ func TestResolveEntryAgentPathsRejectsNotInAllowedRoots(t *testing.T) {
 
 // TestResolveEntryAgentPathsVersionedClaudeTarget 覆盖版本化安装形态：
 // claude → <安装根>/claude/versions/<ver>（basename 是版本号，路径含 /claude/ 段
-	// 且位于已知安装根前缀之下）的软链目标须正常并入 EntryAgents。
+// 且位于已知安装根前缀之下）的软链目标须正常并入 EntryAgents。
 func TestResolveEntryAgentPathsVersionedClaudeTarget(t *testing.T) {
 	tmp := t.TempDir()
 	// 版本化目标必须位于已知安装根前缀之下；伪造 HOME 让
@@ -1999,4 +2002,115 @@ func containsPath(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestLandlockReviewerAgentClaudeProjectsLink 验证 reviewer-agent 预设下
+// CLAUDE_CONFIG_DIR 的 projects 共享软链真实生效：沙盒内经
+// <privateTmpDir>/claude/projects/<project-slug>/<uuid>.jsonl 创建子目录与
+// 写入普通文件成功并落盘到共享根 /tmp/herdr-role-sessions/claude-projects；
+// 根级配置文件仍写进每会话私有目录；宿主未授权目录写入仍被 Landlock 拒绝。
+// 该测试针对生产共享根做真实端到端写入，产生的 <slug>/ 子目录由测试清理。
+func TestLandlockReviewerAgentClaudeProjectsLink(t *testing.T) {
+	requireLandlock(t)
+
+	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
+	tmp := t.TempDir()
+	workDir := filepath.Join(tmp, "repo")
+	deniedDir := filepath.Join(tmp, "denied")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.MkdirAll(deniedDir, 0o755); err != nil {
+		t.Fatalf("mkdir denied: %v", err)
+	}
+
+	sharedRoot := filepath.Join("/tmp", "herdr-role-sessions", "claude-projects")
+	slug := "sbx-test-projects-link-" + strings.ReplaceAll(t.Name(), "/", "_")
+	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(sharedRoot, slug)) })
+
+	cmd := exec.Command(os.Args[0])
+	// 显式空覆盖剥离宿主侧 AgentDir 变量，防止泄露进子进程改变私有隔离解析。
+	cmd.Env = append(os.Environ(),
+		testSubprocEnv+"=reviewer_agent_claude_projects",
+		"TEST_WORKDIR="+workDir,
+		"TEST_DENIED_DIR="+deniedDir,
+		"TEST_SHARED_ROOT="+sharedRoot,
+		"TEST_PROJECT_SLUG="+slug,
+		"PIG_CODING_AGENT_DIR=",
+		"PI_CODING_AGENT_DIR=",
+		"PIG_USE_PI_DIRS=",
+		"CLAUDE_CONFIG_DIR=",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("reviewer_agent_claude_projects subprocess failed: %v\noutput:\n%s", err, string(out))
+	}
+
+	// 子进程经软链写入的项目日志必须真实落在共享根（清理由 t.Cleanup 负责）。
+	jsonl := filepath.Join(sharedRoot, slug, "session-uuid.jsonl")
+	if data, err := os.ReadFile(jsonl); err != nil || string(data) != "{}\n" {
+		t.Fatalf("sandboxed claude projects write must land in shared root: data=%q err=%v", data, err)
+	}
+}
+
+func subprocReviewerAgentClaudeProjects() {
+	workDir := os.Getenv("TEST_WORKDIR")
+	deniedDir := os.Getenv("TEST_DENIED_DIR")
+	sharedRoot := os.Getenv("TEST_SHARED_ROOT")
+	slug := os.Getenv("TEST_PROJECT_SLUG")
+
+	policy := sandbox.ReviewerAgent(workDir)
+	if err := sandbox.Apply(policy); err != nil {
+		fmt.Fprintf(os.Stderr, "Apply(ReviewerAgent) failed: %v\n", err)
+		os.Exit(1)
+	}
+	// 自清理私有临时目录（subproc 以 os.Exit 收尾，不跑 defer）。
+	privateTmp := os.Getenv("TMPDIR")
+	defer os.RemoveAll(privateTmp)
+	defer os.RemoveAll(os.Getenv("PI_SANDBOX_GO_EXEC_DIR"))
+
+	cfgDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if cfgDir == "" || filepath.Clean(cfgDir) != filepath.Join(filepath.Clean(privateTmp), "claude") {
+		fmt.Fprintf(os.Stderr, "CLAUDE_CONFIG_DIR = %q, want <privateTmpDir>/claude under %q\n", cfgDir, privateTmp)
+		os.Exit(1)
+	}
+
+	// <cfgDir>/projects 必须是指向共享根的符号链接。
+	projectsLink := filepath.Join(cfgDir, "projects")
+	info, err := os.Lstat(projectsLink)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		fmt.Fprintf(os.Stderr, "%s must be a symlink (err=%v)\n", projectsLink, err)
+		os.Exit(1)
+	}
+	target, err := os.Readlink(projectsLink)
+	if err != nil || target != sharedRoot {
+		fmt.Fprintf(os.Stderr, "projects symlink target = %q err=%v, want %q\n", target, err, sharedRoot)
+		os.Exit(1)
+	}
+
+	// 沙盒内经软链创建 <project-slug>/ 子目录并写入 .jsonl 普通文件必须成功。
+	projectDir := filepath.Join(projectsLink, slug)
+	if err := os.MkdirAll(projectDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir %s via projects symlink under Landlock failed: %v\n", projectDir, err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "session-uuid.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write .jsonl via projects symlink under Landlock failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 根级配置文件写进每会话私有配置目录必须成功（每会话私有隔离）。
+	if err := os.WriteFile(filepath.Join(cfgDir, ".claude.json"), []byte("{}\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s/.claude.json failed: %v\n", cfgDir, err)
+		os.Exit(1)
+	}
+
+	// 宿主未授权目录写入仍必须被拒绝。
+	if err := os.WriteFile(filepath.Join(deniedDir, "evil.txt"), []byte("x"), 0o644); err == nil {
+		fmt.Fprintf(os.Stderr, "SECURITY BREACH: write to unauthorized dir %s succeeded\n", deniedDir)
+		os.Exit(1)
+	}
+
+	os.Exit(0)
 }
