@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/pi-extensions/go/sandbox"
+	"golang.org/x/sys/unix"
 )
 
 // version 由构建时 -ldflags "-X main.version=X.Y.Z" 注入；未注入时为 "dev"。
@@ -424,10 +425,11 @@ func runMain(args []string) int {
 	return runSandboxedChild(bin, cfg, policy)
 }
 
-// runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与 syscall.Exec；
+// runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与目标命令启动；
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
-// Linux 下子进程以 CLONE_NEWNS 进入独立挂载命名空间（socket 白名单视图见 mountns_linux.go）；
+// Linux 下子进程以 CLONE_NEWNS|CLONE_NEWPID 进入独立挂载与 PID 命名空间（子进程即新 PID ns
+// 的 PID 1，完成隔离后担任轻量 init 派生目标命令为 PID 2；socket 白名单视图见 mountns_linux.go）；
 // --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
 // <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
 func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
@@ -561,11 +563,79 @@ func runChildFromEnv() int {
 	// mergeEnv 只能覆盖不能删：对宿主继承部分剔除外部指针类变量后再合并，
 	// policy.Env 中预设注入的同名键（如私有 XDG_RUNTIME_DIR）不受影响。
 	execEnv := mergeEnv(stripSandboxEnv(os.Environ()), policy.Env)
+	// MountNS 路径下本进程是新 PID 命名空间的 PID 1：不得直接 syscall.Exec
+	// 顶替 PID 1（业务进程作为 PID 1 会忽略默认未捕获信号，且无人回收孤儿
+	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生 PID 2。
+	if spec.MountNS {
+		return runAsSandboxInit(spec.Bin, spec.Command, execEnv)
+	}
 	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", spec.Bin, err)
 		return 126
 	}
 	return 0
+}
+
+// runAsSandboxInit 在新 PID 命名空间内以 PID 1 运行轻量 init：派生目标
+// 命令为 PID 2，转发信号并回收孤儿僵尸进程。PID 1 有特殊语义——默认未
+// 捕获的信号对它不生效（kill 不掉），且其退出的子孙会被内核转给它收尸；
+// 让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉并残留僵尸。
+//
+// 收尸与转发在同一循环内完成：每轮先以 Wait4(-1, WNOHANG) 排空全部已
+// 退出子孙（命中 PID 2 即返回其退出码/128+信号；PID 1 退出后内核自动
+// 清理命名空间内残余进程），无待收割子进程时阻塞等信号——SIGCHLD 继续
+// 排空，其余信号转发给 PID 2。cmd.Process.Release() 避免 os/exec 的
+// pidfd Wait 路径与 Wait4(-1) 竞争 ECHILD。
+func runAsSandboxInit(bin string, argv []string, env []string) int {
+	sigCh := make(chan os.Signal, 16)
+	signal.Notify(sigCh,
+		syscall.SIGCHLD, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP,
+		syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGWINCH)
+	defer signal.Stop(sigCh)
+
+	cmd := &exec.Cmd{
+		Path:   bin,
+		Args:   argv,
+		Env:    env,
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
+		return 126
+	}
+	childPid := cmd.Process.Pid
+	_ = cmd.Process.Release()
+
+	for {
+		// 先非阻塞排空全部已退出子孙：SIGCHLD 信号可合并丢失，不能依赖
+		// 一次信号对应一次收割。
+		for {
+			var ws unix.WaitStatus
+			reapedPid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+			if err != nil || reapedPid <= 0 {
+				break
+			}
+			if reapedPid != childPid {
+				continue // 孤儿子孙：仅收尸，不改变主进程退出语义
+			}
+			if ws.Exited() {
+				return ws.ExitStatus()
+			}
+			if ws.Signaled() {
+				return 128 + int(ws.Signal())
+			}
+		}
+
+		sig := <-sigCh
+		if sig == syscall.SIGCHLD {
+			continue // 下轮循环开头重新排空
+		}
+		if s, ok := sig.(syscall.Signal); ok {
+			_ = unix.Kill(childPid, s) // PID 2 已退出时 ESRCH，无害
+		}
+	}
 }
 
 func exitCodeFromWaitErr(err error) int {

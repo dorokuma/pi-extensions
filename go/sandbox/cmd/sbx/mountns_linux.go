@@ -15,10 +15,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// 沙盒 socket 白名单视图（仅 Linux，需 CLONE_NEWNS）：
-// sbx 外层父进程以 Unshareflags=CLONE_NEWNS 派生受限子进程，子进程在进入
-// Landlock 之前（runChildFromEnv → isolateRuntimeSockets → Apply）把宿主
-// 暴露的 IPC socket 面收成白名单视图：
+// 沙盒 socket 白名单视图与进程面隔离（仅 Linux，需 CLONE_NEWNS|CLONE_NEWPID）：
+// sbx 外层父进程以 Cloneflags=CLONE_NEWNS|CLONE_NEWPID 派生受限子进程，
+// 子进程直接作为新 PID 命名空间的 PID 1 启动，在进入 Landlock 之前
+// （runChildFromEnv → isolateRuntimeSockets → Apply）把宿主暴露的 IPC
+// socket 面与进程面收成白名单视图：
+//   - 挂载新 PID 命名空间专属的独立 procfs（MS_NOSUID|MS_NODEV|MS_NOEXEC），
+//     沙盒内 /proc 只反映本沙盒的进程：宿主全部 PID 不可见，
+//     /proc/<pid>/root|cwd|fd 魔链只指向沙盒自身的挂载命名空间（其中 /run
+//     已被覆盖），不再穿透到宿主视图；挂载前硬校验 os.Getpid()==1，绝不在
+//     共享 PID 命名空间内覆盖 procfs；
 //   - 整个 /run 被空 tmpfs 覆盖，仅按原相对路径回绑白名单项
 //     （/run/user/0/moshi-hook.sock——agy 钩子遥测；/etc/resolv.conf 经
 //     EvalSymlinks 落在 /run/ 下的真实文件，保证 DNS stub 解析不断），
@@ -27,12 +33,19 @@ import (
 //   - 覆盖路径不存在时跳过；任一步骤失败默认拒绝启动（fail-closed），
 //     --best-effort 下只告警降级；
 //   - 全部挂载与清理完成后安装 PR_SET_NO_NEW_PRIVS + seccomp-BPF
-//     过滤器：mount/umount2/setns/unshare/pivot_root/open_tree/move_mount/
-//     fsopen/fsconfig/fsmount/fspick/mount_setattr 一律返回 EPERM，
-//     使沙盒内 root（init userns 的 CAP_SYS_ADMIN）无法经 setns 跳回宿主
-//     挂载命名空间或 umount2 撤销白名单视图；过滤器安装时带
-//     SECCOMP_FILTER_FLAG_TSYNC 同步本进程全部线程（不含 TSYNC 时只锁
-//     调用线程，其余线程可经挂载族 syscall 逃逸）。
+//     过滤器（SECCOMP_FILTER_FLAG_TSYNC 同步本进程全部线程，不含
+//     TSYNC 时只锁调用线程，其余线程可经被拦 syscall 逃逸）：
+//     mount/umount2/setns/unshare/pivot_root/open_tree/move_mount/
+//     fsopen/fsconfig/fsmount/fspick/mount_setattr（挂载族）与
+//     chroot/ptrace/process_vm_readv/process_vm_writev/pidfd_getfd/
+//     kcmp（越狱第二跳与进程控制族）共 18 个系统调用一律返回 EPERM，
+//     amd64 下另以 JGE 0x40000000 封堵 x32 ABI 位绕过；
+//     pidfd_open 有意不封——Go 标准库管理沙盒内自身子进程会用它，
+//     而在独立 PID ns 内宿主 PID 本就 ESRCH 不可达。
+//
+// PID 1 由 sbx 自身担任轻量 init：runAsSandboxInit 派生目标命令为 PID 2，
+// 回收孤儿僵尸并向 PID 2 转发信号（业务进程若为 PID 1 会忽略默认未捕获
+// 信号且无人收尸）。
 //
 // 已知边界（按设计保持可达）：/root/.herdsman/herdsman.sock（herdsman 扩展
 // 必需）、/root/.config/herdr/herdr.sock（老 herdr agent 状态上报）、
@@ -57,6 +70,7 @@ const (
 	mountSealRetKillProcess uint32 = 0x80000000 // SECCOMP_RET_KILL_PROCESS
 	mountSealAuditArchX8664 uint32 = 0xc000003e // AUDIT_ARCH_X86_64
 	mountSealAuditArchARM64 uint32 = 0xc00000b7 // AUDIT_ARCH_AARCH64
+	mountSealX32SyscallBit  uint32 = 0x40000000 // __X32_SYSCALL_BIT：amd64 x32 ABI 调用号高位
 	mountSealDataNrOffset   uint32 = 0          // seccomp_data.nr
 	mountSealDataArchOffset uint32 = 4          // seccomp_data.arch
 	mountSealBPFJmpMax             = 255        // BPF 单跳上限
@@ -66,17 +80,23 @@ const (
 	bpfABS uint16 = 0x20 // BPF_ABS
 	bpfJMP uint16 = 0x05 // BPF_JMP
 	bpfJEQ uint16 = 0x10 // BPF_JEQ
+	bpfJGE uint16 = 0x30 // BPF_JGE
 	bpfK   uint16 = 0x00 // BPF_K
 	bpfRET uint16 = 0x06 // BPF_RET
 )
 
-// childSysProcAttr 返回派生受限子进程使用的 SysProcAttr：CLONE_NEWNS 创建
-// 独立挂载命名空间。Go 运行时在 unshare 后自动把 / 置为 rprivate
+// childSysProcAttr 返回派生受限子进程使用的 SysProcAttr：
+// Cloneflags=CLONE_NEWNS|CLONE_NEWPID 在 clone 时同时创建独立挂载命名空间
+// 与独立 PID 命名空间，子进程直接以新 PID ns 的 PID 1 启动（Go 1.26 实测
+// cmd.Start() 子进程 os.Getpid()==1；不能用 Unshareflags 携带
+// CLONE_NEWPID——unshare(2) 只把新 PID ns 记给未来的子进程，调用进程本身
+// 仍留在宿主 PID ns，挂载的 procfs 依旧反映宿主进程面）。
+// Go 运行时在 unshare 后自动把 / 置为 rprivate
 // （src/syscall/exec_linux.go: unshare 不处理 --shared 挂载的传播标记，
 // Go 会补 mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)），子进程内的
 // 覆盖挂载不会传播回宿主挂载命名空间。
 func childSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNS}
+	return &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID}
 }
 
 // isolateRuntimeSockets 在受限子进程内（进入 Landlock 之前）施加白名单视图
@@ -103,6 +123,12 @@ func isolateRuntimeSockets(bestEffort bool) error {
 	}); err != nil {
 		return err
 	}
+	// 独立 procfs 必须在 private-propagation 之后、seal 之前挂载：此后沙盒内
+	// /proc 只反映新 PID 命名空间，宿主 PID 与其 /proc/<pid>/root|cwd|fd
+	// 魔链彻底不可见。
+	if err := step("mount-proc", mountIsolatedProc); err != nil {
+		return err
+	}
 	if err := step("cover-tmux-sockets", coverTmuxSockets); err != nil {
 		return err
 	}
@@ -112,6 +138,20 @@ func isolateRuntimeSockets(bestEffort bool) error {
 	// 挂载命名空间篡改封锁：必须在全部覆盖/回绑/暂存清理完成后安装，
 	// 因为 seccomp 锁生效后自身也不能再执行 mount/umount2。
 	return step("seal-mount-namespace", sealMountNamespace)
+}
+
+// mountIsolatedProc 在新 PID 命名空间内挂载专属 procfs（本进程即该 ns 的
+// PID 1）。硬校验 os.Getpid()==1：CLONE_NEWPID 经 Cloneflags 生效时子进程
+// 直接以 PID 1 启动；若派生路径漂移导致进程仍留在共享 PID 命名空间，
+// 挂载 procfs 只会把宿主进程视图（含 /proc/<hostPid>/root 魔链）原样带进
+// 沙盒，必须拒绝继续而非掩耳盗铃。procfs 内容恒反映调用进程的 PID ns，
+// 挂载后 /proc/1 即本进程自身、/proc/1/root 指向本沙盒已覆盖 /run 的
+// 挂载命名空间视图。
+func mountIsolatedProc() error {
+	if os.Getpid() != 1 {
+		return fmt.Errorf("refusing to mount /proc outside isolated PID namespace (pid=%d)", os.Getpid())
+	}
+	return unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
 }
 
 // coverTmuxSockets 以空只读 tmpfs 覆盖 /tmp/tmux-0（存在时），切断沙盒内
@@ -238,8 +278,13 @@ func coverRuntimeDir() error {
 	return nil
 }
 
-// mountSealBlockedSyscalls 返回当前架构下被封堵的挂载命名空间相关系统调用
-// 号集合。非 amd64/arm64 返回 nil（该架构不安装过滤器）。
+// mountSealBlockedSyscalls 返回当前架构下被封堵的系统调用号集合：
+// 12 个挂载命名空间相关系统调用 + 6 个越狱/进程控制调用（chroot 是
+// /proc/<pid>/root 魔链的越狱第二跳；ptrace/process_vm_*/pidfd_getfd/kcmp
+// 是共享 PID ns 残余面下的进程控制族，独立 PID ns 已使宿主 PID 不可达，
+// 此处纵深封锁本 ns 内滥用）。非 amd64/arm64 返回 nil（该架构不安装过滤器）。
+// pidfd_open 刻意不在名单内：Go 标准库用它管理本 ns 内子进程，而宿主 PID
+// 在新 PID ns 下本就 ESRCH 不可达。
 func mountSealBlockedSyscalls() []uintptr {
 	switch runtime.GOARCH {
 	case "amd64", "arm64":
@@ -256,6 +301,12 @@ func mountSealBlockedSyscalls() []uintptr {
 			unix.SYS_FSMOUNT,
 			unix.SYS_FSPICK,
 			unix.SYS_MOUNT_SETATTR,
+			unix.SYS_CHROOT,
+			unix.SYS_PTRACE,
+			unix.SYS_PROCESS_VM_READV,
+			unix.SYS_PROCESS_VM_WRITEV,
+			unix.SYS_PIDFD_GETFD,
+			unix.SYS_KCMP,
 		}
 	default:
 		return nil
@@ -274,15 +325,19 @@ func mountSealAuditArch() uint32 {
 	}
 }
 
-// sealMountNamespace 安装 PR_SET_NO_NEW_PRIVS 与挂载族系统调用的
+// sealMountNamespace 安装 PR_SET_NO_NEW_PRIVS 与挂载族/进程控制族系统调用的
 // seccomp-BPF 拦截（返回 EPERM），封堵沙盒内 root 经 setns 跳回宿主挂载
-// 命名空间或经 umount2 撤销 socket 白名单视图。
+// 命名空间、经 umount2 撤销 socket 白名单视图、经 chroot 利用魔链做越狱
+// 第二跳、或经 ptrace/process_vm_*/pidfd_getfd/kcmp 操纵其它进程。
 //
 // 过滤器语义：seccomp_data.arch 与当前 AUDIT_ARCH 不符时直接
-// SECCOMP_RET_KILL_PROCESS（异构 ABI 绝不放行任何系统调用）；当前架构下
-// 12 个挂载族系统调用返回 ERRNO(EPERM)，其余全部 ALLOW——不影响后续
-// Landlock + seccomp user-notif 过滤器叠加安装与白名单命令 execve
-// （过滤器与 NO_NEW_PRIVS 均跨 execve 保留，由 exec 目标进程继承）。
+// SECCOMP_RET_KILL_PROCESS（异构 ABI 绝不放行任何系统调用）；amd64 下
+// 另以 JGE __X32_SYSCALL_BIT 封堵 x32 ABI（x32 与原生 amd64 共享
+// AUDIT_ARCH，调用号带 0x40000000 高位，不拦截会绕过按原生号布防的
+// JEQ 链）；当前架构下 18 个被封堵系统调用返回 ERRNO(EPERM)，其余全部
+// ALLOW——不影响后续 Landlock + seccomp user-notif 过滤器叠加安装与白名单
+// 命令 execve（过滤器与 NO_NEW_PRIVS 均跨 execve 保留，由 exec 目标进程
+// 继承）。
 //
 // 仅支持 linux/amd64 与 linux/arm64；其它架构返回 nil 跳过（与
 // --best-effort 无关，属不支持平台的空操作，不新增回归）。
@@ -299,8 +354,8 @@ func sealMountNamespace() error {
 	if auditArch == 0 || len(blocked) == 0 {
 		return nil
 	}
-	if len(blocked)+4 > mountSealBPFJmpMax {
-		return fmt.Errorf("mount-seal filter too large: %d insns", len(blocked)+4)
+	if len(blocked)+8 > mountSealBPFJmpMax {
+		return fmt.Errorf("mount-seal filter too large: %d insns", len(blocked)+8)
 	}
 
 	runtime.LockOSThread()
@@ -309,17 +364,25 @@ func sealMountNamespace() error {
 		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", err)
 	}
 
-	// 指令布局：
+	// 指令布局（prefix=3，amd64 因 x32 指令为 4）：
 	//   0: 加载 seccomp_data.arch
 	//   1: 若非当前 AUDIT_ARCH → KILL_PROCESS（idxKill）
 	//   2: 加载 seccomp_data.nr
-	//   3..3+N-1: 逐一 JEQ 被封堵系统调用号 → ERRNO(EPERM)（idxErrno）；
+	//   [3]（仅 amd64）: 若 nr >= __X32_SYSCALL_BIT → ERRNO(EPERM)（idxErrno），
+	//                    封堵 x32 ABI 绕过（x32 共享 AUDIT_ARCH_X86_64，
+	//                    调用号带 0x40000000 高位）
+	//   prefix..prefix+N-1: 逐一 JEQ 被封堵系统调用号 → ERRNO(EPERM)；
 	//              未命中继续下一条，全部未命中顺序落到 ALLOW（idxAllow）
-	//   idxAllow = 3+N:  RET ALLOW
-	//   idxErrno = 4+N:  RET ERRNO|EPERM
-	//   idxKill  = 5+N:  RET KILL_PROCESS
+	//   idxAllow = prefix+N:  RET ALLOW
+	//   idxErrno = prefix+N+1: RET ERRNO|EPERM
+	//   idxKill  = prefix+N+2: RET KILL_PROCESS
 	n := len(blocked)
-	idxAllow := 3 + n
+	prefix := 3
+	x32Guard := runtime.GOARCH == "amd64"
+	if x32Guard {
+		prefix = 4
+	}
+	idxAllow := prefix + n
 	idxErrno := idxAllow + 1
 	idxKill := idxAllow + 2
 
@@ -329,10 +392,18 @@ func sealMountNamespace() error {
 		unix.SockFilter{Code: bpfJMP | bpfJEQ | bpfK, Jt: 0, Jf: uint8(idxKill - 2), K: auditArch},
 		unix.SockFilter{Code: bpfLD | bpfW | bpfABS, K: mountSealDataNrOffset},
 	)
+	if x32Guard {
+		filter = append(filter, unix.SockFilter{
+			Code: bpfJMP | bpfJGE | bpfK,
+			Jt:   uint8(idxErrno - 4),
+			Jf:   0,
+			K:    mountSealX32SyscallBit,
+		})
+	}
 	for i, nr := range blocked {
 		filter = append(filter, unix.SockFilter{
 			Code: bpfJMP | bpfJEQ | bpfK,
-			Jt:   uint8(idxErrno - (3 + i) - 1),
+			Jt:   uint8(idxErrno - (prefix + i) - 1),
 			Jf:   0,
 			K:    uint32(nr),
 		})

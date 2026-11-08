@@ -8,10 +8,12 @@
 - **构建方式**：纯 Go（`CGO_ENABLED=0`），不依赖 `libcap` 或任何 C 库。
 - **权限模型**：库级 `sandbox.Apply` 基于 `prctl(PR_SET_NO_NEW_PRIVS, 1)`、
   `landlock_restrict_self` 与 `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`，无需 `root` 或 `CAP_SYS_ADMIN` 权限。
-  命令行 `sbx` 除 Landlock 外默认对受限子进程启用 `CLONE_NEWNS` 挂载命名空间
-  隔离（socket 白名单视图 + mount-seal seccomp 锁），该路径需要 `CAP_SYS_ADMIN`；
-  无此能力时严格模式拒绝启动，`--best-effort` 下降级为不 unshare 并跳过覆盖
-  （与旧版共享宿主挂载命名空间的行为一致，仅 Landlock 边界生效）。
+  命令行 `sbx` 除 Landlock 外默认对受限子进程启用 `CLONE_NEWNS|CLONE_NEWPID`
+  联合命名空间隔离（socket 白名单视图 + 独立 `/proc` + PID 1 轻量 init +
+  mount-seal seccomp 锁），该路径需要 `CAP_SYS_ADMIN`；无此能力时严格模式
+  拒绝启动（父进程派生子进程失败退 `126`），`--best-effort` 下降级为不
+  unshare 并跳过覆盖（与旧版共享宿主命名空间的行为一致，仅 Landlock
+  边界生效）。
 
 ## 核心接口与预设
 
@@ -68,9 +70,19 @@ go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo --report-to t28
 
 `--report-to ID`（如 `t28`，派发方取外层 `HC_TERMINAL_ID` 传入）在 `reviewer-agent` 预设下启用回报通道：sbx 外层父进程（Landlock 规则集外）在 `<goExecDir>/report.sock`（0600）起中继，沙盒内 `hc` 是指向 sbx 本体的受限客户端软链，只接受 `hc send <addr> <text>` 精确两操作数（`hc --help`/`--version` 打受限说明退 0，其它形态退 126，中继不可用时退 75）。中继帧为 4 字节大端长度前缀 + JSON `{"to","text"}`（上限 64KiB），校验 `to` 必须等于父地址，文本经 UTF-8 规范化、剔除除 `\n`/`\t` 外控制字符、8000 字节字符边界截断，再受令牌桶（容量 3、每 30 秒补 1、每会话 20 条）限额；执行 `hc send` 时 argv 固定、不经 shell、超时 5 秒，文本以 `-` 开头时前置空格。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
 
-### 沙盒 socket 白名单视图与环境剥离（Linux，CLONE_NEWNS）
+### 沙盒 socket 白名单视图、进程面隔离与环境剥离（Linux，`CLONE_NEWNS|CLONE_NEWPID`）
 
-受限子进程进入独立挂载命名空间，在 `sandbox.Apply` 之前收紧 pathname unix socket 面（Landlock ABI ≤6 不管 `connect()`）：`/run/user/0` 被 tmpfs 覆盖、仅回绑 `moshi-hook.sock`（agy 钩子遥测）后 remount 只读，`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖；同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。挂载步骤失败默认拒绝启动，`--best-effort` 下告警降级；unshare 失败在 `--best-effort` 下回退不 unshare（跳过全部覆盖）。已知边界：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `broker.sock`/`report.sock` 保持可达。
+受限子进程在 `clone` 时同时进入独立挂载命名空间与独立 PID 命名空间（直接作为新 PID ns 的 PID 1 启动），在 `sandbox.Apply` 之前完成全部隔离步骤：
+
+1. **`/` 置 `MS_REC|MS_PRIVATE` 私有传播**，确保后续覆盖挂载不回流宿主；
+2. **挂载新 PID ns 专属 procfs**（`MS_NOSUID|MS_NODEV|MS_NOEXEC`；挂载前硬校验 `os.Getpid()==1`，绝不在共享 PID ns 内覆盖 `/proc`）——此后沙盒内 `/proc` 只反映本沙盒进程，宿主全部 PID 不可见，`/proc/<pid>/root|cwd|fd` 魔链只指向沙盒自身已覆盖 `/run` 的挂载命名空间，不再穿透宿主视图；
+3. **`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖**（tmux send-keys 注入面）；
+4. **整个 `/run` 被 tmpfs 覆盖**，仅按原相对路径回绑白名单项：`/run/user/0/moshi-hook.sock`（agy 钩子遥测，socket 回绑保持可写，`connect()` 要求挂载点可写）与 `/run` 下的 `/etc/resolv.conf` 解析目标（普通文件，补只读 remount 保 DNS stub）；覆盖层最终整体 remount 为只读；
+5. **mount-seal seccomp-BPF 锁**（`PR_SET_NO_NEW_PRIVS` + `SECCOMP_FILTER_FLAG_TSYNC` 同步全部线程）：12 个挂载族（`mount`/`umount2`/`setns`/`unshare`/`pivot_root`/`open_tree`/`move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/`mount_setattr`）+ 6 个越狱/进程控制族（`chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/`pidfd_getfd`/`kcmp`）共 18 个系统调用一律 `EPERM`；amd64 下另以 `JGE __X32_SYSCALL_BIT` 封堵 x32 ABI 位绕过；`pidfd_open` 有意放行（Go 标准库管理沙盒内子进程需要，宿主 PID 在新 PID ns 内本就 `ESRCH` 不可达）。异构 ABI `KILL_PROCESS`；仅 `linux/amd64` 与 `linux/arm64` 安装，其它架构跳过。
+
+隔离完成后 `sbx` 本体不直接 `exec` 业务命令，而是担任**轻量 PID 1 init**：派生目标命令为 PID 2，向它转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH` 并以 `Wait4(-1, WNOHANG)` 循环回收孤儿僵尸进程（业务进程若为 PID 1 会忽略默认未捕获信号且无人收尸）；PID 2 退出即返回其退出码/`128+信号`，PID 1 退出后内核自动清理命名空间内残余进程。
+
+同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。**退出码口径**：父进程派生子进程失败（`unshare` 不被支持/权限不足等）严格模式退 `126`，`--best-effort` 下告警回退不 unshare（跳过全部覆盖与挂载锁，绝不动宿主命名空间）；子进程内任一挂载/封锁步骤失败默认退 `1` 拒绝启动，`--best-effort` 下仅告警继续。已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `broker.sock`/`report.sock`。
 
 ## 受控发布 `scripts/deploy.sh`
 
@@ -139,5 +151,9 @@ bash go/sandbox/scripts/deploy.sh
 9. **`/tmp/herdr-role-sessions` 为同会话共享写根**：同一沙盒会话内多个角色会话共享该目录，不保证互相隔离。
 10. **Landlock 路径级 `Exec` 无一次性 `execve` 计数器**：`EntryAgents`（agy/pig/pi/claude）顶层放行后，子进程在 OS 层仍可再 `execve` 同一路径；兜底依赖只读角色工具白名单（无 `bash`/`run_command`），`dispatch-agent`/`grok` 仍不在白名单。
 11. **`CLAUDE_CONFIG_DIR` 落在 `privateTmpDir` 下随会话清理、无跨会话持久化**：CC 配置根为每会话私有的 `<privateTmpDir>/claude`（0700），随 `privateTmpDir` 清理、无跨会话状态；`buildPolicy` 在 `mergeEnv` 之后回钉该键，`--env CLAUDE_CONFIG_DIR=` 覆盖不会把写面指回宿主或与策略脱配。
-12. **socket 白名单视图不承诺抵抗沙盒内主动特权操作**：沙盒内进程为 root（本机无 user-ns 包装）时理论上可自行 umount 覆盖层恢复 socket 面；该机制收敛的是 Landlock 管不到的 pathname `connect()` 直通面，不是特权行为边界。
+12. **socket 白名单视图的真实残余边界**：独立挂载/PID 命名空间 + 独立 procfs + 18 系统调用 `EPERM` 锁落地后，沙盒内 root 已无法经 `mount`/`umount2`/`setns`/`chroot`/`ptrace`/`pidfd_getfd` 等恢复 socket 面或操纵宿主进程，`/proc/<pid>/root` 魔链只指向沙盒自身视图。但仍有按设计/架构保留的残余面：
+    - **AF_UNIX 抽象命名空间（`@` 前缀）socket 不经过路径解析**，白名单视图天然不覆盖（如 `@/tmp/.X11-unix/X0` 形态的抽象地址）；
+    - **`/tmp` 下除 `tmux-0` 外的其它宿主 socket 目录未覆盖**（如 `.X11-unix`、`.ICE-unix`；当前主机未运行 X 会话时无实际面）；
+    - **非 `amd64`/`arm64` 架构不安装 mount-seal**（过滤器按架构生成，不支持平台跳过且不拒绝启动），该架构上覆盖层仍可被沙盒内 root 经 `umount2`/`setns` 撤销——socket 隐藏在该架构上是收敛非对抗性意外收口，不是特权行为边界；
+    - 按设计保持可达：`/root/.herdsman/herdsman.sock`、`/root/.config/herdr/herdr.sock`、goExecDir 内 `broker.sock`/`report.sock`。
 13. **回报中继只限文本回父终端**：沙盒内 `hc` 客户端只接受 `hc send <父地址> <text>`；向非父地址、`hc run/exec/file/keys` 等其它形态一律拒绝。中继以沙盒外 root 执行真实 `hc send`，其信任面仅限于「校验后的文本 + 固定 argv」。

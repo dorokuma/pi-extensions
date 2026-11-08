@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,18 +46,21 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// runMountNSProbe 在受限沙盒内执行：对 setns 与 umount2 直接发 syscall，
-// 打印 errno 供父进程断言（seccomp 锁装好后二者必须均为 EPERM=1；
-// umount2 目标用不存在路径，未装锁时返回 ENOENT=2，详见行内注释）。
-// 使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与 arm64
-// 的过滤清单都能命中（过滤器按当前 GOARCH 生成）。此外对
-// moshi-hook.sock 做一次 unix dial：白名单回绑若被只读 remount 覆盖会
-// 返回 EROFS，未回绑返回 ENOENT，二者都打印 moshi_dial=unreachable；
-// 连通或 ECONNREFUSED（socket 可达但无监听端）都算白名单视图有效。
+// runMountNSProbe 在受限沙盒内执行：对 setns、umount2 及越狱/进程控制族
+// 直接发 syscall，打印 errno 供父进程断言（seccomp 锁装好后必须均为
+// EPERM=1；umount2/chroot 目标用不存在路径，未装锁时返回 ENOENT=2，详见
+// 行内注释）。并断言独立 PID 命名空间视图：打印自身 PID、探测宿主父进程
+// PID 在沙盒 /proc 下的可见性、以及 /proc/1/root 魔链是否穿透到宿主
+// /run。使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与
+// arm64 的过滤清单都能命中（过滤器按当前 GOARCH 生成）；amd64 另打 x32
+// 位探针。此外对 moshi-hook.sock 做一次 unix dial：只明确接受
+// connected 与 ECONNREFUSED（socket 可达但无监听端），EROFS（回绑被
+// 只读 remount 覆盖）/ENOENT（未回绑）与 EACCES/超时等其它错误一律报
+// 具体值并在断言侧判失败。
 func runMountNSProbe() int {
-	// setns：打开 /proc/self/ns/mnt 的 fd 发起 setns（跨进程 /proc/1/ns/*
-	// 在 Landlock 下不可读，用 self 足够触发 seccomp 拦截点：过滤器按
-	// 系统调用号拦截，EPERM 与目标无关；无过滤器时本调用返回 0/EINVAL）。
+	// setns：打开 /proc/self/ns/mnt 的 fd 发起 setns（新 PID ns 内
+	// /proc/self 即本沙盒进程自身；过滤器按系统调用号拦截，EPERM 与目标
+	// 无关；无过滤器时本调用返回 0/EINVAL）。
 	setnsErrno := -1
 	if f, err := os.Open("/proc/self/ns/mnt"); err == nil {
 		defer f.Close()
@@ -65,20 +69,20 @@ func runMountNSProbe() int {
 	} else {
 		setnsErrno = -2
 	}
-	// moshi-hook.sock 连通性（先 dial 再发 umount2，保证拨号结果反映的是
-	// 白名单视图原状而非被探针改动后的状态）：socket 路径存在但被只读
-	// remount 时 connect 返回 EROFS；路径未回绑返回 ENOENT。无监听端时
-	// 返回 ECONNREFUSED，与正常连通一样证明白名单回绑可写可达。
+	// moshi-hook.sock 连通性（先 dial 再发其它探针，保证拨号结果反映的是
+	// 白名单视图原状而非被探针改动后的状态）：仅明确接受 connected 与
+	// ECONNREFUSED；EROFS/ENOENT 说明回绑丢失或被只读化，EACCES/超时等
+	// 其它错误同样是失败的证据，全部如实打印供断言判红。
 	if _, err := os.Lstat("/run/user/0/moshi-hook.sock"); err == nil {
 		conn, derr := net.DialTimeout("unix", "/run/user/0/moshi-hook.sock", 2*time.Second)
 		switch {
 		case derr == nil:
 			_ = conn.Close()
 			fmt.Println("moshi_dial=connected")
-		case errors.Is(derr, syscall.ENOENT) || errors.Is(derr, syscall.EROFS):
-			fmt.Printf("moshi_dial=unreachable(%v)\n", derr)
+		case errors.Is(derr, syscall.ECONNREFUSED):
+			fmt.Printf("moshi_dial=refused(%v)\n", derr)
 		default:
-			fmt.Printf("moshi_dial=refused_or_ok(%v)\n", derr)
+			fmt.Printf("moshi_dial=other(%v)\n", derr)
 		}
 	} else {
 		fmt.Println("moshi_dial=absent")
@@ -95,6 +99,52 @@ func runMountNSProbe() int {
 		umountErrno = int(e)
 	}
 	fmt.Printf("setns_errno=%d\numount_errno=%d\n", setnsErrno, umountErrno)
+
+	// 独立 PID 命名空间视图：本进程在沙盒新 PID ns 内；宿主父进程 PID
+	// （经 HOST_PARENT_PID 传入）在沙盒 /proc 下必须 ENOENT。
+	fmt.Printf("self_pid=%d\n", os.Getpid())
+	if hp := strings.TrimSpace(os.Getenv("HOST_PARENT_PID")); hp != "" {
+		if _, err := os.Stat("/proc/" + hp); os.IsNotExist(err) {
+			fmt.Println("host_pid=hidden")
+		} else {
+			fmt.Printf("host_pid=visible(%v)\n", err)
+		}
+	}
+	// /proc/1/root 魔链：新 PID ns + 独立 procfs 下，/proc/1 是本沙盒 init，
+	// 其 root 指向本沙盒已覆盖 /run 的挂载命名空间——经它访问宿主
+	// /run 全权 socket 路径必须 ENOENT（宿主存在性由父进程前置核验）。
+	for _, p := range strings.Split(strings.TrimSpace(os.Getenv("PROC1_ROOT_PROBE_PATHS")), " ") {
+		if p == "" {
+			continue
+		}
+		key := "proc1root_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(strings.TrimPrefix(p, "/"))
+		if _, err := os.Stat(filepath.Join("/proc/1/root", p)); os.IsNotExist(err) {
+			fmt.Println(key + "=hidden")
+		} else {
+			fmt.Printf("%s=visible(%v)\n", key, err)
+		}
+	}
+
+	// 越狱/进程控制族 seccomp 探针（装锁时全部 EPERM=1）：
+	// chroot 对不存在路径未装锁返回 ENOENT(2)，同理不碰任何真实目录；
+	// ptrace 全零参数未装锁返回 0/EINVAL/ESRCH；pidfd_getfd(-1) 未装锁
+	// 内核先校验 fd 返回 EBADF(9)。
+	chrootErrno := -1
+	if p, err := syscall.BytePtrFromString("/nonexistent-sbx-probe"); err == nil {
+		_, _, e := syscall.Syscall(unix.SYS_CHROOT, uintptr(unsafe.Pointer(p)), 0, 0)
+		chrootErrno = int(e)
+	}
+	_, _, ptraceE := syscall.Syscall6(unix.SYS_PTRACE, 0, 0, 0, 0, 0, 0)
+	_, _, pidfdGetfdE := syscall.Syscall(unix.SYS_PIDFD_GETFD, ^uintptr(0), 0, 0) // fd=-1
+	fmt.Printf("chroot_errno=%d\nptrace_errno=%d\npidfd_getfd_errno=%d\n",
+		chrootErrno, int(ptraceE), int(pidfdGetfdE))
+	// x32 ABI 探针（仅 amd64）：调用号带 __X32_SYSCALL_BIT(0x40000000)，
+	// 未封堵时内核按 x32 号表解释返回非 EPERM（如 getpid 成功或 ENOSYS），
+	// 装锁后 JGE 高位规则直接返回 EPERM(1)。
+	if runtime.GOARCH == "amd64" {
+		_, _, x32E := syscall.Syscall(0x40000000|unix.SYS_GETPID, 0, 0, 0)
+		fmt.Printf("x32_getpid_errno=%d\n", int(x32E))
+	}
 	return 0
 }
 
@@ -647,6 +697,13 @@ func TestReportRelayValidation(t *testing.T) {
 	})
 
 	t.Run("frame_size_boundary_64kib", func(t *testing.T) {
+		// 协议边界是字面常量 65532（64*1024-4，含 4B 头的整包不超 64KiB）；
+		// 测试帧长度一律用硬编码边界值构造，不得引用生产常量生成——否则实现
+		// 回退为旧值时测试边界随之漂移，锁定不住回归。先独立断言生产常量。
+		const frameBodyMax = 65532
+		if reportMaxFrame != frameBodyMax {
+			t.Fatalf("reportMaxFrame = %d, want protocol boundary %d", reportMaxFrame, frameBodyMax)
+		}
 		newPipe := func() (*reportRelay, net.Conn) {
 			srv, cli := net.Pipe()
 			r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now(),
@@ -674,22 +731,22 @@ func TestReportRelayValidation(t *testing.T) {
 			return resp[0], string(resp[1:])
 		}
 		// 恰好等于帧体上限（4B 头 + 64KiB-4 体 = 64KiB 整包）：构造合法
-		// JSON 请求体填充至精确 reportMaxFrame 字节，必须走完校验投递返回
+		// JSON 请求体填充至精确 65532 字节，必须走完校验投递返回
 		// reportStatusOK——不能停在超帧拒绝或 bad request。
 		exactBody := []byte(fmt.Sprintf(`{"to":"tTEST","text":"%s"}`,
-			strings.Repeat("a", reportMaxFrame-len(`{"to":"tTEST","text":""}`))))
-		if len(exactBody) != reportMaxFrame {
-			t.Fatalf("exact-limit payload = %d bytes, want %d", len(exactBody), reportMaxFrame)
+			strings.Repeat("a", frameBodyMax-len(`{"to":"tTEST","text":""}`))))
+		if len(exactBody) != frameBodyMax {
+			t.Fatalf("exact-limit payload = %d bytes, want %d", len(exactBody), frameBodyMax)
 		}
 		_, cli := newPipe()
 		if st, reason := sendFrame(cli, exactBody); st != reportStatusOK {
 			t.Fatalf("exact-limit frame status = %d reason=%q, want ok", st, reason)
 		}
 		_ = cli.Close()
-		// 上限 +1 → 超帧拒绝，且原因必须点名 frame too large（不是
+		// 上限 +1（65533）→ 超帧拒绝，且原因必须点名 frame too large（不是
 		// bad request/short frame 等其它拒绝理由）。
 		_, cli = newPipe()
-		if st, reason := sendFrame(cli, make([]byte, reportMaxFrame+1)); st != reportStatusRejected || !strings.Contains(reason, "frame too large") {
+		if st, reason := sendFrame(cli, make([]byte, frameBodyMax+1)); st != reportStatusRejected || !strings.Contains(reason, "frame too large") {
 			t.Fatalf("over-limit frame status = %d reason=%q, want reject+frame too large", st, reason)
 		}
 		_ = cli.Close()
@@ -893,7 +950,16 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 	}
 
 	probeBin, _ := os.Executable()
+	// 宿主 /run 全权 socket 路径集同时用于两类断言：沙盒内直连路径 ENOENT
+	// （runSockAsserts），以及经 /proc/1/root 魔链访问 ENOENT
+	// （PROC1_ROOT_PROBE_PATHS 传给探针按路径逐个 stat）。
+	var proc1ProbePaths []string
+	for _, sc := range runSockAsserts {
+		proc1ProbePaths = append(proc1ProbePaths, sc.path)
+	}
 	script := `
+printf 'sh_pid=%s\n' "$$"
+printf 'init_comm=%s\n' "$(cat /proc/1/comm 2>/dev/null)"
 hc send tTEST hello
 printf 'send_hi_rc=%d\n' "$?"
 hc run true
@@ -926,6 +992,8 @@ echo "gotmpdir=$GOTMPDIR"
 		"--env", "FAKE_HC_ABS=" + fake,
 		"--env", "PROBE_BIN=" + probeBin,
 		"--env", "GO_WANT_SBX_MOUNT_PROBE=1",
+		"--env", "HOST_PARENT_PID=" + strconv.Itoa(os.Getpid()),
+		"--env", "PROC1_ROOT_PROBE_PATHS=" + strings.Join(proc1ProbePaths, " "),
 		"--env", "PI_SANDBOX_GO_EXEC_DIR=/tmp/hijack", // 必须被回钉回 pi-reviewer-exec-*
 		"--exec", filepath.Dir(probeBin),
 		"--", "/bin/sh", "-c", script,
@@ -952,14 +1020,12 @@ echo "gotmpdir=$GOTMPDIR"
 	}
 	if moshiPresent {
 		assertOut("moshi_sock", "visible")
-		// 仅 -S 可见不够：白名单回绑若被只读 remount 覆盖，connect() 会被
-		// EROFS 拦截（未回绑则 ENOENT）。探针拨号必须得到 connected 或
-		// refused_or_ok（ECONNREFUSED 等，socket 可达但无监听端）。
-		if strings.Contains(out, "moshi_dial=unreachable") || strings.Contains(out, "moshi_dial=absent") {
-			t.Fatalf("moshi-hook.sock unreachable from sandbox (rebind lost or read-only); output:\n%s", out)
-		}
-		if !strings.Contains(out, "moshi_dial=connected") && !strings.Contains(out, "moshi_dial=refused_or_ok") {
-			t.Fatalf("missing moshi_dial verdict; output:\n%s", out)
+		// 白名单回绑仅明确接受两类结果：connected 或 ECONNREFUSED（socket
+		// 可达但无监听端）。EROFS（回绑被只读 remount 覆盖）、ENOENT
+		// （未回绑）与 EACCES/超时等其它错误一律判失败——拨号被权限阻断
+		// 不得假绿。
+		if !strings.Contains(out, "moshi_dial=connected") && !strings.Contains(out, "moshi_dial=refused(") {
+			t.Fatalf("moshi_dial verdict missing or unexpected (want connected or refused); output:\n%s", out)
 		}
 	}
 	if resolvConfReadable {
@@ -972,14 +1038,50 @@ echo "gotmpdir=$GOTMPDIR"
 	assertOut("gpg_info", "empty")
 	assertOut("hc_term_id", "kept")
 
-	// mount-seal seccomp 锁：amd64 与 arm64 下探针的 setns/umount2 必须
-	// 返回 EPERM（探针与过滤器同用 x/sys/unix 的架构相关调用号）。
+	// mount-seal seccomp 锁：amd64 与 arm64 下探针的 setns/umount2 与
+	// 越狱/进程控制族（chroot/ptrace/pidfd_getfd）必须全部返回 EPERM
+	// （探针与过滤器同用 x/sys/unix 的架构相关调用号）。
 	switch runtime.GOARCH {
 	case "amd64", "arm64":
 		assertOut("setns_errno", "1")
 		assertOut("umount_errno", "1")
+		assertOut("chroot_errno", "1")
+		assertOut("ptrace_errno", "1")
+		assertOut("pidfd_getfd_errno", "1")
+		if runtime.GOARCH == "amd64" {
+			assertOut("x32_getpid_errno", "1") // x32 ABI 位必须被 JGE 规则封堵
+		}
 	default:
 		t.Logf("GOARCH=%s: mount-seal filter not installed, probe not asserted", runtime.GOARCH)
+	}
+
+	// 独立 PID 命名空间：PID 1 必须是 sbx init 本体（测试二进制自身；
+	// Apply 的 helper/broker 会合法占用 2..N，故不钉死受测命令为 PID 2，
+	// 改以「PID 1 身份 + 小号 PID + 宿主 PID ENOENT」三重证据锁定新 ns）。
+	wantInitComm := filepath.Base(probeBin)
+	if len(wantInitComm) > 15 { // comm 上限 TASK_COMM_LEN-1=15
+		wantInitComm = wantInitComm[:15]
+	}
+	assertOut("init_comm", wantInitComm)
+	assertOut("host_pid", "hidden")
+	for _, key := range []string{"sh_pid", "self_pid"} {
+		matched := false
+		for _, line := range strings.Split(out, "\n") {
+			if v, ok := strings.CutPrefix(line, key+"="); ok {
+				matched = true
+				n, err := strconv.Atoi(v)
+				if err != nil || n <= 0 || n >= 500 {
+					t.Fatalf("%s = %q: not a small sandbox pidns pid (host pid leak?); output:\n%s", key, v, out)
+				}
+			}
+		}
+		if !matched {
+			t.Fatalf("missing %s line; output:\n%s", key, out)
+		}
+	}
+	for _, sc := range runSockAsserts {
+		key := "proc1root_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(strings.TrimPrefix(sc.path, "/"))
+		assertOut(key, "hidden")
 	}
 
 	// PI_SANDBOX_GO_EXEC_DIR：--env 劫持值被回钉回预设注入的

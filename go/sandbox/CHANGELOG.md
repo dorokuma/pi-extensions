@@ -4,7 +4,54 @@
 
 ## [Unreleased]
 
+### Added
+
+- **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
+  `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID`（Go `Cloneflags`，
+  受限子进程直接以新 PID ns 的 PID 1 启动）；覆盖 `/run` 之前先按硬校验
+  （`os.Getpid()==1`，非独立 PID ns 拒绝继续）挂载 `MS_NOSUID|MS_NODEV|
+  MS_NOEXEC` 的 procfs。此后沙盒内 `/proc` 只反映本沙盒进程：宿主全部
+  PID 不可见，`/proc/<pid>/root|cwd|fd` 魔链只解析到沙盒自身已覆盖
+  `/run` 的挂载命名空间（穿透宿主 socket 面需 `ptrace_may_access` +
+  宿主视图，二者同时消失）；`ptrace`/`process_vm_*`/`pidfd_getfd` 对
+  宿主进程的控制面因宿主 PID 不可达而天然失效。此前共享宿主 PID ns
+  时 `/proc/1/root/run/docker.sock` 一行即可绕过全部挂载覆盖，等价
+  沙盒外任意命令执行。
+- **轻量 PID 1 init**：`MountNS` 路径下 `sbx` 不再以 `syscall.Exec` 顶替
+  PID 1（PID 1 忽略默认未捕获信号且无人回收孤儿僵尸），改由
+  `runAsSandboxInit` 担任 init：派生目标命令为 PID 2，向它转发
+  `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH`，
+  每轮先 `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），PID 2 退出
+  即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
+  仍走原 `syscall.Exec`。
+- **mount-seal 扩展至 18 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
+  新增 `chroot`（魔链越狱第二跳）、`ptrace`、`process_vm_readv`、
+  `process_vm_writev`、`pidfd_getfd`、`kcmp`（进程控制族），均返回
+  `EPERM`；amd64 过滤器在 `arch` 校验与 `nr` 比较链之间新增
+  `JGE __X32_SYSCALL_BIT(0x40000000)`，封堵与原生 amd64 共享
+  `AUDIT_ARCH` 的 x32 调用号绕过。`pidfd_open` 有意不封——Go 标准库
+  管理沙盒内自身子进程需要，而宿主 PID 在新 PID ns 内本就 `ESRCH`。
+- **回报中继 Accept 永久错误自旋保护**：`serve()` 维护连续非关闭
+  `Accept` 错误计数，达到 `reportAcceptMaxConsecErrs`（100 次，约 1s
+  退避）主动退出循环，防止监听器 fd 进入永久错误态时空转；成功
+  `Accept` 清零。
+
 ### Fixed
+
+- **`[0.4.0]` 文档勘误**：父进程派生受限子进程失败（`unshare` 不被支持/
+  权限不足等）严格模式实际退 `126`（`--best-effort` 下降级），子进程内
+  挂载/封锁步骤失败才退 `1`；原文「严格模式拒绝启动（退出码 1）」描述
+  的是后者，已更正为两类失败路径区分。
+
+### Changed
+
+- **集成回归断言加固**：帧边界测试改以协议字面常量 `65532`/`65533`
+  构造（不再引用生产常量生成边界，回退实现即红）；moshi 拨号只明确
+  接受 `connected`/`ECONNREFUSED`，`EROFS`/`ENOENT`/`EACCES`/超时等其余
+  错误一律判失败；沙盒内新增独立 PID ns 断言（PID 1 为 sbx init 本体、
+  宿主父 PID `ENOENT`、`/proc/1/root` 经宿主 `/run` 全权 socket 路径
+  `ENOENT`）与扩展 seccomp 探针（`chroot`/`ptrace`/`pidfd_getfd`/amd64
+  `x32` 位全部 `EPERM`）。
 
 - **禁名后缀闭合：`.` 与 `-` 双分隔符前缀派生**：`isForbiddenBaseName`
   的派生判定从仅 `禁名+"-"` 扩为 `禁名+"-"` 与 `禁名+"."` 两种前缀
@@ -43,12 +90,14 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
 
 ### Breaking Changes
 
-- **CLI 默认启用 `CLONE_NEWNS` 挂载命名空间隔离**：此前受限子进程与
-  父进程共享宿主挂载命名空间；现在子进程默认在独立 mount ns 内执行
-  （覆盖挂载不传播回宿主）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权
-  用户且内核未放行 unprivileged user-ns）下 `unshare` 会失败：严格
-  模式拒绝启动（退出码 1），`--best-effort` 下告警降级回旧行为
-  （不 unshare、跳过全部 socket 覆盖、不安装挂载锁）。
+- **CLI 默认启用 `CLONE_NEWNS|CLONE_NEWPID` 联合命名空间隔离**：此前受限
+  子进程与父进程共享宿主挂载与 PID 命名空间；现在子进程在独立 mount ns
+  与 PID ns 内执行（覆盖挂载不传播回宿主，宿主进程在沙盒 `/proc` 下
+  不可见）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权用户且内核未放行
+  unprivileged user-ns）下 `unshare` 会失败：**父进程派生子进程失败**
+  严格模式退 `126`，`--best-effort` 下告警降级回旧行为（不 unshare、
+  跳过全部 socket 覆盖、不安装挂载锁）；**子进程内挂载/封锁步骤失败**
+  退 `1` 拒绝启动，`--best-effort` 下仅告警继续。
 - **socket 白名单视图从 `/run/user/0` 扩为整个 `/run`**：此前仅覆盖
   `/run/user/0`；现在整个 `/run` 被空 tmpfs 覆盖，仅按原相对路径回绑
   `/run/user/0/moshi-hook.sock` 与 `/run` 下的 `/etc/resolv.conf`
@@ -58,15 +107,18 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
   `/run/user/0/herdr-core/*` 等——全部不可见，依赖它们的沙盒内代码
   将收到 `ENOENT`/`EACCES`。迁移方式：确有需求的对象只能经由新增
   白名单回绑项放行（需改码并过审查）。
-- **沙盒内挂载族系统调用一律 `EPERM`**：全部覆盖/回绑与暂存清理完成
-  后、`sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` + seccomp-BPF
-  过滤器（支持 `linux/amd64` 与 `linux/arm64`，异构 ABI 直接
-  `KILL_PROCESS`），`mount`/`umount2`/`setns`/`unshare`/`pivot_root`/
-  `open_tree`/`move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/
-  `mount_setattr` 返回 `EPERM`；过滤器与 NNP 跨 `execve` 继承。此前
-  沙盒内 root 可 `setns` 跳回宿主挂载命名空间或 `umount2` 撤销覆盖层，
-  现在两条逃逸路径均被堵死；依赖挂载类系统调用的沙盒内代码将失败。
-  `--best-effort` 下锁安装失败仅告警降级。
+- **沙盒内挂载族与进程控制族系统调用一律 `EPERM`**：全部覆盖/回绑与
+  暂存清理完成后、`sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` +
+  seccomp-BPF 过滤器（支持 `linux/amd64` 与 `linux/arm64`，异构 ABI
+  直接 `KILL_PROCESS`，amd64 另封堵 x32 `__X32_SYSCALL_BIT`），
+  `mount`/`umount2`/`setns`/`unshare`/`pivot_root`/`open_tree`/
+  `move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/`mount_setattr`
+  与 `chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/
+  `pidfd_getfd`/`kcmp` 共 18 个系统调用返回 `EPERM`；过滤器与 NNP 跨
+  `execve` 继承。此前沙盒内 root 可 `setns` 跳回宿主挂载命名空间、
+  `umount2` 撤销覆盖层、`chroot` 组合魔链越狱或 `ptrace`/`pidfd_getfd`
+  操纵宿主进程，这些逃逸路径均被堵死；依赖上述系统调用的沙盒内代码
+  将失败。`--best-effort` 下锁安装失败仅告警降级。
 
 ### Added
 
@@ -90,16 +142,23 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
   精确两操作数经 report.sock 提交；`hc --help`/`hc --version` 打印受限
   说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
   时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
-- **socket 白名单视图（Linux，`CLONE_NEWNS`）**：受限子进程进入独立
-  挂载命名空间（Go runtime 自动把 `/` 置 rprivate），在 `sandbox.Apply`
-  之前：整个 `/run` 被 tmpfs 覆盖，只按原相对路径回绑白名单项——
-  `moshi-hook.sock`（agy 钩子遥测）与 `/run` 下的 `/etc/resolv.conf`
-  目标文件（DNS stub），文件回绑补只读 remount，随后覆盖层整体
+- **socket 白名单视图（Linux，`CLONE_NEWNS|CLONE_NEWPID`）**：受限子
+  进程同时进入独立挂载与 PID 命名空间（Go runtime 自动把 `/` 置
+  rprivate；子进程即新 PID ns 的 PID 1），在 `sandbox.Apply` 之前：
+  先硬校验 `os.Getpid()==1` 后挂载专属 procfs（宿主 PID 与
+  `/proc/<pid>/root` 魔链彻底不可见），随后整个 `/run` 被 tmpfs 覆盖，
+  只按原相对路径回绑白名单项——`moshi-hook.sock`（agy 钩子遥测，
+  socket 回绑保持可写，`connect()` 要求挂载点可写）与 `/run` 下的
+  `/etc/resolv.conf` 目标文件（DNS stub，补只读 remount），覆盖层整体
   remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。覆盖路径
   不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
   `--best-effort` 下仅告警。unshare 失败在 `--best-effort` 下回退不
-  unshare（此时跳过全部覆盖，绝不动宿主挂载命名空间）。全部挂载与
-  清理完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
+  unshare（此时跳过全部覆盖，绝不动宿主命名空间）。全部挂载与清理
+  完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
+- **轻量 PID 1 init 收尸与信号转发**：`MountNS` 路径下 `sbx` 本体作为
+  新 PID ns 的 PID 1 不直接 `exec` 业务命令，而是派生目标命令为 PID 2
+  并担任 init（转发信号、`Wait4(-1, WNOHANG)` 收尸），避免业务进程作
+  为 PID 1 忽略默认未捕获信号与残留孤儿僵尸。
 - **回报中继生命周期屏障**：`serve()` 在 `mu` 临界区内判 `closing` 并
   同步 `conns` 登记 + `wg.Add`，消除 `Add`/`Wait` 竞态；非 `ErrClosed`
   的 Accept 错误（EMFILE/ENFILE 等）退避 10ms 继续循环而非永久退出；
@@ -120,10 +179,11 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
 - 已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman
   扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、
   goExecDir 内 `broker.sock` 与 `report.sock`。
-- mount-seal seccomp 锁仅在受限子进程的 `CLONE_NEWNS` 路径安装：
-  `--best-effort` 下 unshare 失败回退不 unshare 时，既不施加 socket
-  覆盖也不安装挂载锁（与挂载步骤同口径告警降级），此时沙盒内 root
-  仍可执行挂载类系统调用——降级属可观察 WARN，不作静默承诺。
+- mount-seal seccomp 锁仅在受限子进程的 `CLONE_NEWNS|CLONE_NEWPID`
+  路径安装：`--best-effort` 下 unshare 失败回退不 unshare 时，既不施加
+  socket 覆盖也不安装挂载锁（与挂载步骤同口径告警降级），此时沙盒内
+  root 仍可执行挂载类与进程控制类系统调用——降级属可观察 WARN，不作
+  静默承诺。
 - mount-seal 过滤器支持 `linux/amd64` 与 `linux/arm64`；其它 Linux
   架构跳过安装（不拒绝启动），挂载逃逸面在该架构上保持旧行为。
 

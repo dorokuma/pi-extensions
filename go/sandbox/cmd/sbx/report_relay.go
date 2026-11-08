@@ -64,6 +64,11 @@ var reportConnWriteTimeout = reportWriteTimeout
 // reportAcceptBackoff 为非致命 Accept 错误（EMFILE/ENFILE 等）后的短暂退避。
 const reportAcceptBackoff = 10 * time.Millisecond
 
+// reportAcceptMaxConsecErrs 为连续非关闭 Accept 错误的退路上限：达到后
+// serve() 主动退出循环（close() 与退出码不变），防止监听器 fd 进入永久
+// 错误态时中继空转。按 reportAcceptBackoff 计约 1s 后放弃。
+const reportAcceptMaxConsecErrs = 100
+
 // hcPathOverride 仅用于测试构建以 -ldflags -X 注入假 hc 路径；
 // 生产构建不注入时为空，hc 只在固定可信位置解析，绝不走 PATH 或环境变量。
 var hcPathOverride = ""
@@ -188,9 +193,10 @@ func mainTrustedHomeDir() string {
 
 // serve 接受连接循环：退出时关 serveDone（close 据此刻画 accept 循环
 // 已停）。Accept 返回非 ErrClosed 且未 closing 的错误（EMFILE/ENFILE 等
-// 资源耗尽类）时短暂退避继续循环，不让中继永久静默退出；新连接在 mu
-// 临界区内先判 closing（已关闭立即 c.Close() 丢弃），未关闭才登记 conns
-// 并 wg.Add——与 close() 的 Wait 天然无竞态。
+// 资源耗尽类）时短暂退避继续循环，不让中继永久静默退出；但连续
+// reportAcceptMaxConsecErrs 次非关闭错误视为监听器永久故障，主动退出
+// 循环防止空转。新连接在 mu 临界区内先判 closing（已关闭立即 c.Close()
+// 丢弃），未关闭才登记 conns 并 wg.Add——与 close() 的 Wait 天然无竞态。
 func (r *reportRelay) serve() {
 	defer func() {
 		r.mu.Lock()
@@ -200,6 +206,7 @@ func (r *reportRelay) serve() {
 			close(sd)
 		}
 	}()
+	consecErrs := 0
 	for {
 		c, err := r.ln.Accept()
 		if err != nil {
@@ -209,9 +216,15 @@ func (r *reportRelay) serve() {
 			if errors.Is(err, net.ErrClosed) || closing {
 				return // 监听已关闭
 			}
+			consecErrs++
+			if consecErrs >= reportAcceptMaxConsecErrs {
+				fmt.Fprintf(os.Stderr, "sbx: report relay accept loop giving up after %d consecutive errors (last: %v)\n", consecErrs, err)
+				return
+			}
 			time.Sleep(reportAcceptBackoff)
 			continue
 		}
+		consecErrs = 0
 		r.mu.Lock()
 		if r.closing {
 			r.mu.Unlock()
