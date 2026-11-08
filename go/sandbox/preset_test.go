@@ -644,6 +644,7 @@ type warmTestFixture struct {
 //     /root/workspace/pi-extensions/go/<ext> 完全一致），内含 go.mod + main.go；
 //   - withSDK 为 true 时预建 state/pigsdk/sdk-test（含 go.mod）；
 //     false 时留空以覆盖 state/pigsdk 缺失的真实冷启动。
+//
 // 显式 AgentDir 相关环境变量一律剥离（unsetEnv），保证测试封闭：
 // 宿主 PIG_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / PIG_USE_PI_DIRS 若泄漏
 // 进测试，resolveSourcePigAgentDir 会把源 AgentDir 指离夹具而跳过预热。
@@ -1770,5 +1771,133 @@ exit 0
 	err := execWarmCommand(ctx, fakePig, fakeDir, []string{"PATH=/bin:/usr/bin"})
 	if err == nil {
 		t.Fatal("execWarmCommand must return error when WaitDelay expires on held stderr")
+	}
+}
+
+// TestPreparePrivateClaudeConfigDirProjectsSymlink 覆盖 claude 私有配置目录的
+// projects 共享软链：<privateTmpDir>/claude 仍是 0700 每会话私有目录，但其下
+// projects 是指向 claudeSharedProjectsRoot 的符号链接（共享根预建 0700），
+// 经软链创建的 <project-slug>/ 子目录与写入的 .jsonl 普通文件实际落盘到共享根，
+// 而根级配置文件（.claude.json / settings.json）仍留在私有目录、不进共享根。
+// 测试把共享根临时指向 t.TempDir()，不污染真实 /tmp/herdr-role-sessions。
+func TestPreparePrivateClaudeConfigDirProjectsSymlink(t *testing.T) {
+	privateTmp := t.TempDir()
+	sharedRoot := filepath.Join(t.TempDir(), "claude-projects")
+
+	orig := claudeSharedProjectsRoot
+	claudeSharedProjectsRoot = sharedRoot
+	t.Cleanup(func() { claudeSharedProjectsRoot = orig })
+
+	dir := preparePrivateClaudeConfigDir(privateTmp)
+	if dir != filepath.Join(privateTmp, "claude") {
+		t.Fatalf("preparePrivateClaudeConfigDir = %q, want %q", dir, filepath.Join(privateTmp, "claude"))
+	}
+
+	// 私有配置目录本体仍是真实目录 0700。
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("private claude config dir missing: %v", err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private claude config dir bad state: mode=%v", info.Mode())
+	}
+
+	// 共享根已预建为真实目录 0700。
+	sharedInfo, err := os.Stat(sharedRoot)
+	if err != nil {
+		t.Fatalf("shared projects root missing: %v", err)
+	}
+	if !sharedInfo.IsDir() || sharedInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("shared projects root bad state: mode=%v", sharedInfo.Mode())
+	}
+
+	// <dir>/projects 是指向共享根的符号链接。
+	projectsLink := filepath.Join(dir, "projects")
+	linkInfo, err := os.Lstat(projectsLink)
+	if err != nil {
+		t.Fatalf("Lstat %s: %v", projectsLink, err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s must be a symlink, mode=%v", projectsLink, linkInfo.Mode())
+	}
+	if target, err := os.Readlink(projectsLink); err != nil || target != sharedRoot {
+		t.Fatalf("projects symlink target = %q err=%v, want %q", target, err, sharedRoot)
+	}
+
+	// 经软链创建项目子目录并写入 .jsonl 普通文件，实际落盘到共享根。
+	projectDir := filepath.Join(projectsLink, "-proj-slug")
+	if err := os.MkdirAll(projectDir, 0o700); err != nil {
+		t.Fatalf("mkdir via projects symlink: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sharedRoot, "-proj-slug")); err != nil {
+		t.Fatalf("project dir must land in shared root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "session-uuid.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write jsonl via projects symlink: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(sharedRoot, "-proj-slug", "session-uuid.jsonl")); err != nil || string(data) != "{}\n" {
+		t.Fatalf("jsonl must land in shared root: data=%q err=%v", data, err)
+	}
+
+	// 根级配置文件仍每会话私有：写 <dir>/.claude.json 与 settings.json
+	// 均不泄漏进共享根。
+	for _, name := range []string{".claude.json", "settings.json"} {
+		priv := filepath.Join(dir, name)
+		if err := os.WriteFile(priv, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", priv, err)
+		}
+		if _, err := os.Lstat(filepath.Join(sharedRoot, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s must not leak into shared root, err=%v", name, err)
+		}
+	}
+
+	// 共享根被预置为指向外部目录的符号链接时（os.MkdirAll 对指向目录的软链
+	// 返回 nil，必须靠 Lstat 守卫识别本体），不跟随软链修改外部目标权限，
+	// 也不预置 <dir>/projects 软链（容忍降级）。
+	externalDir := filepath.Join(t.TempDir(), "victim-dir")
+	if err := os.MkdirAll(externalDir, 0o755); err != nil {
+		t.Fatalf("mkdir external dir: %v", err)
+	}
+	if err := os.Chmod(externalDir, 0o755); err != nil {
+		t.Fatalf("chmod external dir: %v", err)
+	}
+	linkRoot := filepath.Join(t.TempDir(), "claude-projects")
+	if err := os.Symlink(externalDir, linkRoot); err != nil {
+		t.Fatalf("symlink shared root to external dir: %v", err)
+	}
+	claudeSharedProjectsRoot = linkRoot
+	privateTmpLink := t.TempDir()
+	preparePrivateClaudeConfigDir(privateTmpLink)
+	if fi, statErr := os.Stat(externalDir); statErr != nil || fi.Mode().Perm() != 0o755 {
+		var mode os.FileMode
+		if fi != nil {
+			mode = fi.Mode().Perm()
+		}
+		t.Fatalf("external dir perm = %v err=%v, want 0755 unchanged", mode, statErr)
+	}
+	if _, lerr := os.Lstat(filepath.Join(privateTmpLink, "claude", "projects")); !os.IsNotExist(lerr) {
+		t.Fatalf("projects symlink must not be created when shared root is a symlink, err=%v", lerr)
+	}
+
+	// 共享根的父目录（模拟 herdrRoleSessionsRoot）被预置为符号链接时，
+	// 不容忍降级跟随父软链在外部目标下创建 claude-projects 子目录，
+	// 也不预置 <dir>/projects 软链，与 ReviewerAgentWithEnv 对
+	// sessionRoot 拒绝软链的 ReadWrite 白名单口径一致。
+	externalTarget := filepath.Join(t.TempDir(), "external-target")
+	if err := os.MkdirAll(externalTarget, 0o755); err != nil {
+		t.Fatalf("mkdir external target: %v", err)
+	}
+	parentLink := filepath.Join(t.TempDir(), "parent-link")
+	if err := os.Symlink(externalTarget, parentLink); err != nil {
+		t.Fatalf("symlink parent dir to external target: %v", err)
+	}
+	claudeSharedProjectsRoot = filepath.Join(parentLink, "claude-projects")
+	privateTmpParentLink := t.TempDir()
+	dir = preparePrivateClaudeConfigDir(privateTmpParentLink)
+	if _, lerr := os.Lstat(filepath.Join(externalTarget, "claude-projects")); !os.IsNotExist(lerr) {
+		t.Fatalf("claude-projects must not be created under external target via parent symlink, err=%v", lerr)
+	}
+	if _, lerr := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(lerr) {
+		t.Fatalf("projects symlink must not be created when shared root parent is a symlink, err=%v", lerr)
 	}
 }

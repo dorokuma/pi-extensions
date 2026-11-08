@@ -137,6 +137,7 @@ func readAgentSettings(srcAgentDir string) []byte {
 //     未显式排除默认目录时才扫描 <srcAgentDir>/extensions；
 //     非排除条目解析后是目录的——自身含 go.mod 则直接作为 Go 扩展条目，
 //     否则扫其下 nativeGoExtensionDirs 并入集。
+//
 // 全部条目按 (name, realDir) 去重排序，保证指纹确定。
 func sourceAgentGoExtensionDirs(srcAgentDir string, settings []byte) []goDirEntry {
 	srcAgentDir = filepath.Clean(srcAgentDir)
