@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -46,9 +47,11 @@ func TestMain(m *testing.M) {
 
 // runMountNSProbe 在受限沙盒内执行：对 setns 与 umount2 直接发 syscall，
 // 打印 errno 供父进程断言（seccomp 锁装好后二者必须均为 EPERM=1）。
-// 使用 syscall.Syscall 硬编码 amd64 系统调用号，避免平台依赖；非 amd64
-// Linux 下 setns=308/umount2=166 不命中过滤清单会走内核原生路径，测试层
-// 按 GOARCH 决定是否断言。
+// 使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与 arm64
+// 的过滤清单都能命中（过滤器按当前 GOARCH 生成）。此外对
+// moshi-hook.sock 做一次 unix dial：白名单回绑若被只读 remount 覆盖会
+// 返回 EROFS，未回绑返回 ENOENT，二者都打印 moshi_dial=unreachable；
+// 连通或 ECONNREFUSED（socket 可达但无监听端）都算白名单视图有效。
 func runMountNSProbe() int {
 	// setns：打开 /proc/self/ns/mnt 的 fd 发起 setns（跨进程 /proc/1/ns/*
 	// 在 Landlock 下不可读，用 self 足够触发 seccomp 拦截点：过滤器按
@@ -56,15 +59,34 @@ func runMountNSProbe() int {
 	setnsErrno := -1
 	if f, err := os.Open("/proc/self/ns/mnt"); err == nil {
 		defer f.Close()
-		_, _, e := syscall.Syscall(308, f.Fd(), 0, 0) // amd64 SYS_SETNS
+		_, _, e := syscall.Syscall(unix.SYS_SETNS, f.Fd(), 0, 0)
 		setnsErrno = int(e)
 	} else {
 		setnsErrno = -2
 	}
+	// moshi-hook.sock 连通性（放在 umount2 尝试之前：未封锁的旧路径下
+	// umount2 会真卸载 /run 覆盖层，先做 dial 才能反映白名单视图原状）：
+	// socket 路径存在但被只读 remount 时 connect 返回 EROFS；路径未回绑
+	// 返回 ENOENT。无监听端时返回 ECONNREFUSED，与正常连通一样证明白名单
+	// 回绑可写可达。
+	if _, err := os.Lstat("/run/user/0/moshi-hook.sock"); err == nil {
+		conn, derr := net.DialTimeout("unix", "/run/user/0/moshi-hook.sock", 2*time.Second)
+		switch {
+		case derr == nil:
+			_ = conn.Close()
+			fmt.Println("moshi_dial=connected")
+		case errors.Is(derr, syscall.ENOENT) || errors.Is(derr, syscall.EROFS):
+			fmt.Printf("moshi_dial=unreachable(%v)\n", derr)
+		default:
+			fmt.Printf("moshi_dial=refused_or_ok(%v)\n", derr)
+		}
+	} else {
+		fmt.Println("moshi_dial=absent")
+	}
 	// umount2：直接对 /run 发 MNT_DETACH 卸载，撤销 socket 白名单视图。
 	umountErrno := -1
 	if p, err := syscall.BytePtrFromString("/run"); err == nil {
-		_, _, e := syscall.Syscall(166, uintptr(unsafe.Pointer(p)), unix.MNT_DETACH, 0) // amd64 SYS_UMOUNT2
+		_, _, e := syscall.Syscall(unix.SYS_UMOUNT2, uintptr(unsafe.Pointer(p)), unix.MNT_DETACH, 0)
 		umountErrno = int(e)
 	}
 	fmt.Printf("setns_errno=%d\numount_errno=%d\n", setnsErrno, umountErrno)
@@ -589,60 +611,81 @@ func TestReportRelayValidation(t *testing.T) {
 			now = now.Add(d)
 			mu.Unlock()
 		}
-		// 消耗 1 枚 → tokens=2；推进 30s+100ms：只进 1 个整周期，tokens 回满
-		// 3 且余数 100ms 保留（lastRef=t0+30s 而非 t0+30.1s）。
-		if !r.takeToken() {
-			t.Fatal("first takeToken rejected")
+		// 耗尽突发桶：连取 reportBurstTokens 枚全部成功，紧接一次必然失败，
+		// 此刻 tokens==0、lastRef==t0，后续 refill 必走未满桶 else 分支
+		// （余数保留路径），不再是满桶重置路径。
+		for i := 0; i < reportBurstTokens; i++ {
+			if !r.takeToken() {
+				t.Fatalf("takeToken %d rejected while draining burst bucket", i)
+			}
 		}
-		advance(reportRefillEvery + 100*time.Millisecond)
-		if !r.takeToken() {
-			t.Fatal("refill takeToken rejected")
+		if r.takeToken() {
+			t.Fatal("takeToken succeeded with empty burst bucket")
 		}
-		if r.tokens != reportBurstTokens-1 {
-			t.Fatalf("tokens = %d, want %d after refill+take", r.tokens, reportBurstTokens-1)
-		}
-		// 再前进 30s：距 lastRef 已 30.1s（含保留余数）→ 仍可补 1 枚；
-		// 若实现丢弃余数（lastRef=now），此刻仅 29.9s 必然拒绝。
-		advance(reportRefillEvery)
+		// 推进 45s（1.5 个周期）：elapsed=45s → add=1，0+1 < burstTokens 命中
+		// else 分支，lastRef 只推进已消费的整周期 → lastRef = t0+30s；
+		// 消费后 tokens 回 0，同一时刻再取必失败。
+		advance(45 * time.Second)
 		if !r.takeToken() {
-			t.Fatal("remainder-preserved refill rejected: lastRef lost remainder")
+			t.Fatal("refill after 45s rejected: expected add=1 via else branch")
+		}
+		if r.takeToken() {
+			t.Fatal("second takeToken at same instant succeeded: tokens should be 0")
+		}
+		// 再推进 15s（累计 t0+60s，距 lastRef 恰满 30s）：add=1 → tokens=1，
+		// 取出成功。若实现丢弃 15s 余数把 lastRef 置成 now（t0+45s），此刻
+		// 仅过 15s，必然拒绝——本条断言正是余数保留的红灯探针。
+		advance(15 * time.Second)
+		if !r.takeToken() {
+			t.Fatal("remainder-preserved refill rejected: lastRef lost 15s remainder")
 		}
 	})
 
 	t.Run("frame_size_boundary_64kib", func(t *testing.T) {
 		newPipe := func() (*reportRelay, net.Conn) {
 			srv, cli := net.Pipe()
-			r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now()}
+			r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now(),
+				hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n")}
 			go r.handleConn(srv)
 			return r, cli
 		}
-		sendFrame := func(cli net.Conn, n uint32) byte {
+		// sendFrame 发出 n 字节帧体并读取完整回包（1 字节状态 + 原因文本）。
+		sendFrame := func(cli net.Conn, payload []byte) (byte, string) {
 			t.Helper()
 			var hdr [4]byte
-			binary.BigEndian.PutUint32(hdr[:], n)
-			payload := make([]byte, n)
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
 			go func() {
 				_, _ = cli.Write(hdr[:])
 				_, _ = cli.Write(payload)
 			}()
 			_ = cli.SetReadDeadline(time.Now().Add(3 * time.Second))
-			status := make([]byte, 1)
-			if _, err := io.ReadFull(cli, status); err != nil {
+			resp, err := io.ReadAll(cli)
+			if err != nil {
 				t.Fatalf("read reply: %v", err)
 			}
-			return status[0]
+			if len(resp) == 0 {
+				t.Fatal("empty reply frame")
+			}
+			return resp[0], string(resp[1:])
 		}
-		// 恰好等于帧体上限（4B 头 + 64KiB-4 体 = 64KiB 整包）→ 进入 JSON 解析
-		// 而非超帧拒绝。
+		// 恰好等于帧体上限（4B 头 + 64KiB-4 体 = 64KiB 整包）：构造合法
+		// JSON 请求体填充至精确 reportMaxFrame 字节，必须走完校验投递返回
+		// reportStatusOK——不能停在超帧拒绝或 bad request。
+		exactBody := []byte(fmt.Sprintf(`{"to":"tTEST","text":"%s"}`,
+			strings.Repeat("a", reportMaxFrame-len(`{"to":"tTEST","text":""}`))))
+		if len(exactBody) != reportMaxFrame {
+			t.Fatalf("exact-limit payload = %d bytes, want %d", len(exactBody), reportMaxFrame)
+		}
 		_, cli := newPipe()
-		if st := sendFrame(cli, reportMaxFrame); st != reportStatusRejected {
-			t.Fatalf("exact-limit frame status = %d, want reject(bad request)", st)
+		if st, reason := sendFrame(cli, exactBody); st != reportStatusOK {
+			t.Fatalf("exact-limit frame status = %d reason=%q, want ok", st, reason)
 		}
 		_ = cli.Close()
-		// 上限 +1 → 超帧拒绝。
+		// 上限 +1 → 超帧拒绝，且原因必须点名 frame too large（不是
+		// bad request/short frame 等其它拒绝理由）。
 		_, cli = newPipe()
-		if st := sendFrame(cli, reportMaxFrame+1); st != reportStatusRejected {
-			t.Fatalf("over-limit frame status = %d, want reject", st)
+		if st, reason := sendFrame(cli, make([]byte, reportMaxFrame+1)); st != reportStatusRejected || !strings.Contains(reason, "frame too large") {
+			t.Fatalf("over-limit frame status = %d reason=%q, want reject+frame too large", st, reason)
 		}
 		_ = cli.Close()
 	})
@@ -811,6 +854,16 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
 		moshiPresent = true
 	}
+	// 宿主 /etc/resolv.conf 存在且可读时，沙盒内同名路径必须可读
+	// （systemd-resolved stub 场景靠 /run 白名单回绑还原；普通文件场景
+	// /etc 不在覆盖范围内）。宿主不可读时跳过该断言防假绿。
+	resolvConfReadable := false
+	if f, err := os.Open("/etc/resolv.conf"); err == nil {
+		_ = f.Close()
+		resolvConfReadable = true
+	} else {
+		t.Logf("host /etc/resolv.conf unreadable (skip precondition): %v", err)
+	}
 	// 宿主前置核验：/run 全权 socket 面在宿主上确实存在，沙盒内断言
 	// 才有隐藏语义（非假绿）；宿主不存在时记录跳过该断言。
 	type runSockCheck struct{ path, key string }
@@ -849,6 +902,7 @@ printf 'abs_hc_rc=%d\n' "$?"
 [ -S /run/user/0/bus ] && echo bus_sock=visible || echo bus_sock=hidden
 [ -S /run/user/0/herdr-core/default.sock ] && echo hc_sock=visible || echo hc_sock=hidden
 [ -S /run/user/0/moshi-hook.sock ] && echo moshi_sock=visible || echo moshi_sock=absent
+[ -r /etc/resolv.conf ] && echo resolv_conf=readable || echo resolv_conf=unreadable
 [ -n "$HC_TERMINAL_SOCKET" ] && echo hc_term_sock=set || echo hc_term_sock=empty
 [ -n "$HC_SCOPE" ] && echo hc_scope=set || echo hc_scope=empty
 [ -n "$SSH_AUTH_SOCK" ] && echo ssh_sock=set || echo ssh_sock=empty
@@ -893,6 +947,18 @@ echo "gotmpdir=$GOTMPDIR"
 	}
 	if moshiPresent {
 		assertOut("moshi_sock", "visible")
+		// 仅 -S 可见不够：白名单回绑若被只读 remount 覆盖，connect() 会被
+		// EROFS 拦截（未回绑则 ENOENT）。探针拨号必须得到 connected 或
+		// refused_or_ok（ECONNREFUSED 等，socket 可达但无监听端）。
+		if strings.Contains(out, "moshi_dial=unreachable") || strings.Contains(out, "moshi_dial=absent") {
+			t.Fatalf("moshi-hook.sock unreachable from sandbox (rebind lost or read-only); output:\n%s", out)
+		}
+		if !strings.Contains(out, "moshi_dial=connected") && !strings.Contains(out, "moshi_dial=refused_or_ok") {
+			t.Fatalf("missing moshi_dial verdict; output:\n%s", out)
+		}
+	}
+	if resolvConfReadable {
+		assertOut("resolv_conf", "readable")
 	}
 	assertOut("hc_term_sock", "empty")
 	assertOut("hc_scope", "empty")
@@ -901,12 +967,14 @@ echo "gotmpdir=$GOTMPDIR"
 	assertOut("gpg_info", "empty")
 	assertOut("hc_term_id", "kept")
 
-	// mount-seal seccomp 锁：amd64 下探针的 setns/umount2 必须返回 EPERM。
-	if runtime.GOARCH == "amd64" {
+	// mount-seal seccomp 锁：amd64 与 arm64 下探针的 setns/umount2 必须
+	// 返回 EPERM（探针与过滤器同用 x/sys/unix 的架构相关调用号）。
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
 		assertOut("setns_errno", "1")
 		assertOut("umount_errno", "1")
-	} else {
-		t.Logf("GOARCH=%s: raw amd64 syscall numbers probe not asserted", runtime.GOARCH)
+	default:
+		t.Logf("GOARCH=%s: mount-seal filter not installed, probe not asserted", runtime.GOARCH)
 	}
 
 	// PI_SANDBOX_GO_EXEC_DIR：--env 劫持值被回钉回预设注入的

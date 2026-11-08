@@ -30,7 +30,9 @@ import (
 //     过滤器：mount/umount2/setns/unshare/pivot_root/open_tree/move_mount/
 //     fsopen/fsconfig/fsmount/fspick/mount_setattr 一律返回 EPERM，
 //     使沙盒内 root（init userns 的 CAP_SYS_ADMIN）无法经 setns 跳回宿主
-//     挂载命名空间或 umount2 撤销白名单视图。
+//     挂载命名空间或 umount2 撤销白名单视图；过滤器安装时带
+//     SECCOMP_FILTER_FLAG_TSYNC 同步本进程全部线程（不含 TSYNC 时只锁
+//     调用线程，其余线程可经挂载族 syscall 逃逸）。
 //
 // 已知边界（按设计保持可达）：/root/.herdsman/herdsman.sock（herdsman 扩展
 // 必需）、/root/.config/herdr/herdr.sock（老 herdr agent 状态上报）、
@@ -48,6 +50,7 @@ const (
 // filter.h），与 go/sandbox/landlock_linux.go 中的定义同源但独立（跨包）。
 const (
 	mountSealSetModeFilter uintptr = 1 // SECCOMP_SET_MODE_FILTER
+	mountSealFlagTSync     uintptr = 1 // SECCOMP_FILTER_FLAG_TSYNC：同步全部线程的 NNP 与过滤器
 
 	mountSealRetErrno       uint32 = 0x00050000 // SECCOMP_RET_ERRNO
 	mountSealRetAllow       uint32 = 0x7fff0000 // SECCOMP_RET_ALLOW
@@ -124,8 +127,9 @@ func coverTmuxSockets() error {
 
 // runPreserveItem 描述覆盖 /run 前需要保留并按原相对路径回绑的白名单项。
 type runPreserveItem struct {
-	rel  string // 相对 /run 的路径（也是覆盖层内重建挂载点的路径）
-	host string // 覆盖前宿主视角的绝对路径
+	rel      string // 相对 /run 的路径（也是覆盖层内重建挂载点的路径）
+	host     string // 覆盖前宿主视角的绝对路径
+	isSocket bool   // 回绑目标为 unix socket：connect() 需挂载点可写，不得补只读 remount
 }
 
 // collectRunPreserveItems 收集 /run 覆盖层的白名单回绑项：
@@ -138,7 +142,7 @@ func collectRunPreserveItems() []runPreserveItem {
 
 	moshiHost := filepath.Join(runDir, filepath.FromSlash(moshiHookSockRel))
 	if s, err := os.Stat(moshiHost); err == nil && s.Mode()&os.ModeSocket != 0 {
-		items = append(items, runPreserveItem{rel: moshiHookSockRel, host: moshiHost})
+		items = append(items, runPreserveItem{rel: moshiHookSockRel, host: moshiHost, isSocket: true})
 		seen[moshiHookSockRel] = struct{}{}
 	}
 	if resolved, err := filepath.EvalSymlinks(resolvConfPath); err == nil && strings.HasPrefix(resolved, runDir+"/") {
@@ -157,8 +161,10 @@ func collectRunPreserveItems() []runPreserveItem {
 // /run/docker.sock、/run/containerd/containerd.sock、/run/dbus/system_bus_socket、
 // /run/user/0/herdr-core/* 等全部宿主全权 socket 面；随后只把白名单项
 // （moshi-hook.sock、/run 下的 resolv.conf 目标）经 /tmp 暂存回绑还原路径
-// （文件回绑补只读 remount），最后把覆盖层 remount 为只读（MS_REMOUNT 只
-// 作用于覆盖层自身，不影响其上的回绑挂载）。覆盖路径不存在时跳过。
+// （文件回绑补只读 remount；socket 回绑跳过只读化——connect() 要求挂载点
+// 可写，MS_RDONLY remount 会让 unix connect 返回 EROFS），最后把覆盖层
+// remount 为只读（MS_REMOUNT 只作用于覆盖层自身，不影响其上的回绑挂载）。
+// 覆盖路径不存在时跳过。
 func coverRuntimeDir() error {
 	st, err := os.Stat(runDir)
 	if err != nil || !st.IsDir() {
@@ -216,10 +222,13 @@ func coverRuntimeDir() error {
 		if err := unix.Mount(sp, dst, "", unix.MS_BIND, ""); err != nil {
 			return fmt.Errorf("rebind %s: %w", it.rel, err)
 		}
-		// 文件回绑补只读 remount：bind 挂载自身的只读化不影响经其打开的
-		// socket connect()/文件读，只挡写路径。
-		if err := unix.Mount("", dst, "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
-			return fmt.Errorf("remount %s read-only: %w", it.rel, err)
+		// 仅普通文件回绑补只读 remount：bind 挂载自身的只读化不影响经其打开的
+		// 文件读，只挡写路径；socket 回绑保持可写，否则 unix connect() 被
+		// EROFS 拦截（moshi-hook.sock 必须在沙盒内可连接）。
+		if !it.isSocket {
+			if err := unix.Mount("", dst, "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
+				return fmt.Errorf("remount %s read-only: %w", it.rel, err)
+			}
 		}
 	}
 	if err := unix.Mount("tmpfs", runDir, "tmpfs",
@@ -278,8 +287,11 @@ func mountSealAuditArch() uint32 {
 // 仅支持 linux/amd64 与 linux/arm64；其它架构返回 nil 跳过（与
 // --best-effort 无关，属不支持平台的空操作，不新增回归）。
 //
-// 必须 LockOSThread：NNP 与过滤器都挂在调用线程上，且必须保证随后
-// syscall.Exec 的就是这条线程（execve 保留线程的 NNP 与过滤器栈）。
+// 必须 LockOSThread：调用线程须保证随后 syscall.Exec 的就是它（execve
+// 保留线程的 NNP 与过滤器栈）；seccomp 系统调用带
+// SECCOMP_FILTER_FLAG_TSYNC，把 NO_NEW_PRIVS 与本过滤器同步安装到进程
+// 内全部现存线程（子进程此刻只有 Go runtime 线程，无外来线程竞争），
+// 杜绝未过滤线程在 execve 前经挂载族 syscall 逃逸的窗口。
 // 锁定不解开是有意的：本函数返回后子进程只会走到 Apply 与 exec 或退出。
 func sealMountNamespace() error {
 	auditArch := mountSealAuditArch()
@@ -338,7 +350,7 @@ func sealMountNamespace() error {
 	_, _, errno := unix.Syscall(
 		unix.SYS_SECCOMP,
 		mountSealSetModeFilter,
-		0,
+		mountSealFlagTSync,
 		uintptr(unsafe.Pointer(&prog)),
 	)
 	runtime.KeepAlive(&filter)
