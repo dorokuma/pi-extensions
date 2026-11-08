@@ -15,9 +15,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// 沙盒 socket 白名单视图与进程面隔离（仅 Linux，需 CLONE_NEWNS|CLONE_NEWPID）：
-// sbx 外层父进程以 Cloneflags=CLONE_NEWNS|CLONE_NEWPID 派生受限子进程，
-// 子进程直接作为新 PID 命名空间的 PID 1 启动，在进入 Landlock 之前
+// 沙盒 socket 白名单视图、进程面与 SysV IPC 隔离（仅 Linux，需
+// CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC）：sbx 外层父进程以
+// Cloneflags=CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 派生受限子进程，
+// 子进程直接作为新 PID 命名空间的 PID 1 启动，并同时获得独立 IPC
+// 命名空间（SysV shm/sem/msg 与 POSIX mqueue 与宿主完全隔离——沙盒
+// 内读不到宿主共享内存段，沙盒内创建的 IPC 对象随命名空间销毁，
+// 不留宿主持久残留）；在进入 Landlock 之前
 // （runChildFromEnv → isolateRuntimeSockets → Apply）把宿主暴露的 IPC
 // socket 面与进程面收成白名单视图：
 //   - 动手前先硬校验 os.Getpid()==1：进程未在独立 PID 命名空间内时绝不
@@ -54,10 +58,11 @@ import (
 //     kcmp（越狱第二跳与进程控制族）与 reboot/kexec*/init|finit|
 //     delete_module/bpf/perf_event_open/fanotify_init/syslog/
 //     sethostname/setdomainname/settimeofday/clock_settime/adjtimex/
-//     clock_adjtime/swapon/swapoff/quotactl/acct/open_by_handle_at/
+//     clock_adjtime/swapon/swapoff/quotactl/quotactl_fd/acct/
+//     open_by_handle_at/
 //     name_to_handle_at/add_key/request_key/keyctl/pidfd_send_signal
 //     （capability 门控的宿主全局副作用/句柄/密钥环族，纵深封锁）
-//     共 44 个系统调用一律返回 EPERM（amd64 另有 ioperm/iopl 共 46 个）；
+//     共 45 个系统调用一律返回 EPERM（amd64 另有 ioperm/iopl 共 47 个）；
 //     amd64 下另以 JGE 0x40000000 封堵 x32 ABI 位绕过；
 //     pidfd_open 有意不封——Go 标准库管理沙盒内自身子进程会用它，
 //     而在独立 PID ns 内宿主 PID 本就 ESRCH 不可达。
@@ -95,6 +100,12 @@ const (
 	mountSealDataArchOffset uint32 = 4          // seccomp_data.arch
 	mountSealBPFJmpMax             = 255        // BPF 单跳上限
 
+	// amd64 专属系统调用号：x/sys 只为 amd64/386/ppc/mips 定义
+	// SYS_IOPERM/SYS_IOPL，arm64 无这两个调用（也无此号）——直接内联
+	// amd64 调用号避免引用架构专属常量导致 GOARCH=arm64 交叉编译失败。
+	mountSealSysIopermAmd64 uintptr = 173 // SYS_IOPERM (amd64)
+	mountSealSysIoplAmd64   uintptr = 172 // SYS_IOPL (amd64)
+
 	bpfLD  uint16 = 0x00 // BPF_LD
 	bpfW   uint16 = 0x00 // BPF_W
 	bpfABS uint16 = 0x20 // BPF_ABS
@@ -106,8 +117,11 @@ const (
 )
 
 // childSysProcAttr 返回派生受限子进程使用的 SysProcAttr：
-// Cloneflags=CLONE_NEWNS|CLONE_NEWPID 在 clone 时同时创建独立挂载命名空间
-// 与独立 PID 命名空间，子进程直接以新 PID ns 的 PID 1 启动（Go 1.26 实测
+// Cloneflags=CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 在 clone 时同时创建
+// 独立挂载命名空间、独立 PID 命名空间与独立 IPC 命名空间——后者切断
+// 沙盒读写宿主 SysV 共享内存/信号量/消息队列及 POSIX mqueue 的通道，
+// 沙盒内新建的 IPC 对象随命名空间销毁、不残留宿主。子进程直接以新
+// PID ns 的 PID 1 启动（Go 1.26 实测
 // cmd.Start() 子进程 os.Getpid()==1；不能用 Unshareflags 携带
 // CLONE_NEWPID——unshare(2) 只把新 PID ns 记给未来的子进程，调用进程本身
 // 仍留在宿主 PID ns，挂载的 procfs 依旧反映宿主进程面）。
@@ -118,7 +132,7 @@ const (
 // 执行（失败即熔断全部覆盖挂载），保证子进程内的覆盖挂载不传播回宿主
 // 挂载命名空间。
 func childSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID}
+	return &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC}
 }
 
 // isolateRuntimeSockets 在受限子进程内（进入 Landlock 之前）施加白名单视图、
@@ -487,13 +501,14 @@ func dropSandboxCapabilities() error {
 // 12 个挂载命名空间相关系统调用 + 6 个越狱/进程控制调用（chroot 是
 // /proc/<pid>/root 魔链的越狱第二跳；ptrace/process_vm_*/pidfd_getfd/kcmp
 // 是共享 PID ns 残余面下的进程控制族，独立 PID ns 已使宿主 PID 不可达，
-// 此处纵深封锁本 ns 内滥用）+ 26 个 capability 门控的宿主全局副作用/
+// 此处纵深封锁本 ns 内滥用）+ 27 个 capability 门控的宿主全局副作用/
 // 句柄/密钥环调用（能力裁剪是根治，seccomp 按号拦截做无旁路的纵深：
 // reboot/kexec_load/kexec_file_load 换核与重启宿主、init_module/
 // finit_module/delete_module 内核代码执行、bpf/perf_event_open 全域
 // 观测与注入、fanotify_init 宿主打标、syslog 读内核日志、sethostname/
 // setdomainname 改宿主 UTS 主机名、settimeofday/clock_settime/adjtimex/
-// clock_adjtime 篡改宿主时钟、swapon/swapoff/quotactl/acct 存储与计费
+// clock_adjtime 篡改宿主时钟、swapon/swapoff/quotactl/quotactl_fd/acct
+// 存储与计费
 // 面、open_by_handle_at/name_to_handle_at 路径无关句柄打开（Landlock
 // 无拦截点）、add_key/request_key/keyctl init-userns 密钥环、
 // pidfd_send_signal 经走私 pidfd 信令宿主进程）。amd64 另有 ioperm/iopl
@@ -542,6 +557,7 @@ func mountSealBlockedSyscalls() []uintptr {
 		unix.SYS_SWAPON,
 		unix.SYS_SWAPOFF,
 		unix.SYS_QUOTACTL,
+		unix.SYS_QUOTACTL_FD,
 		unix.SYS_ACCT,
 		unix.SYS_OPEN_BY_HANDLE_AT,
 		unix.SYS_NAME_TO_HANDLE_AT,
@@ -552,7 +568,7 @@ func mountSealBlockedSyscalls() []uintptr {
 	}
 	switch runtime.GOARCH {
 	case "amd64":
-		return append(blocked, unix.SYS_IOPERM, unix.SYS_IOPL)
+		return append(blocked, mountSealSysIopermAmd64, mountSealSysIoplAmd64)
 	case "arm64":
 		return blocked
 	default:

@@ -7,8 +7,11 @@
 ### Added
 
 - **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
-  `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID`（Go `Cloneflags`，
-  受限子进程直接以新 PID ns 的 PID 1 启动）；覆盖 `/run` 之前先按硬校验
+  `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`（Go
+  `Cloneflags`，受限子进程直接以新 PID ns 的 PID 1 启动，并同时获得
+  独立 IPC 命名空间——SysV `shm`/`sem`/`msg` 与 POSIX `mqueue` 与宿主
+  完全隔离：沙盒内读不到宿主共享内存段，沙盒内创建的 IPC 对象随
+  命名空间销毁不留宿主持久残留）；覆盖 `/run` 之前先按硬校验
   （`os.Getpid()==1`，非独立 PID ns 拒绝继续）挂载 `MS_NOSUID|MS_NODEV|
   MS_NOEXEC` 的 procfs。此后沙盒内 `/proc` 只反映本沙盒进程：宿主全部
   PID 不可见，`/proc/<pid>/root|cwd|fd` 魔链只解析到沙盒自身已覆盖
@@ -26,14 +29,15 @@
   `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），目标子进程退出
   即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
   仍走原 `syscall.Exec`。
-- **mount-seal 扩展至 44/46 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
+- **mount-seal 扩展至 45/47 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
   新增 `chroot`（魔链越狱第二跳）、`ptrace`、`process_vm_readv`、
   `process_vm_writev`、`pidfd_getfd`、`kcmp`（进程控制族），以及
-  capability 门控的宿主全局副作用/句柄/密钥环族 26 个（`reboot`/
+  capability 门控的宿主全局副作用/句柄/密钥环族 27 个（`reboot`/
   `kexec_load`/`kexec_file_load`/`init_module`/`finit_module`/
   `delete_module`/`bpf`/`perf_event_open`/`fanotify_init`/`syslog`/
   `sethostname`/`setdomainname`/`settimeofday`/`clock_settime`/
-  `adjtimex`/`clock_adjtime`/`swapon`/`swapoff`/`quotactl`/`acct`/
+  `adjtimex`/`clock_adjtime`/`swapon`/`swapoff`/`quotactl`/
+  `quotactl_fd`/`acct`/
   `open_by_handle_at`/`name_to_handle_at`/`add_key`/`request_key`/
   `keyctl`/`pidfd_send_signal`，amd64 另有 `ioperm`/`iopl`），均返回
   `EPERM`；amd64 过滤器在 `arch` 校验与 `nr` 比较链之间新增
@@ -84,9 +88,11 @@
   的是后者，已更正为两类失败路径区分。
 - **init 文档口径修正**：README/CHANGELOG 中「派生目标命令为 PID 2」
   更正为「记录的目标子进程 PID」——`sandbox.Apply` 先派生
-  helper/broker，业务进程 PID 不固定为 2；同时区分外层 `sbx` 仅转发
-  `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 与容器内 PID-1 init 监听的
-  七种信号，不再混述为同一端到端能力。
+  helper/broker，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
+  父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 4 种信号，
+  与容器内 PID-1 init 监听的 8 种信号（`SIGCHLD` 仅用于唤醒 `Wait4`
+  收尸不转发，其余 7 种转发给目标子进程），不再混述为同一端到端
+  能力。
 - **drain 超时取消在途投递失效**：`deliver` 的 `cmd.Stdout/Stderr =
   io.Discard` 非 `*os.File`，`exec` 会建管道并起 copy goroutine；`hc`
   派生继承管道的孤儿子孙时，`cmd.Wait` 被拖到子孙退出才返回——

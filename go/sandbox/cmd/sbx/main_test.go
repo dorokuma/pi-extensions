@@ -33,6 +33,13 @@ const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
 // 发 syscall 并打印 errno，验证 mount-seal seccomp 锁以 EPERM 拦截。
 const envTestMountProbe = "GO_WANT_SBX_MOUNT_PROBE"
 
+// probeShmMagicSize 是 CLONE_NEWIPC 实证探针使用的唯一魔数段大小：
+// 沙盒内以 shmget(IPC_PRIVATE, probeShmMagicSize) 创建私有段，宿主侧
+// 对比探针前后 /proc/sysvipc/shm 的 (key,shmid,size) 集合——沙盒退出后
+// 宿主若新增 size=probeShmMagicSize 的段即判定 IPC ns 隔离失效/残留
+// （不比对 shmid 值本身，避免极小概率 ID 号巧合误判）。
+const probeShmMagicSize = 12288
+
 func TestMain(m *testing.M) {
 	if os.Getenv(envSbxChildSpecKey) != "" {
 		os.Exit(runChildFromEnv())
@@ -58,6 +65,12 @@ func TestMain(m *testing.M) {
 // 位探针。capabilities 断言读取 /proc/self/status 五组 Cap* 掩码（裁剪后
 // Eff/Prm/Bnd 应精确为 0x22、Inh/Amb 为 0），bpf/finit_module/
 // open_by_handle_at 三个非破坏探针验证宿主全局副作用族被 EPERM 拦截。
+// CLONE_NEWIPC 隔离实证：读取 /proc/sysvipc/shm 统计除表头外的数据行数
+// 打印 sysvipc_init_shm=<n>（独立 IPC ns 内即使宿主存在 PostgreSQL 等
+// 共享内存段也必为 0），再以 shmget(IPC_PRIVATE, probeShmMagicSize)
+// 创建私有段打印 sandbox_shmid=<id>（不调 IPC_RMID——若未隔离该段会
+// 持久残留宿主；隔离时随 IPC ns 销毁自动回收，宿主侧按
+// probeShmMagicSize 魔数对比前后段集合断言无新增残留）。
 // 此外对 moshi-hook.sock 做一次 unix dial：只明确接受
 // connected 与 ECONNREFUSED（socket 可达但无监听端），EROFS（回绑被
 // 只读 remount 覆盖）/ENOENT（未回绑）与 EACCES/超时等其它错误一律报
@@ -177,6 +190,26 @@ func runMountNSProbe() int {
 	_, _, obhE := syscall.Syscall(unix.SYS_OPEN_BY_HANDLE_AT, ^uintptr(0), 0, 0)
 	fmt.Printf("bpf_errno=%d\nfinit_module_errno=%d\nopen_by_handle_at_errno=%d\n",
 		int(bpfE), int(finitE), int(obhE))
+
+	// CLONE_NEWIPC 隔离实证：独立 IPC ns 内 /proc/sysvipc/shm 必为空
+	// （宿主 SysV shm/sem/msg 与 POSIX mqueue 不可见）；再经 shmget
+	// 创建私有段验证自身 IPC 可用且退出后随 ns 自动销毁不残留宿主。
+	if b, err := os.ReadFile("/proc/sysvipc/shm"); err == nil {
+		n := 0
+		for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if i > 0 && strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		fmt.Printf("sysvipc_init_shm=%d\n", n)
+	} else {
+		fmt.Printf("sysvipc_init_shm=error(%v)\n", err)
+	}
+	if shmid, _, shmE := unix.Syscall(unix.SYS_SHMGET, 0, probeShmMagicSize, unix.IPC_CREAT|0o600); shmE == 0 {
+		fmt.Printf("sandbox_shmid=%d\n", int(shmid))
+	} else {
+		fmt.Printf("sandbox_shmid=error(%v)\n", shmE)
+	}
 	// x32 ABI 探针（仅 amd64）：调用号带 __X32_SYSCALL_BIT(0x40000000)，
 	// 未封堵时内核按 x32 号表解释返回非 EPERM（如 getpid 成功或 ENOSYS），
 	// 装锁后 JGE 高位规则直接返回 EPERM(1)。
@@ -1177,6 +1210,25 @@ func captureRunMain(t *testing.T, args []string) (string, int) {
 	return string(out), code
 }
 
+// hostShmSegments 返回宿主 /proc/sysvipc/shm 中除表头外的数据行集合
+// （每行含 key/shmid/perms/size/attach 计数字段），供探针前后对比；
+// 宿主文件不可读时返回空集合并由调用方决定是否跳过断言。
+func hostShmSegments(t *testing.T) map[string]struct{} {
+	t.Helper()
+	segs := make(map[string]struct{})
+	b, err := os.ReadFile("/proc/sysvipc/shm")
+	if err != nil {
+		t.Logf("host /proc/sysvipc/shm unreadable: %v", err)
+		return segs
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if i > 0 && strings.TrimSpace(line) != "" {
+			segs[line] = struct{}{}
+		}
+	}
+	return segs
+}
+
 // TestSbxReportRelayIntegration 集成回归：reviewer-agent + --report-to 下
 // 沙盒内 hc 受限客户端经 report.sock 中继回报，同时验证 socket 白名单视图与
 // 环境剥离。假 hc 路径经 hcPathOverride 注入（等价于构建期 -ldflags -X，
@@ -1311,12 +1363,39 @@ echo "xdg_rt=$XDG_RUNTIME_DIR"
 [ -n "$HC_TERMINAL_ID" ] && echo hc_term_id=kept || echo hc_term_id=empty
 echo "goexec_dir=$PI_SANDBOX_GO_EXEC_DIR"
 echo "gotmpdir=$GOTMPDIR"
-# PID-1 孤儿收尸实证：双 fork 派生后台孤儿（纯 shell 自旋作延时——sleep
-# 不在执行白名单），孤儿退出后 reparent 到沙盒 init 被收割，再扫描
-# /proc 断言零僵尸。
-( (i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done) & )
-i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done
-i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done
+# PID-1 孤儿收尸实证（有界确认，无假绿）：子 shell 后台启动轮询
+# orphan.release 的孙进程并记下其 PID，子 shell 随即退出使孙进程成为
+# 孤儿；主脚本先确证孤儿被 PID 1 接管（PPid=1），再放行退出并确证
+# /proc/<pid> 目录已消失（PID 1 经 Wait4 收割），最后扫 /proc 断言零僵尸。
+( (while [ ! -f "$TMPDIR/orphan.release" ]; do :; done) &
+  printf '%s\n' "$!" > "$TMPDIR/orphan.pid" )
+i=0; ORPHAN_PID=""
+while [ -z "$ORPHAN_PID" ] && [ $i -lt 20000 ]; do
+	[ -s "$TMPDIR/orphan.pid" ] && ORPHAN_PID=$(cat "$TMPDIR/orphan.pid")
+	i=$((i+1))
+done
+i=0
+while [ $i -lt 20000 ]; do
+	if [ -n "$ORPHAN_PID" ] && grep -q '^PPid:[[:space:]]*1$' "/proc/$ORPHAN_PID/status" 2>/dev/null; then
+		break
+	fi
+	j=0; while [ $j -lt 500 ]; do j=$((j+1)); done
+	i=$((i+1))
+done
+if grep -q '^PPid:[[:space:]]*1$' "/proc/$ORPHAN_PID/status" 2>/dev/null; then
+	echo orphan_adopted=1
+else
+	echo orphan_adopted=0
+fi
+: > "$TMPDIR/orphan.release"
+i=0
+while [ -e "/proc/$ORPHAN_PID" ] && [ $i -lt 200000 ]; do i=$((i+1)); done
+if [ ! -e "/proc/$ORPHAN_PID" ]; then
+	echo orphan_reaped=1
+else
+	echo orphan_reaped=0
+	grep '^State:' "/proc/$ORPHAN_PID/status" 2>/dev/null || true
+fi
 z=0; for s in /proc/[0-9]*/status; do grep -q 'State:.*Z' "$s" && z=$((z+1)); done
 printf 'zombie_count=%s\n' "$z"
 # 经 helper broker 的 go test 子孙同样须满足 CapEff=0x22（能力裁剪经
@@ -1326,6 +1405,10 @@ printf 'gotest_rc=%d\n' "$?"
 grep gotest_capeff "$TMPDIR/captest.out" || true
 `
 	script += strings.Join(runSockScriptLines, "\n") + "\n"
+	// CLONE_NEWIPC 实证对照基线：探针前宿主 SysV shm 段集合（探针后
+	// 断言宿主无新增 size=probeShmMagicSize 的残留段——独立 IPC ns
+	// 销毁时沙盒内 shmget 段随 ns 自动回收，不泄漏到宿主）。
+	shmBefore := hostShmSegments(t)
 	out, code := captureRunMain(t, []string{
 		"--preset", "reviewer-agent", "--workdir", workdir,
 		"--report-to", "tTEST",
@@ -1413,7 +1496,11 @@ grep gotest_capeff "$TMPDIR/captest.out" || true
 	assertOut("gotest_rc", "0")
 	assertOut("gotest_capeff", "0000000000000022")
 
-	// PID-1 孤儿收尸：后台孤儿退出后零僵尸残留。
+	// PID-1 孤儿收尸：孤儿先被 PID 1 接管（orphan_adopted），放行退出后
+	// /proc/<pid> 彻底消失（orphan_reaped——PID 1 经 Wait4 收割），全量
+	// /proc 扫描零僵尸残留。
+	assertOut("orphan_adopted", "1")
+	assertOut("orphan_reaped", "1")
 	assertOut("zombie_count", "0")
 
 	// 独立 PID 命名空间：PID 1 必须是 sbx init 本体（测试二进制自身；
@@ -1425,6 +1512,34 @@ grep gotest_capeff "$TMPDIR/captest.out" || true
 	}
 	assertOut("init_comm", wantInitComm)
 	assertOut("host_pid", "hidden")
+
+	// CLONE_NEWIPC 隔离：独立 IPC ns 内 sysvipc 初始视图必为空；沙盒内
+	// 私有 shmget 段退出后随 ns 销毁——宿主 /proc/sysvipc/shm 不得新增
+	// size=probeShmMagicSize 的残留段（以魔数 size 区分宿主既有段与
+	// 探针段，不比对 shmid 值，避免极小概率 ID 号巧合误判）。
+	assertOut("sysvipc_init_shm", "0")
+	sawShmid := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "sandbox_shmid="); ok {
+			sawShmid = true
+			if _, err := strconv.Atoi(v); err != nil {
+				t.Fatalf("sandbox_shmid = %q: shmget inside sandbox failed; output:\n%s", v, out)
+			}
+		}
+	}
+	if !sawShmid {
+		t.Fatalf("missing sandbox_shmid line; output:\n%s", out)
+	}
+	for seg := range hostShmSegments(t) {
+		if _, known := shmBefore[seg]; !known {
+			fields := strings.Fields(seg)
+			// /proc/sysvipc/shm 列布局：key shmid perms size ...；
+			// 新增行且 size 字段（第 4 列）命中魔数即判定沙盒 IPC 段残留宿主。
+			if len(fields) >= 4 && fields[3] == strconv.Itoa(probeShmMagicSize) {
+				t.Fatalf("host sysvipc shm leaked segment after sandbox exit (magic size %d): %q", probeShmMagicSize, seg)
+			}
+		}
+	}
 	for _, key := range []string{"sh_pid", "self_pid"} {
 		matched := false
 		for _, line := range strings.Split(out, "\n") {

@@ -429,7 +429,9 @@ func runMain(args []string) int {
 // runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与目标命令启动；
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
-// Linux 下子进程以 CLONE_NEWNS|CLONE_NEWPID 进入独立挂载与 PID 命名空间（子进程即新 PID ns
+// Linux 下子进程以 CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 进入独立挂载、PID
+// 与 IPC 命名空间（独立 IPC ns 同时隔离 SysV shm/sem/msg 与 POSIX mqueue；
+// 子进程即新 PID ns
 // 的 PID 1，完成隔离后担任轻量 init 派生目标命令（记录目标子进程 PID——
 // sandbox.Apply 会先派生 helper/broker，业务进程 PID 不固定为 2；socket
 // 白名单视图见 mountns_linux.go）；
@@ -483,6 +485,9 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 	cmd := newChildCmd()
 
 	sigCh := make(chan os.Signal, 8)
+	// 外层父进程仅监听并转发 SIGINT/SIGTERM/SIGHUP/SIGQUIT 4 种信号给受限
+	// 子进程；容器内 PID-1 init 另监听 8 种信号（SIGCHLD 仅用于唤醒
+	// Wait4 收尸不转发，其余 7 种转发给目标子进程），见 runAsSandboxInit。
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(sigCh)
 
@@ -593,6 +598,11 @@ func runChildFromEnv() int {
 // 语义——默认未捕获的信号对它不生效（kill 不掉），且其退出的子孙会被
 // 内核转给它收尸；让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉
 // 并残留僵尸。
+//
+// 本进程监听 8 种信号：SIGCHLD 仅用于唤醒 Wait4 排空循环（不转发），
+// 其余 SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2/SIGWINCH 共 7 种
+// 转发给目标子进程（外层 sbx 父进程仅监听并转发
+// SIGINT/SIGTERM/SIGHUP/SIGQUIT 4 种）。
 //
 // 收尸与转发在同一循环内完成：每轮先以 Wait4(-1, WNOHANG) 排空全部已
 // 退出子孙（命中目标子进程 PID 即返回其退出码/128+信号；PID 1 退出后
