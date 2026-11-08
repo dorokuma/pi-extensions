@@ -584,7 +584,9 @@ func runChildFromEnv() int {
 // 收尸与转发在同一循环内完成：每轮先以 Wait4(-1, WNOHANG) 排空全部已
 // 退出子孙（命中 PID 2 即返回其退出码/128+信号；PID 1 退出后内核自动
 // 清理命名空间内残余进程），无待收割子进程时阻塞等信号——SIGCHLD 继续
-// 排空，其余信号转发给 PID 2。cmd.Process.Release() 避免 os/exec 的
+// 排空，其余信号转发给 PID 2。Wait4 返回 EINTR 时重试，ECHILD（无任何
+// 子进程，含 PID 2 已被收割）时直接返回 0，绝不落入 <-sigCh 空转阻塞。
+// cmd.Process.Release() 避免 os/exec 的
 // pidfd Wait 路径与 Wait4(-1) 竞争 ECHILD。
 func runAsSandboxInit(bin string, argv []string, env []string) int {
 	sigCh := make(chan os.Signal, 16)
@@ -614,7 +616,19 @@ func runAsSandboxInit(bin string, argv []string, env []string) int {
 		for {
 			var ws unix.WaitStatus
 			reapedPid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
-			if err != nil || reapedPid <= 0 {
+			if err != nil {
+				// EINTR：被信号打断，重试；ECHILD：无任何子进程可收割，
+				// 绝不能落到 <-sigCh 永久阻塞（PID 1 此时已没有等待对象），
+				// 直接退出让内核清理命名空间。
+				if errors.Is(err, syscall.EINTR) {
+					continue
+				}
+				if errors.Is(err, syscall.ECHILD) {
+					return 0
+				}
+				break
+			}
+			if reapedPid <= 0 {
 				break
 			}
 			if reapedPid != childPid {

@@ -91,10 +91,12 @@ const (
 // cmd.Start() 子进程 os.Getpid()==1；不能用 Unshareflags 携带
 // CLONE_NEWPID——unshare(2) 只把新 PID ns 记给未来的子进程，调用进程本身
 // 仍留在宿主 PID ns，挂载的 procfs 依旧反映宿主进程面）。
-// Go 运行时在 unshare 后自动把 / 置为 rprivate
-// （src/syscall/exec_linux.go: unshare 不处理 --shared 挂载的传播标记，
-// Go 会补 mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)），子进程内的
-// 覆盖挂载不会传播回宿主挂载命名空间。
+// Go 标准库只对 Unshareflags 路径自动补一次
+// mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)（src/syscall/exec_linux.go，
+// 修正 unshare 不处理 --shared 挂载的传播标记）；Cloneflags 派生路径没有该
+// 补挂，/ 的私有化由 isolateRuntimeSockets 首步 private-propagation 硬前置
+// 执行（失败即熔断全部覆盖挂载），保证子进程内的覆盖挂载不传播回宿主
+// 挂载命名空间。
 func childSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID}
 }
@@ -103,7 +105,9 @@ func childSysProcAttr() *syscall.SysProcAttr {
 // 并在全部挂载与清理完成后安装 mount-seal seccomp 锁。
 // 仅当父进程确实以 CLONE_NEWNS 派生（childExecSpec.MountNS=true）时才被调用；
 // 任一覆盖/回绑/封锁步骤失败默认返回错误拒绝启动，bestEffort 时仅告警并继续
-// （含挂载未全部成功时仍按同策略安装 seccomp 锁）。
+// （含挂载未全部成功时仍按同策略安装 seccomp 锁）。/ 的 rprivate 化是全部
+// 覆盖挂载的硬前置：失败时 bestEffort 下也跳过全部覆盖挂载（仅仍尝试安装
+// seccomp 锁），绝不在未私有化的 / 上执行 mount。
 func isolateRuntimeSockets(bestEffort bool) error {
 	step := func(name string, fn func() error) error {
 		if err := fn(); err != nil {
@@ -116,12 +120,17 @@ func isolateRuntimeSockets(bestEffort bool) error {
 		return nil
 	}
 
-	// Go 运行时在 CLONE_NEWNS 后已自动执行一次；此处显式再置一次，语义独立于
-	// runtime 实现细节，确保后续覆盖挂载不传播回宿主挂载命名空间。
-	if err := step("private-propagation", func() error {
-		return unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, "")
-	}); err != nil {
-		return err
+	// / 的 rprivate 化是全部覆盖挂载的硬前置：Go 标准库只对 Unshareflags
+	// 路径自动补 MS_REC|MS_PRIVATE，Cloneflags 派生路径不会执行，必须在此
+	// 显式完成。若失败且 / 仍为 shared 传播，任何后续覆盖挂载都会泄漏回
+	// 宿主挂载命名空间，因此 bestEffort 下也只安装 mount-seal 锁（非挂载
+	// 操作）后直接返回，绝不在未私有化的 / 上执行 mount。
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		if bestEffort {
+			fmt.Fprintf(os.Stderr, "sbx: WARN mount step private-propagation failed, skipping all cover mounts: %v\n", err)
+			return step("seal-mount-namespace", sealMountNamespace)
+		}
+		return fmt.Errorf("mount step private-propagation failed: %w", err)
 	}
 	// 独立 procfs 必须在 private-propagation 之后、seal 之前挂载：此后沙盒内
 	// /proc 只反映新 PID 命名空间，宿主 PID 与其 /proc/<pid>/root|cwd|fd

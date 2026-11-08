@@ -143,8 +143,11 @@ MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视�
   说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
   时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
 - **socket 白名单视图（Linux，`CLONE_NEWNS|CLONE_NEWPID`）**：受限子
-  进程同时进入独立挂载与 PID 命名空间（Go runtime 自动把 `/` 置
-  rprivate；子进程即新 PID ns 的 PID 1），在 `sandbox.Apply` 之前：
+  进程同时进入独立挂载与 PID 命名空间（Go 标准库只对 `Unshareflags`
+  路径自动置 `/` rprivate，`Cloneflags` 路径不会自动执行，由
+  `isolateRuntimeSockets` 首步 private-propagation 硬前置执行
+  `MS_REC|MS_PRIVATE`，失败即熔断全部覆盖挂载；子进程即新 PID ns
+  的 PID 1），在 `sandbox.Apply` 之前：
   先硬校验 `os.Getpid()==1` 后挂载专属 procfs（宿主 PID 与
   `/proc/<pid>/root` 魔链彻底不可见），随后整个 `/run` 被 tmpfs 覆盖，
   只按原相对路径回绑白名单项——`moshi-hook.sock`（agy 钩子遥测，
