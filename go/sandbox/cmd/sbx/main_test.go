@@ -26,8 +26,8 @@ import (
 const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
 
 // envTestMountProbe 让复用测试二进制的沙盒内进程进入 mount 探针模式：
-// 直接对 setns(/proc/1/ns/mnt) 与 umount2(/run, MNT_DETACH) 发 syscall 并
-// 打印 errno，验证 mount-seal seccomp 锁以 EPERM 拦截。
+// 直接对 setns(/proc/1/ns/mnt) 与 umount2(/nonexistent-sbx-mount-seal-probe)
+// 发 syscall 并打印 errno，验证 mount-seal seccomp 锁以 EPERM 拦截。
 const envTestMountProbe = "GO_WANT_SBX_MOUNT_PROBE"
 
 func TestMain(m *testing.M) {
@@ -46,7 +46,8 @@ func TestMain(m *testing.M) {
 }
 
 // runMountNSProbe 在受限沙盒内执行：对 setns 与 umount2 直接发 syscall，
-// 打印 errno 供父进程断言（seccomp 锁装好后二者必须均为 EPERM=1）。
+// 打印 errno 供父进程断言（seccomp 锁装好后二者必须均为 EPERM=1；
+// umount2 目标用不存在路径，未装锁时返回 ENOENT=2，详见行内注释）。
 // 使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与 arm64
 // 的过滤清单都能命中（过滤器按当前 GOARCH 生成）。此外对
 // moshi-hook.sock 做一次 unix dial：白名单回绑若被只读 remount 覆盖会
@@ -64,11 +65,10 @@ func runMountNSProbe() int {
 	} else {
 		setnsErrno = -2
 	}
-	// moshi-hook.sock 连通性（放在 umount2 尝试之前：未封锁的旧路径下
-	// umount2 会真卸载 /run 覆盖层，先做 dial 才能反映白名单视图原状）：
-	// socket 路径存在但被只读 remount 时 connect 返回 EROFS；路径未回绑
-	// 返回 ENOENT。无监听端时返回 ECONNREFUSED，与正常连通一样证明白名单
-	// 回绑可写可达。
+	// moshi-hook.sock 连通性（先 dial 再发 umount2，保证拨号结果反映的是
+	// 白名单视图原状而非被探针改动后的状态）：socket 路径存在但被只读
+	// remount 时 connect 返回 EROFS；路径未回绑返回 ENOENT。无监听端时
+	// 返回 ECONNREFUSED，与正常连通一样证明白名单回绑可写可达。
 	if _, err := os.Lstat("/run/user/0/moshi-hook.sock"); err == nil {
 		conn, derr := net.DialTimeout("unix", "/run/user/0/moshi-hook.sock", 2*time.Second)
 		switch {
@@ -83,10 +83,15 @@ func runMountNSProbe() int {
 	} else {
 		fmt.Println("moshi_dial=absent")
 	}
-	// umount2：直接对 /run 发 MNT_DETACH 卸载，撤销 socket 白名单视图。
+	// umount2：对保证不存在的固定路径发卸载请求探针。seccomp-BPF 过滤器
+	// 在系统调用入口按 syscall 号直接拦截，早于内核路径查找，装锁时必然
+	// 返回 EPERM(1)；未装锁时内核路径查找返回 ENOENT(2)。故意选不存在
+	// 路径是为了防误伤：即使开发者或子代理在宿主机 root 环境误裸跑本探针，
+	// 也绝不会卸载任何真实挂载点（旧实现对 /run 发 MNT_DETACH，宿主机
+	// 裸跑会把宿主 /run 延迟卸载）。
 	umountErrno := -1
-	if p, err := syscall.BytePtrFromString("/run"); err == nil {
-		_, _, e := syscall.Syscall(unix.SYS_UMOUNT2, uintptr(unsafe.Pointer(p)), unix.MNT_DETACH, 0)
+	if p, err := syscall.BytePtrFromString("/nonexistent-sbx-mount-seal-probe"); err == nil {
+		_, _, e := syscall.Syscall(unix.SYS_UMOUNT2, uintptr(unsafe.Pointer(p)), 0, 0)
 		umountErrno = int(e)
 	}
 	fmt.Printf("setns_errno=%d\numount_errno=%d\n", setnsErrno, umountErrno)
