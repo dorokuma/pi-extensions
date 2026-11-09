@@ -4,7 +4,114 @@
 
 ## [Unreleased]
 
+### Added
+
+- **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
+  `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`（Go
+  `Cloneflags`，受限子进程直接以新 PID ns 的 PID 1 启动，并同时获得
+  独立 IPC 命名空间——隔离 SysV `shm`/`sem`/`msg` 与按命名空间解析的
+  POSIX `mq_open`/`mq_unlink` 系统调用：沙盒内读不到宿主共享内存段、
+  按名打开宿主 POSIX 队列返回 `ENOENT`，沙盒内创建的 SysV IPC 对象随
+  命名空间销毁不留宿主持久残留；继承的宿主 `/dev/mqueue` 挂载未额外
+  覆盖，Landlock 阻断其写/建，但若宿主预存可读队列节点仍可经路径
+  `O_RDONLY` 打开并 `mq_timedreceive` 取走消息）；覆盖 `/run` 之前先按硬校验
+  （`os.Getpid()==1`，非独立 PID ns 拒绝继续）挂载 `MS_NOSUID|MS_NODEV|
+  MS_NOEXEC` 的 procfs。此后沙盒内 `/proc` 只反映本沙盒进程：宿主全部
+  PID 不可见，`/proc/<pid>/root|cwd|fd` 魔链只解析到沙盒自身已覆盖
+  `/run` 的挂载命名空间（穿透宿主 socket 面需 `ptrace_may_access` +
+  宿主视图，二者同时消失）；`ptrace`/`process_vm_*`/`pidfd_getfd` 对
+  宿主进程的控制面因宿主 PID 不可达而天然失效。此前共享宿主 PID ns
+  时 `/proc/1/root/run/docker.sock` 一行即可绕过全部挂载覆盖，等价
+  沙盒外任意命令执行。
+- **轻量 PID 1 init**：`MountNS` 路径下 `sbx` 不再以 `syscall.Exec` 顶替
+  PID 1（PID 1 忽略默认未捕获信号且无人回收孤儿僵尸），改由
+  `runAsSandboxInit` 担任 init：派生目标命令（记录其实际 PID 并向它转发
+  信号——`sandbox.Apply` 会先派生 helper/broker 辅助进程，业务进程 PID
+  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`，
+  容器内 init 另监听 `SIGUSR1`/`SIGUSR2`/`SIGWINCH`/`SIGCHLD`；每轮先
+  `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），目标子进程退出
+  即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
+  仍走原 `syscall.Exec`。
+- **mount-seal 扩展至 45/47 系统调用 + x32 ABI 封堵**：在 12 个挂载族之上
+  新增 `chroot`（魔链越狱第二跳）、`ptrace`、`process_vm_readv`、
+  `process_vm_writev`、`pidfd_getfd`、`kcmp`（进程控制族），以及
+  capability 门控的宿主全局副作用/句柄/密钥环族 27 个（`reboot`/
+  `kexec_load`/`kexec_file_load`/`init_module`/`finit_module`/
+  `delete_module`/`bpf`/`perf_event_open`/`fanotify_init`/`syslog`/
+  `sethostname`/`setdomainname`/`settimeofday`/`clock_settime`/
+  `adjtimex`/`clock_adjtime`/`swapon`/`swapoff`/`quotactl`/
+  `quotactl_fd`/`acct`/
+  `open_by_handle_at`/`name_to_handle_at`/`add_key`/`request_key`/
+  `keyctl`/`pidfd_send_signal`，amd64 另有 `ioperm`/`iopl`），均返回
+  `EPERM`；amd64 过滤器在 `arch` 校验与 `nr` 比较链之间新增
+  `JGE __X32_SYSCALL_BIT(0x40000000)`，封堵与原生 amd64 共享
+  `AUDIT_ARCH` 的 x32 调用号绕过。`pidfd_open` 有意不封——Go 标准库
+  管理沙盒内自身子进程需要，而宿主 PID 在新 PID ns 内本就 `ESRCH`。
+- **Linux capabilities 根治裁剪（`drop-capabilities`）**：全部覆盖挂载与
+  继承 cwd 重绑完成后、seal 之前，循环 `PR_CAPBSET_DROP` 收缩 bounding
+  set（`CAP_SETPCAP` 留到循环最后一步——内核要求调用时仍持该能力），
+  `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，`capset` 把
+  Effective/Permitted 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`）
+  Inheritable 置 0；helper/broker、目标命令与 `go test` 子孙经
+  fork/exec 继承同一已裁剪能力集，`reboot`/载模块/改时钟/`bpf` 等
+  capability 门控宿主副作用在能力校验层整体失效。优先
+  `syscall.AllThreadsSyscall` 全线程生效，`-race`/cgo 下 `ENOTSUP`
+  回退 `runChildFromEnv` 入口 `runtime.LockOSThread()` 锁定的线程。
+- **继承 cwd 重绑（`rebind-cwd`，闭环相对路径拨号旁路）**：tmpfs 覆盖只
+  改变其后的绝对路径解析，内核已持有的 `fs->pwd` 仍引用覆盖前的底层
+  目录项——调用方从 `/run/user/0` 启动 sbx 时，沙盒内相对路径
+  `herdr-core/default.sock` 可直拨覆盖前的宿主 socket。全部覆盖完成后
+  `os.Chdir` 回原 cwd 并 `os.Getwd()` 复核，强制从新挂载命名空间根
+  重解析 cwd；原 cwd 在新视图不存在（如 `/run/user/0/herdr-core` 未
+  回绑）时 `ENOENT`，默认 fail-closed 拒绝启动，不擅自切往
+  `--workdir`。
+- **PID-ns 硬校验前置到一切宿主可见变异之前**：`isolateRuntimeSockets`
+  首步即判 `os.Getpid()==1`，非独立 PID ns 时严格模式直接拒绝（绝不
+  先私有化宿主 `/` 再报错），`--best-effort` 下告警点名
+  `/proc/<hostPid>/root` 魔链仍可达并跳过全部覆盖挂载（仅降权+装锁）；
+  `private-propagation` 失败与 `mount-proc` 失败的 best-effort 告警同样
+  点名魔链残余面。
+- **回报中继在途连接硬上限**：`serve()` 对同时在途连接设上限
+  `reportMaxActiveConns=32`，超限连接立即以 100ms 写超时回
+  `reject + relay busy` 并丢弃——杜绝沙盒内廉价空拨号耗尽外层父进程
+  FD/内存并把 `consecErrs` 顶满杀死中继。
+- **回报中继 Accept 永久错误自旋保护**：`serve()` 维护连续非关闭
+  `Accept` 错误计数，达到 `reportAcceptMaxConsecErrs`（100 次，约 1s
+  退避）主动退出循环，防止监听器 fd 进入永久错误态时空转；成功
+  `Accept` 清零。
+- **回报文本剔除 Unicode `Cf` 格式控制符**：`sanitizeReportText` 在剔除
+  除 `\n`/`\t` 外控制字符之上，同步剔除 `\u202e` 双向覆盖符、\u200b
+  零宽字符与 BOM 等 `Cf` 类别字符，防父终端渲染侧文本欺骗。
+
 ### Fixed
+
+- **`[0.4.0]` 文档勘误**：父进程派生受限子进程失败（`unshare` 不被支持/
+  权限不足等）严格模式实际退 `126`（`--best-effort` 下降级），子进程内
+  挂载/封锁步骤失败才退 `1`；原文「严格模式拒绝启动（退出码 1）」描述
+  的是后者，已更正为两类失败路径区分。
+- **init 文档口径修正**：README/CHANGELOG 中「派生目标命令为 PID 2」
+  更正为「记录的目标子进程 PID」——`sandbox.Apply` 先派生
+  helper/broker，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
+  父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 4 种信号，
+  与容器内 PID-1 init 监听的 8 种信号（`SIGCHLD` 仅用于唤醒 `Wait4`
+  收尸不转发，其余 7 种转发给目标子进程），不再混述为同一端到端
+  能力。
+- **drain 超时取消在途投递失效**：`deliver` 的 `cmd.Stdout/Stderr =
+  io.Discard` 非 `*os.File`，`exec` 会建管道并起 copy goroutine；`hc`
+  派生继承管道的孤儿子孙时，`cmd.Wait` 被拖到子孙退出才返回——
+  `close()` drain 超时 `cancel()` 杀死 `hc` 本体后 `Wait` 仍挂至其
+  孤儿子孙自然退出。改为 stdout/stderr 置 nil（走 `/dev/null`，不建
+  管道），drain 超时取消路径恢复即时生效。
+
+### Changed
+
+- **集成回归断言加固**：帧边界测试改以协议字面常量 `65532`/`65533`
+  构造（不再引用生产常量生成边界，回退实现即红）；moshi 拨号只明确
+  接受 `connected`/`ECONNREFUSED`，`EROFS`/`ENOENT`/`EACCES`/超时等其余
+  错误一律判失败；沙盒内新增独立 PID ns 断言（PID 1 为 sbx init 本体、
+  宿主父 PID `ENOENT`、`/proc/1/root` 经宿主 `/run` 全权 socket 路径
+  `ENOENT`）与扩展 seccomp 探针（`chroot`/`ptrace`/`pidfd_getfd`/amd64
+  `x32` 位全部 `EPERM`）。
 
 - **禁名后缀闭合：`.` 与 `-` 双分隔符前缀派生**：`isForbiddenBaseName`
   的派生判定从仅 `禁名+"-"` 扩为 `禁名+"-"` 与 `禁名+"."` 两种前缀
@@ -32,6 +139,116 @@
   预设自建的合法 `Exec` 路径误判禁名、击穿全部预设。短禁名仍按精确匹配
   判定；长度 ≥ 5 的禁名（`dispatch-agent`、`dispatch-agent-go`、`herdr`、
   `herdr-core`、`herdr-mobile-bridge`）继续 `-` 派生并新增 `.` 派生。
+
+## [0.4.0] - 2026-11-07
+
+MINOR：只读角色回报中继（`--report-to`）+ 沙盒 socket 白名单视图 +
+环境剥离。Landlock ABI 6 不管 pathname unix socket 的 `connect()`，
+此前沙盒内任意代码可直连 `/run/user/0/herdr-core/*`（hc 控制面）、
+`systemd/private`/`bus`（驱动 root systemd，等价沙盒外任意命令执行）、
+`/tmp/tmux-0/*`（终端按键注入）、gnupg/openssh_agent（凭据代理）。
+
+### Breaking Changes
+
+- **CLI 默认启用 `CLONE_NEWNS|CLONE_NEWPID` 联合命名空间隔离**：此前受限
+  子进程与父进程共享宿主挂载与 PID 命名空间；现在子进程在独立 mount ns
+  与 PID ns 内执行（覆盖挂载不传播回宿主，宿主进程在沙盒 `/proc` 下
+  不可见）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权用户且内核未放行
+  unprivileged user-ns）下 `unshare` 会失败：**父进程派生子进程失败**
+  严格模式退 `126`，`--best-effort` 下告警降级回旧行为（不 unshare、
+  跳过全部 socket 覆盖、不安装挂载锁）；**子进程内挂载/封锁步骤失败**
+  退 `1` 拒绝启动，`--best-effort` 下仅告警继续。
+- **socket 白名单视图从 `/run/user/0` 扩为整个 `/run`**：此前仅覆盖
+  `/run/user/0`；现在整个 `/run` 被空 tmpfs 覆盖，仅按原相对路径回绑
+  `/run/user/0/moshi-hook.sock` 与 `/run` 下的 `/etc/resolv.conf`
+  解析目标（普通文件）。沙盒内原可达的 `/run` 下其它对象——
+  `/run/systemd/private`、`/run/docker.sock`、
+  `/run/containerd/containerd.sock`、`/run/dbus/system_bus_socket`、
+  `/run/user/0/herdr-core/*` 等——全部不可见，依赖它们的沙盒内代码
+  将收到 `ENOENT`/`EACCES`。迁移方式：确有需求的对象只能经由新增
+  白名单回绑项放行（需改码并过审查）。
+- **沙盒内挂载族与进程控制族系统调用一律 `EPERM`**：全部覆盖/回绑与
+  暂存清理完成后、`sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` +
+  seccomp-BPF 过滤器（支持 `linux/amd64` 与 `linux/arm64`，异构 ABI
+  直接 `KILL_PROCESS`，amd64 另封堵 x32 `__X32_SYSCALL_BIT`），
+  `mount`/`umount2`/`setns`/`unshare`/`pivot_root`/`open_tree`/
+  `move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/`mount_setattr`
+  与 `chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/
+  `pidfd_getfd`/`kcmp` 共 18 个系统调用返回 `EPERM`；过滤器与 NNP 跨
+  `execve` 继承。此前沙盒内 root 可 `setns` 跳回宿主挂载命名空间、
+  `umount2` 撤销覆盖层、`chroot` 组合魔链越狱或 `ptrace`/`pidfd_getfd`
+  操纵宿主进程，这些逃逸路径均被堵死；依赖上述系统调用的沙盒内代码
+  将失败。`--best-effort` 下锁安装失败仅告警降级。
+
+### Added
+
+- **`--report-to ID`**：父终端地址（如 `t28`，由派发方取外层
+  `HC_TERMINAL_ID` 传入）。仅 `--preset reviewer-agent` 且地址合法且可信
+  hc 存在时，sbx 外层父进程（在 Landlock 规则集外）在
+  `<goExecDir>/report.sock`（0600）起回报中继，先于受限子进程就绪：
+  4 字节大端长度前缀 + JSON `{"to","text"}`（整包上限 64KiB），每连接 5s
+  读 deadline，校验顺序为 `to` 必须等于父地址 → UTF-8 规范化并剔除除
+  `\n`/`\t` 外 C0/C1 控制字符 → 超 8000 字节按字符边界截断并追加
+  `…[truncated by sbx]` → 令牌桶（容量 3，每 30 秒补 1，每会话 20 条）→
+  `exec.CommandContext` 固定 argv `hc send <parent> <text>`（不经 shell，
+  超时 5s，文本以 `-` 开头时前置空格——hc 的 clap 参数解析不接受 `-`
+  开头的 TEXT 操作数）。回包 1 字节状态（0 成功 / 1 拒绝 / 2 投递失败）
+  + 简短原因；退出时先关监听再在途等待最多 6 秒。hc 仅在固定可信位置
+  解析（`/root/.local/bin/hc` 与 trustedHome 同路径，绝不走 PATH）；
+  外层 `HC_TERMINAL_ID` 存在且等于 `--report-to` 时拒绝启用（防发给自己）。
+- **沙盒内 `hc` 受限客户端**：`ReviewerAgentWithEnv` 在
+  `<goExecDir>/bin/hc` 建指向 sbx 本体的软链（仅此预设），`init` 分发按
+  argv[0]==`hc` 进入 `runReportClient`：仅放行 `hc send <addr> <text>`
+  精确两操作数经 report.sock 提交；`hc --help`/`hc --version` 打印受限
+  说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
+  时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
+- **socket 白名单视图（Linux，`CLONE_NEWNS|CLONE_NEWPID`）**：受限子
+  进程同时进入独立挂载与 PID 命名空间（Go 标准库只对 `Unshareflags`
+  路径自动置 `/` rprivate，`Cloneflags` 路径不会自动执行，由
+  `isolateRuntimeSockets` 首步 private-propagation 硬前置执行
+  `MS_REC|MS_PRIVATE`，失败即熔断全部覆盖挂载；子进程即新 PID ns
+  的 PID 1），在 `sandbox.Apply` 之前：
+  先硬校验 `os.Getpid()==1` 后挂载专属 procfs（宿主 PID 与
+  `/proc/<pid>/root` 魔链彻底不可见），随后整个 `/run` 被 tmpfs 覆盖，
+  只按原相对路径回绑白名单项——`moshi-hook.sock`（agy 钩子遥测，
+  socket 回绑保持可写，`connect()` 要求挂载点可写）与 `/run` 下的
+  `/etc/resolv.conf` 目标文件（DNS stub，补只读 remount），覆盖层整体
+  remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。覆盖路径
+  不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
+  `--best-effort` 下仅告警。unshare 失败在 `--best-effort` 下回退不
+  unshare（此时跳过全部覆盖，绝不动宿主命名空间）。全部挂载与清理
+  完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
+- **轻量 PID 1 init 收尸与信号转发**：`MountNS` 路径下 `sbx` 本体作为
+  新 PID ns 的 PID 1 不直接 `exec` 业务命令，而是派生目标命令并担任
+  init（记录目标子进程 PID、转发信号、`Wait4(-1, WNOHANG)` 收尸），
+  避免业务进程作为 PID 1 忽略默认未捕获信号与残留孤儿僵尸。
+- **回报中继生命周期屏障**：`serve()` 在 `mu` 临界区内判 `closing` 并
+  同步 `conns` 登记 + `wg.Add`，消除 `Add`/`Wait` 竞态；非 `ErrClosed`
+  的 Accept 错误（EMFILE/ENFILE 等）退避 10ms 继续循环而非永久退出；
+  `close()` 先关监听、等 accept 循环退出，再以 6s drain 定时器收尾，
+  超时则取消根 `ctx`（回收在途 `hc send` 子进程）并强关残余连接。
+  `PI_SANDBOX_GO_EXEC_DIR` 与 `PIG_HOME`/`CLAUDE_CONFIG_DIR` 同口径
+  回钉，`--env` 不能劫持 relay 监听路径。帧体上限 64KiB-4（整包含 4B
+  头不超 64KiB），响应写 deadline 独立 5s，令牌桶 refill 保留余数。
+- **环境剥离**：沙盒内剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、
+  `GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS`、
+  `XDG_RUNTIME_DIR`；作用于宿主继承环境（`runSandboxedChild` 的 cmd.Env
+  与 `runChildFromEnv` 的 mergeEnv 基底）与 `--env` 传入值（`buildPolicy`
+  同口径过滤）。预设自身注入的 `XDG_RUNTIME_DIR`（reviewer-agent 私有
+  0700 目录）不属于外部指针，不受影响。
+
+### Known Risks
+
+- 已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman
+  扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、
+  goExecDir 内 `broker.sock` 与 `report.sock`。
+- mount-seal seccomp 锁仅在受限子进程的 `CLONE_NEWNS|CLONE_NEWPID`
+  路径安装：`--best-effort` 下 unshare 失败回退不 unshare 时，既不施加
+  socket 覆盖也不安装挂载锁（与挂载步骤同口径告警降级），此时沙盒内
+  root 仍可执行挂载类与进程控制类系统调用——降级属可观察 WARN，不作
+  静默承诺。
+- mount-seal 过滤器支持 `linux/amd64` 与 `linux/arm64`；其它 Linux
+  架构跳过安装（不拒绝启动），挂载逃逸面在该架构上保持旧行为。
 
 ## [0.3.3] - 2026-11-07
 
@@ -388,7 +605,8 @@ MINOR：向后兼容的新预设与 CLI 能力。
 - `BestEffort` 下 seccomp 失败会去掉 `PROT_EXEC` 守卫，不得对其抱安全预期。
 - helper / go broker 提权面、Unix socket、`/proc/<pid>/fd` TOCTOU、脚本解释器白名单、默认 `DenyNet: false` 等既有边界仍然存在；详见模块 `README.md`。
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.3...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.4.0...HEAD
+[0.4.0]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.3...go/sandbox/v0.4.0
 [0.3.3]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.2...go/sandbox/v0.3.3
 [0.3.2]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.1...go/sandbox/v0.3.2
 [0.3.1]: https://github.com/dorokuma/pi-extensions/compare/go/sandbox/v0.3.0...go/sandbox/v0.3.1

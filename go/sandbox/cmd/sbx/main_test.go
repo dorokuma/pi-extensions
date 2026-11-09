@@ -3,20 +3,49 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
 
+// envTestMountProbe 让复用测试二进制的沙盒内进程进入 mount 探针模式：
+// 直接对 setns(/proc/1/ns/mnt) 与 umount2(/nonexistent-sbx-mount-seal-probe)
+// 发 syscall 并打印 errno，验证 mount-seal seccomp 锁以 EPERM 拦截。
+const envTestMountProbe = "GO_WANT_SBX_MOUNT_PROBE"
+
+// probeShmMagicSize 是 CLONE_NEWIPC 实证探针使用的唯一魔数段大小：
+// 沙盒内以 shmget(IPC_PRIVATE, probeShmMagicSize) 创建私有段，宿主侧
+// 对比探针前后 /proc/sysvipc/shm 的 (key,shmid,size) 集合——沙盒退出后
+// 宿主若新增 size=probeShmMagicSize 的段即判定 IPC ns 隔离失效/残留
+// （不比对 shmid 值本身，避免极小概率 ID 号巧合误判）。
+const probeShmMagicSize = 12288
+
 func TestMain(m *testing.M) {
 	if os.Getenv(envSbxChildSpecKey) != "" {
 		os.Exit(runChildFromEnv())
+	}
+	if os.Getenv(envTestMountProbe) == "1" {
+		os.Exit(runMountNSProbe())
 	}
 	if os.Getenv(envTestWantSbxMain) == "1" {
 		_ = os.Unsetenv(envTestWantSbxMain)
@@ -24,6 +53,171 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+// runMountNSProbe 在受限沙盒内执行：对 setns、umount2 及越狱/进程控制族
+// 直接发 syscall，打印 errno 供父进程断言（seccomp 锁装好后必须均为
+// EPERM=1；umount2/chroot 目标用不存在路径，未装锁时返回 ENOENT=2，详见
+// 行内注释）。并断言独立 PID 命名空间视图：打印自身 PID、探测宿主父进程
+// PID 在沙盒 /proc 下的可见性、以及 /proc/1/root 魔链是否穿透到宿主
+// /run。使用 golang.org/x/sys/unix 的架构相关系统调用号常量，amd64 与
+// arm64 的过滤清单都能命中（过滤器按当前 GOARCH 生成）；amd64 另打 x32
+// 位探针。capabilities 断言读取 /proc/self/status 五组 Cap* 掩码（裁剪后
+// Eff/Prm/Bnd 应精确为 0x22、Inh/Amb 为 0），bpf/finit_module/
+// open_by_handle_at 三个非破坏探针验证宿主全局副作用族被 EPERM 拦截。
+// CLONE_NEWIPC 隔离实证：读取 /proc/sysvipc/shm 统计除表头外的数据行数
+// 打印 sysvipc_init_shm=<n>（独立 IPC ns 内即使宿主存在 PostgreSQL 等
+// 共享内存段也必为 0），再以 shmget(IPC_PRIVATE, probeShmMagicSize)
+// 创建私有段打印 sandbox_shmid=<id>（不调 IPC_RMID——若未隔离该段会
+// 持久残留宿主；隔离时随 IPC ns 销毁自动回收，宿主侧按
+// probeShmMagicSize 魔数对比前后段集合断言无新增残留）。
+// 此外对 moshi-hook.sock 做一次 unix dial：只明确接受
+// connected 与 ECONNREFUSED（socket 可达但无监听端），EROFS（回绑被
+// 只读 remount 覆盖）/ENOENT（未回绑）与 EACCES/超时等其它错误一律报
+// 具体值并在断言侧判失败。
+func runMountNSProbe() int {
+	// setns：打开 /proc/self/ns/mnt 的 fd 发起 setns（新 PID ns 内
+	// /proc/self 即本沙盒进程自身；过滤器按系统调用号拦截，EPERM 与目标
+	// 无关；无过滤器时本调用返回 0/EINVAL）。
+	setnsErrno := -1
+	if f, err := os.Open("/proc/self/ns/mnt"); err == nil {
+		defer f.Close()
+		_, _, e := syscall.Syscall(unix.SYS_SETNS, f.Fd(), 0, 0)
+		setnsErrno = int(e)
+	} else {
+		setnsErrno = -2
+	}
+	// moshi-hook.sock 连通性（先 dial 再发其它探针，保证拨号结果反映的是
+	// 白名单视图原状而非被探针改动后的状态）：仅明确接受 connected 与
+	// ECONNREFUSED；EROFS/ENOENT 说明回绑丢失或被只读化，EACCES/超时等
+	// 其它错误同样是失败的证据，全部如实打印供断言判红。
+	if _, err := os.Lstat("/run/user/0/moshi-hook.sock"); err == nil {
+		conn, derr := net.DialTimeout("unix", "/run/user/0/moshi-hook.sock", 2*time.Second)
+		switch {
+		case derr == nil:
+			_ = conn.Close()
+			fmt.Println("moshi_dial=connected")
+		case errors.Is(derr, syscall.ECONNREFUSED):
+			fmt.Printf("moshi_dial=refused(%v)\n", derr)
+		default:
+			fmt.Printf("moshi_dial=other(%v)\n", derr)
+		}
+	} else {
+		fmt.Println("moshi_dial=absent")
+	}
+	// umount2：对保证不存在的固定路径发卸载请求探针。seccomp-BPF 过滤器
+	// 在系统调用入口按 syscall 号直接拦截，早于内核路径查找，装锁时必然
+	// 返回 EPERM(1)；未装锁时内核路径查找返回 ENOENT(2)。故意选不存在
+	// 路径是为了防误伤：即使开发者或子代理在宿主机 root 环境误裸跑本探针，
+	// 也绝不会卸载任何真实挂载点（旧实现对 /run 发 MNT_DETACH，宿主机
+	// 裸跑会把宿主 /run 延迟卸载）。
+	umountErrno := -1
+	if p, err := syscall.BytePtrFromString("/nonexistent-sbx-mount-seal-probe"); err == nil {
+		_, _, e := syscall.Syscall(unix.SYS_UMOUNT2, uintptr(unsafe.Pointer(p)), 0, 0)
+		umountErrno = int(e)
+	}
+	fmt.Printf("setns_errno=%d\numount_errno=%d\n", setnsErrno, umountErrno)
+
+	// 独立 PID 命名空间视图：本进程在沙盒新 PID ns 内；宿主父进程 PID
+	// （经 HOST_PARENT_PID 传入）在沙盒 /proc 下必须 ENOENT。
+	fmt.Printf("self_pid=%d\n", os.Getpid())
+	if hp := strings.TrimSpace(os.Getenv("HOST_PARENT_PID")); hp != "" {
+		if _, err := os.Stat("/proc/" + hp); os.IsNotExist(err) {
+			fmt.Println("host_pid=hidden")
+		} else {
+			fmt.Printf("host_pid=visible(%v)\n", err)
+		}
+	}
+	// /proc/1/root 魔链：新 PID ns + 独立 procfs 下，/proc/1 是本沙盒 init，
+	// 其 root 指向本沙盒已覆盖 /run 的挂载命名空间——经它访问宿主
+	// /run 全权 socket 路径必须 ENOENT（宿主存在性由父进程前置核验）。
+	for _, p := range strings.Split(strings.TrimSpace(os.Getenv("PROC1_ROOT_PROBE_PATHS")), " ") {
+		if p == "" {
+			continue
+		}
+		key := "proc1root_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(strings.TrimPrefix(p, "/"))
+		if _, err := os.Stat(filepath.Join("/proc/1/root", p)); os.IsNotExist(err) {
+			fmt.Println(key + "=hidden")
+		} else {
+			fmt.Printf("%s=visible(%v)\n", key, err)
+		}
+	}
+
+	// 越狱/进程控制族 seccomp 探针（装锁时全部 EPERM=1）：
+	// chroot 对不存在路径未装锁返回 ENOENT(2)，同理不碰任何真实目录；
+	// ptrace 全零参数未装锁返回 0/EINVAL/ESRCH；pidfd_getfd(-1) 未装锁
+	// 内核先校验 fd 返回 EBADF(9)。
+	chrootErrno := -1
+	if p, err := syscall.BytePtrFromString("/nonexistent-sbx-probe"); err == nil {
+		_, _, e := syscall.Syscall(unix.SYS_CHROOT, uintptr(unsafe.Pointer(p)), 0, 0)
+		chrootErrno = int(e)
+	}
+	_, _, ptraceE := syscall.Syscall6(unix.SYS_PTRACE, 0, 0, 0, 0, 0, 0)
+	_, _, pidfdGetfdE := syscall.Syscall(unix.SYS_PIDFD_GETFD, ^uintptr(0), 0, 0) // fd=-1
+	fmt.Printf("chroot_errno=%d\nptrace_errno=%d\npidfd_getfd_errno=%d\n",
+		chrootErrno, int(ptraceE), int(pidfdGetfdE))
+
+	// capabilities 裁剪：/proc/self/status 五组掩码原样打印供父进程断言
+	// （裁剪后 CapEff/CapPrm/CapBnd 应精确为 0000000000000022，
+	// CapInh/CapAmb 为 0000000000000000）。
+	if st, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(st), "\n") {
+			key, val, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb":
+				fmt.Printf("%s=%s\n", strings.ToLower(key), strings.TrimSpace(val))
+			}
+		}
+	} else {
+		fmt.Printf("caps_status=error(%v)\n", err)
+	}
+
+	// 宿主全局副作用族 seccomp 探针（装锁时全部 EPERM=1，均非破坏）：
+	// bpf(BPF_MAP_CREATE) 未装锁且能力在位时返回 0/EINVAL；finit_module
+	// 与 open_by_handle_at 对 fd=-1 未装锁时返回 EBADF(9)（能力校验在前，
+	// 未装锁且有能力亦可能 EPERM，但装锁后必然 EPERM）。
+	bpfAttr := []byte{
+		1, 0, 0, 0, // map_type = BPF_MAP_TYPE_HASH
+		4, 0, 0, 0, // key_size
+		4, 0, 0, 0, // value_size
+		1, 0, 0, 0, // max_entries
+	}
+	_, _, bpfE := syscall.Syscall(unix.SYS_BPF, 0, uintptr(unsafe.Pointer(&bpfAttr[0])), 0)
+	_, _, finitE := syscall.Syscall(unix.SYS_FINIT_MODULE, ^uintptr(0), 0, 0) // fd=-1
+	_, _, obhE := syscall.Syscall(unix.SYS_OPEN_BY_HANDLE_AT, ^uintptr(0), 0, 0)
+	fmt.Printf("bpf_errno=%d\nfinit_module_errno=%d\nopen_by_handle_at_errno=%d\n",
+		int(bpfE), int(finitE), int(obhE))
+
+	// CLONE_NEWIPC 隔离实证：独立 IPC ns 内 /proc/sysvipc/shm 必为空
+	// （宿主 SysV shm/sem/msg 不可见，按名 mq_open 亦隔离）；再经 shmget
+	// 创建私有段验证自身 IPC 可用且退出后随 ns 自动销毁不残留宿主。
+	if b, err := os.ReadFile("/proc/sysvipc/shm"); err == nil {
+		n := 0
+		for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if i > 0 && strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		fmt.Printf("sysvipc_init_shm=%d\n", n)
+	} else {
+		fmt.Printf("sysvipc_init_shm=error(%v)\n", err)
+	}
+	if shmid, _, shmE := unix.Syscall(unix.SYS_SHMGET, 0, probeShmMagicSize, unix.IPC_CREAT|0o600); shmE == 0 {
+		fmt.Printf("sandbox_shmid=%d\n", int(shmid))
+	} else {
+		fmt.Printf("sandbox_shmid=error(%v)\n", shmE)
+	}
+	// x32 ABI 探针（仅 amd64）：调用号带 __X32_SYSCALL_BIT(0x40000000)，
+	// 未封堵时内核按 x32 号表解释返回非 EPERM（如 getpid 成功或 ENOSYS），
+	// 装锁后 JGE 高位规则直接返回 EPERM(1)。
+	if runtime.GOARCH == "amd64" {
+		_, _, x32E := syscall.Syscall(0x40000000|unix.SYS_GETPID, 0, 0, 0)
+		fmt.Printf("x32_getpid_errno=%d\n", int(x32E))
+	}
+	return 0
 }
 
 func TestParseArgsBasicAndReviewerAlias(t *testing.T) {
@@ -425,6 +619,13 @@ printf "%s\n%s\n%s\n" "$TMPDIR" "$PI_SANDBOX_GO_EXEC_DIR" "$auth_file"
 
 func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (string, int) {
 	t.Helper()
+	return invokeSbxSubprocessDir(t, "", extraEnv, args...)
+}
+
+// invokeSbxSubprocessDir 与 invokeSbxSubprocess 相同，另允许指定子进程
+// 启动目录 dir（空串保持继承），用于覆盖挂载后继承 cwd 重绑的回归。
+func invokeSbxSubprocessDir(t *testing.T, dir string, extraEnv []string, args ...string) (string, int) {
+	t.Helper()
 	selfExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -434,6 +635,9 @@ func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (strin
 	env := append(os.Environ(), envTestWantSbxMain+"=1")
 	env = append(env, extraEnv...)
 	cmd.Env = env
+	if dir != "" {
+		cmd.Dir = dir
+	}
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -441,4 +645,1026 @@ func invokeSbxSubprocess(t *testing.T, extraEnv []string, args ...string) (strin
 
 	err = cmd.Run()
 	return out.String(), exitCodeFromWaitErr(err)
+}
+
+// TestReportRelayValidation 表驱动覆盖中继校验链路：非父地址拒绝、控制字符
+// 剔除、UTF-8 边界截断、限流拒绝/恢复、慢连接读超时。
+func TestReportRelayValidation(t *testing.T) {
+	t.Run("sanitize_strips_control_chars", func(t *testing.T) {
+		in := "a\x1b[31m\r\nb\x07\tend"
+		got := sanitizeReportText(in)
+		want := "a[31m\nb\tend"
+		if got != want {
+			t.Fatalf("sanitizeReportText = %q, want %q", got, want)
+		}
+		// Unicode Cf 格式控制符同样剔除：\u202e 双向覆盖符、\u200b 零宽
+		// 空格、\ufeff BOM——防父终端渲染侧文本欺骗。
+		inCf := "x\u202ey\u200bz\ufeffw"
+		if got := sanitizeReportText(inCf); got != "xyzw" {
+			t.Fatalf("sanitizeReportText(Cf) = %q, want %q", got, "xyzw")
+		}
+	})
+
+	t.Run("sanitize_truncates_at_rune_boundary", func(t *testing.T) {
+		pad := strings.Repeat("a", reportMaxTextBytes-1)
+		got := sanitizeReportText(pad + "尾tail")
+		// 「尾」占字节 7999-8001 跨 8000 边界，回退到字符边界后整字剔除。
+		want := pad + reportTruncSuffix
+		if got != want {
+			t.Fatalf("truncated = %q (len %d), want len %d", got[len(got)-40:], len(got), len(want))
+		}
+	})
+
+	t.Run("non_parent_address_rejected", func(t *testing.T) {
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now()}
+		status, _ := r.process(reportRequest{To: "tOTHER", Text: "hi"})
+		if status != reportStatusRejected {
+			t.Fatalf("status = %d, want reject(%d)", status, reportStatusRejected)
+		}
+	})
+
+	t.Run("rate_limit_burst_and_session_cap", func(t *testing.T) {
+		var calls int32
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now()}
+		fake := writeFakeHc(t, "#!/bin/sh\nexit 0\n")
+		r.hcPath = fake
+		for i := 0; i < reportBurstTokens; i++ {
+			status, _ := r.process(reportRequest{To: "tTEST", Text: "x"})
+			if status != reportStatusOK {
+				t.Fatalf("send %d status = %d, want ok", i, status)
+			}
+			calls++
+		}
+		if status, reason := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected || !strings.Contains(reason, "rate") {
+			t.Fatalf("burst exhausted: status=%d reason=%q", status, reason)
+		}
+		// 时间前进一格 refill 周期后恢复。
+		r.mu.Lock()
+		r.lastRef = time.Now().Add(-reportRefillEvery)
+		r.mu.Unlock()
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusOK {
+			t.Fatalf("after refill status = %d, want ok", status)
+		}
+		// 会话上限：耗尽 sent 计数后拒绝。
+		r.mu.Lock()
+		r.sent = reportSessionMax
+		r.tokens = reportBurstTokens
+		r.mu.Unlock()
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected {
+			t.Fatalf("session cap: status = %d, want reject", status)
+		}
+		_ = calls
+	})
+
+	t.Run("session_cap_via_injectable_clock", func(t *testing.T) {
+		var mu sync.Mutex
+		now := time.Now()
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: now,
+			hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			now:    func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+		advance := func(d time.Duration) {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+		}
+		// 真实走完 1..20 条成功：tokens 耗尽时推进一个 refill 周期补充。
+		for i := 1; i <= reportSessionMax; i++ {
+			if status, _ := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusOK {
+				t.Fatalf("send %d status = %d, want ok", i, status)
+			}
+			if i < reportSessionMax {
+				advance(reportRefillEvery)
+			}
+		}
+		// 第 21 条：会话上限拒绝。
+		if status, reason := r.process(reportRequest{To: "tTEST", Text: "x"}); status != reportStatusRejected || !strings.Contains(reason, "rate") {
+			t.Fatalf("session cap 21st: status=%d reason=%q, want reject", status, reason)
+		}
+	})
+
+	t.Run("token_refill_preserves_remainder", func(t *testing.T) {
+		var mu sync.Mutex
+		t0 := time.Now()
+		now := t0
+		r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: t0,
+			hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			now:    func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+		advance := func(d time.Duration) {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+		}
+		// 耗尽突发桶：连取 reportBurstTokens 枚全部成功，紧接一次必然失败，
+		// 此刻 tokens==0、lastRef==t0，后续 refill 必走未满桶 else 分支
+		// （余数保留路径），不再是满桶重置路径。
+		for i := 0; i < reportBurstTokens; i++ {
+			if !r.takeToken() {
+				t.Fatalf("takeToken %d rejected while draining burst bucket", i)
+			}
+		}
+		if r.takeToken() {
+			t.Fatal("takeToken succeeded with empty burst bucket")
+		}
+		// 推进 45s（1.5 个周期）：elapsed=45s → add=1，0+1 < burstTokens 命中
+		// else 分支，lastRef 只推进已消费的整周期 → lastRef = t0+30s；
+		// 消费后 tokens 回 0，同一时刻再取必失败。
+		advance(45 * time.Second)
+		if !r.takeToken() {
+			t.Fatal("refill after 45s rejected: expected add=1 via else branch")
+		}
+		if r.takeToken() {
+			t.Fatal("second takeToken at same instant succeeded: tokens should be 0")
+		}
+		// 再推进 15s（累计 t0+60s，距 lastRef 恰满 30s）：add=1 → tokens=1，
+		// 取出成功。若实现丢弃 15s 余数把 lastRef 置成 now（t0+45s），此刻
+		// 仅过 15s，必然拒绝——本条断言正是余数保留的红灯探针。
+		advance(15 * time.Second)
+		if !r.takeToken() {
+			t.Fatal("remainder-preserved refill rejected: lastRef lost 15s remainder")
+		}
+	})
+
+	t.Run("frame_size_boundary_64kib", func(t *testing.T) {
+		// 协议边界是字面常量 65532（64*1024-4，含 4B 头的整包不超 64KiB）；
+		// 测试帧长度一律用硬编码边界值构造，不得引用生产常量生成——否则实现
+		// 回退为旧值时测试边界随之漂移，锁定不住回归。先独立断言生产常量。
+		const frameBodyMax = 65532
+		if reportMaxFrame != frameBodyMax {
+			t.Fatalf("reportMaxFrame = %d, want protocol boundary %d", reportMaxFrame, frameBodyMax)
+		}
+		newPipe := func() (*reportRelay, net.Conn) {
+			srv, cli := net.Pipe()
+			r := &reportRelay{parent: "tTEST", tokens: reportBurstTokens, lastRef: time.Now(),
+				hcPath: writeFakeHc(t, "#!/bin/sh\nexit 0\n")}
+			go r.handleConn(srv)
+			return r, cli
+		}
+		// sendFrame 发出 n 字节帧体并读取完整回包（1 字节状态 + 原因文本）。
+		sendFrame := func(cli net.Conn, payload []byte) (byte, string) {
+			t.Helper()
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+			go func() {
+				_, _ = cli.Write(hdr[:])
+				_, _ = cli.Write(payload)
+			}()
+			_ = cli.SetReadDeadline(time.Now().Add(3 * time.Second))
+			resp, err := io.ReadAll(cli)
+			if err != nil {
+				t.Fatalf("read reply: %v", err)
+			}
+			if len(resp) == 0 {
+				t.Fatal("empty reply frame")
+			}
+			return resp[0], string(resp[1:])
+		}
+		// 恰好等于帧体上限（4B 头 + 64KiB-4 体 = 64KiB 整包）：构造合法
+		// JSON 请求体填充至精确 65532 字节，必须走完校验投递返回
+		// reportStatusOK——不能停在超帧拒绝或 bad request。
+		exactBody := []byte(fmt.Sprintf(`{"to":"tTEST","text":"%s"}`,
+			strings.Repeat("a", frameBodyMax-len(`{"to":"tTEST","text":""}`))))
+		if len(exactBody) != frameBodyMax {
+			t.Fatalf("exact-limit payload = %d bytes, want %d", len(exactBody), frameBodyMax)
+		}
+		_, cli := newPipe()
+		if st, reason := sendFrame(cli, exactBody); st != reportStatusOK {
+			t.Fatalf("exact-limit frame status = %d reason=%q, want ok", st, reason)
+		}
+		_ = cli.Close()
+		// 上限 +1（65533）→ 超帧拒绝，且原因必须点名 frame too large（不是
+		// bad request/short frame 等其它拒绝理由）。
+		_, cli = newPipe()
+		if st, reason := sendFrame(cli, make([]byte, frameBodyMax+1)); st != reportStatusRejected || !strings.Contains(reason, "frame too large") {
+			t.Fatalf("over-limit frame status = %d reason=%q, want reject+frame too large", st, reason)
+		}
+		_ = cli.Close()
+	})
+
+	t.Run("concurrent_dial_close_race", func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			sockDir := t.TempDir()
+			ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+			if err != nil {
+				t.Skipf("unix listen: %v", err)
+			}
+			rctx, rcancel := context.WithCancel(context.Background())
+			r := &reportRelay{
+				parent:    "tTEST",
+				ln:        ln,
+				ctx:       rctx,
+				cancel:    rcancel,
+				serveDone: make(chan struct{}),
+				conns:     make(map[net.Conn]struct{}),
+				tokens:    reportSessionMax,
+				lastRef:   time.Now(),
+				hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+			}
+			go r.serve()
+			var wg sync.WaitGroup
+			for d := 0; d < 8; d++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if c, err := net.Dial("unix", ln.Addr().String()); err == nil {
+						_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+						_ = c.Close()
+					}
+				}()
+			}
+			// 与在途拨号并发关闭：旧实现 Add/Wait 竞态在 -race 下报警。
+			r.close()
+			wg.Wait()
+		}
+	})
+
+	t.Run("delivery_failure_maps_status2", func(t *testing.T) {
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now()}
+		r.hcPath = writeFakeHc(t, "#!/bin/sh\nexit 3\n")
+		status, reason := r.process(reportRequest{To: "tTEST", Text: "x"})
+		if status != reportStatusFailed || !strings.Contains(reason, "delivery") {
+			t.Fatalf("status=%d reason=%q, want failed", status, reason)
+		}
+	})
+
+	t.Run("dash_prefixed_text_gets_leading_space", func(t *testing.T) {
+		logFile := filepath.Join(t.TempDir(), "hc.log")
+		fake := writeFakeHc(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+logFile+"\n")
+		r := &reportRelay{parent: "tTEST", tokens: 1, lastRef: time.Now(), hcPath: fake}
+		if status, _ := r.process(reportRequest{To: "tTEST", Text: "-dash"}); status != reportStatusOK {
+			t.Fatalf("status = %d, want ok", status)
+		}
+		data, err := os.ReadFile(logFile)
+		if err != nil {
+			t.Fatalf("read hc log: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != 3 || lines[0] != "send" || lines[1] != "tTEST" || lines[2] != " -dash" {
+			t.Fatalf("hc argv lines = %v, want [send tTEST ' -dash']", lines)
+		}
+	})
+
+	t.Run("slow_connection_times_out", func(t *testing.T) {
+		sockDir := t.TempDir()
+		ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+		if err != nil {
+			t.Skipf("unix listen: %v", err)
+		}
+		r := &reportRelay{parent: "tTEST", ln: ln, tokens: 1, lastRef: time.Now()}
+		old := reportConnReadTimeout
+		reportConnReadTimeout = 200 * time.Millisecond
+		// 先关停中继再恢复全局超时：全局变量的恢复期若排在 r.close() 之前，
+		// 高负载下 handler 可能按旧值再跑一轮，构成时序抖动源。
+		defer func() {
+			r.close()
+			reportConnReadTimeout = old
+		}()
+		go r.serve()
+		conn, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		// 永不写字节：服务端读超时应主动关连接并回拒绝帧。
+		deadline := time.After(3 * time.Second)
+		reply := make(chan []byte, 1)
+		go func() {
+			buf := make([]byte, 256)
+			n, _ := conn.Read(buf)
+			reply <- buf[:n]
+		}()
+		select {
+		case b := <-reply:
+			if len(b) == 0 || b[0] != reportStatusRejected {
+				t.Fatalf("reply = %v, want reject frame", b)
+			}
+		case <-deadline:
+			t.Fatal("server did not close slow connection within read timeout")
+		}
+	})
+
+	t.Run("drain_timeout_cancels_inflight_deliver", func(t *testing.T) {
+		// 假 hc 先落标记文件证明子进程确实启动，再阻塞 5s 制造在途投递。
+		marker := filepath.Join(t.TempDir(), "hc-started")
+		rctx, rcancel := context.WithCancel(context.Background())
+		sd := make(chan struct{})
+		close(sd) // 不经 serve()：预关闭 serveDone 让 close() 直走 drain 路径
+		r := &reportRelay{
+			parent:    "tTEST",
+			ctx:       rctx,
+			cancel:    rcancel,
+			serveDone: sd,
+			conns:     make(map[net.Conn]struct{}),
+			tokens:    1,
+			lastRef:   time.Now(),
+			hcPath:    writeFakeHc(t, "#!/bin/sh\ntouch "+marker+"\nsleep 5\n"),
+		}
+		// 在途 deliver 必须先于 close() 登记 wg，消除 Add/Wait 竞态。
+		r.wg.Add(1)
+		statusCh := make(chan byte, 1)
+		go func() {
+			defer r.wg.Done()
+			st, _ := r.process(reportRequest{To: "tTEST", Text: "x"})
+			statusCh <- st
+		}()
+		waitForFile(t, marker, 3*time.Second)
+
+		old := reportDrainTimeout
+		reportDrainTimeout = 80 * time.Millisecond
+		defer func() { reportDrainTimeout = old }()
+		start := time.Now()
+		r.close()
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Fatalf("close() took %v, want < 1s (drain timeout must cancel in-flight deliver)", elapsed)
+		}
+		select {
+		case st := <-statusCh:
+			if st == reportStatusOK {
+				t.Fatal("in-flight deliver reported ok after drain-timeout cancel")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("deliver goroutine did not return after drain-timeout cancel")
+		}
+	})
+
+	t.Run("active_conn_cap_prevents_dos", func(t *testing.T) {
+		sockDir := t.TempDir()
+		ln, err := net.Listen("unix", filepath.Join(sockDir, "report.sock"))
+		if err != nil {
+			t.Skipf("unix listen: %v", err)
+		}
+		rctx, rcancel := context.WithCancel(context.Background())
+		r := &reportRelay{
+			parent:    "tTEST",
+			ln:        ln,
+			ctx:       rctx,
+			cancel:    rcancel,
+			serveDone: make(chan struct{}),
+			conns:     make(map[net.Conn]struct{}),
+			tokens:    reportSessionMax,
+			lastRef:   time.Now(),
+			hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+		}
+		go r.serve()
+		defer r.close()
+
+		// 32 个空闲连接不写数据，占满在途上限。
+		idle := make([]net.Conn, 0, reportMaxActiveConns)
+		for i := 0; i < reportMaxActiveConns; i++ {
+			c, err := net.Dial("unix", ln.Addr().String())
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			idle = append(idle, c)
+		}
+		defer func() {
+			for _, c := range idle {
+				_ = c.Close()
+			}
+		}()
+		waitForConns(t, r, reportMaxActiveConns)
+
+		// 第 33 个连接立即收到拒绝帧（含 busy），不占名额。
+		extra, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial extra: %v", err)
+		}
+		_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 256)
+		n, err := extra.Read(buf)
+		_ = extra.Close()
+		if err != nil || n == 0 {
+			t.Fatalf("read reject frame: n=%d err=%v", n, err)
+		}
+		if buf[0] != reportStatusRejected || !strings.Contains(string(buf[1:n]), "busy") {
+			t.Fatalf("reject frame = %q, want status %d + busy", string(buf[:n]), reportStatusRejected)
+		}
+
+		// 释放一个名额后正常请求立即成功。
+		_ = idle[0].Close()
+		idle = idle[1:]
+		waitForConns(t, r, reportMaxActiveConns-1)
+		ok, err := net.Dial("unix", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial after free: %v", err)
+		}
+		defer ok.Close()
+		st, reason := sendReportRequest(t, ok, "tTEST", "hi")
+		if st != reportStatusOK {
+			t.Fatalf("after freeing a slot status=%d reason=%q, want ok", st, reason)
+		}
+	})
+
+	t.Run("accept_consec_error_cap_exits", func(t *testing.T) {
+		l := &errListener{err: errors.New("boom")}
+		r := newTestReportRelay(t, l)
+		done := make(chan struct{})
+		go func() {
+			r.serve()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("serve() did not exit after %d consecutive accept errors", reportAcceptMaxConsecErrs)
+		}
+		if got := atomic.LoadInt32(&l.calls); got != int32(reportAcceptMaxConsecErrs) {
+			t.Fatalf("Accept called %d times, want exactly %d", got, reportAcceptMaxConsecErrs)
+		}
+		select {
+		case <-r.serveDone:
+		case <-time.After(time.Second):
+			t.Fatal("serveDone not closed after serve() exit")
+		}
+	})
+}
+
+// sendReportRequest 向中继连接发送一帧 {to,text} 并读取完整回包，返回
+// 1 字节状态与原因文本。
+func sendReportRequest(t *testing.T, c net.Conn, to, text string) (byte, string) {
+	t.Helper()
+	payload, err := json.Marshal(reportRequest{To: to, Text: text})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := c.Write(hdr[:]); err != nil {
+		t.Fatalf("write frame hdr: %v", err)
+	}
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("write frame body: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 512)
+	n, err := c.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("read reply: n=%d err=%v", n, err)
+	}
+	return buf[0], string(buf[1:n])
+}
+
+// waitForConns 轮询等待中继登记的活跃连接数达到 want（注册/注销都是
+// 异步的，固定 sleep 属时序抖动源）。
+func waitForConns(t *testing.T, r *reportRelay, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		r.mu.Lock()
+		n := len(r.conns)
+		r.mu.Unlock()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("active conns = %d, want %d", n, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForFile 轮询等待标记文件出现（子进程启动确认用）。
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("marker file %q did not appear within %v", path, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// newTestReportRelay 构造一个带假 hc 与后台 ctx 的中继实例。
+func newTestReportRelay(t *testing.T, ln net.Listener) *reportRelay {
+	t.Helper()
+	rctx, rcancel := context.WithCancel(context.Background())
+	t.Cleanup(rcancel)
+	return &reportRelay{
+		parent:    "tTEST",
+		ln:        ln,
+		ctx:       rctx,
+		cancel:    rcancel,
+		serveDone: make(chan struct{}),
+		conns:     make(map[net.Conn]struct{}),
+		tokens:    reportSessionMax,
+		lastRef:   time.Now(),
+		hcPath:    writeFakeHc(t, "#!/bin/sh\nexit 0\n"),
+	}
+}
+
+// errListener 是一个 Accept 永远返回固定错误的伪 net.Listener。
+type errListener struct {
+	calls int32
+	err   error
+}
+
+func (l *errListener) Accept() (net.Conn, error) {
+	atomic.AddInt32(&l.calls, 1)
+	return nil, l.err
+}
+func (l *errListener) Close() error   { return nil }
+func (l *errListener) Addr() net.Addr { return dummyAddr("err-listener") }
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "dummy" }
+func (d dummyAddr) String() string  { return string(d) }
+
+func writeFakeHc(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fake-hc")
+	if err := os.WriteFile(p, []byte(body), 0o700); err != nil {
+		t.Fatalf("write fake hc: %v", err)
+	}
+	return p
+}
+
+// captureRunMain 在本进程内调用 runMain 并捕获其 stdout/stderr（受限子进程
+// 经 os.Executable() 复用测试二进制，TestMain 的 envSbxChildSpecKey 分支进入
+// runChildFromEnv）。
+func captureRunMain(t *testing.T, args []string) (string, int) {
+	t.Helper()
+	origOut, origErr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	outCh := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(rOut); outCh <- b }()
+	errCh := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(rErr); errCh <- b }()
+
+	os.Stdout, os.Stderr = wOut, wErr
+	code := runMain(args)
+	os.Stdout, os.Stderr = origOut, origErr
+	_ = wOut.Close()
+	_ = wErr.Close()
+	out := append(<-outCh, <-errCh...)
+	return string(out), code
+}
+
+// hostShmSegments 返回宿主 /proc/sysvipc/shm 中除表头外的数据行集合
+// （每行含 key/shmid/perms/size/attach 计数字段），供探针前后对比；
+// 宿主文件不可读时返回空集合并由调用方决定是否跳过断言。
+func hostShmSegments(t *testing.T) map[string]struct{} {
+	t.Helper()
+	segs := make(map[string]struct{})
+	b, err := os.ReadFile("/proc/sysvipc/shm")
+	if err != nil {
+		t.Logf("host /proc/sysvipc/shm unreadable: %v", err)
+		return segs
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if i > 0 && strings.TrimSpace(line) != "" {
+			segs[line] = struct{}{}
+		}
+	}
+	return segs
+}
+
+// TestSbxReportRelayIntegration 集成回归：reviewer-agent + --report-to 下
+// 沙盒内 hc 受限客户端经 report.sock 中继回报，同时验证 socket 白名单视图与
+// 环境剥离。假 hc 路径经 hcPathOverride 注入（等价于构建期 -ldflags -X，
+// 生产不可经环境覆盖）。
+func TestSbxReportRelayIntegration(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mount namespace isolation requires CAP_SYS_ADMIN (euid 0)")
+	}
+	workdir := t.TempDir()
+	logFile := filepath.Join(t.TempDir(), "hc.log")
+	fake := writeFakeHc(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+logFile+"\nexit 0\n")
+
+	oldOverride := hcPathOverride
+	hcPathOverride = fake
+	defer func() { hcPathOverride = oldOverride }()
+	// 外层 HC_TERMINAL_ID 与 --report-to 不同：不禁用中继，且应透传进沙盒。
+	t.Setenv("HC_TERMINAL_ID", "t999")
+	// 父进程预置非空哨兵，验证外部指针类变量在沙盒内被全部剥离；
+	// --env 同口径校验（HC_TERMINAL_SOCKET 走 --env 显式注入）。
+	t.Setenv("HC_SCOPE", "leak")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/leak.sock")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/leak")
+	t.Setenv("GPG_AGENT_INFO", "leak")
+
+	moshiPresent := false
+	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
+		moshiPresent = true
+	}
+	// 宿主 /etc/resolv.conf 存在且可读时，沙盒内同名路径必须可读
+	// （systemd-resolved stub 场景靠 /run 白名单回绑还原；普通文件场景
+	// /etc 不在覆盖范围内）。宿主不可读时跳过该断言防假绿。
+	resolvConfReadable := false
+	if f, err := os.Open("/etc/resolv.conf"); err == nil {
+		_ = f.Close()
+		resolvConfReadable = true
+	} else {
+		t.Logf("host /etc/resolv.conf unreadable (skip precondition): %v", err)
+	}
+	// 宿主前置核验：/run 全权 socket 面在宿主上确实存在，沙盒内断言
+	// 才有隐藏语义（非假绿）；宿主不存在时记录跳过该断言。
+	type runSockCheck struct{ path, key string }
+	runSocks := []runSockCheck{
+		{"/run/systemd/private", "run_systemd_private"},
+		{"/run/docker.sock", "run_docker_sock"},
+		{"/run/containerd/containerd.sock", "run_containerd_sock"},
+		{"/run/dbus/system_bus_socket", "run_dbus_sock"},
+		{"/run/user/0/herdr-core/default.sock", "run_herdr_sock"},
+	}
+	var runSockScriptLines []string
+	var runSockAsserts []runSockCheck
+	for _, sc := range runSocks {
+		// 存在为 socket 或普通文件都算“宿主上可达对象存在”。
+		if st, err := os.Stat(sc.path); err == nil && (st.Mode()&os.ModeSocket != 0 || st.Mode().IsRegular()) {
+			runSockScriptLines = append(runSockScriptLines,
+				"[ -e "+sc.path+" ] && echo "+sc.key+"=visible || echo "+sc.key+"=hidden")
+			runSockAsserts = append(runSockAsserts, sc)
+		} else {
+			t.Logf("host %s absent (skip precondition): socket-hiding assertion not applicable", sc.path)
+		}
+	}
+
+	probeBin, _ := os.Executable()
+	// 沙盒内经 broker 的 go test 子进程 capabilities 证据：在 workdir 下
+	// 预置最小模块（go test 二进制经 pi-test-runner 降权后读取自身
+	// /proc/self/status 打印 CapEff）。
+	capTestDir := filepath.Join(workdir, "captest")
+	if err := os.MkdirAll(capTestDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll captest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(capTestDir, "go.mod"),
+		[]byte("module example.com/captest\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatalf("write captest go.mod: %v", err)
+	}
+	capTestSrc := `package captest
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestCaps(t *testing.T) {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "CapEff:\t"); ok {
+			t.Logf("gotest_capeff=%s", v)
+			if v != "0000000000000022" {
+				t.Fatalf("CapEff = %s, want 0000000000000022", v)
+			}
+			return
+		}
+	}
+	t.Fatal("CapEff line not found in /proc/self/status")
+}
+`
+	if err := os.WriteFile(filepath.Join(capTestDir, "cap_test.go"), []byte(capTestSrc), 0o644); err != nil {
+		t.Fatalf("write cap_test.go: %v", err)
+	}
+	// 宿主 /run 全权 socket 路径集同时用于两类断言：沙盒内直连路径 ENOENT
+	// （runSockAsserts），以及经 /proc/1/root 魔链访问 ENOENT
+	// （PROC1_ROOT_PROBE_PATHS 传给探针按路径逐个 stat）。
+	var proc1ProbePaths []string
+	for _, sc := range runSockAsserts {
+		proc1ProbePaths = append(proc1ProbePaths, sc.path)
+	}
+	script := `
+printf 'sh_pid=%s\n' "$$"
+printf 'init_comm=%s\n' "$(cat /proc/1/comm 2>/dev/null)"
+hc send tTEST hello
+printf 'send_hi_rc=%d\n' "$?"
+hc run true
+printf 'hc_run_rc=%d\n' "$?"
+hc send tOTHER x
+printf 'send_other_rc=%d\n' "$?"
+"$FAKE_HC_ABS" ls
+printf 'abs_hc_rc=%d\n' "$?"
+"$PROBE_BIN" 2>/dev/null
+[ -S /run/user/0/systemd/private ] && echo systemd_sock=visible || echo systemd_sock=hidden
+[ -S /run/user/0/bus ] && echo bus_sock=visible || echo bus_sock=hidden
+[ -S /run/user/0/herdr-core/default.sock ] && echo hc_sock=visible || echo hc_sock=hidden
+[ -S /run/user/0/moshi-hook.sock ] && echo moshi_sock=visible || echo moshi_sock=absent
+[ -r /etc/resolv.conf ] && echo resolv_conf=readable || echo resolv_conf=unreadable
+[ -n "$HC_TERMINAL_SOCKET" ] && echo hc_term_sock=set || echo hc_term_sock=empty
+[ -n "$HC_SCOPE" ] && echo hc_scope=set || echo hc_scope=empty
+[ -n "$SSH_AUTH_SOCK" ] && echo ssh_sock=set || echo ssh_sock=empty
+[ -n "$DBUS_SESSION_BUS_ADDRESS" ] && echo dbus_addr=set || echo dbus_addr=empty
+[ -n "$GPG_AGENT_INFO" ] && echo gpg_info=set || echo gpg_info=empty
+echo "xdg_rt=$XDG_RUNTIME_DIR"
+[ -n "$HC_TERMINAL_ID" ] && echo hc_term_id=kept || echo hc_term_id=empty
+echo "goexec_dir=$PI_SANDBOX_GO_EXEC_DIR"
+echo "gotmpdir=$GOTMPDIR"
+# PID-1 孤儿收尸实证（有界确认，无假绿）：子 shell 后台启动轮询
+# orphan.release 的孙进程并记下其 PID，子 shell 随即退出使孙进程成为
+# 孤儿；主脚本先确证孤儿被 PID 1 接管（PPid=1），再放行退出并确证
+# /proc/<pid> 目录已消失（PID 1 经 Wait4 收割），最后扫 /proc 断言零僵尸。
+( (while [ ! -f "$TMPDIR/orphan.release" ]; do :; done) &
+  printf '%s\n' "$!" > "$TMPDIR/orphan.pid" )
+i=0; ORPHAN_PID=""
+while [ -z "$ORPHAN_PID" ] && [ $i -lt 20000 ]; do
+	[ -s "$TMPDIR/orphan.pid" ] && ORPHAN_PID=$(cat "$TMPDIR/orphan.pid")
+	i=$((i+1))
+done
+i=0
+while [ $i -lt 20000 ]; do
+	if [ -n "$ORPHAN_PID" ] && grep -q '^PPid:[[:space:]]*1$' "/proc/$ORPHAN_PID/status" 2>/dev/null; then
+		break
+	fi
+	j=0; while [ $j -lt 500 ]; do j=$((j+1)); done
+	i=$((i+1))
+done
+if grep -q '^PPid:[[:space:]]*1$' "/proc/$ORPHAN_PID/status" 2>/dev/null; then
+	echo orphan_adopted=1
+else
+	echo orphan_adopted=0
+fi
+: > "$TMPDIR/orphan.release"
+i=0
+while [ -e "/proc/$ORPHAN_PID" ] && [ $i -lt 200000 ]; do i=$((i+1)); done
+if [ ! -e "/proc/$ORPHAN_PID" ]; then
+	echo orphan_reaped=1
+else
+	echo orphan_reaped=0
+	grep '^State:' "/proc/$ORPHAN_PID/status" 2>/dev/null || true
+fi
+z=0; for s in /proc/[0-9]*/status; do grep -q 'State:.*Z' "$s" && z=$((z+1)); done
+printf 'zombie_count=%s\n' "$z"
+# 经 helper broker 的 go test 子孙同样须满足 CapEff=0x22（能力裁剪经
+# fork/exec 继承）。
+cd "$CAPTEST_DIR" && go test -v -count=1 . > "$TMPDIR/captest.out" 2>&1
+printf 'gotest_rc=%d\n' "$?"
+grep gotest_capeff "$TMPDIR/captest.out" || true
+`
+	script += strings.Join(runSockScriptLines, "\n") + "\n"
+	// CLONE_NEWIPC 实证对照基线：探针前宿主 SysV shm 段集合（探针后
+	// 断言宿主无新增 size=probeShmMagicSize 的残留段——独立 IPC ns
+	// 销毁时沙盒内 shmget 段随 ns 自动回收，不泄漏到宿主）。
+	shmBefore := hostShmSegments(t)
+	out, code := captureRunMain(t, []string{
+		"--preset", "reviewer-agent", "--workdir", workdir,
+		"--report-to", "tTEST",
+		"--env", "HC_TERMINAL_SOCKET=/run/user/0/herdr-core/default.sock",
+		"--env", "FAKE_HC_ABS=" + fake,
+		"--env", "PROBE_BIN=" + probeBin,
+		"--env", "CAPTEST_DIR=" + capTestDir,
+		"--env", "GO_WANT_SBX_MOUNT_PROBE=1",
+		"--env", "HOST_PARENT_PID=" + strconv.Itoa(os.Getpid()),
+		"--env", "PROC1_ROOT_PROBE_PATHS=" + strings.Join(proc1ProbePaths, " "),
+		"--env", "PI_SANDBOX_GO_EXEC_DIR=/tmp/hijack", // 必须被回钉回 pi-reviewer-exec-*
+		"--exec", filepath.Dir(probeBin),
+		"--", "/bin/sh", "-c", script,
+	})
+	if code != 0 {
+		t.Fatalf("sbx exit = %d, want 0; output:\n%s", code, out)
+	}
+
+	assertOut := func(key, want string) {
+		t.Helper()
+		if !strings.Contains(out, key+"="+want) {
+			t.Fatalf("missing %q; output:\n%s", key+"="+want, out)
+		}
+	}
+	assertOut("send_hi_rc", "0")
+	assertOut("hc_run_rc", "126")
+	assertOut("send_other_rc", "1")
+	assertOut("abs_hc_rc", "126")
+	assertOut("systemd_sock", "hidden")
+	assertOut("bus_sock", "hidden")
+	assertOut("hc_sock", "hidden")
+	for _, sc := range runSockAsserts {
+		assertOut(sc.key, "hidden")
+	}
+	if moshiPresent {
+		assertOut("moshi_sock", "visible")
+		// 白名单回绑仅明确接受两类结果：connected 或 ECONNREFUSED（socket
+		// 可达但无监听端）。EROFS（回绑被只读 remount 覆盖）、ENOENT
+		// （未回绑）与 EACCES/超时等其它错误一律判失败——拨号被权限阻断
+		// 不得假绿。
+		if !strings.Contains(out, "moshi_dial=connected") && !strings.Contains(out, "moshi_dial=refused(") {
+			t.Fatalf("moshi_dial verdict missing or unexpected (want connected or refused); output:\n%s", out)
+		}
+	}
+	if resolvConfReadable {
+		assertOut("resolv_conf", "readable")
+	}
+	assertOut("hc_term_sock", "empty")
+	assertOut("hc_scope", "empty")
+	assertOut("ssh_sock", "empty")
+	assertOut("dbus_addr", "empty")
+	assertOut("gpg_info", "empty")
+	assertOut("hc_term_id", "kept")
+
+	// mount-seal seccomp 锁：amd64 与 arm64 下探针的 setns/umount2 与
+	// 越狱/进程控制族（chroot/ptrace/pidfd_getfd）及宿主全局副作用族
+	//（bpf/finit_module/open_by_handle_at）必须全部返回 EPERM
+	// （探针与过滤器同用 x/sys/unix 的架构相关调用号）。
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+		assertOut("setns_errno", "1")
+		assertOut("umount_errno", "1")
+		assertOut("chroot_errno", "1")
+		assertOut("ptrace_errno", "1")
+		assertOut("pidfd_getfd_errno", "1")
+		assertOut("bpf_errno", "1")
+		assertOut("finit_module_errno", "1")
+		assertOut("open_by_handle_at_errno", "1")
+		if runtime.GOARCH == "amd64" {
+			assertOut("x32_getpid_errno", "1") // x32 ABI 位必须被 JGE 规则封堵
+		}
+	default:
+		t.Logf("GOARCH=%s: mount-seal filter not installed, probe not asserted", runtime.GOARCH)
+	}
+
+	// capabilities 根治裁剪：沙盒内 CapEff/CapPrm/CapBnd 精确为
+	// 0x22（CAP_DAC_OVERRIDE|CAP_KILL），CapInh/CapAmb 全零；经 helper
+	// broker 的 go test 子孙同样满足 CapEff=0x22（fork/exec 继承裁剪后
+	// 能力集）。
+	assertOut("capinh", "0000000000000000")
+	assertOut("capprm", "0000000000000022")
+	assertOut("capeff", "0000000000000022")
+	assertOut("capbnd", "0000000000000022")
+	assertOut("capamb", "0000000000000000")
+	assertOut("gotest_rc", "0")
+	assertOut("gotest_capeff", "0000000000000022")
+
+	// PID-1 孤儿收尸：孤儿先被 PID 1 接管（orphan_adopted），放行退出后
+	// /proc/<pid> 彻底消失（orphan_reaped——PID 1 经 Wait4 收割），全量
+	// /proc 扫描零僵尸残留。
+	assertOut("orphan_adopted", "1")
+	assertOut("orphan_reaped", "1")
+	assertOut("zombie_count", "0")
+
+	// 独立 PID 命名空间：PID 1 必须是 sbx init 本体（测试二进制自身；
+	// Apply 的 helper/broker 会合法占用 2..N，故不钉死受测命令为 PID 2，
+	// 改以「PID 1 身份 + 小号 PID + 宿主 PID ENOENT」三重证据锁定新 ns）。
+	wantInitComm := filepath.Base(probeBin)
+	if len(wantInitComm) > 15 { // comm 上限 TASK_COMM_LEN-1=15
+		wantInitComm = wantInitComm[:15]
+	}
+	assertOut("init_comm", wantInitComm)
+	assertOut("host_pid", "hidden")
+
+	// CLONE_NEWIPC 隔离：独立 IPC ns 内 sysvipc 初始视图必为空；沙盒内
+	// 私有 shmget 段退出后随 ns 销毁——宿主 /proc/sysvipc/shm 不得新增
+	// size=probeShmMagicSize 的残留段（以魔数 size 区分宿主既有段与
+	// 探针段，不比对 shmid 值，避免极小概率 ID 号巧合误判）。
+	assertOut("sysvipc_init_shm", "0")
+	sawShmid := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "sandbox_shmid="); ok {
+			sawShmid = true
+			if _, err := strconv.Atoi(v); err != nil {
+				t.Fatalf("sandbox_shmid = %q: shmget inside sandbox failed; output:\n%s", v, out)
+			}
+		}
+	}
+	if !sawShmid {
+		t.Fatalf("missing sandbox_shmid line; output:\n%s", out)
+	}
+	for seg := range hostShmSegments(t) {
+		if _, known := shmBefore[seg]; !known {
+			fields := strings.Fields(seg)
+			// /proc/sysvipc/shm 列布局：key shmid perms size ...；
+			// 新增行且 size 字段（第 4 列）命中魔数即判定沙盒 IPC 段残留宿主。
+			if len(fields) >= 4 && fields[3] == strconv.Itoa(probeShmMagicSize) {
+				t.Fatalf("host sysvipc shm leaked segment after sandbox exit (magic size %d): %q", probeShmMagicSize, seg)
+			}
+		}
+	}
+	for _, key := range []string{"sh_pid", "self_pid"} {
+		matched := false
+		for _, line := range strings.Split(out, "\n") {
+			if v, ok := strings.CutPrefix(line, key+"="); ok {
+				matched = true
+				n, err := strconv.Atoi(v)
+				if err != nil || n <= 0 || n >= 500 {
+					t.Fatalf("%s = %q: not a small sandbox pidns pid (host pid leak?); output:\n%s", key, v, out)
+				}
+			}
+		}
+		if !matched {
+			t.Fatalf("missing %s line; output:\n%s", key, out)
+		}
+	}
+	for _, sc := range runSockAsserts {
+		key := "proc1root_" + strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(strings.TrimPrefix(sc.path, "/"))
+		assertOut(key, "hidden")
+	}
+
+	// PI_SANDBOX_GO_EXEC_DIR：--env 劫持值被回钉回预设注入的
+	// pi-reviewer-exec-*，且 GOTMPDIR 与其同根（gotmp 子目录）。
+	sawGoExec := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "goexec_dir="); ok {
+			sawGoExec = true
+			if !strings.HasPrefix(filepath.Base(v), "pi-reviewer-exec-") {
+				t.Fatalf("PI_SANDBOX_GO_EXEC_DIR = %q, want /tmp/pi-reviewer-exec-* (re-pin failed)", v)
+			}
+			if v == "/tmp/hijack" {
+				t.Fatalf("PI_SANDBOX_GO_EXEC_DIR hijack survived: %q", v)
+			}
+		}
+	}
+	if !sawGoExec {
+		t.Fatalf("missing goexec_dir line; output:\n%s", out)
+	}
+
+	// XDG_RUNTIME_DIR 由预设回钉为私有目录（非宿主 /run/user/0）。
+	sawXDG := false
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "xdg_rt="); ok {
+			sawXDG = true
+			if v == "" || v == "/run/user/0" {
+				t.Fatalf("XDG_RUNTIME_DIR = %q, want private runtime dir", v)
+			}
+		}
+	}
+	if !sawXDG {
+		t.Fatalf("missing xdg_rt line; output:\n%s", out)
+	}
+
+	// 假 hc 收到的 argv 必须是 send tTEST hello。
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("fake hc log missing (delivery never happened): %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"send", "tTEST", "hello"}
+	if len(got) != len(want) {
+		t.Fatalf("fake hc argv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fake hc argv = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestSbxCwdRebindAfterCover 覆盖挂载后继承 cwd 重绑回归（reviewer #1）：
+// tmpfs 覆盖只改变其后的绝对路径解析，不迁移内核已持有的 fs->pwd——沙盒
+// 内相对路径仍可引用覆盖前的底层目录。修复后隔离流程在全部覆盖完成后
+// os.Chdir 回原 cwd 从新视图重解析：
+//   - 原 cwd 为 /run/user/0（宿主存在）：目录本身在回绑白名单项时被重建，
+//     重绑成功；相对路径 herdr-core/default.sock 必须 ENOENT（未回绑），
+//     moshi-hook.sock 回绑后相对路径可见；
+//   - 原 cwd 为 /run/user/0/herdr-core（宿主存在时）：新视图下该子目录未
+//     重建，rebind-cwd 返回 ENOENT，必须 fail-closed 非零退出。
+func TestSbxCwdRebindAfterCover(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mount namespace isolation requires CAP_SYS_ADMIN (euid 0)")
+	}
+	if _, err := os.Stat("/run/user/0"); err != nil {
+		t.Skipf("host /run/user/0 absent: %v", err)
+	}
+	workdir := t.TempDir()
+
+	moshiPresent := false
+	if st, err := os.Stat("/run/user/0/moshi-hook.sock"); err == nil && st.Mode()&os.ModeSocket != 0 {
+		moshiPresent = true
+	}
+
+	out, code := invokeSbxSubprocessDir(t, "/run/user/0", nil,
+		"--preset", "reviewer-agent", "--workdir", workdir,
+		"--", "/bin/sh", "-c",
+		`[ -e herdr-core/default.sock ] && echo rel_herdr=visible || echo rel_herdr=hidden
+[ -e moshi-hook.sock ] && echo rel_moshi=visible || echo rel_moshi=absent`,
+	)
+	if !moshiPresent {
+		// 无回绑项时覆盖层不重建 /run/user/0：原 cwd 在新视图不存在，
+		// fail-closed 拒绝启动同样满足「不得静默继承旧目录项」的契约。
+		if code == 0 {
+			t.Fatalf("cwd under un-recreated /run/user/0 must fail closed, got 0; output:\n%s", out)
+		}
+		return
+	}
+	if code != 0 {
+		t.Fatalf("sbx exit = %d, want 0 (rebound cwd should resolve /run/user/0); output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "rel_herdr=hidden") {
+		t.Fatalf("relative herdr-core/default.sock must be ENOENT after cwd rebind; output:\n%s", out)
+	}
+	if !strings.Contains(out, "rel_moshi=visible") {
+		t.Fatalf("relative moshi-hook.sock must be visible via rebind; output:\n%s", out)
+	}
+
+	if _, err := os.Stat("/run/user/0/herdr-core"); err == nil {
+		out, code := invokeSbxSubprocessDir(t, "/run/user/0/herdr-core", nil,
+			"--preset", "reviewer-agent", "--workdir", workdir,
+			"--", "/bin/sh", "-c", "echo SHOULD_NOT_REACH",
+		)
+		if code == 0 || strings.Contains(out, "SHOULD_NOT_REACH") {
+			t.Fatalf("cwd inside covered /run/user/0/herdr-core must fail closed (exit=%d); output:\n%s", code, out)
+		}
+	} else {
+		t.Log("host /run/user/0/herdr-core absent; fail-closed case not applicable")
+	}
 }
