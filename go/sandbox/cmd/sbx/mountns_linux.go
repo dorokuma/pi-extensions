@@ -19,9 +19,11 @@ import (
 // CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC）：sbx 外层父进程以
 // Cloneflags=CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 派生受限子进程，
 // 子进程直接作为新 PID 命名空间的 PID 1 启动，并同时获得独立 IPC
-// 命名空间（SysV shm/sem/msg 与 POSIX mqueue 与宿主完全隔离——沙盒
-// 内读不到宿主共享内存段，沙盒内创建的 IPC 对象随命名空间销毁，
-// 不留宿主持久残留）；在进入 Landlock 之前
+// 命名空间（隔离 SysV shm/sem/msg 与按名 mq_open/mq_unlink——沙盒
+// 内读不到宿主共享内存段且按名打开宿主 POSIX 队列返回 ENOENT，沙盒
+// 内创建的 IPC 对象随命名空间销毁不留宿主持久残留；未覆盖继承的
+// /dev/mqueue 挂载视图，若宿主预存可读队列节点仍可经路径 O_RDONLY
+// 打开并 mq_timedreceive 取走消息，写/建由 Landlock 阻断）；在进入 Landlock 之前
 // （runChildFromEnv → isolateRuntimeSockets → Apply）把宿主暴露的 IPC
 // socket 面与进程面收成白名单视图：
 //   - 动手前先硬校验 os.Getpid()==1：进程未在独立 PID 命名空间内时绝不
@@ -119,7 +121,9 @@ const (
 // childSysProcAttr 返回派生受限子进程使用的 SysProcAttr：
 // Cloneflags=CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 在 clone 时同时创建
 // 独立挂载命名空间、独立 PID 命名空间与独立 IPC 命名空间——后者切断
-// 沙盒读写宿主 SysV 共享内存/信号量/消息队列及 POSIX mqueue 的通道，
+// 沙盒读写宿主 SysV 共享内存/信号量/消息队列及按名
+// mq_open/mq_unlink 的通道（继承的 /dev/mqueue 挂载视图未覆盖，见文件头
+// 注释），
 // 沙盒内新建的 IPC 对象随命名空间销毁、不残留宿主。子进程直接以新
 // PID ns 的 PID 1 启动（Go 1.26 实测
 // cmd.Start() 子进程 os.Getpid()==1；不能用 Unshareflags 携带

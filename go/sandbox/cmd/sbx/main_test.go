@@ -192,7 +192,7 @@ func runMountNSProbe() int {
 		int(bpfE), int(finitE), int(obhE))
 
 	// CLONE_NEWIPC 隔离实证：独立 IPC ns 内 /proc/sysvipc/shm 必为空
-	// （宿主 SysV shm/sem/msg 与 POSIX mqueue 不可见）；再经 shmget
+	// （宿主 SysV shm/sem/msg 不可见，按名 mq_open 亦隔离）；再经 shmget
 	// 创建私有段验证自身 IPC 可用且退出后随 ns 自动销毁不残留宿主。
 	if b, err := os.ReadFile("/proc/sysvipc/shm"); err == nil {
 		n := 0

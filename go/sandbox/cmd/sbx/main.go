@@ -70,7 +70,8 @@ type childExecSpec struct {
 	Env         []string `json:"env"`
 	BestEffort  bool     `json:"best_effort"`
 	EntryAgents []string `json:"entry_agents"`
-	// MountNS 记录父进程是否以 CLONE_NEWNS 派生子进程；仅当为 true 时
+	// MountNS 记录父进程是否以 CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC
+	// 三命名空间联合 Cloneflags 派生子进程的标记；仅当为 true 时
 	// 子进程才执行挂载命名空间内的 socket 白名单视图（--best-effort 下
 	// unshare 失败回退不 unshare 时绝不碰宿主挂载命名空间）。
 	MountNS bool `json:"mount_ns"`
@@ -430,7 +431,8 @@ func runMain(args []string) int {
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
 // Linux 下子进程以 CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC 进入独立挂载、PID
-// 与 IPC 命名空间（独立 IPC ns 同时隔离 SysV shm/sem/msg 与 POSIX mqueue；
+// 与 IPC 命名空间（隔离 SysV shm/sem/msg 与按名 mq_open/mq_unlink
+// （继承 /dev/mqueue 挂载未覆盖）；
 // 子进程即新 PID ns
 // 的 PID 1，完成隔离后担任轻量 init 派生目标命令（记录目标子进程 PID——
 // sandbox.Apply 会先派生 helper/broker，业务进程 PID 不固定为 2；socket

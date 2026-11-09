@@ -10,7 +10,7 @@
   `landlock_restrict_self` 与 `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`，无需 `root` 或 `CAP_SYS_ADMIN` 权限。
   命令行 `sbx` 除 Landlock 外默认对受限子进程启用 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`
   联合命名空间隔离（socket 白名单视图 + 独立 `/proc` + 独立 IPC
-  命名空间（SysV shm/sem/msg 与 POSIX mqueue）+ PID 1 轻量 init +
+  命名空间（隔离 SysV shm/sem/msg 与按名解析的 mq_open 系统调用）+ PID 1 轻量 init +
   Linux capabilities 裁剪至 `0x22` + mount-seal seccomp 锁），该路径需要
   `CAP_SYS_ADMIN`；无此能力时严格模式
   拒绝启动（父进程派生子进程失败退 `126`），`--best-effort` 下降级为不
@@ -75,9 +75,11 @@ go run ./cmd/sbx --preset reviewer-agent --workdir /path/to/repo --report-to t28
 ### 沙盒 socket 白名单视图、进程面隔离与环境剥离（Linux，`CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`）
 
 受限子进程在 `clone` 时同时进入独立挂载命名空间、独立 PID 命名空间与
-独立 IPC 命名空间（后者隔离 SysV `shm`/`sem`/`msg` 与 POSIX `mqueue`：
-沙盒内读不到宿主共享内存段，沙盒内创建的 IPC 对象随命名空间销毁不留
-宿主持久残留；直接作为新 PID ns 的 PID 1 启动），在 `sandbox.Apply` 之前完成全部隔离步骤：
+独立 IPC 命名空间（后者隔离 SysV `shm`/`sem`/`msg` 与按命名空间解析的 POSIX
+`mq_open`/`mq_unlink` 系统调用：沙盒内读不到宿主共享内存段且无法按名打开宿主
+POSIX 消息队列，沙盒内创建的 SysV IPC 对象随命名空间销毁不留宿主持久残留；
+注：继承的宿主 /dev/mqueue 挂载视图未额外覆盖，见残余 #12；直接作为新 PID ns 的
+PID 1 启动），在 `sandbox.Apply` 之前完成全部隔离步骤：
 
 1. **PID-ns 前置硬校验**（先于一切宿主可见变异）：`os.Getpid()!=1` 说明进程仍留在共享 PID 命名空间，严格模式直接拒绝启动（绝不先改宿主 `/` 传播属性再报错）；`--best-effort` 下告警（点名 `/proc/<hostPid>/root` 魔链仍可达）并跳过全部覆盖挂载，仅执行降权与封锁；
 2. **`/` 置 `MS_REC|MS_PRIVATE` 私有传播**，确保后续覆盖挂载不回流宿主（失败同样熔断全部覆盖挂载）；
@@ -166,5 +168,6 @@ bash go/sandbox/scripts/deploy.sh
     - **`--best-effort` 降级面**：PID-ns 硬校验未过或私有传播失败时跳过全部覆盖挂载（仅降权+装锁），`mount-proc` 失败时宿主 procfs 仍在——两种情形下 `/proc/<hostPid>/root` 魔链均可达，告警文案会显式点名该残余面；
     - **`--best-effort` 完全降级残余（O5′）**：派生时完全放弃命名空间（`MountNS=false`，unshare 失败回退）的降级路径下，除 `/proc/<hostPid>/root` 魔链外还存在更宽的残余面——未执行 `isolateRuntimeSockets` 意味着 capabilities 未裁剪至 `0x22`（宿主 root 仍持完整能力）、继承 `cwd` 未从新挂载视图重绑、mount-seal 锁未安装（走原 `syscall.Exec` 而非 init 路径），与挂载步骤失败的「降权+装锁」部分降级属不同口径；
     - **无特权只读宿主信息面（O3′）**：`AF_NETLINK`（如 `NETLINK_KOBJECT_UEVENT`/`NETLINK_ROUTE` 只读 dump）与 `/proc/sys`、`/sys` 的只读宿主信息在沙盒内仍可读——无特权只读面按设计保留，不属越权通道；
+    - **继承的宿主 `/dev/mqueue` 挂载视图未覆盖**：`CLONE_NEWIPC` 隔离了按命名空间解析的 `mq_open`/`mq_unlink` 系统调用（按名打开宿主队列返回 `ENOENT`），但未额外重挂或 tmpfs 覆盖宿主继承的 `/dev/mqueue` 挂载（绑定于宿主 `init_ipc_ns`）；Landlock / 只读规则阻断了 `O_RDWR` 打开与新建写入（`EACCES`），但若宿主 `/dev/mqueue` 预存可读队列节点，沙盒内经路径 `O_RDONLY` 打开 fd 后仍可调用 `mq_timedreceive` 接收并取走宿主队列消息（当前主机常态无宿主 POSIX 队列）。
     - 按设计保持可达：`/root/.herdsman/herdsman.sock`、`/root/.config/herdr/herdr.sock`、goExecDir 内 `broker.sock`/`report.sock`。
 13. **回报中继只限文本回父终端**：沙盒内 `hc` 客户端只接受 `hc send <父地址> <text>`；向非父地址、`hc run/exec/file/keys` 等其它形态一律拒绝。中继以沙盒外 root 执行真实 `hc send`，其信任面仅限于「校验后的文本 + 固定 argv」。

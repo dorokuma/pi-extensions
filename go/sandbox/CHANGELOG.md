@@ -9,9 +9,12 @@
 - **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
   `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`（Go
   `Cloneflags`，受限子进程直接以新 PID ns 的 PID 1 启动，并同时获得
-  独立 IPC 命名空间——SysV `shm`/`sem`/`msg` 与 POSIX `mqueue` 与宿主
-  完全隔离：沙盒内读不到宿主共享内存段，沙盒内创建的 IPC 对象随
-  命名空间销毁不留宿主持久残留）；覆盖 `/run` 之前先按硬校验
+  独立 IPC 命名空间——隔离 SysV `shm`/`sem`/`msg` 与按命名空间解析的
+  POSIX `mq_open`/`mq_unlink` 系统调用：沙盒内读不到宿主共享内存段、
+  按名打开宿主 POSIX 队列返回 `ENOENT`，沙盒内创建的 SysV IPC 对象随
+  命名空间销毁不留宿主持久残留；继承的宿主 `/dev/mqueue` 挂载未额外
+  覆盖，Landlock 阻断其写/建，但若宿主预存可读队列节点仍可经路径
+  `O_RDONLY` 打开并 `mq_timedreceive` 取走消息）；覆盖 `/run` 之前先按硬校验
   （`os.Getpid()==1`，非独立 PID ns 拒绝继续）挂载 `MS_NOSUID|MS_NODEV|
   MS_NOEXEC` 的 procfs。此后沙盒内 `/proc` 只反映本沙盒进程：宿主全部
   PID 不可见，`/proc/<pid>/root|cwd|fd` 魔链只解析到沙盒自身已覆盖
