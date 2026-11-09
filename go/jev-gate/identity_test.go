@@ -1029,6 +1029,110 @@ func TestQueryPaneShellPidTimeout(t *testing.T) {
 	}
 }
 
+// TestQueryHcTerminalInfo covers the terminal.get JSON-RPC 2.0 wire shape
+// against a real unix socket: only a live record whose parent key carries the
+// JSON literal null (or a non-empty parent address) can prove a terminal;
+// a missing "parent" key, an empty-string parent, a non-string parent or a
+// non-"live" state all fail closed.
+func TestQueryHcTerminalInfo(t *testing.T) {
+	ok := `{"id":"pi-identity","jsonrpc":"2.0","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`
+	cases := []struct {
+		name       string
+		reply      string
+		wantOK     bool
+		wantParent string
+	}{
+		{"ok_toplevel_parent_null", ok, true, ""},
+		{"ok_parent_address", `{"id":"pi-identity","result":{"address":"t12t","parent":"t9t","state":"live","pid":4321}}`, true, "t9t"},
+		{"state_absent_tolerated", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"pid":4321}}`, true, ""},
+		{"state_finished", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"finished","pid":4321}}`, false, ""},
+		{"state_wrong_type", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":1,"pid":4321}}`, false, ""},
+		{"missing_parent_key", `{"id":"pi-identity","result":{"address":"t12t","state":"live","pid":4321}}`, false, ""},
+		{"empty_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":"","state":"live","pid":4321}}`, false, ""},
+		{"non_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":5,"state":"live","pid":4321}}`, false, ""},
+		{"result_null", `{"id":"pi-identity","result":null}`, false, ""},
+		{"wrong_request_id", `{"id":"other","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`, false, ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := paneSocket(t, testCase.reply)
+			info, gotOK := queryHcTerminalInfo(path, "t12t", time.Second)
+			if gotOK != testCase.wantOK || info.Parent != testCase.wantParent {
+				t.Fatalf("queryHcTerminalInfo = %+v,%v want parent=%q ok=%v", info, gotOK, testCase.wantParent, testCase.wantOK)
+			}
+		})
+	}
+}
+
+// TestResolveHcTerminalIdentity walks the herdr-core S1/S2 shape: with
+// HERDR_PANE_ID absent and HC_TERMINAL_ID exported, terminal.get's
+// parent=null record is the hc analogue of the :p1 main pane.
+func TestResolveHcTerminalIdentity(t *testing.T) {
+	chain := []AncestorProcess{
+		{PID: 100, PPID: 200, Cmdline: "/opt/ext/jev-gate"},
+		{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi --print"},
+		{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
+	}
+	hcFixture := func(info HcTerminalInfo, ok bool) IdentityEnv {
+		environment := identityFixture(map[string]string{
+			"HC_TERMINAL_ID": "t12t",
+			"PIG_EXT_SOCKET": "/tmp/x",
+		}, chain, 0)
+		environment.QueryHcSocket = func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
+			if socketPath != HcSocketFile && !strings.HasPrefix(socketPath, "/tmp/") {
+				t.Fatalf("hc socket path %q must be the hard-coded default or an injected test path", socketPath)
+			}
+			if termID != "t12t" {
+				t.Fatalf("hc query went out for %q, want t12t", termID)
+			}
+			return info, ok
+		}
+		return environment
+	}
+
+	t.Run("toplevel_parent_null_passes", func(t *testing.T) {
+		// parent null + matching address + pid in ancestry: main agent.
+		environment := hcFixture(HcTerminalInfo{Address: "t12t", PID: 300}, true)
+		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
+			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
+		}
+	})
+	t.Run("parent_set_is_subagent_terminal", func(t *testing.T) {
+		// `hc run --bg` children always carry the parent address; a non-null
+		// parent fails closed at S1 like a non-:p1 pane.
+		environment := hcFixture(HcTerminalInfo{Address: "t12t", Parent: "t9t", PID: 300}, true)
+		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+		if !isSubagent || !strings.Contains(reason, "S1: HC_TERMINAL_ID=t12t has parent=t9t (subagent terminal)") {
+			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
+		}
+	})
+	t.Run("shell_pid_not_in_ancestry", func(t *testing.T) {
+		// A truthful top-level record whose pid is not a strict ancestor of
+		// this process still fails at S3 — the hc branch changes only how
+		// shell_pid is resolved, not the ancestry proof.
+		environment := hcFixture(HcTerminalInfo{Address: "t12t", PID: 999}, true)
+		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+		if !isSubagent || !strings.Contains(reason, "is not in this process ancestry") {
+			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
+		}
+	})
+	t.Run("malformed_terminal_id_fails_at_s1", func(t *testing.T) {
+		environment := identityFixture(map[string]string{
+			"HC_TERMINAL_ID": "t12t;touch-pwn",
+			"PIG_EXT_SOCKET": "/tmp/x",
+		}, chain, 0)
+		environment.QueryHcSocket = func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
+			t.Fatal("a malformed terminal id must be rejected before the socket query")
+			return HcTerminalInfo{}, false
+		}
+		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+		if !isSubagent || !strings.Contains(reason, "S1: HC_TERMINAL_ID=t12t;touch-pwn is not a terminal address") {
+			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
+		}
+	})
+}
+
 // TestReadProcSelf exercises the real /proc readers on this process.
 func TestReadProcSelf(t *testing.T) {
 	pid := os.Getpid()

@@ -120,6 +120,7 @@ func TestIdentityResolverIsSharedCore(t *testing.T) {
 			switch {
 			case strings.HasPrefix(key, "PIG_EXT_"), key == "CTXMODE_ROLE",
 				key == "PI_SUBAGENT", key == "PI_ROLE", key == "HERDR_PANE_ID",
+				key == "HC_TERMINAL_ID",
 				key == "PIG_HARNESS_ARGV_FILE":
 				t.Setenv(key, "")
 			}

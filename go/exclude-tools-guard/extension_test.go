@@ -531,6 +531,153 @@ func TestResolveAgentIdentityWithEnv(t *testing.T) {
 	})
 }
 
+// hcTerminalSocket starts a unix socket server that replies with reply for
+// every connection and returns its path.
+func hcTerminalSocket(t *testing.T, reply string) string {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "herdr-core.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create unix socket listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			buffer := make([]byte, 4096)
+			_, _ = conn.Read(buffer)
+			if reply != "" {
+				_, _ = conn.Write([]byte(reply))
+			}
+			_ = conn.Close()
+		}
+	}()
+	return sockPath
+}
+
+// 2a2. QueryHcTerminalInfo 对 terminal.get JSON-RPC 2.0 报文的解析边界回归：
+// 只有 parent 键真实存在且为 JSON null（或非空父地址）才能证明顶层终端；
+// 缺 parent 键、parent:""、非字符串 parent、state 非 "live" 一律 fail-closed。
+func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
+	ok := `{"id":"pi-identity","jsonrpc":"2.0","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`
+	cases := []struct {
+		name       string
+		reply      string
+		wantOK     bool
+		wantParent string
+	}{
+		{"ok_toplevel_parent_null", ok, true, ""},
+		{"ok_parent_address", `{"id":"pi-identity","result":{"address":"t12t","parent":"t9t","state":"live","pid":4321}}`, true, "t9t"},
+		{"state_absent_tolerated", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"pid":4321}}`, true, ""},
+		{"state_finished", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"finished","pid":4321}}`, false, ""},
+		{"state_wrong_type", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":1,"pid":4321}}`, false, ""},
+		{"missing_parent_key", `{"id":"pi-identity","result":{"address":"t12t","state":"live","pid":4321}}`, false, ""},
+		{"empty_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":"","state":"live","pid":4321}}`, false, ""},
+		{"non_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":5,"state":"live","pid":4321}}`, false, ""},
+		{"result_null", `{"id":"pi-identity","result":null}`, false, ""},
+		{"wrong_request_id", `{"id":"other","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`, false, ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			sockPath := hcTerminalSocket(t, testCase.reply)
+			info, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 500*time.Millisecond)
+			if gotOK != testCase.wantOK || info.Parent != testCase.wantParent {
+				t.Fatalf("QueryHcTerminalInfo = %+v,%v want parent=%q ok=%v", info, gotOK, testCase.wantParent, testCase.wantOK)
+			}
+		})
+	}
+}
+
+// 2b. herdr-core (hc) 身份形状回归：HERDR_PANE_ID 缺位且导出 HC_TERMINAL_ID 时，
+// terminal.get 的 parent=null 顶层记录等价于老 herdr 的主窗格正证明。
+func TestResolveAgentIdentity_HcTerminal(t *testing.T) {
+	// 拓扑：100 (扩展 subprocess) -> 200 (pi 宿主) -> 4242 (hc 终端 shell)
+	hcEnv := func(info HcTerminalInfo, ok bool) IdentityEnv {
+		return IdentityEnv{
+			Getenv: func(k string) string {
+				switch k {
+				case "HC_TERMINAL_ID":
+					return "t12t"
+				case "PIG_EXT_SOCKET":
+					return "/tmp/pig-ext-sock.sock"
+				}
+				return ""
+			},
+			Environ: func() []string {
+				return []string{"HC_TERMINAL_ID=t12t", "PIG_EXT_SOCKET=/tmp/pig-ext-sock.sock"}
+			},
+			Args:        []string{"exclude-tools-guard"},
+			PID:         100,
+			SocketPath:  "/tmp/fake.sock",
+			Timeout:     time.Second,
+			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) { return 0, false },
+			QueryHcSocket: func(sock, termID string, to time.Duration) (HcTerminalInfo, bool) {
+				if sock != HcSocketFile && !strings.HasPrefix(sock, "/tmp/") {
+					t.Fatalf("hc socket path %q must be the hard-coded default or an injected test path", sock)
+				}
+				if termID != "t12t" {
+					t.Fatalf("hc query went out for %q, want t12t", termID)
+				}
+				return info, ok
+			},
+			ReadStat: func(pid int) (int, bool) {
+				switch pid {
+				case 100:
+					return 200, true
+				case 200:
+					return 4242, true
+				case 4242:
+					return 1, true
+				}
+				return 0, false
+			},
+			ReadCmdline: func(pid int) string {
+				switch pid {
+				case 100:
+					return "/opt/ext/exclude-tools-guard"
+				case 200:
+					return "pi"
+				case 4242:
+					return "/bin/bash"
+				}
+				return ""
+			},
+		}
+	}
+
+	t.Run("HcTopLevelTerminal_ParentNull_Passes", func(t *testing.T) {
+		env := hcEnv(HcTerminalInfo{Address: "t12t", PID: 4242}, true)
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if isSub {
+			t.Fatalf("top-level hc terminal must resolve as main agent, got isSub=%v, reason=%s", isSub, reason)
+		}
+		if !strings.Contains(reason, "S1-S4 hold") {
+			t.Fatalf("unexpected reason: %s", reason)
+		}
+	})
+
+	t.Run("HcSubagentTerminal_ParentSet_Denied", func(t *testing.T) {
+		// `hc run --bg` 派生的终端 parent 为父终端地址，绝不是 null。
+		env := hcEnv(HcTerminalInfo{Address: "t12t", Parent: "t9t", PID: 4242}, true)
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if !isSub || !strings.Contains(reason, "S1: HC_TERMINAL_ID=t12t has parent=t9t (subagent terminal)") {
+			t.Fatalf("expected hc parent denial, got isSub=%v, reason=%s", isSub, reason)
+		}
+	})
+
+	t.Run("HcShellPid_NotInAncestry_Denied", func(t *testing.T) {
+		// 顶层记录为真但 pid 不在本进程祖先链上，仍在 S3 失败。
+		env := hcEnv(HcTerminalInfo{Address: "t12t", PID: 9999}, true)
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if !isSub || !strings.Contains(reason, "is not in this process ancestry") {
+			t.Fatalf("expected S3 ancestry denial, got isSub=%v, reason=%s", isSub, reason)
+		}
+	})
+}
+
 // 2a. 身份判据重构回归（oracle2 反例 A/B + 三条已决落地）
 //   - pane 命名不构成判据；PIG_EXT_SOCKET 为主判别式；hostIndex = 第一个 agent-runtime 祖先；
 //   - 找不到祖先 / fused 自身无法识别 / herdr 查询失败一律 fail-closed 判子代理。

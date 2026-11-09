@@ -21,6 +21,13 @@
     ```
     一次查询硬上限 1500ms（从函数入口起算的总预算硬上限，**不延长预算、不叠加阻塞式重试层**）。回执必须满足 `reply.id === "pi-identity"`、`reply.result.process_info.pane_id === paneId`、且 `shell_pid > 0`。查询失败/超时一律 fail-closed 判子代理，并只向 stderr 记**一条** warning（`sync.Once` 去重）。**S1/S3/S4 的 fail-closed 分支同样走这条去重 warning**（reason 里带分支名，例如 `S1: HERDR_PANE_ID unset or empty`、`S3: no agent-runtime ancestor …`、`S4: agent runtime ancestor …`），`PI_IDENTITY_DEBUG=1` 只增加细节、不改变判定。
     > **已知局限（stderr 在部署形态可能不可见）**：pig 会把扩展子进程的 stderr 重定向到临时文件且通常不保留（`ref/PiG/coding/extension/host/subprocess/host.go:3238-3248`，D56），所以这条 warning 在真实部署里**可能看不到**。它只是尽力而为的信号，不是可依赖的交付通道；排障时以 `PI_IDENTITY_DEBUG=1` 的前台运行或 reason 字符串为准。
+  - **S1/S2 的 herdr-core（`hc`）形状**：`HERDR_PANE_ID` 为空且导出的 `HC_TERMINAL_ID` 匹配
+    `^t[0-9a-z]+$` 时，正证明改走 `hc` 分支——连接写死的 `/run/user/0/herdr-core/default.sock`
+    （同样绝不读 `HC_TERMINAL_SOCKET`）发送 JSON-RPC 2.0 `terminal.get`，回执必须 `id` 与
+    `address` 均回环、`state` 字段存在时必须为 `"live"`（`"finished"` 等一律 fail-closed）、
+    `parent` 键必须存在且为 JSON 字面 `null`（顶层主终端，等价于老 herdr 的主窗格；`hc run
+    --bg` 派生的子代理终端必带父地址，因此 `parent` 缺失/`""`/非字符串同样 fail-closed），
+    `pid > 0` 后作为 `shell_pid` 继续跑 S3 严格祖先链与 S4。
   - **S3 内核进程表祖先链与宿主锚定**：通过回溯本进程的 `/proc/<pid>/stat`（最多 32 跳），提取祖先进程链。该祖先链必须包含 S2 查询得到的 `shell_pid`，且 `shell_pid` 必须位于宿主进程的严格祖先方向（`shellIndex > hostIndex`）。宿主位置由**进程拓扑**锚定，与 pane 命名无关：
     - **subprocess 形态（主判别式 `DetectSubprocessForm`）**：从 self 向上遍历，**第一个** `IsAgentRuntimeCmdline(cmdline)` 为真的祖先即宿主；若到 pane shell 之前都没找到 → fail-closed 判子代理（reason 写清 `no agent-runtime ancestor` 与命中的环境键）。subprocess 形态的判据覆盖全部三种 out-of-process 传输形态：
       - isolated 进程：`PIG_EXT_SOCKET` 非空；
@@ -136,7 +143,7 @@ go test -count=1 -race -v ./...
 ```
 
 测试覆盖内容：
-- **真实 Unix Socket 假服务端测试**：模拟真实 socket 通信，覆盖主代理成功响应、`pane_id` 不符、半开连接断开、字符串 `shell_pid` 严格拒绝、`shell_pid <= 0`、垃圾 JSON、不应答超时（50ms）、socket 文件不存在等所有 fail-closed 分支。
+- **真实 Unix Socket 假服务端测试**：模拟真实 socket 通信，覆盖主代理成功响应、`pane_id` 不符、半开连接断开、字符串 `shell_pid` 严格拒绝、`shell_pid <= 0`、垃圾 JSON、不应答超时（50ms）、socket 文件不存在等所有 fail-closed 分支；另有 hc `terminal.get` 报文边界测试（`TestQueryHcTerminalInfo_HcSocket`）：`parent:null,state:"live"` 成功、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id 一律 fail-closed。
 - **S1-S4 身份推导测试（M1/M3 实证）**：覆盖全部负向标记（`PI_SUBAGENT=1`、`PI_ROLE`、各种 argv）、S1 pane id 未设、S2 socket 失败、S3 祖先链丢失 `shell_pid`、S3 祖先链为空；重点验证正向拓扑（扩展是 `pi`/`pig` 宿主子进程判定为 main agent）与反向拓扑（宿主与 shell 之间存在 agent runtime 判定为 subagent）。
 - **身份判据重构回归（oracle2 反例 A/B 实证）**：六条定点用例——① subprocess 拓扑下宿主自身 cmdline 带 `--name role-reviewer`（经 `PIG_HARNESS_ARGV_FILE` 桥接）判 subagent；② 隔层 spawn `ext→sh→pi→bash` 判 main；③ fused 形态但 self cmdline 为 `node /x/index.js` 判 subagent（fail-closed）；④ subprocess 拓扑但链上无 agent-runtime 祖先判 subagent；⑤ 同进程第二次调用仍判 subagent（argv 缓存）；⑥ `HERDR_PANE_ID=w32:p23`（非 `:p1`）且其余条件都像主代理时判 main（证明 pane 命名不再作判据）。另验证 herdr 查询失败/超时时 fail-closed 判子代理且只记一条 warning（`sync.Once` 去重、1500ms 预算不被改写）。
 - **PIG_HARNESS_ARGV_FILE 宿主参数桥接测试（M2 实证）**：覆盖文件包含 role-reviewer、herdr-role-sessions、dispatch 任务；覆盖环境变量存在但文件缺失或坏 JSON 时 fail-closed 判定为 subagent；覆盖环境变量未设时安全 fallback 为 main；覆盖读取后变量**保留可读**供 packed cell 兄弟使用。
