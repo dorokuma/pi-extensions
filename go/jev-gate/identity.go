@@ -16,6 +16,17 @@ package jevgate
 //   S2: the running herdr server answers the pane query with a matching
 //       shell_pid > 0. The socket path is a hard-coded constant, never read
 //       from HERDR_SOCKET_PATH, which would be one more forgeable variable.
+//
+//   Under herdr-core (hc) — where HERDR_PANE_ID is absent and HC_TERMINAL_ID
+//   is exported instead — S1/S2 take the hc shape while S3/S4 run unchanged
+//   on the resolved pid:
+//     S1: HC_TERMINAL_ID is non-empty AND matches ^t[0-9a-z]+$.
+//     S2: the hc server answers terminal.get with a record whose address
+//         echoes the terminal id, whose parent is null — the top-level-
+//         terminal analogue of :p1, since a subagent spawned via
+//         `hc run --bg` always carries its parent's address — and whose
+//         pid > 0 becomes the shell_pid. The socket path is again a
+//         hard-coded constant, never read from HC_TERMINAL_SOCKET.
 //   S3: the shell_pid is a strict ancestor of this process, and every
 //       ancestor's /proc cmdline is readable — an empty argv is fail-closed,
 //       it can never sneak past the S4 scans.
@@ -64,6 +75,10 @@ import (
 const (
 	// herdrSocketFile is the herdr server socket; hard-coded on purpose.
 	herdrSocketFile = "/root/.config/herdr/herdr.sock"
+	// HcSocketFile is the herdr-core server socket; hard-coded on purpose.
+	// HC_TERMINAL_SOCKET is deliberately never read: it would be one more
+	// forgeable variable. Tests may inject a path via IdentityEnv.HcSocketPath.
+	HcSocketFile = "/run/user/0/herdr-core/default.sock"
 	// identityQueryTimeout bounds one socket query; a timeout resolves as subagent.
 	identityQueryTimeout = 1500 * time.Millisecond
 	// identityAncestorMaxHops bounds the /proc walk (cycles, malformed stat).
@@ -98,6 +113,7 @@ type AncestorProcess struct {
 // queryPaneShellPid asks the herdr server for a pane's shell pid. Any failure
 // (connect, timeout, non-JSON, mismatched reply, missing pane) is (0, false).
 func queryPaneShellPid(socketPath, paneID string, timeout time.Duration) (int, bool) {
+
 	deadline := time.Now().Add(timeout)
 	dialTimeout := time.Until(deadline)
 	if dialTimeout <= 0 {
@@ -164,6 +180,128 @@ func queryPaneShellPid(socketPath, paneID string, timeout time.Duration) (int, b
 	}
 	return shellPID, true
 }
+
+// HcTerminalInfo is the herdr-core terminal record S2 needs: the terminal's
+// own address, its parent address ("" = JSON null = top-level terminal, the
+// hc analogue of herdr's :p1 main pane), and its shell pid.
+type HcTerminalInfo struct {
+	Address string
+	Parent  string
+	PID     int
+}
+
+// queryHcTerminalInfo asks the herdr-core server for a terminal's record via
+// the JSON-RPC 2.0 terminal.get method. Any failure (connect, timeout,
+// non-JSON, mismatched reply id, missing or non-object result, mismatched
+// address, a "state" present but not "live", a "parent" key absent/
+// non-string/non-null/empty-string, non-positive pid) is (zero, false).
+//
+// The result is decoded as a raw key map rather than a struct: Parent any
+// conflates a missing "parent" key, parent:"" and parent:null into the same
+// zero value, and only the JSON literal null marks a top-level terminal.
+func queryHcTerminalInfo(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
+	deadline := time.Now().Add(timeout)
+	dialTimeout := time.Until(deadline)
+	if dialTimeout <= 0 {
+		return HcTerminalInfo{}, false
+	}
+	conn, err := net.DialTimeout("unix", socketPath, dialTimeout)
+	if err != nil {
+		return HcTerminalInfo{}, false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(deadline)
+
+	request, err := json.Marshal(map[string]any{
+		"id":      "pi-identity",
+		"jsonrpc": "2.0",
+		"method":  "terminal.get",
+		"params":  map[string]any{"caller": termID, "terminal": termID},
+	})
+	if err != nil {
+		return HcTerminalInfo{}, false
+	}
+	request = append(request, '\n')
+	if _, err := conn.Write(request); err != nil {
+		return HcTerminalInfo{}, false
+	}
+
+	reader := bufio.NewReader(io.LimitReader(conn, 1048576))
+	line, err := reader.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return HcTerminalInfo{}, false
+	}
+	var reply struct {
+		ID     string                     `json:"id"`
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(line, &reply); err != nil {
+		return HcTerminalInfo{}, false
+	}
+	if reply.ID != "pi-identity" || reply.Result == nil {
+		return HcTerminalInfo{}, false
+	}
+	var address string
+	rawAddress, hasAddress := reply.Result["address"]
+	if !hasAddress || json.Unmarshal(rawAddress, &address) != nil || address != termID {
+		return HcTerminalInfo{}, false
+	}
+	// "state" is optional on the wire but fail-closed when present: a record
+	// advertising anything but "live" ("finished", a wrong type, a bare
+	// literal) can never prove a live terminal.
+	if rawState, hasState := reply.Result["state"]; hasState {
+		var state string
+		if json.Unmarshal(rawState, &state) != nil || state != "live" {
+			return HcTerminalInfo{}, false
+		}
+	}
+	// "parent" is required and must be the JSON literal null (top-level
+	// terminal) or a non-empty string (a `hc run --bg` parent's address).
+	// A missing key, an empty string or any other type cannot prove the
+	// top-level shape, so the whole record fails closed.
+	rawParent, hasParent := reply.Result["parent"]
+	if !hasParent {
+		return HcTerminalInfo{}, false
+	}
+	var parent *string
+	if err := json.Unmarshal(rawParent, &parent); err != nil {
+		return HcTerminalInfo{}, false
+	}
+	info := HcTerminalInfo{Address: address}
+	if parent != nil {
+		if *parent == "" {
+			return HcTerminalInfo{}, false
+		}
+		// A parent address (e.g. "t9t") marks a `hc run --bg` subagent
+		// terminal; the caller treats it as fail-closed.
+		info.Parent = *parent
+	}
+	var pidValue any
+	rawPid, hasPid := reply.Result["pid"]
+	if !hasPid || json.Unmarshal(rawPid, &pidValue) != nil {
+		return HcTerminalInfo{}, false
+	}
+	switch pid := pidValue.(type) {
+	case float64:
+		info.PID = int(pid)
+		if float64(info.PID) != pid {
+			return HcTerminalInfo{}, false
+		}
+	case int:
+		info.PID = pid
+	default:
+		return HcTerminalInfo{}, false
+	}
+	if info.PID <= 0 {
+		return HcTerminalInfo{}, false
+	}
+	return info, true
+}
+
+// hcTerminalIDPattern is the herdr-core terminal address shape ("t12t").
+// Only the env-provided terminal id itself is validated; socket parameters
+// are never derived from it.
+var hcTerminalIDPattern = regexp.MustCompile(`^t[0-9a-z]+$`)
 
 // readProcPpid reads ppid from /proc/<pid>/stat (after the last ')').
 func readProcPpid(pid int) (int, bool) {
@@ -1313,24 +1451,34 @@ type IdentityEnv struct {
 	// whose names are not known in advance.
 	Environ     func() []string
 	QuerySocket func(socketPath, paneID string, timeout time.Duration) (int, bool)
-	ArgvCache   *ArgvCache
+	// HcSocketPath overrides the herdr-core socket for tests; the production
+	// value is the hard-coded HcSocketFile, never HC_TERMINAL_SOCKET.
+	HcSocketPath string
+	// QueryHcSocket is the herdr-core terminal.get query. It is a separate
+	// field from QuerySocket because the hc record also carries the parent
+	// address — the top-level check QuerySocket's (pid, ok) shape cannot
+	// express.
+	QueryHcSocket func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool)
+	ArgvCache     *ArgvCache
 }
 
 // defaultIdentityEnv is the production identity environment.
 func defaultIdentityEnv() IdentityEnv {
 	return IdentityEnv{
-		Getenv:      os.Getenv,
-		Args:        os.Args,
-		PID:         os.Getpid(),
-		SocketPath:  herdrSocketFile,
-		Timeout:     identityQueryTimeout,
-		ReadStat:    readProcPpid,
-		ReadCmdline: readProcCmdline,
-		ReadArgv:    readProcArgv,
-		ReadEnviron: readProcEnviron,
-		Environ:     os.Environ,
-		QuerySocket: queryPaneShellPid,
-		ArgvCache:   defaultArgvCache,
+		Getenv:        os.Getenv,
+		Args:          os.Args,
+		PID:           os.Getpid(),
+		SocketPath:    herdrSocketFile,
+		Timeout:       identityQueryTimeout,
+		ReadStat:      readProcPpid,
+		ReadCmdline:   readProcCmdline,
+		ReadArgv:      readProcArgv,
+		ReadEnviron:   readProcEnviron,
+		Environ:       os.Environ,
+		QuerySocket:   queryPaneShellPid,
+		HcSocketPath:  HcSocketFile,
+		QueryHcSocket: queryHcTerminalInfo,
+		ArgvCache:     defaultArgvCache,
 	}
 }
 
@@ -1429,6 +1577,12 @@ func fillIdentityDefaults(env *IdentityEnv) {
 	if env.QuerySocket == nil {
 		env.QuerySocket = queryPaneShellPid
 	}
+	if env.HcSocketPath == "" {
+		env.HcSocketPath = HcSocketFile
+	}
+	if env.QueryHcSocket == nil {
+		env.QueryHcSocket = queryHcTerminalInfo
+	}
 	if env.Timeout <= 0 {
 		env.Timeout = identityQueryTimeout
 	}
@@ -1451,21 +1605,48 @@ func resolveIdentity(env IdentityEnv, mcpMode bool) (bool, string) {
 		return true, "launch marker: " + marker
 	}
 
-	// S1: the pane id is both the herdr lookup key and a necessary condition —
-	// a main agent's pane id always ends with ":p1"; anything else cannot be
-	// the main pane and is rejected before the socket query.
+	// S1/S2 come in two shapes. With HERDR_PANE_ID set, the herdr shape: the
+	// pane id is both the herdr lookup key and a necessary condition — a main
+	// agent's pane id always ends with ":p1"; anything else cannot be the
+	// main pane and is rejected before the socket query. Under herdr-core
+	// (HERDR_PANE_ID absent, HC_TERMINAL_ID exported), the hc shape: the
+	// terminal id is the hc lookup key, terminal.get must return a live
+	// top-level record (a "state" present but not "live" fails; parent
+	// must be the JSON literal null — the hc analogue of the :p1 main
+	// pane, since a `hc run --bg` subagent always carries its parent's
+	// address) and its pid becomes the shell_pid S3/S4 run against.
+	var shellPID int
 	paneID := strings.TrimSpace(env.Getenv("HERDR_PANE_ID"))
 	if paneID == "" {
-		return failClosed("S1: HERDR_PANE_ID unset or empty")
-	}
-	if !strings.HasSuffix(paneID, ":p1") {
-		return failClosed(fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID))
-	}
+		termID := strings.TrimSpace(env.Getenv("HC_TERMINAL_ID"))
+		if termID == "" {
+			return failClosed("S1: HERDR_PANE_ID unset or empty")
+		}
+		if !hcTerminalIDPattern.MatchString(termID) {
+			return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s is not a terminal address (no ^t[0-9a-z]+$ match)", termID))
+		}
+		info, ok := env.QueryHcSocket(env.HcSocketPath, termID, env.Timeout)
+		if !ok || info.Address != termID || info.PID <= 0 {
+			return failClosed(fmt.Sprintf("S2: hc terminal.get for %s failed, timed out or mismatched", termID))
+		}
+		if info.Parent != "" {
+			return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s has parent=%s (subagent terminal)", termID, info.Parent))
+		}
+		shellPID = info.PID
+		// Reuse paneID as the diagnostic label below; the value is the
+		// terminal address.
+		paneID = termID
+	} else {
+		if !strings.HasSuffix(paneID, ":p1") {
+			return failClosed(fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID))
+		}
 
-	// S2: ask the running herdr server.
-	shellPID, ok := env.QuerySocket(env.SocketPath, paneID, env.Timeout)
-	if !ok || shellPID <= 0 {
-		return failClosed(fmt.Sprintf("S2: herdr pane query for %s failed, timed out or mismatched", paneID))
+		// S2: ask the running herdr server.
+		pid, ok := env.QuerySocket(env.SocketPath, paneID, env.Timeout)
+		if !ok || pid <= 0 {
+			return failClosed(fmt.Sprintf("S2: herdr pane query for %s failed, timed out or mismatched", paneID))
+		}
+		shellPID = pid
 	}
 
 	// S3: the pane shell must be in this ancestry, and every hop's argv must be

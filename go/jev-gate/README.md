@@ -89,7 +89,13 @@ TS 侧无对应的 Go 加固：有界响应读取 `jev.go:43-52`（含常量/哨
 `identity.go` 是扩展（`ResolveAgentIdentity`）与 `cmd/jev-mcp`（`ResolveMCPAgentIdentity`）**共用**
 的 fail-closed 判据：负向启动标记（env + argv，prompt 参数剥离——与 PiG `args.go` 的 `-p/--print`
 消费规则一致：@file 不吞、`-` 开头不吞、`---` 开头吞）、S1 的 `:p1` pane 要求、S2 herdr
-socket 查询、S3/S4 祖先链证明；MCP 模式允许 jev-mcp 与 pane shell 之间至多一层宿主
+socket 查询、S3/S4 祖先链证明。另有 **herdr-core（`hc`）正证明分支**：`HERDR_PANE_ID` 为空且
+`HC_TERMINAL_ID` 匹配 `^t[0-9a-z]+$` 时，S1/S2 改走 `hc` 形状——连接写死的
+`/run/user/0/herdr-core/default.sock`（不读 `HC_TERMINAL_SOCKET`）发 JSON-RPC 2.0
+`terminal.get`，回执必须 `id` 回环、`address` 回环、`state` 存在时必须为 `"live"`、
+`parent` 键必须存在且为 JSON 字面 `null`（顶层主终端；`hc run --bg` 的子代理终端必带父
+地址，`parent` 缺失/`""`/非字符串、非 `"live"` 的 `state` 一律 fail-closed）、`pid > 0`
+后作为 `shell_pid` 供 S3 严格祖先链与 S4 继续证明；MCP 模式允许 jev-mcp 与 pane shell 之间至多一层宿主
 （agy/antigravity 或 pi/pig），其余 hop 一律 fail-closed。解释器脚本提取
 （`isAgyTokens` / `isPiPigTokens`）与 `checkExecutableTokens` 共用同一张 flag 表：`--` 与
 `-m`/`--module` 取下一个 token 判定，`inlineTextFlags`（`-e`/`--eval`/`-c`/`--command`/
@@ -287,7 +293,7 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
 | HTTP 契约 | `TestCallJevAcceptedEnvelopes`（3 形态）、`TestCallJevUsageAliases`（6 例）、`TestCallJevRequestShape`、`TestCallJevFailures`（10 例）、`TestCallJevRateLimitedBody`、`TestCallJevTimeout`、`TestCallJevCallerCancellation`、`TestCallJevMissingCredential`、`TestCallJevTruncatesPayload`、`TestOversizedResponseBodyFailsClosed`（>4 MiB 响应体：`Call` / `classifyWith` 两路均 fail-closed） |
 | 响应校验 | `TestUnwrapSystemOneBody`（6 例）、`TestValidateAnswers`（含 score 档位越界、未知题型 fail-closed） |
 | 工具/注册 | `TestExecuteCheckInvalidTask` / `…EmptyPayload` / `…ContractLintRole` / `…Success` / `…SummaryKeepsEveryVerdictLine` / `…ContractLintSuccess` / `…Truncation` / `…HTTPError` / `…RequestBodyIsSmall`、`TestJevCheckSchema`、`TestToolDefinition`、`TestProviderConfig`、`TestNewExtensionBranches` |
-| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（10 子例：S1/S2/S3×2/S4/主代理/打包单元/融合/融合未知/pane 非 `:p1`）、`TestResolveMCPAgentIdentity`（MCP 拓扑：agy/pi 宿主层、`bash -c` inline 非宿主、嵌套宿主、forbidden runtime、未知中间层、空 cmdline）、`TestEnvArgv0Masking`（env 掩码：`-a`/`--argv0`/`--argv`/`--arg`/`-ia`/`-iam`/`-S` 七种形态×扩展/MCP 两种模式）、`TestEnvCommandTokens`（GNU env 9.7 选项表 42 例：缩写、簇、尾随缺参、未知/歧义、`-0`、可选参数、`-S` 重扫、permutation-free）、`TestPromptArgStrippingFlagBoundary`（PiG 消费规则：@file/marker 可见、`---` 提示词吞掉）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestQueryPaneShellPid`（7 子例 + 无 socket）、`TestQueryPaneShellPidTimeout`、`TestReadProcSelf`、`TestPackedCellArgvFileSharedAcrossExtensions`（两顺序×双侧独立 ArgvCache） |
+| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（10 子例：S1/S2/S3×2/S4/主代理/打包单元/融合/融合未知/pane 非 `:p1`）、`TestQueryPaneShellPid`（临时 unix socket 协议分支：回执错 id、pane 不符、零/小数 pid、坏 JSON、空应答、无 socket）、`TestQueryHcTerminalInfo`（hc `terminal.get` 报文边界：`parent:null,state:"live"` 成功、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id 一律 fail-closed）、`TestResolveHcTerminalIdentity`（hc 身份形状：顶层 parent null 判 main、带父地址判 subagent、pid 不在祖先链仍 S3 失败、畸形 terminal id 先于 socket 查询判死）、`TestResolveMCPAgentIdentity`（MCP 拓扑：agy/pi 宿主层、`bash -c` inline 非宿主、嵌套宿主、forbidden runtime、未知中间层、空 cmdline）、`TestEnvArgv0Masking`（env 掩码：`-a`/`--argv0`/`--argv`/`--arg`/`-ia`/`-iam`/`-S` 七种形态×扩展/MCP 两种模式）、`TestEnvCommandTokens`（GNU env 9.7 选项表 42 例：缩写、簇、尾随缺参、未知/歧义、`-0`、可选参数、`-S` 重扫、permutation-free）、`TestPromptArgStrippingFlagBoundary`（PiG 消费规则：@file/marker 可见、`---` 提示词吞掉）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestQueryPaneShellPid`（7 子例 + 无 socket）、`TestQueryPaneShellPidTimeout`、`TestReadProcSelf`、`TestPackedCellArgvFileSharedAcrossExtensions`（两顺序×双侧独立 ArgvCache） |
 | 分类器回调 | `TestClassifyTypesafeSystemOne`、`…Failures`、`TestClassifyWithoutUsage`、`TestClassifyRejectsMalformedAnswers`（畸形答案 + `bool` 题型 + `score` 数组 `criteria` 正反例）、`TestClassifyBoolQuestionWireMapping`、`TestClassifyRejectsUntrustedBaseUrl` |
 | 并发 | `TestExecuteCheckConcurrent`（8 goroutine × 8 次，`-race`） |
 
