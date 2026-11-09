@@ -73,8 +73,23 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 - SDK 校验：
   ```sh
   make sdk-check
-  # 将本地 go/pigsdk 与当前环境 staged SDK 进行逐文件 md5sum 对齐校验
+  # 将本地 go/pigsdk 与当前环境 staged SDK 进行逐文件 md5sum 对齐校验；
+  # 唯一允许的偏差是 Makefile 变量 PIGSDK_LOCAL_PATCHES 显式声明的
+  # 「路径:md5」本地防御补丁（当前为 SetTheme nil-result 守卫（对应历史
+  # 修复 H10）与 MCP 连接生命周期补丁，见下节）。
+  # 声明的补丁路径必须同时存在于 staged 与本地 md5 清单，staged 缺失即 FAIL，
+  # 防止上游删文件后过期豁免掩盖偏差。
   ```
+
+## SDK 镜像与本地补丁纪律
+
+`go/pigsdk` 是 staged SDK 的仓内镜像：除 `PIGSDK_LOCAL_PATCHES` 声明的文件外必须与 `$PIG_HOME/state/pigsdk/sdk-*/` 逐字节一致，因此**不得在 `go/pigsdk` 内放测试或任何非 staged 文件**。SDK 的回归测试放在独立嵌套模块 `go/pigsdk-regress`（通过导出 API 驱动，随 `make test` 执行）。新增防御补丁时把其「路径:md5」加入 `PIGSDK_LOCAL_PATCHES` 并在注释说明理由；补丁若被证实不可达须删除并移除条目（原 before_agent_start nil-data 守卫即因 preparePromptOptions 先行拒绝 nil data 而不可达，已删除）。
+
+### MCP 连接生命周期补丁（mcp_extension_options.go）
+
+**原因**：上游 staged SDK 的 MCP 会话图回调在宿主连接断开时存在三类泄漏——（1）transport 的 `receive` 长轮询与 `send` 上下文挂在 `context.Background` 上，连接断后仍占住 handler goroutine，拖过 shutdown deadline；（2）credentials 的 refresh-lock 等待（`unlock` 未回、`WithRefreshLock` 取锁中/持锁中）同样不释放，持锁 goroutine 永久泄漏；（3）transport 本身从不随断连关闭：回调 id 残留注册表、listener 不摘除、事件队列持续增长。此外，宿主在连接仍存活时显式 close transport（每次 create/close 一轮），shim 的 lifetime watcher 仍停在 `lifetime.Done()` 上，每轮泄漏一个 goroutine——本轮补上 `released` 通知通道让 watcher 同时随 release 退出。
+
+**范围**：仅限 `mcp_extension_options.go` 内 shim 层——为 `mcpTransportShim`/`mcpCredentialsShim` 引入 `serveContext()`（宿主连接 lifetime）并在各等待点 `select` 上它；断连时 `release()` 幂等关闭 transport、摘除 listener、注销回调；`release()` 完成后关闭 `released` 通道唤醒 watcher 退出（watcher 自身不在 `release()` 内等待，避免死锁）。回归覆盖：`go/pigsdk-regress/extension_h11_test.go` 的六条 MCP 用例（断连×5 + 显式 close watcher 泄漏×1）。
 - 隔离目录验证：
   ```sh
   make install-test

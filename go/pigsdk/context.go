@@ -97,9 +97,19 @@ type RemoteOverlayOptions struct {
 	// OverlayOptions is upstream ui.custom()'s overlayOptions: the overlay's
 	// position and size. Nil leaves them to the host's defaults.
 	OverlayOptions *OverlayOptions `json:"overlayOptions,omitempty"`
+	// Blocked is upstream ui.custom()'s blocked option: while an inline component (Overlay false) is visible, the terminal's program
+	// status reports pi as blocked on it. An overlay ignores it.
+	Blocked *RemoteOverlayBlocked `json:"blocked,omitempty"`
 	// OnHandle is upstream ui.custom()'s onHandle: it receives the mounted overlay's [OverlayHandle] (Overlay must be true). It stays in
 	// this process.
 	OnHandle OverlayHandleFunc `json:"-"`
+}
+
+// RemoteOverlayBlocked is upstream ui.custom()'s `blocked` option: Kind is "question", "permission" or "auth" and Message is the line the
+// terminal shows.
+type RemoteOverlayBlocked struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
 }
 
 // OverlayOptions is the serializable subset of upstream pi-tui OverlayOptions:
@@ -308,8 +318,7 @@ func (c Context) CancellationReason() string {
 	if c.ctx == nil {
 		return ""
 	}
-	var reason cancelReason
-	if errors.As(context.Cause(c.ctx), &reason) {
+	if reason, ok := errors.AsType[cancelReason](context.Cause(c.ctx)); ok {
 		return string(reason)
 	}
 	return ""
@@ -515,17 +524,18 @@ func (c Context) ConfirmWithOptions(title, message string, opts DialogOptions) (
 
 // InputWithOptions is [Context.Input] with upstream's dialog options.
 func (c Context) InputWithOptions(title, placeholder string, opts DialogOptions) (any, bool, error) {
-	return c.inputDialog(withNonEmpty(map[string]any{"title": title, "opts": opts}, "placeholder", placeholder))
+	return c.inputDialog(map[string]any{"title": title, "placeholder": placeholder, "opts": opts})
 }
 
-// withNonEmpty sets args[key] to value unless it is empty. An optional dialog member (Pi's `placeholder?`, `prefill?`) is undefined when the extension passes
-// none, and a Go string cannot be undefined: an empty one is the unset member, as in every native SDK. The host then writes no such member to an RPC client,
-// as Pi does, where it writes `placeholder: ""` for the empty string a Node extension can pass.
-func withNonEmpty(args map[string]any, key, value string) map[string]any {
-	if value != "" {
-		args[key] = value
-	}
-	return args
+// InputWithoutPlaceholder is Pi's `input(title)`: the placeholder is undefined, not the empty string [Context.Input] sends, so an RPC client's request has no
+// `placeholder` member (rpc-mode.ts input). A Go string cannot be undefined, hence the second spelling, as [Context.ClearStatus] is for [Context.SetStatus].
+func (c Context) InputWithoutPlaceholder(title string) (any, bool, error) {
+	return c.inputDialog(map[string]any{"title": title})
+}
+
+// InputWithoutPlaceholderWithOptions is [Context.InputWithoutPlaceholder] with upstream's dialog options: Pi's `input(title, undefined, opts)`.
+func (c Context) InputWithoutPlaceholderWithOptions(title string, opts DialogOptions) (any, bool, error) {
+	return c.inputDialog(map[string]any{"title": title, "opts": opts})
 }
 
 func (c Context) selectDialog(args map[string]any) (any, bool, error) {
@@ -570,20 +580,28 @@ func (c Context) confirmDialog(args map[string]any) (any, error) {
 	return resp.Confirmed, nil
 }
 
-// Input shows a text input dialog.
+// Input shows a text input dialog. The placeholder is sent as given, the empty string included (Pi's `input(title, "")`, which RPC mode writes as
+// `placeholder: ""`); [Context.InputWithoutPlaceholder] is Pi's `input(title)`.
 // Returns (nil, false, nil) if cancelled and a non-nil error when the host UI call fails. The result is typed as for [Context.Select].
 func (c Context) Input(title, placeholder string) (any, bool, error) {
-	return c.inputDialog(withNonEmpty(map[string]any{"title": title}, "placeholder", placeholder))
+	return c.inputDialog(map[string]any{"title": title, "placeholder": placeholder})
 }
 
 func (c Context) inputDialog(args map[string]any) (any, bool, error) {
 	return c.valueDialog("ui.input", "text", args)
 }
 
-// Editor opens a multi-line editor.
+// Editor opens a multi-line editor. The prefill is sent as given, the empty string included (Pi's `editor(title, "")`, which RPC mode writes as
+// `prefill: ""`); [Context.EditorWithoutPrefill] is Pi's `editor(title)`.
 // Returns (nil, false, nil) if cancelled and a non-nil error when the host UI call fails. The result is typed as for [Context.Select].
 func (c Context) Editor(title, prefill string) (any, bool, error) {
-	return c.valueDialog("ui.editor", "text", withNonEmpty(map[string]any{"title": title}, "prefill", prefill))
+	return c.valueDialog("ui.editor", "text", map[string]any{"title": title, "prefill": prefill})
+}
+
+// EditorWithoutPrefill is Pi's `editor(title)`: the prefill is undefined, not the empty string [Context.Editor] sends, so an RPC client's request has no
+// `prefill` member (rpc-mode.ts editor). A Go string cannot be undefined, hence the second spelling, as [Context.ClearStatus] is for [Context.SetStatus].
+func (c Context) EditorWithoutPrefill(title string) (any, bool, error) {
+	return c.valueDialog("ui.editor", "text", map[string]any{"title": title})
 }
 
 // ── Message Injection ────────────────────────────────────────────────────────
@@ -598,7 +616,7 @@ type SendMessageOptions struct {
 	DeliverAs   string // "steer", "followUp", or "nextTurn"; empty: host default
 }
 
-// SendMessage injects a custom message into the conversation.
+// SendMessage injects a custom message into the conversation. With TriggerTurn the run it starts keeps [Context.IsIdle] busy until the handler yields ([Context.Yield], [Context.Sleep]) or returns; a handler that polls for that run with a raw time.Sleep stays busy.
 func (c Context) SendMessage(customType, content string, display bool, opts SendMessageOptions) error {
 	options := map[string]any{}
 	if opts.TriggerTurn != nil {
@@ -639,7 +657,10 @@ type CustomMessage struct {
 }
 
 // SendCustomMessage injects a custom message into the conversation, as
-// upstream pi.sendMessage does, with block content and details.
+// upstream pi.sendMessage does, with block content and details. With
+// TriggerTurn the run it starts keeps IsIdle busy until this handler yields
+// ([Context.Yield], [Context.Sleep], a call Pi awaits, or its return): a handler
+// that polls IsIdle for that run must use Sleep, not time.Sleep (D225).
 func (c Context) SendCustomMessage(msg CustomMessage, opts SendMessageOptions) error {
 	options := map[string]any{}
 	if opts.TriggerTurn != nil {
@@ -800,6 +821,9 @@ type SourceInfo struct {
 	Scope   string `json:"scope"`
 	Origin  string `json:"origin"`
 	BaseDir string `json:"baseDir,omitempty"`
+	// ChangelogPath is the changelog file of the package that supplied the resource, when it has one (source-info.ts
+	// SourceInfo.changelogPath). It is set for a resource a package contributed and empty otherwise.
+	ChangelogPath string `json:"changelogPath,omitempty"`
 }
 
 // ToolInfo mirrors upstream ToolInfo, one entry of GetAllTools: a tool
@@ -1531,18 +1555,28 @@ func modelStreamErrorEvent(err error, model map[string]any) map[string]any {
 
 // ModelRegistry exposes Session model discovery, request authentication, and
 // model operations through the host-owned runtime.
-type ModelRegistry struct{ context Context }
+type ModelRegistry struct {
+	context Context
+	// runtime is the ModelRuntime this registry forwards to ([NewModelRegistry]); nil is the Session's registry.
+	runtime *ModelRuntime
+}
 
 // ModelRegistry returns the current Session model registry facade.
 func (c Context) ModelRegistry() ModelRegistry { return ModelRegistry{context: c} }
 
 // Find resolves a model by exact provider and model ID through the host registry. It returns a nil map and a nil error when no model matches, as Pi's find returns undefined (model-registry.ts:72); a host or transport failure is the error, never a model that is absent.
 func (r ModelRegistry) Find(providerID, modelID string) (map[string]any, error) {
+	if r.runtime != nil {
+		return r.runtime.GetModel(providerID, modelID)
+	}
 	return hostValue[map[string]any](r.context, "getModel", map[string]string{"provider": providerID, "modelId": modelID})
 }
 
 // GetApiKeyAndHeaders resolves request authentication through the host.
 func (r ModelRegistry) GetApiKeyAndHeaders(model map[string]any) (map[string]any, error) {
+	if r.runtime != nil {
+		return r.runtime.requestAuth(model), nil
+	}
 	provider, _ := model["provider"].(string)
 	if provider == "" {
 		if value, ok := model["provider"].(map[string]any); ok {
@@ -1568,6 +1602,9 @@ func (r ModelRegistry) GetApiKeyAndHeaders(model map[string]any) (map[string]any
 }
 
 func (r ModelRegistry) Stream(model, request, options map[string]any) *ModelEventStream {
+	if r.runtime != nil {
+		return r.runtime.Stream(model, request, options)
+	}
 	return r.stream(model, request, options, false)
 }
 
@@ -1626,10 +1663,16 @@ func (r ModelRegistry) streamOn(runtime string, model, request, options map[stri
 }
 
 func (r ModelRegistry) StreamSimple(model, request, options map[string]any) *ModelEventStream {
+	if r.runtime != nil {
+		return r.runtime.StreamSimple(model, request, options)
+	}
 	return r.stream(model, request, options, true)
 }
 
 func (r ModelRegistry) Complete(model, request, options map[string]any) map[string]any {
+	if r.runtime != nil {
+		return r.runtime.Complete(model, request, options)
+	}
 	return r.Stream(model, request, options).Result()
 }
 
@@ -1659,9 +1702,10 @@ type ExecResult struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	ExitCode int    `json:"code"`
-	// Killed reports that the command was killed by its timeout or by
-	// cancellation.
+	// Killed reports that the command was terminated by pi: its timeout, cancellation, or output over MaxBuffer.
 	Killed bool `json:"killed"`
+	// Truncated reports that the output exceeded MaxBuffer: Stdout and Stderr are incomplete and ExitCode is nonzero.
+	Truncated bool `json:"truncated"`
 }
 
 // ExecOptions are the options of [Context.ExecWithOptions], upstream's ExecOptions.
@@ -1672,11 +1716,16 @@ type ExecOptions struct {
 	Timeout float64 `json:"timeout,omitempty"`
 	// Cwd is the command's working directory. Empty uses the session's.
 	Cwd string `json:"cwd,omitempty"`
+	// MaxBuffer is the byte limit of stdout and stderr together. Output past it terminates the command and the result has Truncated
+	// and Killed set and a nonzero ExitCode; a character the limit cuts is dropped whole. nil is undefined: 256 MiB, capped by the
+	// runtime string limit. Pi's maxBuffer is a JavaScript number that must be an integer from 0 to that limit: the host fails
+	// the call for a fraction, a negative value or a value above it (and the call fails here for NaN or an infinity).
+	MaxBuffer *float64 `json:"maxBuffer,omitempty"`
 	// Signal is upstream's options.signal. When it is done the host terminates the command, as Pi does: the command alone
 	// receives SIGTERM (the process is killed on Windows), no descendant is signalled, and the call returns the output
 	// written so far with Killed set and ExitCode 0, which is what a command that a signal ended reports. A Signal that is done
-	// before the call starts the command and ends it at once. Like upstream, nothing follows the SIGTERM, so a command that
-	// ignores it keeps the call waiting.
+	// before the call starts the command and ends it at once. SIGKILL follows the SIGTERM five seconds later if the command has not
+	// exited, as it does for a timeout or a MaxBuffer overflow.
 	//
 	// Without a Signal the command ends when the calling request is cancelled. A Signal replaces that cancellation, as
 	// upstream's exec has no signal but the one the caller passes: cancelling the request then leaves the command running
@@ -1691,6 +1740,11 @@ func (c Context) Exec(command string, args []string) (*ExecResult, error) {
 
 // ExecWithOptions is [Context.Exec] with upstream's exec options.
 func (c Context) ExecWithOptions(command string, args []string, opts ExecOptions) (*ExecResult, error) {
+	// Upstream rejects a maxBuffer that is not an integer before it spawns. NaN and the infinities cross the wire as null, which the host reads as
+	// undefined, so the call fails here instead.
+	if opts.MaxBuffer != nil && (math.IsNaN(*opts.MaxBuffer) || math.IsInf(*opts.MaxBuffer, 0)) {
+		return nil, errors.New("maxBuffer must be an integer between 0 and the runtime string limit")
+	}
 	payload := map[string]any{"command": command, "args": args, "options": opts}
 	if opts.Signal == nil {
 		return c.exec(payload)
@@ -2282,7 +2336,7 @@ func (c Context) IsProjectTrusted() (bool, error) {
 	return hostRequired[bool](c, "isProjectTrusted", nil, "trusted")
 }
 
-// IsIdle returns whether the agent is currently idle (not streaming). A host or transport failure is returned rather than assumed idle.
+// IsIdle returns whether the agent is currently idle (not streaming). A host or transport failure is returned rather than assumed idle. After a SendMessage with TriggerTurn the session reads busy until the handler yields: a handler that waits for the run it started (a poll `for !idle { sleep }`) must use [Context.Sleep] or [Context.Yield]; a raw time.Sleep keeps the hold until the handler returns.
 func (c Context) IsIdle() (bool, error) {
 	return hostRequired[bool](c, "isIdle", nil, "idle")
 }
@@ -2392,6 +2446,21 @@ func decodeCancelledResult(result *callResultMsg) CancelledResult {
 func (c Context) WaitForIdle() error {
 	result, err := c.callHost("waitForIdle", nil)
 	return callResultError(result, err)
+}
+
+// Yield is the point where a handler's code gives control back to the host, standing for Pi's first `await`. Pi's `sendMessage(..., {triggerTurn: true})` keeps IsIdle busy until the sending code yields; a goroutine cannot await, so a handler that waits for the run it started (a poll `for !idle { ctx.Sleep(...) }`) must call Yield or Sleep. A raw time.Sleep keeps the hold until the handler returns. A host or transport failure is returned.
+func (c Context) Yield() error {
+	result, err := c.callHost("yield", map[string]any{})
+	return callResultError(result, err)
+}
+
+// Sleep yields (see [Context.Yield]) and then blocks for d. Use it instead of time.Sleep when polling IsIdle for a run the handler started with SendMessage. Like Pi's setTimeout it does not return early when the request is cancelled: select on Done() to stop earlier.
+func (c Context) Sleep(d time.Duration) error {
+	if err := c.Yield(); err != nil {
+		return err
+	}
+	time.Sleep(d)
+	return nil
 }
 
 // NewSession starts a new session. opts may hold "parentSession", a "setup" SetupFunc that seeds the new session through its SessionManager before it starts (types.ts:411), and a "withSession" WithSessionFunc.

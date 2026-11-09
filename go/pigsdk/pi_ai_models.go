@@ -112,6 +112,7 @@ func CalculateCost(model, usage map[string]any) (map[string]any, error) {
 	cacheWriteCost := (float64(rateCacheWrite*shortWrite) + float64(float64(rateInput*2)*longWrite)) / 1000000
 	cost["input"], cost["output"], cost["cacheRead"], cost["cacheWrite"] = input, output, cacheReadCost, cacheWriteCost
 	cost["total"] = input + output + cacheReadCost + cacheWriteCost
+	cost["totalFromProvider"] = false
 	return cost, nil
 }
 
@@ -255,6 +256,7 @@ var (
 		`input is too long for requested model`,
 		`exceeds the context window`,
 		`exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))`,
+		`context window exceeded`,
 		`input token count.*exceeds the maximum`,
 		`maximum prompt length is \d+`,
 		`reduce the length of the messages`,
@@ -296,6 +298,7 @@ var (
 		`subscription_sharing_usage_limit_exceeded`,
 		// Sign in with ChatGPT on a ChatGPT Business plan: a usage limit set by the workspace admin. Only the admin can raise it.
 		`subscription_sharing_workplace_individual_usage_limit_exceeded`,
+		`"code"\s*:\s*"?1308([^0-9]|$)`,
 	)
 	retryableProviderErrorPattern = lazyAlternation(
 		`overloaded`,

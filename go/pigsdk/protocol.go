@@ -105,18 +105,18 @@ type virtualModelDecl struct {
 }
 
 type toolDef struct {
-	Name                string   `json:"name"`
-	Label               string   `json:"label,omitempty"` // upstream ToolDefinition.label
-	Description         string   `json:"description"`
-	Parameters          Schema   `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters
-	ConstrainedSampling any      `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
-	PromptSnippet       string   `json:"prompt_snippet,omitempty"`
-	ExecutionMode       string   `json:"execution_mode,omitempty"`
-	PromptGuidelines    []string `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
-	Source              string   `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
-	RenderShell         string   `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
-	RendersCall         bool     `json:"renders_call,omitempty"`      // the tool has a call renderer
-	RendersResult       bool     `json:"renders_result,omitempty"`    // the tool has a result renderer
+	Name                string     `json:"name"`
+	Label               string     `json:"label,omitempty"` // upstream ToolDefinition.label
+	Description         string     `json:"description"`
+	Parameters          schemaRoot `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters; the root is written in the order TSchema.Schema recorded
+	ConstrainedSampling any        `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
+	PromptSnippet       string     `json:"prompt_snippet,omitempty"`
+	ExecutionMode       string     `json:"execution_mode,omitempty"`
+	PromptGuidelines    []string   `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
+	Source              string     `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
+	RenderShell         string     `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
+	RendersCall         bool       `json:"renders_call,omitempty"`      // the tool has a call renderer
+	RendersResult       bool       `json:"renders_result,omitempty"`    // the tool has a result renderer
 	// The upstream 0.99.1 tool definition fields, in the host's ToolDecl shape.
 	OutputSchema    Schema           `json:"output_schema,omitempty"`
 	Exposure        ToolExposure     `json:"exposure,omitempty"`
