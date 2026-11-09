@@ -2,7 +2,16 @@
 PIG_HOME_DIR ?= $(or $(PIG_HOME),$(HOME)/.pig)
 PIG := ./bin/pig-test
 PIG_ISOLATED_DIR ?= $(PIG_HOME_DIR)/agent
-COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod */cmd/*/go.mod)))
+
+# RETIRED: herdr-agent-state and herdsman are retired from the deployed
+# ~/.pig/agent/extensions set (no symlinks there anymore). Their sources stay
+# archived in this tree and in go.work for reference, but they no longer
+# participate in the default build/vet/test loop. Run
+# `cd <component> && go build/vet/test ./...` manually if the archived source
+# needs to be exercised.
+RETIRED_COMPONENTS := herdr-agent-state herdsman
+ALL_COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod */cmd/*/go.mod)))
+COMPONENTS := $(filter-out $(RETIRED_COMPONENTS),$(ALL_COMPONENTS))
 
 # PIGSDK_LOCAL_PATCHES: 本地相对 staged SDK 的故意偏差（防御性守卫），格式
 # 为「相对路径:md5」。sdk-check 除这些文件及其声明的 md5 外，仍要求 go/pigsdk

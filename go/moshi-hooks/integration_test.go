@@ -94,6 +94,14 @@ func (d *testDaemon) waitFor(t *testing.T, count int) []connection {
 }
 
 func TestDeliveryWritesOneJSONLineAndHalfCloses(t *testing.T) {
+	// baseEnvelope resolves the ambient terminal identity; clear the detection
+	// variables so a real hc / tmux / herdr / zellij pane cannot change the
+	// expected envelope (same list newHarness clears).
+	for _, key := range clearEnvKeys {
+		t.Setenv(key, "")
+	}
+	ResetTerminalContextForTest()
+	t.Cleanup(ResetTerminalContextForTest)
 	daemon := startDaemon(t, 0)
 	envelope := baseEnvelope(&HookPayload{SessionID: "s-1", Cwd: "/work/moshi"}, "s-1", "SessionStart")
 

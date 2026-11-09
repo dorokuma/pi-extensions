@@ -99,6 +99,44 @@ func TestResolveTerminalContextIgnoresHerdrIdsWithoutEnv(t *testing.T) {
 	}
 }
 
+// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET instead of the
+// HERDR_* variables; a pig session inside a hc terminal must still report a
+// herdr-shaped identity.
+func TestResolveTerminalContextHc(t *testing.T) {
+	context := resolveTerminalContext(envFunc(map[string]string{
+		"HC_TERMINAL_ID":     "t12t",
+		"HC_TERMINAL_SOCKET": "/run/user/0/herdr-core/default.sock",
+		"HC_SCOPE":           "scope-1",
+	}), runFunc("", nil))
+
+	if context.TerminalKind != "herdr" {
+		t.Fatalf("TerminalKind = %q, want herdr", context.TerminalKind)
+	}
+	if context.HerdrPane != "t12t" {
+		t.Fatalf("HerdrPane = %q, want t12t (HC_TERMINAL_ID)", context.HerdrPane)
+	}
+	if context.HerdrSession != "default" {
+		t.Fatalf("HerdrSession = %q, want default (session from socket path)", context.HerdrSession)
+	}
+	// The hc variables ride muxEnv verbatim (TS muxEnvKeys parity); HC_SCOPE is
+	// not in the registry list and must not leak.
+	if context.MuxEnv["HC_TERMINAL_ID"] != "t12t" ||
+		context.MuxEnv["HC_TERMINAL_SOCKET"] != "/run/user/0/herdr-core/default.sock" {
+		t.Fatalf("MuxEnv = %v, want HC_TERMINAL_ID + HC_TERMINAL_SOCKET", context.MuxEnv)
+	}
+	if _, ok := context.MuxEnv["HC_SCOPE"]; ok {
+		t.Fatalf("MuxEnv leaked HC_SCOPE: %v", context.MuxEnv)
+	}
+	// A socket without a .sock basename yields no session name.
+	noSession := resolveTerminalContext(envFunc(map[string]string{
+		"HC_TERMINAL_ID":     "t12t",
+		"HC_TERMINAL_SOCKET": "/run/user/0/herdr-core/not-a-sock",
+	}), runFunc("", nil))
+	if noSession.HerdrSession != "" || noSession.TerminalKind != "herdr" {
+		t.Fatalf("hc without session socket = %+v, want empty session + herdr kind", noSession)
+	}
+}
+
 func TestResolveTerminalContextZellij(t *testing.T) {
 	withSession := resolveTerminalContext(envFunc(map[string]string{
 		"ZELLIJ_SESSION_NAME": "z",
@@ -119,12 +157,18 @@ func TestResolveTerminalContextZellij(t *testing.T) {
 
 func TestResolveTerminalContextMuxEnv(t *testing.T) {
 	context := resolveTerminalContext(envFunc(map[string]string{
-		"TERN_PANE":    "t-1",
-		"TUIOS_ENV":    "1",
-		"TUIOS_SOCKET": "",
+		"TERN_PANE":          "t-1",
+		"TUIOS_ENV":          "1",
+		"TUIOS_SOCKET":       "",
+		"HC_TERMINAL_ID":     "t9",
+		"HC_TERMINAL_SOCKET": "/run/user/0/herdr-core/default.sock",
 	}), runFunc("", nil))
-
-	want := map[string]string{"TERN_PANE": "t-1", "TUIOS_ENV": "1"}
+	want := map[string]string{
+		"TERN_PANE":          "t-1",
+		"TUIOS_ENV":          "1",
+		"HC_TERMINAL_ID":     "t9",
+		"HC_TERMINAL_SOCKET": "/run/user/0/herdr-core/default.sock",
+	}
 	if !reflect.DeepEqual(context.MuxEnv, want) {
 		t.Fatalf("MuxEnv = %v, want %v", context.MuxEnv, want)
 	}

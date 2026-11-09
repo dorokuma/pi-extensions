@@ -43,8 +43,16 @@ type TerminalContext struct {
 }
 
 // MuxEnvKeys are the variables the daemon's mux drivers detect panes from;
-// the TS renders this list from internal/mux's registry (L127).
+// the TS renders this list from internal/mux's registry (L127). Kept in sync
+// with the deployed TS list, which includes the herdr-core (hc) variables
+// HC_SESSION / HC_TERMINAL_ID / HC_TERMINAL_SOCKET and the rex driver keys.
 var MuxEnvKeys = []string{
+	"HC_SESSION",
+	"HC_TERMINAL_ID",
+	"HC_TERMINAL_SOCKET",
+	"REX_BLOCK",
+	"REX_SERVER",
+	"REX_SESSION",
 	"TERN_PANE",
 	"TERN_PANE_SOCKET",
 	"TERN_WINDOW_KEY",
@@ -66,6 +74,22 @@ func tmuxSocketFromEnv(value string) string {
 		return value[:index]
 	}
 	return ""
+}
+
+// hcSessionFromSocket derives the herdr-core session name from
+// HC_TERMINAL_SOCKET, whose shape is "<dir>/<session>.sock" (observed:
+// /run/user/0/herdr-core/default.sock → "default"). Anything that is not a
+// ".sock" basename yields "".
+func hcSessionFromSocket(value string) string {
+	base := value
+	if index := strings.LastIndexAny(base, `/\`); index >= 0 {
+		base = base[index+1:]
+	}
+	const suffix = ".sock"
+	if !strings.HasSuffix(base, suffix) || len(base) == len(suffix) {
+		return ""
+	}
+	return base[:len(base)-len(suffix)]
 }
 
 // runForOutput runs a command and returns its stdout
@@ -117,11 +141,24 @@ func resolveTerminalContext(getenv func(string) string, run func(string, []strin
 		herdrTabID = getenv("HERDR_TAB_ID")
 	}
 
+	// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET instead of
+	// HERDR_* variables; when the classic herdr env is absent a hc terminal is
+	// still reported with terminalKind "herdr": the terminal id fills
+	// herdrPane and the session name is parsed from the socket path. The
+	// daemon resolves labels from those ids exactly as for classic herdr.
+	hcTerminalID := getenv("HC_TERMINAL_ID")
+	if hcTerminalID != "" && !inHerdr {
+		herdrPane = hcTerminalID
+		if socket := getenv("HC_TERMINAL_SOCKET"); socket != "" {
+			herdrSession = hcSessionFromSocket(socket)
+		}
+	}
+
 	terminalKind := ""
 	switch {
 	case tmuxSession != "":
 		terminalKind = "tmux"
-	case getenv("HERDR_ENV") == "1":
+	case inHerdr || hcTerminalID != "":
 		terminalKind = "herdr"
 	case getenv("ZELLIJ") != "" || zellijSession != "" || zellijPane != "":
 		terminalKind = "zellij"
