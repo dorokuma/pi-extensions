@@ -5,19 +5,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/tui"
 )
 
-// This file ports the pure formatting helpers of cache-stats.ts: formatTps,
+// This file ports the pure formatting helpers of cache-stats.ts:
 // formatWindowSize, formatHerdsmanStatus (with sheepMeat and stripProvider),
-// contextSegment, truncateFooter, and the turn-speed estimator computeTurnTps
-// (TS L432-520 and L700-810).
-
-// nowMillis is Date.now(). Tests substitute it to drive the streaming
-// estimator deterministically; the default reads the wall clock.
-var nowMillis = func() float64 { return float64(time.Now().UnixMilli()) }
+// contextSegment, truncateFooter and the ECMAScript Number::toString(10)
+// renderer jsNumberString (TS L432-533 and L861-868).
 
 // themeStyler is the slice of Pi's Theme the footer uses: fg(token, text)
 // colors text with the named token. The SDK's sdk.UITheme satisfies it through
@@ -59,29 +54,6 @@ func formatWindowSize(size float64) string {
 	// Round at integer-tenth granularity so binary float drift cannot drop a
 	// value a full tenth; a trailing ".0" vanishes on its own.
 	return jsNumberString(math.Round(size/100_000)/10) + "M"
-}
-
-// formatTps formats an estimated generation speed (output tokens per second)
-// into a compact footer string, or nil when the estimate is impossible or
-// meaningless. TS: formatTps (L497-520).
-func formatTps(outputTokens, elapsedMs float64) *string {
-	if math.IsNaN(outputTokens) || math.IsInf(outputTokens, 0) || outputTokens <= 0 {
-		return nil
-	}
-	if math.IsNaN(elapsedMs) || math.IsInf(elapsedMs, 0) || elapsedMs <= 0 {
-		return nil
-	}
-	tps := outputTokens / (elapsedMs / 1000)
-	if math.IsNaN(tps) || math.IsInf(tps, 0) || tps <= 0 {
-		return nil
-	}
-	rounded := math.Round(tps*10) / 10
-	if rounded == math.Trunc(rounded) && rounded != 0 {
-		value := strconv.Itoa(int(rounded))
-		return &value
-	}
-	value := strconv.FormatFloat(rounded, 'f', 1, 64)
-	return &value
 }
 
 var (
@@ -155,165 +127,6 @@ func truncateFooter(line string, width int, theme themeStyler) string {
 		ellipsis = theme.Fg("dim", "…")
 	}
 	return tui.TruncateToWidth(line, maxWidth, ellipsis, false)
-}
-
-// turnTimingStamps is the TS TurnTimingStamps record. A nil field is the TS
-// undefined / null.
-type turnTimingStamps struct {
-	requestStartedAt *float64
-	firstAnyAt       *float64
-	firstThinkingAt  *float64
-	firstTextAt      *float64
-	lastDeltaAt      *float64
-	doneAt           *float64
-	turnEndedAt      *float64
-}
-
-// toStamp coerces a raw value to a finite timestamp or nil. TS: toStamp
-// (L722-724).
-func toStamp(v any) *float64 {
-	switch typed := v.(type) {
-	case nil:
-		return nil
-	case *float64:
-		if typed == nil || math.IsNaN(*typed) || math.IsInf(*typed, 0) {
-			return nil
-		}
-		value := *typed
-		return &value
-	case float64:
-		if math.IsNaN(typed) || math.IsInf(typed, 0) {
-			return nil
-		}
-		value := typed
-		return &value
-	}
-	return nil
-}
-
-// computeTurnTps estimates the tokens/s of the turn that just finished: the
-// output tokens of the assistant message over the elapsed time since the
-// request start stamp. timing accepts a *turnTimingStamps record or a bare
-// *float64 request-start stamp (the TS number overload); nil means no stamp.
-// TS: computeTurnTps (L726-808).
-func computeTurnTps(timing any, rawMessage any) *string {
-	message, ok := asObject(rawMessage)
-	if !ok {
-		return nil
-	}
-	role, _ := message.lookup("role")
-	rawUsage, hasUsage := message.lookup("usage")
-	if role != "assistant" || !hasUsage || rawUsage == nil {
-		return nil
-	}
-	norm := normalizeUsage(rawUsage)
-	if math.IsNaN(norm.output) || math.IsInf(norm.output, 0) || norm.output <= 0 {
-		return nil
-	}
-
-	var requestStartedAt, explicitFirstAnyAt *float64
-	var firstThinkingAt, firstTextAt, lastDeltaAt, doneAt, turnEndedAt *float64
-	switch typed := timing.(type) {
-	case *float64:
-		requestStartedAt = toStamp(typed)
-	case *turnTimingStamps:
-		if typed != nil {
-			requestStartedAt = toStamp(typed.requestStartedAt)
-			explicitFirstAnyAt = toStamp(typed.firstAnyAt)
-			firstThinkingAt = toStamp(typed.firstThinkingAt)
-			firstTextAt = toStamp(typed.firstTextAt)
-			lastDeltaAt = toStamp(typed.lastDeltaAt)
-			doneAt = toStamp(typed.doneAt)
-			turnEndedAt = toStamp(typed.turnEndedAt)
-		}
-	}
-
-	// Non-streaming fallback: end-to-end [requestStartedAt, doneAt ??
-	// turnEndedAt ?? now].
-	if firstThinkingAt == nil && firstTextAt == nil && explicitFirstAnyAt == nil {
-		if requestStartedAt == nil {
-			return nil
-		}
-		end := firstNonNil(doneAt, turnEndedAt)
-		if end == nil {
-			now := nowMillis()
-			end = &now
-		}
-		return formatTps(norm.output, *end-*requestStartedAt)
-	}
-
-	// Streaming decode window, aligned to magpie's decodeOf.
-	var firstAnyAt *float64
-	if explicitFirstAnyAt != nil {
-		firstAnyAt = explicitFirstAnyAt
-	} else if firstThinkingAt != nil && firstTextAt != nil {
-		value := math.Min(*firstThinkingAt, *firstTextAt)
-		firstAnyAt = &value
-	} else if firstThinkingAt != nil {
-		firstAnyAt = firstThinkingAt
-	} else {
-		firstAnyAt = firstTextAt
-	}
-	if firstAnyAt == nil {
-		return nil
-	}
-
-	end := firstNonNil(doneAt, lastDeltaAt, turnEndedAt)
-	if end == nil {
-		now := nowMillis()
-		end = &now
-	}
-	flowBase := end
-	if lastDeltaAt != nil {
-		flowBase = lastDeltaAt
-	}
-	flow := *flowBase - *firstAnyAt
-	think := norm.reasoning
-	out := norm.output
-	visible := think > 0 &&
-		!(firstTextAt != nil && *firstTextAt > 0) &&
-		firstThinkingAt != nil &&
-		*firstThinkingAt >= *firstAnyAt &&
-		flow > 0 &&
-		think <= out
-	n := out
-	if think > 0 && !visible {
-		n = out - think
-	}
-	var from *float64
-	switch {
-	case visible:
-		from = firstThinkingAt
-	case think > 0:
-		from = firstTextAt
-	default:
-		from = firstAnyAt
-	}
-	if from == nil {
-		return nil
-	}
-
-	w := *end - *from
-	if !(n > 0 && *firstAnyAt > 0 && *from > 0 && w >= 100 && n*1000 <= 10000*w) {
-		return nil
-	}
-	if flow > 0 && flow*4 < w {
-		return nil
-	}
-	if think > 0 && firstTextAt != nil && *firstTextAt > 0 && n*(*firstTextAt-*firstAnyAt) > 20*think*w {
-		return nil
-	}
-	return formatTps(n, w)
-}
-
-// firstNonNil returns the first non-nil pointer of the list.
-func firstNonNil(values ...*float64) *float64 {
-	for _, value := range values {
-		if value != nil {
-			return value
-		}
-	}
-	return nil
 }
 
 // jsNumberString is ECMAScript Number::toString(10) for the values the walker

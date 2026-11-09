@@ -3,7 +3,7 @@
 //
 // The extension observes prompt caching: it keeps per-run and all-session
 // cache hit rates, renders an optional TUI footer (herdsman status, dual
-// hit-rate diamonds, context occupancy, tokens/s, model), warns once per model
+// hit-rate diamonds, context occupancy, model), warns once per model
 // that answered 400, and exposes /cache-stats with enable / disable / reset /
 // prefix subcommands. It never rewrites a system prompt or a provider payload:
 // the default mode is safe observation, and by default it also compares the
@@ -50,7 +50,7 @@ func (h sdkAgentHost) refreshFooter(state *instanceState, force bool) {
 
 // Extension constructs and returns the cache-stats extension for PiG. The
 // registered surface is the one the TS factory registers (TS L1782-2074):
-// thirteen event subscriptions and the cache-stats command.
+// ten event subscriptions and the cache-stats command.
 func Extension() *sdk.Extension {
 	e := sdk.New(logName)
 
@@ -70,9 +70,6 @@ func Extension() *sdk.Extension {
 		if !runtimeEnabled(state) {
 			return nil, nil
 		}
-		// TPS timing: clear half-recorded streaming stamps from a
-		// failed/retried request, then mark the start of this request.
-		applyProviderRequestTiming(state)
 		if prefixDiagEnabled(state) {
 			func() {
 				defer func() {
@@ -132,23 +129,6 @@ func Extension() *sdk.Extension {
 			return nil, nil
 		}
 		applyAgentEnd(state, sdkAgentHost{ctx: ctx}, event, verbose)
-		return nil, nil
-	})
-
-	// ── 4b. live footer updates during long runs ──
-	e.OnEvent(sdk.EventMessageUpdate, func(_ sdk.Context, event map[string]any) (any, error) {
-		if !runtimeEnabled(state) {
-			return nil, nil
-		}
-		applyMessageUpdate(state, event["assistantMessageEvent"], int64(nowMillis()))
-		return nil, nil
-	})
-
-	e.OnEvent(sdk.EventMessageEnd, func(_ sdk.Context, event map[string]any) (any, error) {
-		if !runtimeEnabled(state) {
-			return nil, nil
-		}
-		applyMessageEnd(state, event["message"], int64(nowMillis()))
 		return nil, nil
 	})
 
@@ -299,24 +279,12 @@ func applyAgentEnd(state *instanceState, host agentHost, event map[string]any, v
 	state.mu.Unlock()
 }
 
-// applyProviderRequestTiming clears half-recorded streaming stamps from a
-// failed or retried request and stamps the start of this one (TS L1804-1807).
-func applyProviderRequestTiming(state *instanceState) {
-	stamp := int64(nowMillis())
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	clearTurnTimingLocked(state)
-	state.providerRequestStartedAt = &stamp
-}
-
 // applyTurnEndEvent is the turn_end handler body (TS L1936-1955): accumulate
-// the turn's usage, snapshot and consume the timing stamps, then refresh the
-// footer unforced.
+// the turn's usage, then refresh the footer unforced.
 func applyTurnEndEvent(state *instanceState, host agentHost, event map[string]any) {
 	if message, ok := event["message"]; ok && message != nil {
 		recordTurnUsage(state, message)
 	}
-	applyTurnEnd(state, event["message"], int64(nowMillis()))
 	host.readFooter(state)
 	host.refreshFooter(state, false)
 }
@@ -892,7 +860,5 @@ func uninstallFooter(ctx sdk.Context, state *instanceState) {
 	state.footerSources = nil
 	state.footerContext = nil
 	state.footerHitCache = nil
-	clearTurnTimingLocked(state)
-	state.lastTurnTps = nil
 	state.footerInstalled = false
 }

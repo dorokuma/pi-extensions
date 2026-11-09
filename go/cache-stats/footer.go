@@ -10,8 +10,8 @@ import (
 // This file ports the custom footer of cache-stats.ts (TS L512-533 and
 // L611-700 and L966-1055): the geometric icon set, the extension-status
 // segment, the live dual hit-rate segment (◆ cumulative / ◇ latest), the
-// context-usage segment with its occupancy colors, the tokens/s segment and
-// the merged model segment.
+// context-usage segment with its occupancy colors, and the merged model
+// segment.
 
 // footerIcons is FOOTER_ICON: one geometric symbol family, no emoji mixin.
 const (
@@ -19,7 +19,6 @@ const (
 	footerIconHit     = "◆"
 	footerIconLatest  = "◇"
 	footerIconContext = "▲"
-	footerIconTPS     = "▸"
 	footerIconModel   = "■"
 )
 
@@ -57,7 +56,6 @@ type footerRenderSnapshot struct {
 	hitRates     *hitRates
 	context      *footerContext
 	contextKnown bool
-	tps          *string
 	modelName    string
 	thinking     *string
 }
@@ -88,7 +86,6 @@ func captureFooterSnapshot(state *instanceState) (snap footerRenderSnapshot, ent
 	state.mu.Lock()
 	snap.modelName = state.footerModelName
 	snap.thinking = state.footerThinking
-	snap.tps = state.lastTurnTps
 	snap.context = state.footerContext
 	resetBaseline := state.footerResetBaseline
 	hitCache := state.footerHitCache
@@ -125,11 +122,10 @@ func captureFooterSnapshot(state *instanceState) (snap footerRenderSnapshot, ent
 				// show the old run's hit rate for one frame after the reset.
 				// Every other input the fallback renders is refreshed the same
 				// way, so this render shows the reset state consistently instead
-				// of a new-run hit rate next to stale model/context/tps segments.
+				// of a new-run hit rate next to stale model/context segments.
 				snapshotTotals = state.snapshot
 				snap.modelName = state.footerModelName
 				snap.thinking = state.footerThinking
-				snap.tps = state.lastTurnTps
 				snap.context = state.footerContext
 			case hitCache != nil && hitCache.key == hitCacheKey(resetEpoch, resetBaseline, len(entries)):
 				live = hitRates{aggregate: hitCache.aggregate, latest: hitCache.latest}
@@ -214,14 +210,7 @@ func footerRender(state *instanceState, theme themeStyler, statuses map[string]s
 	}
 	parts = append(parts, theme.Fg("dim", footerIconContext)+" "+contextStr)
 
-	// 4. last-turn generation speed (estimate) - icon ▸ (tokens/s)
-	tpsStr := theme.Fg("dim", "n/a")
-	if snap.tps != nil {
-		tpsStr = theme.Fg("text", *snap.tps+" t/s")
-	}
-	parts = append(parts, theme.Fg("dim", footerIconTPS)+" "+tpsStr)
-
-	// 5. model name + thinking level - icon ■ (single segment, merged)
+	// 4. model name + thinking level - icon ■ (single segment, merged)
 	if snap.modelName != "" {
 		label := stripProvider(snap.modelName)
 		if snap.thinking != nil && *snap.thinking != "" {

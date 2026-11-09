@@ -154,7 +154,7 @@ func TestFooterRenderConcurrentWithLifecycle(t *testing.T) {
 		}()
 	}
 
-	// Lifecycle writers: turn_end / message_update / agent_start / agent_end and
+	// Lifecycle writers: turn_end / agent_start / agent_end and
 	// the command handlers, all touching the same state.
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -163,11 +163,8 @@ func TestFooterRenderConcurrentWithLifecycle(t *testing.T) {
 			host := &fakeHost{}
 			for n := 0; n < iterations; n++ {
 				appendEntry(usageMap("input", float64(worker+1), "cacheRead", float64(n%7), "cacheWrite", 0))
-				applyMessageUpdate(state, map[string]any{"type": "text_delta", "delta": "x"}, int64(n))
-				applyMessageEnd(state, map[string]any{"role": "assistant"}, int64(n))
 				applyTurnEndEvent(state, host, map[string]any{"message": assistantMessage(usageMap("input", 1, "cacheRead", 1, "cacheWrite", 0))})
 				recordTurnUsage(state, assistantMessage(usageMap("input", 2, "cacheRead", 2, "cacheWrite", 0)))
-				applyProviderRequestTiming(state)
 				state.mu.Lock()
 				state.liveRun = emptyLiveRun()
 				state.mu.Unlock()
