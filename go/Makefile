@@ -4,6 +4,15 @@ PIG := ./bin/pig-test
 PIG_ISOLATED_DIR ?= $(PIG_HOME_DIR)/agent
 COMPONENTS := $(filter-out pigsdk,$(patsubst %/go.mod,%,$(wildcard */go.mod */cmd/*/go.mod)))
 
+# PIGSDK_LOCAL_PATCHES: 本地相对 staged SDK 的故意偏差（防御性守卫），格式
+# 为「相对路径:md5」。sdk-check 除这些文件及其声明的 md5 外，仍要求 go/pigsdk
+# 与 staged SDK 逐文件逐字节一致；改防御内容须同步更新此处 md5，删除防御须移除条目。
+# 声明的路径必须同时存在于 staged 与本地 md5 清单：staged 缺失即 FAIL，
+# 避免上游删文件被过期豁免掩盖。
+PIGSDK_LOCAL_PATCHES := \
+	./context.go:e90606f4b873db36de583541439b0951 \
+	./mcp_extension_options.go:f5d88a9db0ec05f31d10946b99fe202c
+
 .PHONY: all build test vet sdk-check install-test examples-smoke examples-run help
 
 all: help
@@ -13,7 +22,7 @@ help:
 	@echo "  build           - Compile root module and all component modules"
 	@echo "  test            - Run tests across root module and all component modules"
 	@echo "  vet             - Run static analysis on root module and all component modules"
-	@echo "  sdk-check       - Compare local pigsdk against staged PiG SDK md5sum"
+	@echo "  sdk-check       - Compare local pigsdk against staged PiG SDK md5sum (plus declared local patches)"
 	@echo "  install-test    - Validate and install into isolated directory (PIG_ISOLATED_DIR)"
 	@echo "  examples-smoke  - Load examples/hello in PiG and call hello_ping (JSON output; makes one model call)"
 	@echo "  examples-run    - Same as examples-smoke, plain text output (makes one model call)"
@@ -64,11 +73,32 @@ sdk-check:
 	echo "Checking pigsdk against staged SDK: $$staged"; \
 	(cd "$$staged" && find . -type f ! -path "./README.md" -exec md5sum {} + | sort -k2) > "$$tmpdir/staged.md5"; \
 	(cd pigsdk && find . -type f ! -path "./README.md" -exec md5sum {} + | sort -k2) > "$$tmpdir/local.md5"; \
-	if ! diff -u "$$tmpdir/staged.md5" "$$tmpdir/local.md5"; then \
+	patch_paths=""; \
+	for entry in $(PIGSDK_LOCAL_PATCHES); do \
+		patch_paths="$$patch_paths $${entry%%:*}"; \
+	done; \
+	for file in staged local; do \
+		awk -v paths="$$patch_paths" '{p=" " paths " "; if (index(p, " " $$2 " ")) next; print}' "$$tmpdir/$$file.md5" > "$$tmpdir/$$file.core" || { echo "FAILED: filtering $$file.md5" >&2; exit 1; }; \
+	done; \
+	if ! diff -u "$$tmpdir/staged.core" "$$tmpdir/local.core"; then \
 		echo "FAILED: pigsdk differs from staged SDK ($$staged)" >&2; \
 		exit 1; \
 	fi; \
-	echo "OK: pigsdk matches staged SDK ($$staged)"
+	for entry in $(PIGSDK_LOCAL_PATCHES); do \
+		path=$${entry%%:*}; want=$${entry##*:}; \
+		if ! awk -v p="$$path" '$$2 == p {found=1} END {exit !found}' "$$tmpdir/staged.md5"; then \
+			echo "FAILED: declared patch $$path absent from staged SDK (stale PIGSDK_LOCAL_PATCHES entry; remove it or re-sync staged)" >&2; \
+			exit 1; \
+		fi; \
+		line=$$(awk -v p="$$path" '$$2 == p {print; exit}' "$$tmpdir/local.md5"); \
+		got=$${line%% *}; \
+		if [ "$$got" != "$$want" ]; then \
+			echo "FAILED: local patch $$path md5=$${got:-MISSING}, want $$want (re-sync staged or update PIGSDK_LOCAL_PATCHES)" >&2; \
+			exit 1; \
+		fi; \
+		echo "PATCH OK: $$path ($$want)"; \
+	done; \
+	echo "OK: pigsdk matches staged SDK ($$staged) plus declared local patches"
 
 install-test:
 	@if [ "$$(realpath -m "$(PIG_ISOLATED_DIR)")" = "$$(realpath -m "/root/.pi/agent")" ] || [ "$(PIG_ISOLATED_DIR)" = "/root/.pi/agent" ]; then \
