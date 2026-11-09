@@ -45,7 +45,6 @@ func TestFooterSnapshotFallbackSegments(t *testing.T) {
 	requireContains(t, line, "◆ n/a")
 	requireContains(t, line, "▲ 50%/128K")
 	requireContains(t, line, "■ GPT-4o")
-	requireContains(t, line, "▸ n/a")
 
 	recordTurnUsage(state, map[string]any{"role": "assistant", "usage": usageMap(
 		"prompt_tokens", 200, "completion_tokens", 100, "total_tokens", 1100,
@@ -177,25 +176,22 @@ func TestFooterContextColors(t *testing.T) {
 	line = footerRender(state, upperTheme{}, map[string]string{}, 200)
 	requireContains(t, line, "[ERROR:95%/10K]")
 	requireContains(t, line, "[DIM:n/a]")
-	requireContains(t, line, "[DIM:▸] [DIM:n/a]")
 	requireContains(t, line, "[TEXT:ctx-color-model")
 	requireNotContains(t, line, "[ERROR:n/a]")
 	requireNotContains(t, line, "[WARNING:n/a]")
 }
 
 func TestFooterSegmentOrderAndHerdsman(t *testing.T) {
-	state := footerStateWithEntries("tps-model", nil, boolUsageSource(sdkUsage(1000, 10000, 10)))
+	state := footerStateWithEntries("segment-model", nil, boolUsageSource(sdkUsage(1000, 10000, 10)))
 	statuses := map[string]string{"herdsman": "◆ Herdsman · 2 agent updates"}
 	line := footerRender(state, plainTheme{}, statuses, 200)
 	requireContains(t, line, "● 2 Up")
 	requireContains(t, line, "▲ 10%/10K")
-	requireContains(t, line, "▸ n/a")
-	requireContains(t, line, "■ tps-model")
+	requireContains(t, line, "■ segment-model")
 
 	contextIndex := strings.Index(line, "▲")
-	tpsIndex := strings.Index(line, "▸")
 	modelIndex := strings.Index(line, "■")
-	if !(contextIndex >= 0 && tpsIndex > contextIndex && modelIndex > tpsIndex) {
+	if !(contextIndex >= 0 && modelIndex > contextIndex) {
 		t.Fatalf("segment order is wrong: %q", line)
 	}
 
@@ -212,12 +208,7 @@ func TestFooterSegmentOrderAndHerdsman(t *testing.T) {
 	// The thinking level merges into the model segment.
 	state.footerThinking = strPtr("high")
 	line = footerRender(state, plainTheme{}, map[string]string{}, 200)
-	requireContains(t, line, "■ tps-model · high")
-
-	// The last turn's estimate renders as tokens/s.
-	state.lastTurnTps = strPtr("45")
-	line = footerRender(state, plainTheme{}, map[string]string{}, 200)
-	requireContains(t, line, "▸ 45 t/s")
+	requireContains(t, line, "■ segment-model · high")
 }
 
 func TestFooterRefreshForceFlags(t *testing.T) {

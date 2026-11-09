@@ -1,7 +1,6 @@
 package cachestats
 
 import (
-	"math"
 	"testing"
 )
 
@@ -395,33 +394,6 @@ func TestComputeLiveHitRatesLatestResidue(t *testing.T) {
 	baselined := computeLiveHitRates(seenThenMiss, intPtr(1))
 	requireOptionalInt(t, "seen.baseline.aggregate", baselined.aggregate, nil)
 	requireOptionalInt(t, "seen.baseline.latest", baselined.latest, nil)
-}
-
-func TestFormatTps(t *testing.T) {
-	// Integers render as integers.
-	requireOptionalString(t, "45", formatTps(45, 1000), strPtr("45"))
-	requireOptionalString(t, "90/2000", formatTps(90, 2000), strPtr("45"))
-	requireOptionalString(t, "10000", formatTps(10000, 1000), strPtr("10000"))
-
-	// Non-integers keep one decimal.
-	requireOptionalString(t, "12.5 exact", formatTps(25, 2000), strPtr("12.5"))
-	requireOptionalString(t, "12.46", formatTps(1246, 100000), strPtr("12.5"))
-	requireOptionalString(t, "12.44", formatTps(1244, 100000), strPtr("12.4"))
-	requireOptionalString(t, "45.04", formatTps(4504, 100000), strPtr("45"))
-
-	// Tiny speeds never use scientific notation.
-	tiny := formatTps(1, 100000)
-	requireOptionalString(t, "tiny", tiny, strPtr("0.0"))
-
-	// Uncomputable -> nil, never "NaN"/"Infinity".
-	requireOptionalString(t, "zero output", formatTps(0, 1000), nil)
-	requireOptionalString(t, "negative output", formatTps(-5, 1000), nil)
-	requireOptionalString(t, "NaN output", formatTps(math.NaN(), 1000), nil)
-	requireOptionalString(t, "Inf output", formatTps(math.Inf(1), 1000), nil)
-	requireOptionalString(t, "zero elapsed", formatTps(45, 0), nil)
-	requireOptionalString(t, "negative elapsed", formatTps(45, -1), nil)
-	requireOptionalString(t, "NaN elapsed", formatTps(45, math.NaN()), nil)
-	requireOptionalString(t, "Inf elapsed", formatTps(45, math.Inf(1)), nil)
 }
 
 func TestFormatWindowSize(t *testing.T) {

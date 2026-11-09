@@ -1,7 +1,7 @@
 # cache-stats（Go / PiG 移植）
 
 PiG 的**提示缓存观测扩展**：分别统计当前 run 与全会话的命中率，可选择显示 TUI
-页脚（herdsman 状态、双命中率菱形、上下文占用、tokens/s、模型），对每个模型首次返回
+页脚（herdsman 状态、双命中率菱形、上下文占用、模型），对每个模型首次返回
 400 时告警一次，并注册 `/cache-stats` 命令（`enable` / `disable` / `reset` / `prefix`）。
 默认模式是**只读观测**：不重写 system prompt，不改 provider payload；默认开启的前缀
 诊断只在本扩展自己的 `before_provider_request` hook 里比较 system/developer/
@@ -37,16 +37,13 @@ instructions/tools，不是命中率结论，不是最终 HTTP body，也不是�
 5. **turn 报告有界**：`turnReports` 上限 50 条，超出裁掉最旧的；累计计数不受影响。
 6. **agent_end 回填**：`liveRun` 四项全 0 且 `event.messages` 非空时，从 messages
    汇总 usage 并回填 snapshot，使当前 run 聚合能读到本轮数据。
-7. **TPS 一次性消费**：`before_provider_request` 记录 t0，`turn_end` 通过
-   `clearTurnTiming` 一次性消费全部时间戳；没有新请求的重复 `turn_end` 得到全 null，
-   渲染 `n/a` 而不是把旧 t0 重新量出塌陷的 t/s。
-8. **前缀诊断分 scope 隔离**：scope key = `sessionId + provider + api + model.id +
+7. **前缀诊断分 scope 隔离**：scope key = `sessionId + provider + api + model.id +
    hash(baseUrl)`，另有 16 字节随机 salt，跨实例/跨会话/跨模型/跨 endpoint 不共享
    比较状态；scope 字段缺失、非字符串、超长一律 skip，且从不用显示名当身份键。
-9. **有界遍历**：depth 8、nodes 2000、单串 100 000 字符、总量 250 000 字符、
+8. **有界遍历**：depth 8、nodes 2000、单串 100 000 字符、总量 250 000 字符、
    tools 64、循环引用、非有限数——任一越界都导致 `skipped`，绝不当成 `stable`。
-10. **通知清洗**：所有 `notify` 文本经 `escapeForNotify` 去掉 C0/C1/DEL/行分隔符
-    并截断到 240 字符；身份键始终用原始值，清洗只作用于显示。
+9. **通知清洗**：所有 `notify` 文本经 `escapeForNotify` 去掉 C0/C1/DEL/行分隔符
+   并截断到 240 字符；身份键始终用原始值，清洗只作用于显示。
 
 ## 环境变量
 
@@ -71,27 +68,27 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 166–224 | `scanLiveHitRates` | `usage.go:233` |
 | 226–317 | `computeLiveHitRates` | `usage.go:305` |
 | 228–266 | `cacheHitDenom` / `cacheHitPct` | `usage.go:185` / `usage.go:209`（另有 `…Numbers` 数值重载 `:203` / `:216`） |
-| 320–510 | 类型、`emptySnapshot`/`emptyLiveRun`、`randomSalt`、`createInstanceState`、`clearPrefixMemory`、`clearTurnTiming`、`resetRunState` | `state.go:150` `createInstanceState`；`:165` `clearPrefixMemory`（锁内体 `:171` `…Locked`）；`:178` `clearTurnTiming`（`:184` `…Locked`）；`:194` `resetRunState`（`:200` `…Locked`）；`state.go:138` `randomSalt`；`state.go:133`/`:135` `emptySnapshot`/`emptyLiveRun` |
-| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey`、`sheepMeat`、`formatHerdsmanStatus` | `footer.go:19` 图标常量；`extension.go:224` `isEnabled`；`tps.go:99` `sheepMeat`；`tps.go:107` `formatHerdsmanStatus` |
-| 535–560 | `readFooterCtx` | `state.go:228`（入参 `footerReadInput` 由 `extension.go:565` `captureFooterInput` 从 `sdk.Context` 采集） |
-| 562–571 | `refreshFooter` | `state.go:262` |
-| 573–611 | `recordTurnUsage` | `state.go:275` |
-| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:887` / `extension.go:835`；渲染体 `footer.go:165` `footerRender`，快照 `footer.go:87` `captureFooterSnapshot`（缓存键 `footer.go:44` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:813` `footerRendererHook`（宿主输入安全读取 `extension.go:857` `footerUIInputs`） |
+| 320–510 | 类型、`emptySnapshot`/`emptyLiveRun`、`randomSalt`、`createInstanceState`、`clearPrefixMemory`、`resetRunState`（TPS 计时戳与 `clearTurnTiming` 已于 v0.1.0 随 TPS 功能移除） | `state.go:141` `createInstanceState`；`:156` `clearPrefixMemory`（锁内体 `:162` `…Locked`）；`:169` `resetRunState`（`:175` `…Locked`）；`state.go:129` `randomSalt`；`state.go:124`/`:126` `emptySnapshot`/`emptyLiveRun` |
+| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey`、`sheepMeat`、`formatHerdsmanStatus` | `footer.go:19` 图标常量；`extension.go:204` `isEnabled`；`format.go:71` `sheepMeat`；`format.go:79` `formatHerdsmanStatus` |
+| 535–560 | `readFooterCtx` | `state.go:201`（入参 `footerReadInput` 由 `extension.go:533` `captureFooterInput` 从 `sdk.Context` 采集） |
+| 562–571 | `refreshFooter` | `state.go:235` |
+| 573–611 | `recordTurnUsage` | `state.go:248` |
+| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:855` / `extension.go:803`；渲染体 `footer.go:161` `footerRender`，快照 `footer.go:85` `captureFooterSnapshot`（缓存键 `footer.go:43` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:781` `footerRendererHook`（宿主输入安全读取 `extension.go:825` `footerUIInputs`） |
 | 705–877 | 前缀类型、`emptyBudget`、`section`、`fingerprint`、`escapeForNotify`、读取与预算原语 | `prefix.go:188` `fingerprint`（`padHex8` `:219` / `padInt32Hex8` `:235`）；`:246` `escapeForNotify`；`:273` `chargeChars`；`:290` `chargeString`；`:294` `bumpNodes` |
 | 879–1037 | `hashValue`、`writeValue`、`extractPlainText`、`textToSection` | `prefix.go:320` / `:331` / `:461` / `:544` |
 | 1039–1198 | `collectRoleBag`、`detectShape`、`toolsSection`、标签扇描、extras | `prefix.go:578` / `:676` / `:711` / `:765` `scanUniqueTaggedBlock` / `:825` `extraFromSystemText` |
 | 1200–1560 | `sectionFromExtract`、`scopeKey`、LRU、`decidePrefixStatus`、`summarizePayload` | `prefix.go:846` / `:899` / `:940`–`:977` / `:984` / `:1058` |
 | 1562–1680 | `formatSection`、`prefixStatsLine`、`showPrefix` | `prefix.go:1166` / `:1192` / `:1205` `prefixLines` |
-| 1682–2074 | `Extension()` 工厂与 **12 个事件订阅**、`/cache-stats` | `extension.go:54` `Extension`；`before_provider_request` `extension.go:304` `applyProviderRequestTiming` + `state.go:407` `observePrefixDiagnostics`；`agent_end` `extension.go:235` `applyAgentEnd`；`turn_end` `extension.go:315` `applyTurnEndEvent`；`message_update`/`message_end` `state.go:310`/`:352`；命令 `extension.go:333` `handleCommand` |
-| 2060–2131 | `readSessionAggregate`、`showStats` | `extension.go:432` `sessionAggregateOf`；`extension.go:449` `statsLines` |
-| 700–810 | `computeTurnTps`、`toStamp`、`extractAndNormalizeUsage`、`truncateFooter`、`formatTps`、`formatWindowSize` | `tps.go:199` / `:174` / `usage.go:336` / `tps.go:148` / `tps.go:67` / `tps.go:41` |
+| 1682–2074 | `Extension()` 工厂与 **10 个事件订阅**、`/cache-stats` | `extension.go:54` `Extension`；`before_provider_request` 仅前缀诊断（`state.go:290` `observePrefixDiagnostics`，scope 采集 `extension.go:563` `captureScopeIdentity`）；`agent_end` `extension.go:215` `applyAgentEnd`；`turn_end` `extension.go:284` `applyTurnEndEvent`；命令 `extension.go:301` `handleCommand` |
+| 2060–2131 | `readSessionAggregate`、`showStats` | `extension.go:400` `sessionAggregateOf`；`extension.go:417` `statsLines` |
+| 700–810 | `computeTurnTps`、`toStamp`、`formatTps`（TPS 估算器与格式化器） | **已于 v0.1.0 移除**：TPS 页脚段、计时戳、估算器连同 `tps.go` / `tps_test.go` 整体删除；`truncateFooter` 迁至 `format.go`，`formatWindowSize` 在 `format.go:36`，`extractAndNormalizeUsage` 仍在 `usage.go:336` |
 | 812–856 | `extractAndNormalizeUsage` | `usage.go:336`（回写在 `usage.go:379`） |
 
-**事件订阅数 = 12**（`grep -c OnEvent extension.go` → 12）：`before_provider_request`、
-`after_provider_response`、`agent_start`、`agent_end`、`message_update`、`message_end`、
-`turn_end`、`tool_execution_start`、`tool_execution_end`、`session_start`、
-`model_select`、`thinking_level_select`。之前文档写的“13 个”是错的，源码与 TS 原版
-均为 12。
+**事件订阅数 = 10**（`grep -c OnEvent extension.go` → 10）：`before_provider_request`、
+`after_provider_response`、`agent_start`、`agent_end`、`turn_end`、
+`tool_execution_start`、`tool_execution_end`、`session_start`、`model_select`、
+`thinking_level_select`。TPS 移除前的版本为 12（另有只服务 TPS 的 `message_update`
+与 `message_end`）。
 
 ## 测试与验证证据
 
@@ -99,8 +96,8 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 
 | 原版文件 | Go 测试 |
 |---|---|
-| `test/hit-rate.mjs` §1–6、§8、§9、§10；§7 页脚格式化 | `usage_test.go`：`TestHitRateDenominatorAndPercent`、`TestAggregateHitOverTurns`、`TestNormalizeUsageOpenAIStyles`、`TestNormalizeUsageReasoningAndTotals`、`TestComputeLiveHitRates*`、`TestFormatTps`、`TestFormatWindowSize`、`TestFormatHerdsmanStatus` |
-| `test/cache-stats.mjs` 命中率/turn/页脚/TPS 各段 | `lifecycle_test.go`（agent_end 记账、回填、有界报告、双 scope、reset 口径、400 列表）、`footer_test.go`（双菱形门控、watermark、dirty-check、上下文配色、段序、截断）、`tps_test.go`（`decodeOf` 差分 9 样本、四大护栏、一次性消费） |
+| `test/hit-rate.mjs` §1–6、§8、§9、§10；§7 页脚格式化 | `usage_test.go`：`TestHitRateDenominatorAndPercent`、`TestAggregateHitOverTurns`、`TestNormalizeUsageOpenAIStyles`、`TestNormalizeUsageReasoningAndTotals`、`TestComputeLiveHitRates*`、`TestFormatWindowSize`、`TestFormatHerdsmanStatus` |
+| `test/cache-stats.mjs` 命中率/turn/页脚各段 | `lifecycle_test.go`（agent_end 记账、回填、有界报告、双 scope、reset 口径、400 列表）、`footer_test.go`（双菱形门控、watermark、dirty-check、上下文配色、段序、截断）。TPS 段随功能移除，不再翻成 Go 测试 |
 | `test/prefix-diagnostics.mjs` | `prefix_test.go`：`TestPrefixBaselineStableChangedPerShape`、`TestPrefixShapeFromStructureNotVendor`、`TestPrefixUnknownAndMissingShapes`、`TestPrefixOutputNeverLeaksContent` |
 | `test/prefix-r9-accessors.mjs`、`prefix-r9-budget.mjs`、`prefix-r9-endpoint.mjs` | `TestPrefixBudgetGuards`、`TestPrefixWalkerGuards`、`TestPrefixScopeIsolation`、`TestPrefixScopeMissingFieldsSkip`、`TestPrefixEvictionIsBounded` |
 | `test/prefix-r11-*.mjs` | `TestPrefixExtrasRecognition`、`TestPrefixExtrasUnidentifiedForms`、`TestPrefixRoleBagStructureSensitivity`、`TestPrefixControlCharactersInStats` |
@@ -121,9 +118,9 @@ $ go vet ./...
 （退出码 0）
 
 $ go test -count=3 -race -v ./...
---- PASS（87 个顶层用例全过，另有 50 个子用例；连续 3 轮全绿）
+--- PASS（77 个顶层测试 + 41 个子测试 = 118 条 RUN/PASS 执行记录，全过；连续 3 轮全绿）
 PASS
-ok  	github.com/dorokuma/pi-extensions/go/cache-stats	1.903s
+ok  	github.com/dorokuma/pi-extensions/go/cache-stats	1.792s
 （DATA RACE 计数：0）
 ```
 
@@ -180,8 +177,8 @@ standalone module root 报错。说明：非交互模式下 `-p` 不会分发 `/
    force 形参与调用点，但 re-push 时忽略它（语义等价：都会重渲染）。
 6. **model api / baseUrl 来源**：`GetModelInfo` 不暴露 `api` 与 `baseUrl`，Go 版从
    `ctx.ModelRegistry().GetAll()` 里按 `provider`+`id` 取。**每次观测都重新读注册表，
-   不做任何缓存**（`extension.go:595` `captureScopeIdentity` → `:701`
-   `lookupModelEndpoints` → `:655` `buildModelEndpointResolver` → `:672`
+   不做任何缓存**（`extension.go:563` `captureScopeIdentity` → `:669`
+   `lookupModelEndpoints` → `:623` `buildModelEndpointResolver` → `:640`
    `modelEndpointsFrom`）：早先按 (provider,id)
    永久缓存的版本会把「注册表尚未就绪时的空结果」和查询失败永久记住（整个会话都是
    `skipped`，`session_start` 也不清），并在同名模型切换 `baseUrl`/`api` 后继续用
@@ -199,25 +196,25 @@ standalone module root 报错。说明：非交互模式下 `-p` 不会分发 `/
 
 | 分类 | 文件 | 行数 |
 |---|---|---|
-| 实现 | `extension.go` | 898 |
-| 实现 | `footer.go` | 241 |
+| 实现 | `extension.go` | 864 |
+| 实现 | `footer.go` | 230 |
 | 实现 | `prefix.go` | 1250 |
-| 实现 | `state.go` | 456 |
-| 实现 | `tps.go` | 372 |
+| 实现 | `state.go` | 339 |
+| 实现 | `format.go` | 185 |
 | 实现 | `usage.go` | 470 |
 | 实现 | `values.go` | 101 |
-| **实现小计** | 7 个文件 | **3788** |
-| 测试 | `concurrency_test.go` | 702 |
-| 测试 | `footer_test.go` | 250 |
-| 测试 | `harness_test.go` | 227 |
+| **实现小计** | 7 个文件 | **3439** |
+| 测试 | `concurrency_test.go` | 699 |
+| 测试 | `footer_test.go` | 241 |
+| 测试 | `harness_test.go` | 218 |
 | 测试 | `lifecycle_test.go` | 352 |
 | 测试 | `prefix_test.go` | 967 |
-| 测试 | `tps_test.go` | 569 |
-| 测试 | `usage_test.go` | 477 |
-| **测试小计** | 7 个文件 | **3544** |
-| **合计** | 14 个文件 | **7332** |
+| 测试 | `format_test.go` | 89 |
+| 测试 | `usage_test.go` | 449 |
+| **测试小计** | 7 个文件 | **3015** |
+| **合计** | 14 个文件 | **6454** |
 
-测试/实现比约 3544 / 3788 ≈ 0.94。
+测试/实现比约 3015 / 3439 ≈ 0.88。
 
 ## 遗留
 
@@ -244,4 +241,4 @@ standalone module root 报错。说明：非交互模式下 `-p` 不会分发 `/
    （`TestPadInt32Hex8IsPadStartNotZeroExtend`），逐字符一致。
 5. **`num()` 与 JS `String(v)`**：统计行的计数器渲染必须与模板字面量的 Number→String
    一致。旧实现为了让计数器整个整数域走普通记数法而偏离了 JS 在 `1e21` 处的阈值
-   （JS 是 `"1e+21"`）。现直接委托 `jsNumberString`（`extension.go:544` `num`）。
+   （JS 是 `"1e+21"`）。现直接委托 `jsNumberString`（`extension.go:512` `num`）。

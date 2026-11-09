@@ -9,8 +9,8 @@ import (
 
 // This file ports the per-instance state of cache-stats.ts (TS L320-420 and
 // L536-700): the run snapshot, the live accumulator, the turn reports, the
-// footer capture and its live-hit cache, the prefix memory, and the TPS
-// scratch stamps, together with the transitions that touch them.
+// footer capture and its live-hit cache, and the prefix memory, together with
+// the transitions that touch them.
 
 // snapshot is Snapshot: the current run's cumulative counters.
 type snapshot struct {
@@ -113,15 +113,6 @@ type instanceState struct {
 	footerResetBaseline *int
 	footerHitCache      *footerHitCache
 
-	// TPS estimation stamps: request start, streaming decode stamps and the
-	// formatted tokens/s of the last completed turn.
-	providerRequestStartedAt *int64
-	streamFirstThinkingAt    *int64
-	streamFirstTextAt        *int64
-	streamLastDeltaAt        *int64
-	streamDoneAt             *int64
-	lastTurnTps              *string
-
 	footerInstalled bool
 
 	prefixDiagEnabled bool
@@ -173,22 +164,6 @@ func clearPrefixMemoryLocked(state *instanceState) {
 	state.lastPrefixDiag = nil
 }
 
-// clearTurnTiming drops the TPS scratch stamps. TS: clearTurnTiming
-// (L474-480).
-func clearTurnTiming(state *instanceState) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	clearTurnTimingLocked(state)
-}
-
-func clearTurnTimingLocked(state *instanceState) {
-	state.providerRequestStartedAt = nil
-	state.streamFirstThinkingAt = nil
-	state.streamFirstTextAt = nil
-	state.streamLastDeltaAt = nil
-	state.streamDoneAt = nil
-}
-
 // resetRunState resets the current run, drops the captured footer sources, and
 // invalidates the footer live-hit cache. TS: resetRunState (L482-508).
 func resetRunState(state *instanceState) {
@@ -207,8 +182,6 @@ func resetRunStateLocked(state *instanceState) {
 	state.footerResetEpoch++
 	state.footerResetBaseline = nil
 	state.footerHitCache = nil
-	clearTurnTimingLocked(state)
-	state.lastTurnTps = nil
 }
 
 // footerReadInput is one ctx capture for readFooterCtx: the extension fills it
@@ -303,96 +276,6 @@ func recordTurnUsage(state *instanceState, rawMessage any) {
 		state.snapshot.totalCacheRead += norm.cacheRead
 		state.snapshot.totalHitDenom += denom
 	}
-}
-
-// applyMessageUpdate records one streaming stamp. TS: the message_update
-// handler (L1899-1922).
-func applyMessageUpdate(state *instanceState, assistantMessageEvent any, now int64) {
-	event, ok := asObject(assistantMessageEvent)
-	if !ok {
-		return
-	}
-	typeValue, _ := event.lookup("type")
-	eventType, isString := typeValue.(string)
-	if !isString {
-		return
-	}
-	delta, _ := event.lookup("delta")
-	deltaText, isDeltaString := delta.(string)
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	switch eventType {
-	case "thinking_delta":
-		if isDeltaString && deltaText != "" {
-			if state.streamFirstThinkingAt == nil {
-				stamp := now
-				state.streamFirstThinkingAt = &stamp
-			}
-			stamp := now
-			state.streamLastDeltaAt = &stamp
-		}
-	case "text_delta", "toolcall_delta":
-		if isDeltaString && deltaText != "" {
-			if state.streamFirstTextAt == nil {
-				stamp := now
-				state.streamFirstTextAt = &stamp
-			}
-			stamp := now
-			state.streamLastDeltaAt = &stamp
-		}
-	case "done":
-		stamp := now
-		state.streamDoneAt = &stamp
-	}
-}
-
-// applyMessageEnd locks doneAt once the assistant message finished streaming,
-// so tool latency after it is excluded from the estimate. TS: the message_end
-// handler (L1924-1934).
-func applyMessageEnd(state *instanceState, message any, now int64) {
-	obj, ok := asObject(message)
-	if !ok {
-		return
-	}
-	role, _ := obj.lookup("role")
-	if role != "assistant" {
-		return
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.streamDoneAt == nil && (state.streamFirstThinkingAt != nil || state.streamFirstTextAt != nil) {
-		stamp := now
-		state.streamDoneAt = &stamp
-	}
-}
-
-// applyTurnEnd consumes this turn's timing stamps exactly once and stores the
-// estimated tokens/s. TS: the turn_end handler (L1936-1955).
-func applyTurnEnd(state *instanceState, message any, now int64) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	timing := &turnTimingStamps{
-		requestStartedAt: millisToStamp(state.providerRequestStartedAt),
-		firstThinkingAt:  millisToStamp(state.streamFirstThinkingAt),
-		firstTextAt:      millisToStamp(state.streamFirstTextAt),
-		lastDeltaAt:      millisToStamp(state.streamLastDeltaAt),
-		doneAt:           millisToStamp(state.streamDoneAt),
-	}
-	endStamp := float64(now)
-	timing.turnEndedAt = &endStamp
-	clearTurnTimingLocked(state)
-	// computeTurnTps reads only its own arguments (the stamps and the message),
-	// never the instance state, so it may run under the lock.
-	state.lastTurnTps = computeTurnTps(timing, message)
-}
-
-// millisToStamp widens a millisecond stamp to the float64 the estimator uses.
-func millisToStamp(value *int64) *float64 {
-	if value == nil {
-		return nil
-	}
-	converted := float64(*value)
-	return &converted
 }
 
 // observePrefixDiagnostics records one read-only prefix observation. When the

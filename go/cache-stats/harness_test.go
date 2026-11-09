@@ -199,15 +199,6 @@ func requireOptionalString(t *testing.T, label string, got *string, want *string
 	t.Fatalf("%s = %v, want %v", label, got, want)
 }
 
-// tpsMessage builds an assistant message with the given output/reasoning.
-func tpsMessage(output float64, reasoning any) map[string]any {
-	usage := usageMap("output", output)
-	if reasoning != nil {
-		usage["reasoning"] = reasoning
-	}
-	return map[string]any{"role": "assistant", "usage": usage}
-}
-
 // footerEntries installs a session-entry source into the state.
 func footerEntries(state *instanceState, entries func() ([]any, bool)) {
 	state.footerSources = &footerSources{entries: entries}
