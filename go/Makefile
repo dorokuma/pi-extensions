@@ -13,6 +13,14 @@ PIGSDK_LOCAL_PATCHES := \
 	./context.go:e90606f4b873db36de583541439b0951 \
 	./mcp_extension_options.go:f5d88a9db0ec05f31d10946b99fe202c
 
+# PIGSDK_META_FILES: 非代码元数据文件，豁免 sdk-check 的逐字节比对（两侧 find
+# 均排除）。README.md 历史上已豁免；CHANGELOG.md 由本仓 VERSIONING.md 要求放在
+# 模块目录，属于本地发布元数据而非 SDK 代码，staged 侧不携带，故豁免。
+PIGSDK_META_FILES := \
+	./README.md \
+	./CHANGELOG.md
+PIGSDK_META_FIND := $(foreach f,$(PIGSDK_META_FILES),! -path "$(f)")
+
 .PHONY: all build test vet sdk-check install-test examples-smoke examples-run help
 
 all: help
@@ -71,8 +79,8 @@ sdk-check:
 		exit 0; \
 	fi; \
 	echo "Checking pigsdk against staged SDK: $$staged"; \
-	(cd "$$staged" && find . -type f ! -path "./README.md" -exec md5sum {} + | sort -k2) > "$$tmpdir/staged.md5"; \
-	(cd pigsdk && find . -type f ! -path "./README.md" -exec md5sum {} + | sort -k2) > "$$tmpdir/local.md5"; \
+	(cd "$$staged" && find . -type f $(PIGSDK_META_FIND) -exec md5sum {} + | sort -k2) > "$$tmpdir/staged.md5"; \
+	(cd pigsdk && find . -type f $(PIGSDK_META_FIND) -exec md5sum {} + | sort -k2) > "$$tmpdir/local.md5"; \
 	patch_paths=""; \
 	for entry in $(PIGSDK_LOCAL_PATCHES); do \
 		patch_paths="$$patch_paths $${entry%%:*}"; \
