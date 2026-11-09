@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
 ### Added
 
 - add a herdr-core (`hc`) positive-proof branch to the S1–S4 identity core
