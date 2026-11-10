@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Retired/archived: removed from the deployed `~/.pig/agent/extensions` set and
+  listed in `go/Makefile` `RETIRED_COMPONENTS`. The source stays in this tree
+  and in `go/go.work` for reference but no longer participates in the default
+  `make build`/`make vet`/`make test` loop; run `go build/vet/test ./...`
+  inside this directory manually if needed. No code change.
+
 ## [0.1.0] - 2026-11-10
 
 首次正式发布。Go port of the `moshi-hooks.ts` Pi extension: normalizes Pi
