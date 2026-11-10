@@ -464,9 +464,12 @@ func trustedAgentHomes() []string {
 // trustedHomeDir 注释口径一致）。trustedHomeDir 不可解析时的兜底 "/" 不作
 // home 根（否则 join 出 /.local/bin 等无意义路径），跳过。
 //
-// 相对修复前枚举是超集（修复前 agentLookupDirs/版本化 pig glob 仅 /root 两项，
-// 现含 passwd-HOME + /root + .agy-pro-home），不会拒掉修复前能收录的合法项；
-// 唯一撤掉的是本 diff 新加的 $HOME 项。
+// 仅就 agentLookupDirs 与版本化 pig glob 两面，相对修复前枚举是超集
+// （修复前这两面仅 /root 两项，现含 passwd-HOME + /root + .agy-pro-home），
+// 不会拒掉修复前能收录的合法项；这两面唯一撤掉的是本 diff 新加的 $HOME 项。
+// 其余三面（agyHookLookupDirs / herdsman-go bin / agyStateBin）修复前本就经
+// homeDir() 枚举环境 $HOME，收紧后同样撤销该项——非受信 $HOME 下原本可经
+// homeDir() 收录的合法路径不再收录，此为用户批准的收紧方案一部分。
 func trustedLookupHomes() []string {
 	var homes []string
 	seen := make(map[string]struct{}, 3)
