@@ -1,5 +1,10 @@
 # moshi-hooks（Go 移植）
 
+> **已归档退役**：本组件已从部署目录 `~/.pig/agent/extensions` 下线（该目录已无
+> moshi-hooks 条目），并列入 `go/Makefile` 的 `RETIRED_COMPONENTS`。源码保留在
+> 本目录与 `go/go.work` 中备查，**不再参与默认 `make build`/`make vet`/`make test`
+> 循环**；如需验证归档源码，请在本目录手动执行 `go build/vet/test ./...`。
+
 PiG 的 moshi-hook 生命周期钩子扩展。它把 Pi 的会话事件归一化后，以**一条连接一条 JSON 行**的
 协议写入 moshi-hook 守护进程的 Unix socket（Windows 为命名管道）；守护进程不在时连接失败被
 静默吞掉，用户的回合绝不被打断。
