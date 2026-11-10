@@ -2105,14 +2105,26 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 }
 
 // TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin 覆盖 agy 状态目录
-// 查找根（agyStateBin：.gemini/antigravity-cli/bin）与宿主受信安装/查找根
-// 在隔离 HOME 下的回归：隔离 HOME 后 agy/agentapi/webm_encoder 必须仍从
-// <hostHome>/.gemini/antigravity-cli/bin 解析进 EntryAgents；宿主缺失时
-// 显式构造宿主根目标（<hostHome>/.gemini/.../claude/real-target）保证覆盖
-// 不依赖宿主机是否已安装——其 basename 非白名单，命中第 3 档根判定分支。
+// 查找根（agyStateBin：.gemini/antigravity-cli/bin）在隔离 HOME 下的枚举回归。
+// 生产枚举口径为 trustedHomesWithRoot = trustedAgentHomes()（homeDir() +
+// trustedHomeDir()）+ 硬编码 /root，三个分支各由对应子断言覆盖：
+//  1. homeDir() 分支：隔离 HOME 夹具内布置 agy/agentapi/webm_encoder 三个
+//     普通可执行文件，必须经枚举进入 EntryAgents；
+//  2. trustedHomeDir()/「/root」分支（宿主侧）：宿主受信 home 下已安装的同名
+//     三成员必须仍解析进 EntryAgents——trustedHomeDir() 经 /etc/passwd 解析，
+//     单测进程内无法用 Setenv 指到夹具，且禁止写宿主真实 HOME/.gemini，故
+//     宿主侧完整安装缺失时显式 Skip 该子断言而非假绿；
+//  3. 身份判定第 3 档覆盖：PATH 软链 claude → <隔离HOME>/.gemini/<slug>/claude/
+//     real-target，目标 basename 非白名单，放行必须命中「含 /claude/ 段 +
+//     安装根前缀」分支，不依赖 basename 白名单与宿主安装状态。
+//
+// agentapi/webm_encoder 不在 entry-agent 查找名集（names）内，PATH/
+// standardBinDirs/查找目录均不会解析它们，其宿主侧路径只能由 agyStateBin
+// 枚举产生，故断言即枚举覆盖判据；隔离侧成员路径同理仅枚举可达。
 func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", filepath.Join(tmp, "isolated-home"))
+	isolatedHome := filepath.Join(tmp, "isolated-home")
+	t.Setenv("HOME", isolatedHome)
 
 	// 与生产 trustedHomeDir 同口径：user.LookupId(euid)，不看 $HOME。
 	hostHome := ""
@@ -2123,73 +2135,132 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 		t.Skip("os/user cannot resolve host home dir")
 	}
 
-	t.Run("host agy state bin resolved", func(t *testing.T) {
-		// 宿主缺 agyStateBin 时显式构造宿主根夹具：
-		// <hostHome>/.gemini/.sbx-test-<rand>/claude/real-target——
-		// 目标真实位于宿主 .gemini 安装根之下，basename 故意非白名单，
-		// 放行必须命中「含 /claude/ 路径段 + 宿主安装根前缀」分档，不依赖
-		// 宿主机已安装任何 agent，也不依赖 basename 白名单。
-		agyBinDir := filepath.Join(hostHome, ".gemini", "antigravity-cli", "bin")
-		fixtureLink := ""
-		fixtureTarget := ""
-		if st, err := os.Stat(filepath.Join(agyBinDir, "agy")); err != nil || st.IsDir() {
-			fixtureRoot := filepath.Join(hostHome, ".gemini", ".sbx-test-"+t.Name())
-			fixtureDir := filepath.Join(fixtureRoot, "claude")
-			if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
-				t.Fatalf("mkdir host fixture under .gemini: %v", err)
+	// 与生产 trustedHomesWithRoot 同口径的宿主侧受信 home：hostHome 与硬编码
+	// /root，剔除隔离 HOME（homeDir() 分支由独立夹具断言覆盖）。
+	var hostTrustedHomes []string
+	seenHomes := map[string]struct{}{filepath.Clean(isolatedHome): {}}
+	for _, home := range []string{hostHome, "/root"} {
+		home = filepath.Clean(home)
+		if _, ok := seenHomes[home]; ok {
+			continue
+		}
+		seenHomes[home] = struct{}{}
+		hostTrustedHomes = append(hostTrustedHomes, home)
+	}
+
+	agyStateBinMembers := []string{"agy", "agentapi", "webm_encoder"}
+
+	t.Run("isolated home agy state bin resolved", func(t *testing.T) {
+		// 布置 homeDir() 侧完整三成员普通可执行文件。除 agyStateBin 枚举外
+		// 无任何入口可达：不在 PATH/standardBinDirs/查找目录布置同名文件，
+		// agentapi/webm_encoder 亦不在查找名集内不会被 LookPath 解析。
+		isolatedBin := filepath.Join(isolatedHome, ".gemini", "antigravity-cli", "bin")
+		if err := os.MkdirAll(isolatedBin, 0o755); err != nil {
+			t.Fatalf("mkdir isolated agy bin: %v", err)
+		}
+		for _, name := range agyStateBinMembers {
+			p := filepath.Join(isolatedBin, name)
+			if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatalf("write isolated agy member %s: %v", p, err)
 			}
-			t.Cleanup(func() { _ = os.RemoveAll(fixtureRoot) })
-			fixtureTarget = filepath.Join(fixtureDir, "real-target")
-			if err := os.WriteFile(fixtureTarget, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-				t.Fatalf("write host fixture target: %v", err)
-			}
-			binDir := filepath.Join(tmp, "bin-fixture")
-			if err := os.MkdirAll(binDir, 0o755); err != nil {
-				t.Fatalf("mkdir bin fixture: %v", err)
-			}
-			fixtureLink = filepath.Join(binDir, "claude")
-			if err := os.Symlink(fixtureTarget, fixtureLink); err != nil {
-				t.Fatalf("symlink fixture claude: %v", err)
-			}
-			origPath := os.Getenv("PATH")
-			t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
 		}
 
 		paths := sandbox.ResolveEntryAgentPaths()
-		if fixtureLink != "" {
-			normLink, err := sandbox.NormalizePath(fixtureLink)
+		for _, name := range agyStateBinMembers {
+			norm, err := sandbox.NormalizePath(filepath.Join(isolatedBin, name))
 			if err != nil {
-				t.Fatalf("NormalizePath fixture link: %v", err)
-			}
-			if !containsPath(paths, normLink) {
-				t.Fatalf("host-root fixture symlink %s must enter EntryAgents, got %v", normLink, paths)
-			}
-			resolvedTarget, err := filepath.EvalSymlinks(fixtureLink)
-			if err != nil {
-				t.Fatalf("EvalSymlinks fixture: %v", err)
-			}
-			if norm, err := sandbox.NormalizePath(resolvedTarget); err == nil {
-				resolvedTarget = norm
-			}
-			if !containsPath(paths, resolvedTarget) {
-				t.Fatalf("host-root fixture target %s must enter EntryAgents via root verdict, got %v", resolvedTarget, paths)
-			}
-			return
-		}
-		// 宿主已安装：agyStateBin 成员必须全部解析进 EntryAgents（含
-		// agentapi：basename 非查找名集成员时经第 1 档白名单放行）。
-		for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
-			hostPath := filepath.Join(agyBinDir, name)
-			if st, err := os.Stat(hostPath); err != nil || st.IsDir() {
-				t.Fatalf("host agy state binary %s missing: %v", hostPath, err)
-			}
-			norm, err := sandbox.NormalizePath(hostPath)
-			if err != nil {
-				t.Fatalf("NormalizePath %s: %v", hostPath, err)
+				t.Fatalf("NormalizePath isolated member %s: %v", name, err)
 			}
 			if !containsPath(paths, norm) {
-				t.Fatalf("host agy state binary %s must be in EntryAgents under isolated HOME, got %v", norm, paths)
+				t.Fatalf("isolated-home agy state member %s must enter EntryAgents via homeDir() enumeration, got %v", norm, paths)
 			}
+		}
+	})
+
+	t.Run("host agy state bin resolved", func(t *testing.T) {
+		// 宿主侧受信 home 下已安装的 agy 状态 bin：bin/agy 存在即视为该根
+		// 已安装，要求三成员全部进 EntryAgents。trustedHomeDir() 不经环境
+		// 变量，无法在进程内重定向到夹具；宿主缺安装时 Skip（不能布置
+		// 等价夹具，也不写宿主真实 .gemini 造文件）。
+		paths := sandbox.ResolveEntryAgentPaths()
+		foundInstall := false
+		for _, home := range hostTrustedHomes {
+			binDir := filepath.Join(home, ".gemini", "antigravity-cli", "bin")
+			if st, err := os.Stat(filepath.Join(binDir, "agy")); err != nil || st.IsDir() {
+				continue
+			}
+			foundInstall = true
+			for _, name := range agyStateBinMembers {
+				hostPath := filepath.Join(binDir, name)
+				if st, err := os.Stat(hostPath); err != nil || st.IsDir() {
+					t.Fatalf("host agy state binary %s missing: %v", hostPath, err)
+				}
+				norm, err := sandbox.NormalizePath(hostPath)
+				if err != nil {
+					t.Fatalf("NormalizePath %s: %v", hostPath, err)
+				}
+				if !containsPath(paths, norm) {
+					t.Fatalf("host agy state binary %s must be in EntryAgents under isolated HOME (trusted home %s), got %v", norm, home, paths)
+				}
+			}
+		}
+		if !foundInstall {
+			t.Skipf("no agy state bin under host trusted homes %v; trustedHomeDir() is not redirectable in-process and host .gemini must not be touched", hostTrustedHomes)
+		}
+	})
+
+	t.Run("install-root verdict via isolated gemini root", func(t *testing.T) {
+		// 身份判定第 3 档覆盖：目标 <isolatedHome>/.gemini/<slug>/claude/
+		// real-target 真实位于安装根 <isolatedHome>/.gemini 前缀之下，
+		// basename 故意非白名单，放行必须命中「含 /claude/ 路径段 + 安装根
+		// 前缀」分档，不依赖宿主机已安装任何 agent，也不依赖 basename
+		// 白名单。整棵夹具树位于 t.TempDir() 内，不写宿主真实 HOME/.gemini。
+		slug := strings.ReplaceAll(t.Name(), "/", "_")
+		fixtureRoot := filepath.Join(isolatedHome, ".gemini", ".sbx-test-"+slug)
+		fixtureDir := filepath.Join(fixtureRoot, "claude")
+		if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
+			t.Fatalf("mkdir fixture under isolated .gemini: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(fixtureRoot); err != nil {
+				t.Errorf("remove fixture root %s: %v", fixtureRoot, err)
+			}
+			if _, err := os.Stat(fixtureRoot); !os.IsNotExist(err) {
+				t.Errorf("fixture root %s must not remain (stat err=%v)", fixtureRoot, err)
+			}
+		})
+		fixtureTarget := filepath.Join(fixtureDir, "real-target")
+		if err := os.WriteFile(fixtureTarget, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fixture target: %v", err)
+		}
+		binDir := filepath.Join(tmp, "bin-fixture")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatalf("mkdir bin fixture: %v", err)
+		}
+		fixtureLink := filepath.Join(binDir, "claude")
+		if err := os.Symlink(fixtureTarget, fixtureLink); err != nil {
+			t.Fatalf("symlink fixture claude: %v", err)
+		}
+		origPath := os.Getenv("PATH")
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+		paths := sandbox.ResolveEntryAgentPaths()
+		normLink, err := sandbox.NormalizePath(fixtureLink)
+		if err != nil {
+			t.Fatalf("NormalizePath fixture link: %v", err)
+		}
+		if !containsPath(paths, normLink) {
+			t.Fatalf("install-root fixture symlink %s must enter EntryAgents, got %v", normLink, paths)
+		}
+		resolvedTarget, err := filepath.EvalSymlinks(fixtureLink)
+		if err != nil {
+			t.Fatalf("EvalSymlinks fixture: %v", err)
+		}
+		if norm, err := sandbox.NormalizePath(resolvedTarget); err == nil {
+			resolvedTarget = norm
+		}
+		if !containsPath(paths, resolvedTarget) {
+			t.Fatalf("install-root fixture target %s must enter EntryAgents via root verdict, got %v", resolvedTarget, paths)
 		}
 	})
 }
