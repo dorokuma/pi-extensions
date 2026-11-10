@@ -427,10 +427,54 @@ var ReviewerAgentTools = append(append([]string{}, DefaultReviewerTools...),
 	"mkdir", "cp", "touch",
 )
 
+// trustedAgentHomes 返回代理查找/安装根枚举共用的受信 home 根列表
+// （去重、保持顺序）：homeDir()（当前 $HOME）在前、trustedHomeDir()（被隔离
+// 覆盖的 $HOME 下仍解析到宿主真实 HOME）在后。trustedHomeDir 不可解析时的
+// 兜底 "/" 不作 home 根（否则 join 出 /.local/bin 等无意义路径），跳过。
+// 统一口径避免 agentLookupDirs / agyHookLookupDirs / entryAgentInstallRoots /
+// agyStateBin 多处各自漂移。
+func trustedAgentHomes() []string {
+	var homes []string
+	seen := make(map[string]struct{}, 2)
+	for _, home := range []string{homeDir(), trustedHomeDir()} {
+		home = filepath.Clean(strings.TrimSpace(home))
+		if home == "" || home == "." || home == "/" {
+			continue
+		}
+		if _, ok := seen[home]; ok {
+			continue
+		}
+		seen[home] = struct{}{}
+		homes = append(homes, home)
+	}
+	return homes
+}
+
 // agentLookupDirs 是解析 agy/pig/pi/claude 时除 PATH 与 standardBinDirs 外额外搜索的目录。
-var agentLookupDirs = []string{
-	"/root/.local/bin",
-	"/root/.pig/bin",
+// 覆盖全部 trustedAgentHomes() 的受信宿主安装/查找根（.local/bin、.pig/bin）
+// 与硬编码 /root（agy 本体不跟随 $HOME 的既有约定），在隔离 HOME 下同样完整；
+// 绝不纳入任意 PATH/TMPDIR 目录。
+func agentLookupDirs() []string {
+	var out []string
+	seen := make(map[string]struct{}, 8)
+	add := func(d string) {
+		d = filepath.Clean(strings.TrimSpace(d))
+		if d == "" || d == "." {
+			return
+		}
+		if _, ok := seen[d]; ok {
+			return
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	for _, home := range trustedAgentHomes() {
+		add(filepath.Join(home, ".local", "bin"))
+		add(filepath.Join(home, ".pig", "bin"))
+	}
+	add("/root/.local/bin")
+	add("/root/.pig/bin")
+	return out
 }
 
 // entryAgentPathSet 将 EntryAgents 路径规范化为集合，供 Validate / seccomp 使用。
@@ -496,9 +540,9 @@ var agyHookBinaryNames = []string{
 }
 
 // agyHookLookupDirs 是在 standardBinDirs/agentLookupDirs 之外为 agy 钩子二进制
-// 追加搜索的宿主目录，覆盖 homeDir() 与硬编码 /root 两种 HOME 形态。
+// 追加搜索的宿主目录，覆盖全部 trustedAgentHomes() 与硬编码 /root 两种 HOME 形态。
 func agyHookLookupDirs() []string {
-	seen := make(map[string]struct{}, 2)
+	seen := make(map[string]struct{}, 4)
 	var out []string
 	add := func(d string) {
 		d = filepath.Clean(strings.TrimSpace(d))
@@ -511,7 +555,9 @@ func agyHookLookupDirs() []string {
 		seen[d] = struct{}{}
 		out = append(out, d)
 	}
-	add(filepath.Join(homeDir(), ".local", "bin"))
+	for _, home := range trustedAgentHomes() {
+		add(filepath.Join(home, ".local", "bin"))
+	}
 	add("/root/.local/bin")
 	return out
 }
@@ -563,7 +609,7 @@ func ResolveAgyHookPaths() []string {
 		for _, dir := range standardBinDirs {
 			add(filepath.Join(dir, name))
 		}
-		for _, dir := range agentLookupDirs {
+		for _, dir := range agentLookupDirs() {
 			add(filepath.Join(dir, name))
 		}
 		for _, dir := range agyHookLookupDirs() {
@@ -572,14 +618,16 @@ func ResolveAgyHookPaths() []string {
 	}
 
 	// herdsman 包装脚本 exec 到 herdsman-go 真实二进制；HERDSMAN_GO_BIN 优先于默认路径。
-	// 覆盖 homeDir() 与 /root 两种 HOME，确保 HOME=/root/.agy-pro-home 下同样解析到本体。
+	// 覆盖全部 trustedAgentHomes() 与 /root 两种 HOME，确保 HOME=/root/.agy-pro-home 下同样解析到本体。
 	addHerdsmanGoBin := func(root string) {
 		add(filepath.Join(root, ".local", "lib", "herdsman-go", "herdsman"))
 	}
 	if envBin := strings.TrimSpace(os.Getenv("HERDSMAN_GO_BIN")); envBin != "" {
 		add(envBin)
 	}
-	addHerdsmanGoBin(homeDir())
+	for _, home := range trustedAgentHomes() {
+		addHerdsmanGoBin(home)
+	}
 	addHerdsmanGoBin("/root")
 
 	return out
@@ -632,7 +680,7 @@ func resolveExecutableCandidate(candidate string, seen map[string]struct{}, out 
 
 // ResolveMCPServerPaths 解析 pig / agy MCP 生态的服务二进制及其包装脚本目标：
 // ctxmode、codegraph-go、jev-mcp、jev-mcp-go、agy-recall，逐个在 PATH、
-// standardBinDirs、agentLookupDirs、agyHookLookupDirs()（覆盖 homeDir() 与 /root 两种 HOME）
+// standardBinDirs、agentLookupDirs()、agyHookLookupDirs()（覆盖 trustedAgentHomes() 与 /root 两种 HOME）
 // 下查找，软链与 ELF 本体一并放行（去重）。不放行整个 ~/.local/bin。
 func ResolveMCPServerPaths() []string {
 	seen := make(map[string]struct{}, len(mcpServerBinaryNames)*2)
@@ -644,7 +692,7 @@ func ResolveMCPServerPaths() []string {
 		for _, dir := range standardBinDirs {
 			resolveExecutableCandidate(filepath.Join(dir, name), seen, &out)
 		}
-		for _, dir := range agentLookupDirs {
+		for _, dir := range agentLookupDirs() {
 			resolveExecutableCandidate(filepath.Join(dir, name), seen, &out)
 		}
 		for _, dir := range agyHookLookupDirs() {
@@ -672,19 +720,37 @@ func ResolveEntryAgentPaths() []string {
 
 	// entryAgentInstallRoots 枚举已知安装根前缀（含尾部分隔符）：软链
 	// 解析目标只有位于这些根之下，才可经「含 /<查找名>/ 路径段」判定放行。
+	// 根覆盖全部 trustedAgentHomes()（当前 $HOME 与 trustedHomeDir() 宿主真实
+	// HOME，后者在隔离测试或 systemd 单元改 HOME 时仍解析到宿主
+	// /root/.local/share 等真实安装根）与硬编码 /root 两个形态，去重。
+	// trustedHomesWithRoot 亦复用于下方版本化 pig glob 与 agyStateBin 枚举。
+	trustedHomesWithRoot := dedupeStrings(append(append([]string{}, trustedAgentHomes()...), "/root"))
 	entryAgentInstallRoots := func() []string {
 		sep := string(filepath.Separator)
-		roots := []string{
-			filepath.Join(homeDir(), ".local", "share") + sep,
-			filepath.Join(homeDir(), ".local", "opt") + sep,
-			filepath.Join(homeDir(), ".gemini") + sep,
-			filepath.Join(homeDir(), ".agy-pro-home") + sep,
+		var roots []string
+		seen := make(map[string]struct{}, 8)
+		addRoot := func(root string) {
+			root = filepath.Clean(strings.TrimSpace(root))
+			if root == "" || root == "." {
+				return
+			}
+			if _, ok := seen[root]; ok {
+				return
+			}
+			seen[root] = struct{}{}
+			roots = append(roots, root+sep)
+		}
+		for _, home := range trustedHomesWithRoot {
+			addRoot(filepath.Join(home, ".local", "share"))
+			addRoot(filepath.Join(home, ".local", "opt"))
+			addRoot(filepath.Join(home, ".gemini"))
+			addRoot(filepath.Join(home, ".agy-pro-home"))
 		}
 		for _, d := range standardBinDirs {
-			roots = append(roots, d+sep)
+			addRoot(d)
 		}
-		for _, d := range agentLookupDirs {
-			roots = append(roots, d+sep)
+		for _, d := range agentLookupDirs() {
+			addRoot(d)
 		}
 		return roots
 	}()
@@ -786,19 +852,26 @@ func ResolveEntryAgentPaths() []string {
 		for _, dir := range standardBinDirs {
 			add(name, filepath.Join(dir, name))
 		}
-		for _, dir := range agentLookupDirs {
+		for _, dir := range agentLookupDirs() {
 			add(name, filepath.Join(dir, name))
 		}
 	}
-	if matches, err := filepath.Glob("/root/.local/opt/pig/*/pig"); err == nil {
-		for _, m := range matches {
-			add("pig", m)
+	// 版本化 pig 安装根 glob 覆盖全部 trustedAgentHomes() 与硬编码 /root
+	// （agy/pig 本体不跟随 $HOME 的既有约定），隔离 HOME 下仍能命中宿主 opt。
+	for _, globHome := range trustedHomesWithRoot {
+		if matches, err := filepath.Glob(filepath.Join(globHome, ".local", "opt", "pig", "*", "pig")); err == nil {
+			for _, m := range matches {
+				add("pig", m)
+			}
 		}
 	}
-	// agy stub (/root/.local/bin/agy) 会再 exec 到 antigravity-cli/bin/agy（动态链接真实本体）
-	agyStateBin := filepath.Join(homeDir(), ".gemini", "antigravity-cli", "bin")
-	for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
-		add(name, filepath.Join(agyStateBin, name))
+	// agy stub (…/.local/bin/agy) 会再 exec 到 antigravity-cli/bin/agy（动态链接真实本体）；
+	// agyStateBin 按全部 trustedAgentHomes() + /root 枚举，隔离 HOME 下仍定位宿主状态目录。
+	for _, agyHome := range trustedHomesWithRoot {
+		agyStateBin := filepath.Join(agyHome, ".gemini", "antigravity-cli", "bin")
+		for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
+			add(name, filepath.Join(agyStateBin, name))
+		}
 	}
 	return out
 }

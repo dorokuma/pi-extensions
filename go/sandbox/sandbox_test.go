@@ -8,9 +8,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1993,6 +1995,203 @@ func TestResolveEntryAgentPathsVersionedClaudeTarget(t *testing.T) {
 	if !containsPath(paths, resolvedLink) {
 		t.Fatalf("versioned target %s should be in EntryAgents, got %v", resolvedLink, paths)
 	}
+}
+
+// TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots 覆盖隔离 HOME 回归：
+// $HOME 被指向临时目录时，宿主真实 HOME（trustedHomeDir 同口径：
+// user.LookupId(euid)，不看 $HOME）下的 claude 版本化安装根
+// （<hostHome>/.local/share/claude/versions/<ver>）仍属受信任安装根——
+// 软链目标身份校验按宿主 HOME 而非被覆盖的 $HOME 判定，claude 不得被
+// "not in allowed roots" 拒绝；同时保证毒软链防线不破：同一隔离 HOME
+// 下指向任意路径的 /tmp/<rand>/claude/evil 目标仍被拒。宿主不存在
+// claude 软链或 os/user 解析不到宿主 HOME 时跳过。
+func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
+	tmp := t.TempDir()
+	// 隔离 HOME：宿主 /root/.local/share 不再是 homeDir()/.local/share。
+	t.Setenv("HOME", filepath.Join(tmp, "isolated-home"))
+
+	hostHome := ""
+	// 判定口径与生产 trustedHomeDir 一致：user.LookupId(euid)，不看 $HOME。
+	if u, err := user.LookupId(strconv.Itoa(os.Geteuid())); err == nil && u != nil {
+		hostHome = u.HomeDir
+	}
+	if hostHome == "" {
+		t.Skip("os/user cannot resolve host home dir")
+	}
+
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		t.Skipf("claude not installed on host (LookPath: %v)", err)
+	}
+	resolvedClaude, err := filepath.EvalSymlinks(claudePath)
+	if err != nil {
+		t.Skipf("EvalSymlinks claude: %v", err)
+	}
+	resolvedClaude = filepath.Clean(resolvedClaude)
+	if !strings.HasPrefix(resolvedClaude+string(filepath.Separator),
+		filepath.Join(hostHome, ".local", "share")+string(filepath.Separator)) {
+		t.Skipf("host claude target %s is not a versioned install under <hostHome>/.local/share, scenario not applicable", resolvedClaude)
+	}
+
+	// 根判定分支覆盖保证：versioned claude 的 basename（版本号）绝不在
+	// basename 白名单（agy/pig/pi/claude/agentapi/webm_encoder）内，放行
+	// 只能经「含 /<查找名>/ 路径段 + 宿主安装根前缀」分档；若未来实现把
+	// 该 basename 加入白名单短路，此断言直接失败而不是静默失去覆盖。
+	if base := filepath.Base(resolvedClaude); sandbox.IsForbiddenExec(base) ||
+		base == "agy" || base == "pig" || base == "pi" || base == "claude" ||
+		base == "agentapi" || base == "webm_encoder" {
+		t.Fatalf("test setup broken: resolved claude basename %q would short-circuit root branch", base)
+	}
+
+	// 毒软链防线断言：在隔离 HOME 下 PATH 前置 <tmp>/bin-poison/claude →
+	// <tmp>/claude/evil（路径含 /claude/ 段但不在任何安装根前缀下）。
+	// 注意必须在上面宿主 claude 的 LookPath/EvalSymlinks/skip 判定之后
+	// 才污染 PATH，否则 LookPath 会命中毒链导致场景判定脱靶。
+	evil := filepath.Join(tmp, "claude", "evil")
+	poisonBinDir := filepath.Join(tmp, "bin-poison")
+	if err := os.MkdirAll(filepath.Dir(evil), 0o755); err != nil {
+		t.Fatalf("mkdir evil dir: %v", err)
+	}
+	if err := os.MkdirAll(poisonBinDir, 0o755); err != nil {
+		t.Fatalf("mkdir poison bin: %v", err)
+	}
+	if err := os.WriteFile(evil, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatalf("write evil: %v", err)
+	}
+	poisonLink := filepath.Join(poisonBinDir, "claude")
+	if err := os.Symlink(evil, poisonLink); err != nil {
+		t.Fatalf("symlink claude→evil: %v", err)
+	}
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", poisonBinDir+string(os.PathListSeparator)+origPath)
+
+	var paths []string
+	warnOut := captureStderr(t, func() {
+		paths = sandbox.ResolveEntryAgentPaths()
+	})
+
+	normClaude, err := filepath.Abs(filepath.Clean(claudePath))
+	if err != nil {
+		t.Fatalf("Abs claude: %v", err)
+	}
+	if !containsPath(paths, normClaude) {
+		t.Fatalf("claude symlink %s must stay in EntryAgents under isolated HOME, got %v", normClaude, paths)
+	}
+	if !containsPath(paths, resolvedClaude) {
+		t.Fatalf("host versioned claude target %s must stay in EntryAgents under isolated HOME, got %v", resolvedClaude, paths)
+	}
+	if strings.Contains(warnOut, resolvedClaude+" ") && strings.Contains(warnOut, "not in allowed roots") {
+		t.Fatalf("host claude target must not be rejected as out-of-roots under isolated HOME: %q", warnOut)
+	}
+
+	// 毒软链断言：软链本身与 evil 目标均不得进入 EntryAgents，且 WARN 须
+	// 含 not in allowed roots 拒绝特征并点名 evil 目标。
+	resolvedEvil, err := filepath.EvalSymlinks(evil)
+	if err != nil {
+		t.Fatalf("EvalSymlinks evil: %v", err)
+	}
+	if containsPath(paths, poisonLink) {
+		t.Fatalf("poison symlink %s must not enter EntryAgents under isolated HOME, got %v", poisonLink, paths)
+	}
+	if containsPath(paths, resolvedEvil) {
+		t.Fatalf("not-in-roots evil target %s must not enter EntryAgents under isolated HOME, got %v", resolvedEvil, paths)
+	}
+	if !strings.Contains(warnOut, "not in allowed roots, skipped") {
+		t.Fatalf("expected not-in-allowed-roots WARN for poisoned claude target under isolated HOME, got %q", warnOut)
+	}
+	if !strings.Contains(warnOut, "evil") {
+		t.Fatalf("expected WARN naming rejected target %s under isolated HOME, got %q", resolvedEvil, warnOut)
+	}
+}
+
+// TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin 覆盖 agy 状态目录
+// 查找根（agyStateBin：.gemini/antigravity-cli/bin）与宿主受信安装/查找根
+// 在隔离 HOME 下的回归：隔离 HOME 后 agy/agentapi/webm_encoder 必须仍从
+// <hostHome>/.gemini/antigravity-cli/bin 解析进 EntryAgents；宿主缺失时
+// 显式构造宿主根目标（<hostHome>/.gemini/.../claude/real-target）保证覆盖
+// 不依赖宿主机是否已安装——其 basename 非白名单，命中第 3 档根判定分支。
+func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", filepath.Join(tmp, "isolated-home"))
+
+	// 与生产 trustedHomeDir 同口径：user.LookupId(euid)，不看 $HOME。
+	hostHome := ""
+	if u, err := user.LookupId(strconv.Itoa(os.Geteuid())); err == nil && u != nil {
+		hostHome = u.HomeDir
+	}
+	if hostHome == "" {
+		t.Skip("os/user cannot resolve host home dir")
+	}
+
+	t.Run("host agy state bin resolved", func(t *testing.T) {
+		// 宿主缺 agyStateBin 时显式构造宿主根夹具：
+		// <hostHome>/.gemini/.sbx-test-<rand>/claude/real-target——
+		// 目标真实位于宿主 .gemini 安装根之下，basename 故意非白名单，
+		// 放行必须命中「含 /claude/ 路径段 + 宿主安装根前缀」分档，不依赖
+		// 宿主机已安装任何 agent，也不依赖 basename 白名单。
+		agyBinDir := filepath.Join(hostHome, ".gemini", "antigravity-cli", "bin")
+		fixtureLink := ""
+		fixtureTarget := ""
+		if st, err := os.Stat(filepath.Join(agyBinDir, "agy")); err != nil || st.IsDir() {
+			fixtureRoot := filepath.Join(hostHome, ".gemini", ".sbx-test-"+t.Name())
+			fixtureDir := filepath.Join(fixtureRoot, "claude")
+			if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
+				t.Fatalf("mkdir host fixture under .gemini: %v", err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(fixtureRoot) })
+			fixtureTarget = filepath.Join(fixtureDir, "real-target")
+			if err := os.WriteFile(fixtureTarget, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatalf("write host fixture target: %v", err)
+			}
+			binDir := filepath.Join(tmp, "bin-fixture")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatalf("mkdir bin fixture: %v", err)
+			}
+			fixtureLink = filepath.Join(binDir, "claude")
+			if err := os.Symlink(fixtureTarget, fixtureLink); err != nil {
+				t.Fatalf("symlink fixture claude: %v", err)
+			}
+			origPath := os.Getenv("PATH")
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+		}
+
+		paths := sandbox.ResolveEntryAgentPaths()
+		if fixtureLink != "" {
+			normLink, err := sandbox.NormalizePath(fixtureLink)
+			if err != nil {
+				t.Fatalf("NormalizePath fixture link: %v", err)
+			}
+			if !containsPath(paths, normLink) {
+				t.Fatalf("host-root fixture symlink %s must enter EntryAgents, got %v", normLink, paths)
+			}
+			resolvedTarget, err := filepath.EvalSymlinks(fixtureLink)
+			if err != nil {
+				t.Fatalf("EvalSymlinks fixture: %v", err)
+			}
+			if norm, err := sandbox.NormalizePath(resolvedTarget); err == nil {
+				resolvedTarget = norm
+			}
+			if !containsPath(paths, resolvedTarget) {
+				t.Fatalf("host-root fixture target %s must enter EntryAgents via root verdict, got %v", resolvedTarget, paths)
+			}
+			return
+		}
+		// 宿主已安装：agyStateBin 成员必须全部解析进 EntryAgents（含
+		// agentapi：basename 非查找名集成员时经第 1 档白名单放行）。
+		for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
+			hostPath := filepath.Join(agyBinDir, name)
+			if st, err := os.Stat(hostPath); err != nil || st.IsDir() {
+				t.Fatalf("host agy state binary %s missing: %v", hostPath, err)
+			}
+			norm, err := sandbox.NormalizePath(hostPath)
+			if err != nil {
+				t.Fatalf("NormalizePath %s: %v", hostPath, err)
+			}
+			if !containsPath(paths, norm) {
+				t.Fatalf("host agy state binary %s must be in EntryAgents under isolated HOME, got %v", norm, paths)
+			}
+		}
+	})
 }
 
 func containsPath(list []string, want string) bool {
