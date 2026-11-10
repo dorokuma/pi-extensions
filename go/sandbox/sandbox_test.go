@@ -2106,17 +2106,21 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 
 // TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin 覆盖 agy 状态目录
 // 查找根（agyStateBin：.gemini/antigravity-cli/bin）在隔离 HOME 下的枚举回归。
-// 生产枚举口径为 trustedHomesWithRoot = trustedAgentHomes()（homeDir() +
-// trustedHomeDir()）+ 硬编码 /root，三个分支各由对应子断言覆盖：
-//  1. homeDir() 分支：隔离 HOME 夹具内布置 agy/agentapi/webm_encoder 三个
-//     普通可执行文件，必须经枚举进入 EntryAgents；
-//  2. trustedHomeDir()/「/root」分支（宿主侧）：宿主受信 home 下已安装的同名
-//     三成员必须仍解析进 EntryAgents——trustedHomeDir() 经 /etc/passwd 解析，
-//     单测进程内无法用 Setenv 指到夹具，且禁止写宿主真实 HOME/.gemini，故
-//     宿主侧完整安装缺失时显式 Skip 该子断言而非假绿；
+// 生产枚举口径为 trustedLookupHomes() = trustedHomeDir()（/etc/passwd 解析的
+// 宿主 HOME）+ 硬编码 /root + /root/.agy-pro-home，绝不读 $HOME——$HOME 是
+// 调用方可控输入，不得作为二进制收录的信任边界输入；因此隔离 HOME
+// （homeDir()）不进入枚举，下述分支覆盖：
+//  1. 收紧回归：隔离 HOME 夹具内布置 agy/agentapi/webm_encoder 三个
+//     普通可执行文件，因 homeDir() 已退出枚举，一个都不得进 EntryAgents；
+//  2. trustedLookupHomes() 分支（宿主侧）：宿主受信 home（passwd-HOME、
+//     /root、/root/.agy-pro-home）下已安装的同名三成员必须仍解析进
+//     EntryAgents——trustedHomeDir() 经 /etc/passwd 解析，单测进程内无法
+//     用 Setenv 指到夹具，且禁止写宿主真实 HOME/.gemini，故宿主侧完整
+//     安装缺失时显式 Skip 该子断言而非假绿；
 //  3. 身份判定第 3 档覆盖：PATH 软链 claude → <隔离HOME>/.gemini/<slug>/claude/
 //     real-target，目标 basename 非白名单，放行必须命中「含 /claude/ 段 +
-//     安装根前缀」分支，不依赖 basename 白名单与宿主安装状态。
+//     安装根前缀」分支（安装根前缀判定仍含 homeDir()，系既有信任口径），
+//     不依赖 basename 白名单与宿主安装状态。
 //
 // agentapi/webm_encoder 不在 entry-agent 查找名集（names）内，PATH/
 // standardBinDirs/查找目录均不会解析它们，其宿主侧路径只能由 agyStateBin
@@ -2135,11 +2139,12 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 		t.Skip("os/user cannot resolve host home dir")
 	}
 
-	// 与生产 trustedHomesWithRoot 同口径的宿主侧受信 home：hostHome 与硬编码
-	// /root，剔除隔离 HOME（homeDir() 分支由独立夹具断言覆盖）。
+	// 与生产 trustedLookupHomes() 同口径的宿主侧受信 home：hostHome、硬编码
+	// /root 与 /root/.agy-pro-home，剔除隔离 HOME（homeDir() 已退出二进制
+	// 收录面枚举，由收紧回归子断言覆盖）。
 	var hostTrustedHomes []string
 	seenHomes := map[string]struct{}{filepath.Clean(isolatedHome): {}}
-	for _, home := range []string{hostHome, "/root"} {
+	for _, home := range []string{hostHome, "/root", "/root/.agy-pro-home"} {
 		home = filepath.Clean(home)
 		if _, ok := seenHomes[home]; ok {
 			continue
@@ -2150,9 +2155,11 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 
 	agyStateBinMembers := []string{"agy", "agentapi", "webm_encoder"}
 
-	t.Run("isolated home agy state bin resolved", func(t *testing.T) {
-		// 布置 homeDir() 侧完整三成员普通可执行文件。除 agyStateBin 枚举外
-		// 无任何入口可达：不在 PATH/standardBinDirs/查找目录布置同名文件，
+	t.Run("isolated home agy state bin not collected", func(t *testing.T) {
+		// 收紧回归：隔离 HOME（homeDir()）不再属于二进制收录面
+		// trustedLookupHomes()，夹具内即使布置完整三成员普通可执行文件也
+		// 一个都不得经枚举进入 EntryAgents。除 agyStateBin 枚举外无任何
+		// 入口可达：不在 PATH/standardBinDirs/查找目录布置同名文件，
 		// agentapi/webm_encoder 亦不在查找名集内不会被 LookPath 解析。
 		isolatedBin := filepath.Join(isolatedHome, ".gemini", "antigravity-cli", "bin")
 		if err := os.MkdirAll(isolatedBin, 0o755); err != nil {
@@ -2171,8 +2178,8 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NormalizePath isolated member %s: %v", name, err)
 			}
-			if !containsPath(paths, norm) {
-				t.Fatalf("isolated-home agy state member %s must enter EntryAgents via homeDir() enumeration, got %v", norm, paths)
+			if containsPath(paths, norm) {
+				t.Fatalf("isolated-home agy state member %s must NOT enter EntryAgents: caller-controlled $HOME is out of the binary lookup trust boundary, got %v", norm, paths)
 			}
 		}
 	})
