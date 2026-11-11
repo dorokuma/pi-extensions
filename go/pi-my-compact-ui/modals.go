@@ -84,15 +84,15 @@ func (m *detailModalComponent) startPollingIfNeeded() {
 	if m.entry.kind == "thinking" {
 		interval = thinkingSpinnerIntervalMs
 	}
-	timer := &animTimer{stop: make(chan struct{}), done: make(chan struct{})}
 	m.mu.Lock()
+	if m.disposed || m.polling {
+		m.mu.Unlock()
+		return
+	}
+	timer := &animTimer{stop: make(chan struct{})}
 	m.pollTimer = timer
 	m.polling = true
 	m.mu.Unlock()
-	go func() {
-		<-timer.stop
-		close(timer.done)
-	}()
 	go m.pollLoop(timer, interval)
 }
 
@@ -540,14 +540,10 @@ func (m *inspectSelectorModal) startPollingIfNeeded() {
 		m.mu.Unlock()
 		return
 	}
-	timer := &animTimer{stop: make(chan struct{}), done: make(chan struct{})}
+	timer := &animTimer{stop: make(chan struct{})}
 	m.pollTimer = timer
 	m.polling = true
 	m.mu.Unlock()
-	go func() {
-		<-timer.stop
-		close(timer.done)
-	}()
 	go m.pollLoop(timer)
 }
 
