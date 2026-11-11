@@ -50,19 +50,26 @@ status: active
 
 ## 缺陷清单（观察项，均未修）
 
-1. **多种性质不同的拒绝被压成同一个 `rejected`/rc=1**：中继把恢复窗口
-   与是否值得重试都不同的四类拒绝压进 `reportStatusRejected`，客户端因此
-   无法判断该等 30 秒、该放弃、还是该立即重试。四类分别是：
+1. **四类失败/拒绝分属不同状态字节与退出码，但都不携带重试性质**：
+   前三类回 `reportStatusRejected`（rc=1），第四类回 `reportStatusFailed`
+   （状态 2，`report_relay.go:365-366`）或客户端本地直接退 75——恢复窗口
+   与是否值得重试各不相同的四类形态，回给客户端的却只有状态字节与退出码，
+   没有任何「该等 30 秒 / 该放弃 / 该立即重试」的指示，客户端因此无法判断
+   该等 30 秒、该放弃、还是该立即重试。四类分别是：
    - **突发桶耗尽**：`reportBurstTokens = 3`（`report_relay.go:48`）、
      `reportRefillEvery = 30s`（`:49`）。性质是**可恢复但恢复窗口是 30 秒
-     量级**，100/400ms 的有界重试不会让它恢复。
+     量级**，100/400ms 的短重试不保证恢复——恢复取决于距上一个 refill
+     基准已累积的余量（`takeToken()` 未满桶时 `lastRef` 只推进已消费的
+     整周期数、保留不足一个周期的余数，`report_relay.go:381-391`），
+     最坏接近 30 秒。
    - **会话封顶**：`reportSessionMax = 20`（`:50`），判定在 `takeToken()`
      的 `if r.sent >= reportSessionMax || r.tokens <= 0 { return false }`
      （`:394`）；`sent` 只在 `:398` 递增、**不随补令牌重置**，对单次会话
      而言是**永久**拒绝，重试无意义。
    - **中继连接超限**：`serve()` 在 `len(r.conns) >= reportMaxActiveConns`
      时直接写 `{reportStatusRejected, "relay busy"}` 拒绝帧后丢连接
-     （`:250-253`），不经 `process()`；同样是 rc=1，但它是瞬时拥塞信号，
+     （判限 `:250`、写帧 `:253`、`c.Close()` `:254`、`continue` `:255`，
+     即 `:250-255`），不经 `process()`；同样是 rc=1，但它是瞬时拥塞信号，
      与前三类的语义又不同。
    - **投递/本地失败回 75 的多种来源**：`process()`（`:365-366`）把所有
      `deliver()` 错误一律回 `reportStatusFailed`；客户端
@@ -76,8 +83,12 @@ status: active
    永久拒绝同归 `reportStatusRejected`，是同一缺陷的一部分。
 2. **「只发一次」纪律 × 无客户端重试**：派发契约要求子代理**只发一次、
    勿重试**（hc send 回报是强制收口义务），而客户端（`reportSend`，
-   `report_client_linux.go:53`）对任何失败——包括投递失败 rc=75 这类明确
-   可重试的形态——均无重试，二者叠加把整条回报通道变成单点。
+   `report_client_linux.go:53`）对任何失败——包括投递失败 rc=75 这类**可能**
+   可重试的形态——均无重试。rc=75 的来源既有可恢复的（父侧 `hc send` 排队、
+   core 重启瞬间中继不可达），也有不可恢复的（缺 `PI_SANDBOX_GO_EXEC_DIR`，
+   `report_client_linux.go:53-56` 永远不会自己变好），**同一退出码覆盖两种
+   性质**才是问题。二者叠加把整条回报通道的**自动投递路径**变成单点（人工经
+   子代理会话 `hc read` 恢复不算自动送达保证）。
 
 ## 撤销注记（本版已删除的方案）
 
@@ -108,16 +119,18 @@ status: active
   `reportStatusFailed`）、`frame_size_boundary_64kib`（`:787-840`）、
   `active_conn_cap_prevents_dos`（`:989-1054`）。客户端侧退出码映射
   （rc=0/1/75/126）**无直接单元测试**；集成测试
-  `TestSbxReportRelayIntegration`（`main_test.go:1237`，非 root 在
-  `:1237-1238` skip，本轮未实跑）已断言 `send_hi_rc=0` /
+  `TestSbxReportRelayIntegration`（定义在 `main_test.go:1236`，非 root 的
+  skip 判定在 `:1237-1238`，本轮未实跑）已断言 `send_hi_rc=0` /
   `hc_run_rc=126` / `send_other_rc=1`（`:1436-1438`），其发送端
-  （`:1344-1348`）真实运行沙盒内受限 `hc` 客户端（argv[0] 分发入口
+  （`:1343-1348`，`hc send tTEST hello` 在 `:1343`）真实运行沙盒内受限 `hc` 客户端（argv[0] 分发入口
   `landlock_linux.go:182-185`，hc 软链来自 `preset.go:1098`）。
   **未找到 rc=75（投递失败/中继不可用）路径的断言，也没有重试行为
   断言——75 这条最关键的失败路径无人守，是真正的缺口。**
-- b) 客户端对可重试失败（投递失败 rc=75，及 a 落地后的突发耗尽/relay
-  busy 类瞬时状态）做**有界退避重试，至多一次**（约 100/400ms 量级），
-  不新增任何落盘。
+- b) 客户端对两类真瞬时失败做**有界退避重试，至多一次**（约 100/400ms
+  量级），不新增任何落盘：① 投递失败 rc=75 中**中继不可达/连接被断**
+  这类；② `relay busy`（真瞬时拥塞）。**突发桶耗尽量不列入短退避**——
+  其恢复窗口属 refill 节奏问题（见缺陷 #1），另议；会话封顶继续保持
+  「不得迁成可重试」。
 - `reportHcTimeout` **保持 5s 不变**（决策不变）：`reportDrain=6s >
   reportHcTimeout=5s`（`:51-52`）是刻意配平，放大超时须同步动 drain
   并拖慢 relay 关闭与沙箱退出。本次 `signal: killed` 的根因**降级为
@@ -127,6 +140,12 @@ status: active
   成功 send 路径的耗时证据。确诊需三项证据：该次 send 实际耗时、当时
   relay 根 ctx / 活动连接状态、herdr-core 重启时间线与本次 dispatch 的
   先后关系。
+- **作用层次说明**：候选 b) 的「至多重试一次」指**客户端内部一次重试
+  预算**，不改变派发契约里「子代理只调用一次 `hc send`」的顶层纪律——
+  两者是不同层次（客户端协议实现 vs 代理行为契约）；若日后立项，须同步
+  改写派发契约措辞，避免被读成「允许代理重复调用 `hc send`」。同理，
+  缺陷 #2 的「单点」限定为**自动投递路径**单点，人工经子代理会话恢复
+  不在其内。
 
 ## 协调事实（主代理实测 + 本轮复核）
 
