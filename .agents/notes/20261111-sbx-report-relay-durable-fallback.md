@@ -41,9 +41,9 @@ status: active
   **注意：`hc get`/`hc ls` 约 2ms 只说明 hc 本体轻量，不是成功 `hc send`
   路径的耗时证据**，不能据此排除 send 本身慢。5s 预算对正常路径的宽裕度
   由此降级为估计；本次 `signal: killed` 有两条可产生同一表象的路径：
-  ① `reportHcTimeout` 5s 超时 kill（`report_relay.go:417-419`）；
-  ② `close()` 的 drain 超时经 `r.cancel()` 取消在途 deliver
-  （`report_relay.go:299-305`）。具体走哪条待核（见「修复方向」末项）。
+  ① `reportHcTimeout` 5s 超时 kill；
+  ② `close()` 的 drain 超时经 `r.cancel()` 取消在途 deliver。
+  具体走哪条待核（见「修复方向」末项）。
 - 已配平项（记录为设计正确、不建议改动）：`reportDrain = 6s`（`:52`）大于
   `reportHcTimeout`，注释明确「保证在途投递可收尾」；读写 deadline 各 5s
   （`:53-54`）；帧上限 64KiB（`:45`）。
@@ -92,15 +92,15 @@ status: active
    可重试的形态——均无重试。rc=75 的来源中，可恢复的一类是**中继存活但投递侧
    失败**：父终端繁忙时 relay 的 `hc send` 排队、herdr-core 短暂不可用（本会话
    曾观测 herdr-core 重启而派发子终端继续存活，`hc` 提示 terminals kept
-   running，可作现场佐证），表现为 5s 超时（`report_relay.go:417-419`）或
-   drain/根 ctx 取消（`:299-305`）后回 `reportStatusFailed`→rc=75
-   （`:365-366`）——本次实测现场即此形态：客户端拨号成功
-   （`report_client_linux.go:59-62`）并拿到 `delivery failed: … signal: killed`
+   running，可作现场佐证），表现为 5s 超时或
+   drain/根 ctx 取消后回 `reportStatusFailed`→rc=75
+   ——本次实测现场即此形态：客户端拨号成功
+   并拿到 `delivery failed: … signal: killed`
    原因串，证明中继活到了 deliver 分支，被 kill 的是中继 fork 的 `hc send`
    子进程。与之相对，「中继不可达」（`maybeStartReportRelay()` 返回 nil 的
    早退分支，见 b)）是永久的、重试必然空转，两者不是一回事。不可恢复的
-   另一类是缺 `PI_SANDBOX_GO_EXEC_DIR`（`report_client_linux.go:53-56`
-   永远不会自己变好），**同一退出码覆盖两种
+   另一类是缺 `PI_SANDBOX_GO_EXEC_DIR`
+   （永远不会自己变好），**同一退出码覆盖两种
    性质**才是问题。二者叠加把整条回报通道的**自动投递路径**变成单点（人工经
    子代理会话 `hc read` 恢复不算自动送达保证）。
 
@@ -141,17 +141,14 @@ status: active
   **未找到 rc=75（投递失败/中继不可用）路径的断言，也没有重试行为
   断言——75 这条最关键的失败路径无人守，是真正的缺口。**
 - b) 客户端对**已确认可恢复的传输故障**做**有界退避重试，至多一次**，
-  不新增任何落盘：① `relay busy`（`:250-255`，
+  不新增任何落盘：① `relay busy`（
   真瞬时拥塞信号）；② 中继**已启动**前提下的一次连接被断；③ **中继存活但
-  投递侧失败**——deliver 超时（`:417-419`）或根 ctx 取消（`:299-305`）后回
-  `reportStatusFailed`→rc=75（`:365-366`），即本次实测现场形态（见缺陷 #2）。
-  **「中继不可达」
-  本身不足以判定瞬时**：`maybeStartReportRelay()` 有四条返回 nil、中继
-  永不启动的分支——`:128-130`（`HC_TERMINAL_ID` 等于 `--report-to`，防自投）、
-  `:132-135`（可信位置找不到 hc）、`:136-139`（`PI_SANDBOX_GO_EXEC_DIR`
-  列表为空）、`:141-145`（`net.Listen` 失败）——此时沙盒内客户端
-  （`report_client_linux.go:59-62` 拨号失败退 75）在同一会话里无论重试
-  多少次都不可能出现中继，重试必然空转；而 `main.go:453` 拿到 nil relay
+  投递侧失败**——deliver 超时或根 ctx 取消后回
+  `reportStatusFailed`→rc=75，即本次实测现场形态（见缺陷 #2）。
+  **「中继不可达」本身不足以判定瞬时**：`maybeStartReportRelay()`
+  存在多条早退分支（不满足启用条件、地址校验不过、找不到可信 hc、
+  监听或权限设置失败等），此时中继根本不启动，沙盒内客户端在同一会话里
+  无论重试多少次都不可能出现中继，重试必然空转；而 `main.go:453` 拿到 nil relay
   后仍在 `:496` 照常启动子进程（fail-open，`defer relay.close()` 对 nil
   无害），不可达在此是永久状态，与 ③ 的「中继存活、投递侧失败」**不是一回事，
   不可达不重试**。**突发桶耗尽量不列入短退避**——其恢复
@@ -162,7 +159,7 @@ status: active
   reportHcTimeout=5s`（`:51-52`）是刻意配平，放大超时须同步动 drain
   并拖慢 relay 关闭与沙箱退出。本次 `signal: killed` 的根因**降级为
   待核假设**（原稿定为「父终端繁忙 + core 重启拥塞」，证据不足）：
-  ① 除 5s 超时外，`close()` drain 路径（`:299-305`）也会经根 ctx 取消
+  ① 除 5s 超时外，`close()` drain 路径也会经根 ctx 取消
   在途 `deliver`，可产生同样的 kill；② `hc get`/`hc ls` 约 2ms 不构成
   成功 send 路径的耗时证据。确诊需三项证据：该次 send 实际耗时、当时
   relay 根 ctx / 活动连接状态、herdr-core 重启时间线与本次 dispatch 的
@@ -175,7 +172,9 @@ status: active
   不在其内。
 - **参数收缩注记**：未实施的候选方案被过度具体化（如原稿的 100/400ms 退避
   量级），已导致同一份登记反复返修；本节只做方向登记，退避量级、重试次数等
-  参数留待后续立项时按实测数据定，不再预先写死。
+  参数留待后续立项时按实测数据定，不再预先写死。第 6 轮曾把
+  `maybeStartReportRelay()` 早退分支误计为四条（实为七条），
+  据此确认「候选方案不配行号级论证」这条纪律的必要性。
 
 ## 协调事实（主代理实测 + 本轮复核）
 
