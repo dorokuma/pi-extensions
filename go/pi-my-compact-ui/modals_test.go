@@ -1180,3 +1180,42 @@ func TestCustomRootDisposeStopsBothPolls(t *testing.T) {
 		t.Errorf("dispose left polls armed: selector=%v detail=%v", selectorPolling, detailPolling)
 	}
 }
+
+// The detail modal's startPollingIfNeeded must not replace an armed timer:
+// without the disposed/polling guard a second call would overwrite
+// m.pollTimer, orphan the first loop goroutine (it stays blocked until its
+// own timer.stop fires — a leak), and a call after dispose would arm a new
+// loop on a dead modal.
+func TestDetailModalStartPollingReentryGuard(t *testing.T) {
+	r, _ := selectorRuntime(t)
+	tool := newTestTool("reentry", "read", nil).pending()
+	detail := r.newDetailModal(groupEntry{kind: "tool", tool: tool})
+	defer detail.dispose()
+
+	detail.mu.Lock()
+	if !detail.polling || detail.pollTimer == nil {
+		detail.mu.Unlock()
+		t.Fatal("live entry did not arm the poll loop")
+	}
+	first := detail.pollTimer
+	detail.mu.Unlock()
+
+	// A second call while armed is a no-op: same timer, still exactly one loop.
+	detail.startPollingIfNeeded()
+	detail.mu.Lock()
+	if detail.pollTimer != first {
+		detail.mu.Unlock()
+		t.Fatal("re-entrant startPollingIfNeeded replaced the armed timer")
+	}
+	detail.mu.Unlock()
+
+	// After dispose the guard must refuse to re-arm.
+	detail.dispose()
+	detail.startPollingIfNeeded()
+	detail.mu.Lock()
+	if detail.polling || detail.pollTimer != nil {
+		detail.mu.Unlock()
+		t.Fatal("startPollingIfNeeded re-armed the poll loop after dispose")
+	}
+	detail.mu.Unlock()
+}

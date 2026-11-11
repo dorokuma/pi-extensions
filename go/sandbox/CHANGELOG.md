@@ -85,6 +85,25 @@
 
 ### Fixed
 
+- **`[pattern:verifier-transient-fail]` 结案（agy 瞬态状态文件 TOCTOU 击穿
+  `sbx`）**：`appendAgyStateReadWrite` 经 `os.ReadDir` 快照枚举
+  antigravity-cli 状态根下的根级文件（`settings.json`/`history.jsonl`/
+  `*.db` 及其 SQLite 瞬态伴侣 `*.db-shm`/`*.db-wal`/`*.db-journal`、临时
+  原子写文件）并追加进 `Policy.ReadWrite`；宿主 agy 在枚举与受限子进程
+  `sandbox.Apply` 的毫秒级窗口内经 WAL checkpoint 删除 `.db-shm` 时，
+  `unix.Open(path, O_PATH)` 返回 ENOENT 直接击穿整个沙盒启动
+  （`sbx: apply sandbox policy failed: sandbox: open "...db-shm": no such
+  file or directory`，即 2026-11-08 ROW48 悬案）。修复：`Policy` 新增
+  `OptionalReadWrite` 字段（`Validate` 同样经 `NormalizePaths` 规范化校验），
+  `appendAgyStateReadWrite` 枚举出的根级文件同步登记（授权仍完全由
+  `ReadWrite` 决定，`OptionalReadWrite` 仅标记「缺失可容忍」）；该字段
+  随 `childExecSpec.orw` 与 `helperConfig.orw` 跨
+  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 与 broker/helper/`pi-test-runner`
+  全链路 100% 透传。`buildPathRuleEntries` 将 OptionalReadWrite 归一化为
+  集合打标 `transient`，`addPathRule` 仅对 `transient` 条目容忍
+  `ENOENT`（含悬空软链）安全跳过；未登记的普通 `ReadWrite` 缺失路径
+  （显式 `--rw`、`<workdir>/reports`、私有 `TMPDIR`、agyStateDataSubdirs
+  数据子目录等）保持严格 fail-closed ENOENT 报错不变。
 - **`[0.4.0]` 文档勘误**：父进程派生受限子进程失败（`unshare` 不被支持/
   权限不足等）严格模式实际退 `126`（`--best-effort` 下降级），子进程内
   挂载/封锁步骤失败才退 `1`；原文「严格模式拒绝启动（退出码 1）」描述
@@ -139,6 +158,21 @@
   预设自建的合法 `Exec` 路径误判禁名、击穿全部预设。短禁名仍按精确匹配
   判定；长度 ≥ 5 的禁名（`dispatch-agent`、`dispatch-agent-go`、`herdr`、
   `herdr-core`、`herdr-mobile-bridge`）继续 `-` 派生并新增 `.` 派生。
+- **`sbx --report-to` 父终端地址白名单收紧**：`reportAddrRe` 收紧为
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`——首字符必须是 ASCII 字母或数字
+  （剔除前导 `-`/`.`/`_`），总长 1–64，字符集不含 `:`/`/`；封堵
+  `--report-to=-flag` 这类向 `hc send` 注入选项参数的地址，并拒绝旧式
+  `ws:p7` 与 `a/../x` 路径形态。非法地址保持既有降级语义：stderr 打印
+  告警并仅关闭回报中继（客户端侧以退出码 75 报告），沙盒照常运行；
+  校验口径与 `dispatch-agent` 的地址校验完全一致。
+- **`ResolveEntryAgentPaths` 隔离 HOME 单测去宿主依赖夹具化**：
+  `sandbox_test.go` 的 `TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots`
+  与 `TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin` 改用
+  `t.TempDir()` 合成宿主安装根夹具（claude 版本化安装根与 agyStateBin
+  三成员），经测试专用 seam `sandbox.ResolveEntryAgentPathsForTest`
+  注入 `hostHome`（与生产 `resolveEntryAgentPaths(trustedHomeDir())`
+  同一代码路径，生产 HOME 信任边界不变），消除干净容器/CI 未安装
+  `claude` 或 `agy` 时的静默 `t.Skip`。
 
 ## [0.4.0] - 2026-11-07
 

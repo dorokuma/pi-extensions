@@ -93,8 +93,11 @@ func Extension() *sdk.Extension {
 	// asking tool cannot run before this subscription is in place, and ctx.Events()
 	// rides the running connection.
 	e.OnLoaded(func(ctx sdk.Context) {
-		if _, err := ctx.Events().On(AskUserAnswerEvent, func(_ sdk.Context, payload any) error {
-			answers.Handle(payload)
+		if _, err := ctx.Events().On(AskUserAnswerEvent, func(dispatchCtx sdk.Context, payload any) error {
+			// The verdict replies through the dispatch's own request context
+			// (Context.Events): an emit over Extension.Events() is not tied to a
+			// request and waits behind the extension's other non-request calls.
+			answers.HandleEmit(payload, dispatchCtx.Events().Emit)
 			return nil
 		}); err != nil {
 			// A bus that cannot be reached is a load-time failure the host reports; the

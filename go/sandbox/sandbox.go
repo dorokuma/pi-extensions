@@ -32,11 +32,24 @@ var (
 // ReadWrite 默认仅授予读写、创建、删除、截断权限，不授予执行权限（严格遵循 W^X 原则）。
 // 在 ReadOnlyReviewer 预设下，所有可写目录（含 <workdir>/reports、TMPDIR、GOTMPDIR、GOCACHE）
 // 均不具备执行权限；go test 编译产物由受控的 Go 工具链包装器在独立的只读可执行目录中构建并降权运行。
+// ReadWrite 中的路径在构建 Landlock 规则集时按 fail-closed 处理：
+// 除 BestEffort 降级外，路径不存在（ENOENT）即报错。例外是同时登记在
+// OptionalReadWrite 中的瞬态状态文件——例如经目录快照枚举的 SQLite 瞬态文件
+// （*.db-shm/*.db-wal/*.db-journal），枚举与 Apply 之间被 WAL checkpoint
+// 删除属正常竞态，此类路径在 Apply 时 ENOENT 仅安全跳过，不报错。
 type Policy struct {
 	// ReadOnly 允许只读访问的目录或文件路径列表。
 	ReadOnly []string
 	// ReadWrite 允许读写访问的目录或文件路径列表（默认不含执行权限）。
 	ReadWrite []string
+	// OptionalReadWrite 标记 ReadWrite 中允许在 Apply 时瞬时缺失（ENOENT）的条目。
+	// 仅用于目录快照枚举产生的瞬态状态文件（如 agy SQLite .db-shm/.db-wal）；
+	// 不授予任何额外权限（授权仍完全由 ReadWrite 决定），仅在该路径以
+	// O_PATH 打开返回 ENOENT 时安全跳过而非 fail-closed 报错。
+	// 显式声明的读写路径（显式 --rw、<workdir>/reports、私有 TMPDIR、
+	// agyStateDataSubdirs 数据子目录等）绝不登记于此——它们的缺失仍按
+	// 原契约 ENOENT 报错。
+	OptionalReadWrite []string
 	// Exec 允许执行（execve）的二进制文件或目录路径白名单。
 	Exec []string
 	// DenyNet 为 true 时禁止所有 TCP 端口的 bind 与 connect 操作（需 Landlock ABI >= 4）。
@@ -112,6 +125,9 @@ func (p Policy) Validate() error {
 	}
 	if _, err := NormalizePaths(p.ReadWrite); err != nil {
 		return fmt.Errorf("ReadWrite: %w", err)
+	}
+	if _, err := NormalizePaths(p.OptionalReadWrite); err != nil {
+		return fmt.Errorf("OptionalReadWrite: %w", err)
 	}
 	execPaths, err := NormalizePaths(p.Exec)
 	if err != nil {

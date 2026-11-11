@@ -61,15 +61,19 @@ type cliConfig struct {
 
 // childExecSpec 封装父进程传递给受限子进程的沙盒配置与目标命令。
 type childExecSpec struct {
-	Bin         string   `json:"bin"`
-	Command     []string `json:"command"`
-	ReadOnly    []string `json:"ro"`
-	ReadWrite   []string `json:"rw"`
-	Exec        []string `json:"exec"`
-	DenyNet     bool     `json:"deny_net"`
-	Env         []string `json:"env"`
-	BestEffort  bool     `json:"best_effort"`
-	EntryAgents []string `json:"entry_agents"`
+	Bin       string   `json:"bin"`
+	Command   []string `json:"command"`
+	ReadOnly  []string `json:"ro"`
+	ReadWrite []string `json:"rw"`
+	// OptionalReadWrite 透传 Policy.OptionalReadWrite（appendAgyStateReadWrite
+	// 快照枚举的瞬态状态文件登记位）：缺失该字段会导致子进程对宿主已删除的
+	// 瞬态文件（如 .db-shm）恢复 fail-closed ENOENT 崩溃，必须随 spec 100% 透传。
+	OptionalReadWrite []string `json:"orw"`
+	Exec              []string `json:"exec"`
+	DenyNet           bool     `json:"deny_net"`
+	Env               []string `json:"env"`
+	BestEffort        bool     `json:"best_effort"`
+	EntryAgents       []string `json:"entry_agents"`
 	// MountNS 记录父进程是否以 CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC
 	// 三命名空间联合 Cloneflags 派生子进程的标记；仅当为 true 时
 	// 子进程才执行挂载命名空间内的 socket 白名单视图（--best-effort 下
@@ -455,16 +459,17 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 
 	sysProcAttr := childSysProcAttr()
 	spec := childExecSpec{
-		Bin:         bin,
-		Command:     cfg.Command,
-		ReadOnly:    policy.ReadOnly,
-		ReadWrite:   policy.ReadWrite,
-		Exec:        policy.Exec,
-		DenyNet:     policy.DenyNet,
-		Env:         policy.Env,
-		BestEffort:  policy.BestEffort,
-		EntryAgents: policy.EntryAgents,
-		MountNS:     sysProcAttr != nil,
+		Bin:               bin,
+		Command:           cfg.Command,
+		ReadOnly:          policy.ReadOnly,
+		ReadWrite:         policy.ReadWrite,
+		OptionalReadWrite: policy.OptionalReadWrite,
+		Exec:              policy.Exec,
+		DenyNet:           policy.DenyNet,
+		Env:               policy.Env,
+		BestEffort:        policy.BestEffort,
+		EntryAgents:       policy.EntryAgents,
+		MountNS:           sysProcAttr != nil,
 	}
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
@@ -557,13 +562,14 @@ func runChildFromEnv() int {
 	}
 
 	policy := sandbox.Policy{
-		ReadOnly:    spec.ReadOnly,
-		ReadWrite:   spec.ReadWrite,
-		Exec:        spec.Exec,
-		DenyNet:     spec.DenyNet,
-		Env:         spec.Env,
-		BestEffort:  spec.BestEffort,
-		EntryAgents: spec.EntryAgents,
+		ReadOnly:          spec.ReadOnly,
+		ReadWrite:         spec.ReadWrite,
+		OptionalReadWrite: spec.OptionalReadWrite,
+		Exec:              spec.Exec,
+		DenyNet:           spec.DenyNet,
+		Env:               spec.Env,
+		BestEffort:        spec.BestEffort,
+		EntryAgents:       spec.EntryAgents,
 	}
 	// 仅当父进程确实以 CLONE_NEWNS 派生（MountNS）时收紧 socket 白名单视图；
 	// 挂载步骤失败默认拒绝启动（退出码 1），--best-effort 下仅告警。

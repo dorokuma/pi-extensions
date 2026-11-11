@@ -38,8 +38,8 @@ PiG 扩展组件，移植 `pi-extensions/extensions/ctx-orchestrate/src/ctx-orch
 | `:275` `searchDigestSchema` | `extension.go:55` `searchDigestSchema` |
 | `:288` `searchDigestOutput` | `extension.go:80` `searchDigestOutputSchema` |
 | `:300` `executeSearchDigest` | `digest.go:246` `executeSearchDigest` |
-| `:460` `textCap` / `:464` `governEnabled` | `govern.go:79` `TextCap` / `govern.go:84` `GovernEnabled` |
-| `:475` `capCodemodeResult` | `govern.go:97` `CapCodemodeResult`（导出，同 TS `export`） |
+| `:460` `textCap` / `:464` `governEnabled` | `govern.go:92` `TextCap` / `govern.go:97` `GovernEnabled` |
+| `:475` `capCodemodeResult` | `govern.go:110` `CapCodemodeResult`（导出，同 TS `export`） |
 | `:556` `installGovernanceHook` | `extension.go:128` `handleToolResult` + `extension.go:163` `e.OnToolResult` |
 | `:572` `export default function (pi)` | `extension.go:139` `Extension()` |
 

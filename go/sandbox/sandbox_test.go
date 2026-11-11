@@ -8,11 +8,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +44,12 @@ func TestMain(m *testing.M) {
 		return
 	case "reviewer_agent_claude_projects":
 		subprocReviewerAgentClaudeProjects()
+		return
+	case "optional_rw_transient":
+		subprocOptionalRWTransient()
+		return
+	case "missing_rw_strict":
+		subprocMissingRWStrict()
 		return
 	}
 	os.Exit(m.Run())
@@ -86,6 +90,31 @@ func TestNormalizePathsAndValidate(t *testing.T) {
 	}
 	if err := badEnv.Validate(); !errors.Is(err, sandbox.ErrInvalidPolicy) {
 		t.Fatalf("expected ErrInvalidPolicy for invalid env entry, got %v", err)
+	}
+
+	// OptionalReadWrite 同样经 Validate 路径规范化校验：空串/NUL 字节
+	// 必须报 ErrInvalidPolicy，合法路径不影响整体校验结果。
+	badORW := sandbox.Policy{
+		ReadOnly:          []string{"/usr"},
+		OptionalReadWrite: []string{""},
+	}
+	if err := badORW.Validate(); !errors.Is(err, sandbox.ErrInvalidPolicy) {
+		t.Fatalf("expected ErrInvalidPolicy for empty OptionalReadWrite entry, got %v", err)
+	}
+	badORWNUL := sandbox.Policy{
+		ReadOnly:          []string{"/usr"},
+		OptionalReadWrite: []string{"bad\x00path"},
+	}
+	if err := badORWNUL.Validate(); !errors.Is(err, sandbox.ErrInvalidPolicy) {
+		t.Fatalf("expected ErrInvalidPolicy for NUL OptionalReadWrite entry, got %v", err)
+	}
+	okORW := sandbox.Policy{
+		ReadOnly:          []string{"/usr"},
+		ReadWrite:         []string{"/tmp"},
+		OptionalReadWrite: []string{"/tmp/a/../b"},
+	}
+	if err := okORW.Validate(); err != nil {
+		t.Fatalf("expected valid policy with OptionalReadWrite, got %v", err)
 	}
 
 	for _, forbidden := range sandbox.ForbiddenExecNames {
@@ -2003,34 +2032,40 @@ func TestResolveEntryAgentPathsVersionedClaudeTarget(t *testing.T) {
 // （<hostHome>/.local/share/claude/versions/<ver>）仍属受信任安装根——
 // 软链目标身份校验按宿主 HOME 而非被覆盖的 $HOME 判定，claude 不得被
 // "not in allowed roots" 拒绝；同时保证毒软链防线不破：同一隔离 HOME
-// 下指向任意路径的 /tmp/<rand>/claude/evil 目标仍被拒。宿主不存在
-// claude 软链或 os/user 解析不到宿主 HOME 时跳过。
+// 下指向任意路径的 /tmp/<rand>/claude/evil 目标仍被拒。
+//
+// 宿主无关确定性覆盖（[pattern:test-coverage-silent-skip] 收口）：claude
+// 软链与版本化目标全部落在 t.TempDir() 夹具宿主 home 内，经
+// sandbox.ResolveEntryAgentPathsForTest 注入 hostHome——该 seam 与生产
+// resolveEntryAgentPaths(trustedHomeDir()) 走同一代码路径，仅把
+// trustedHomeDir() 位置换成显式参数；不再 LookPath 宿主 claude、不再因
+// 宿主未装 claude 或版本化安装根不存在而 t.Skip。夹具 claude 放在
+// <hostHome>/.local/bin（受信收录面 agentLookupDirs 枚举可达），与生产
+// 中 claude 通常经 <host>/.local/bin 收录的口径一致。
 func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 	tmp := t.TempDir()
-	// 隔离 HOME：宿主 /root/.local/share 不再是 homeDir()/.local/share。
+	// 隔离 HOME：宿主真实 HOME（此处为夹具 home）不再是 homeDir()/.local/share。
 	t.Setenv("HOME", filepath.Join(tmp, "isolated-home"))
 
-	hostHome := ""
-	// 判定口径与生产 trustedHomeDir 一致：user.LookupId(euid)，不看 $HOME。
-	if u, err := user.LookupId(strconv.Itoa(os.Geteuid())); err == nil && u != nil {
-		hostHome = u.HomeDir
+	// 夹具宿主 home：取代生产 trustedHomeDir() 的位置。
+	hostHome := filepath.Join(tmp, "host-home")
+	verDir := filepath.Join(hostHome, ".local", "share", "claude", "versions")
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		t.Fatalf("mkdir versions: %v", err)
 	}
-	if hostHome == "" {
-		t.Skip("os/user cannot resolve host home dir")
+	resolvedClaude := filepath.Join(verDir, "2.1.319")
+	if err := os.WriteFile(resolvedClaude, []byte("#!/bin/sh\necho 2.1.319\n"), 0o755); err != nil {
+		t.Fatalf("write versioned claude: %v", err)
 	}
-
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		t.Skipf("claude not installed on host (LookPath: %v)", err)
+	// 收录入口：<hostHome>/.local/bin/claude 软链到版本化目标（宿主 bin
+	// 目录属 agentLookupDirs 收录面，隔离 HOME 下依然可达）。
+	hostBinDir := filepath.Join(hostHome, ".local", "bin")
+	if err := os.MkdirAll(hostBinDir, 0o755); err != nil {
+		t.Fatalf("mkdir host bin: %v", err)
 	}
-	resolvedClaude, err := filepath.EvalSymlinks(claudePath)
-	if err != nil {
-		t.Skipf("EvalSymlinks claude: %v", err)
-	}
-	resolvedClaude = filepath.Clean(resolvedClaude)
-	if !strings.HasPrefix(resolvedClaude+string(filepath.Separator),
-		filepath.Join(hostHome, ".local", "share")+string(filepath.Separator)) {
-		t.Skipf("host claude target %s is not a versioned install under <hostHome>/.local/share, scenario not applicable", resolvedClaude)
+	claudePath := filepath.Join(hostBinDir, "claude")
+	if err := os.Symlink(resolvedClaude, claudePath); err != nil {
+		t.Fatalf("symlink claude: %v", err)
 	}
 
 	// 根判定分支覆盖保证：versioned claude 的 basename（版本号）绝不在
@@ -2043,10 +2078,10 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 		t.Fatalf("test setup broken: resolved claude basename %q would short-circuit root branch", base)
 	}
 
-	// 毒软链防线断言：在隔离 HOME 下 PATH 前置 <tmp>/bin-poison/claude →
-	// <tmp>/claude/evil（路径含 /claude/ 段但不在任何安装根前缀下）。
-	// 注意必须在上面宿主 claude 的 LookPath/EvalSymlinks/skip 判定之后
-	// 才污染 PATH，否则 LookPath 会命中毒链导致场景判定脱靶。
+	// 毒软链防线断言：PATH 前置 <tmp>/bin-poison/claude → <tmp>/claude/evil
+	// （路径含 /claude/ 段但不在任何安装根前缀下）。毒链经 PATH LookPath
+	// 收录（首命中即返），合法 claude 经 <hostHome>/.local/bin 收录——两条
+	// 独立收录通道互不遮蔽，故二者可同时断言。
 	evil := filepath.Join(tmp, "claude", "evil")
 	poisonBinDir := filepath.Join(tmp, "bin-poison")
 	if err := os.MkdirAll(filepath.Dir(evil), 0o755); err != nil {
@@ -2067,12 +2102,12 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 
 	var paths []string
 	warnOut := captureStderr(t, func() {
-		paths = sandbox.ResolveEntryAgentPaths()
+		paths = sandbox.ResolveEntryAgentPathsForTest(hostHome)
 	})
 
-	normClaude, err := filepath.Abs(filepath.Clean(claudePath))
+	normClaude, err := sandbox.NormalizePath(claudePath)
 	if err != nil {
-		t.Fatalf("Abs claude: %v", err)
+		t.Fatalf("NormalizePath claude: %v", err)
 	}
 	if !containsPath(paths, normClaude) {
 		t.Fatalf("claude symlink %s must stay in EntryAgents under isolated HOME, got %v", normClaude, paths)
@@ -2112,11 +2147,8 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 // （homeDir()）不进入枚举，下述分支覆盖：
 //  1. 收紧回归：隔离 HOME 夹具内布置 agy/agentapi/webm_encoder 三个
 //     普通可执行文件，因 homeDir() 已退出枚举，一个都不得进 EntryAgents；
-//  2. trustedLookupHomes() 分支（宿主侧）：宿主受信 home（passwd-HOME、
-//     /root、/root/.agy-pro-home）下已安装的同名三成员必须仍解析进
-//     EntryAgents——trustedHomeDir() 经 /etc/passwd 解析，单测进程内无法
-//     用 Setenv 指到夹具，且禁止写宿主真实 HOME/.gemini，故宿主侧完整
-//     安装缺失时显式 Skip 该子断言而非假绿；
+//  2. trustedLookupHomes() 分支（宿主侧）：受信宿主 home 下已安装的同名
+//     三成员必须仍解析进 EntryAgents；
 //  3. 身份判定第 3 档覆盖：PATH 软链 claude → <隔离HOME>/.gemini/<slug>/claude/
 //     real-target，目标 basename 非白名单，放行必须命中「含 /claude/ 段 +
 //     安装根前缀」分支（安装根前缀判定仍含 homeDir()，系既有信任口径），
@@ -2125,32 +2157,23 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsHostRoots(t *testing.T) {
 // agentapi/webm_encoder 不在 entry-agent 查找名集（names）内，PATH/
 // standardBinDirs/查找目录均不会解析它们，其宿主侧路径只能由 agyStateBin
 // 枚举产生，故断言即枚举覆盖判据；隔离侧成员路径同理仅枚举可达。
+//
+// 宿主无关确定性覆盖（[pattern:test-coverage-silent-skip] 收口）：trustedHomeDir()
+// 的位置经 sandbox.ResolveEntryAgentPathsForTest 注入为 t.TempDir() 夹具宿主
+// home（与生产 resolveEntryAgentPaths(trustedHomeDir()) 同一代码路径），宿主侧
+// agyStateBin 成员也全部落在夹具内——不再探测宿主真实 .gemini 安装、宿主无
+// agy 安装时不再 t.Skip，任何干净 CI 容器都 100% 实跑三条子断言。
 func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 	tmp := t.TempDir()
 	isolatedHome := filepath.Join(tmp, "isolated-home")
 	t.Setenv("HOME", isolatedHome)
 
-	// 与生产 trustedHomeDir 同口径：user.LookupId(euid)，不看 $HOME。
-	hostHome := ""
-	if u, err := user.LookupId(strconv.Itoa(os.Geteuid())); err == nil && u != nil {
-		hostHome = u.HomeDir
-	}
-	if hostHome == "" {
-		t.Skip("os/user cannot resolve host home dir")
-	}
-
-	// 与生产 trustedLookupHomes() 同口径的宿主侧受信 home：hostHome、硬编码
-	// /root 与 /root/.agy-pro-home，剔除隔离 HOME（homeDir() 已退出二进制
-	// 收录面枚举，由收紧回归子断言覆盖）。
-	var hostTrustedHomes []string
-	seenHomes := map[string]struct{}{filepath.Clean(isolatedHome): {}}
-	for _, home := range []string{hostHome, "/root", "/root/.agy-pro-home"} {
-		home = filepath.Clean(home)
-		if _, ok := seenHomes[home]; ok {
-			continue
-		}
-		seenHomes[home] = struct{}{}
-		hostTrustedHomes = append(hostTrustedHomes, home)
+	// 夹具宿主 home：取代生产 trustedHomeDir() 的位置。trustedLookupHomesFor
+	// 会在此之外按生产口径追加硬编码 /root 与 /root/.agy-pro-home（无安装时
+	// 枚举为空，不影响断言）。
+	hostHome := filepath.Join(tmp, "host-home")
+	resolvePaths := func() []string {
+		return sandbox.ResolveEntryAgentPathsForTest(hostHome)
 	}
 
 	agyStateBinMembers := []string{"agy", "agentapi", "webm_encoder"}
@@ -2172,7 +2195,7 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 			}
 		}
 
-		paths := sandbox.ResolveEntryAgentPaths()
+		paths := resolvePaths()
 		for _, name := range agyStateBinMembers {
 			norm, err := sandbox.NormalizePath(filepath.Join(isolatedBin, name))
 			if err != nil {
@@ -2185,34 +2208,30 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 	})
 
 	t.Run("host agy state bin resolved", func(t *testing.T) {
-		// 宿主侧受信 home 下已安装的 agy 状态 bin：bin/agy 存在即视为该根
-		// 已安装，要求三成员全部进 EntryAgents。trustedHomeDir() 不经环境
-		// 变量，无法在进程内重定向到夹具；宿主缺安装时 Skip（不能布置
-		// 等价夹具，也不写宿主真实 .gemini 造文件）。
-		paths := sandbox.ResolveEntryAgentPaths()
-		foundInstall := false
-		for _, home := range hostTrustedHomes {
-			binDir := filepath.Join(home, ".gemini", "antigravity-cli", "bin")
-			if st, err := os.Stat(filepath.Join(binDir, "agy")); err != nil || st.IsDir() {
-				continue
-			}
-			foundInstall = true
-			for _, name := range agyStateBinMembers {
-				hostPath := filepath.Join(binDir, name)
-				if st, err := os.Stat(hostPath); err != nil || st.IsDir() {
-					t.Fatalf("host agy state binary %s missing: %v", hostPath, err)
-				}
-				norm, err := sandbox.NormalizePath(hostPath)
-				if err != nil {
-					t.Fatalf("NormalizePath %s: %v", hostPath, err)
-				}
-				if !containsPath(paths, norm) {
-					t.Fatalf("host agy state binary %s must be in EntryAgents under isolated HOME (trusted home %s), got %v", norm, home, paths)
-				}
+		// 受信宿主 home（夹具）下完整的 agy 状态 bin：三成员必须全部经
+		// agyStateBin 枚举进 EntryAgents——与生产 trustedLookupHomes() 枚举
+		// 分支同路径，只是枚举根换成夹具 home。
+		binDir := filepath.Join(hostHome, ".gemini", "antigravity-cli", "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatalf("mkdir host agy bin: %v", err)
+		}
+		for _, name := range agyStateBinMembers {
+			p := filepath.Join(binDir, name)
+			if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatalf("write host agy member %s: %v", p, err)
 			}
 		}
-		if !foundInstall {
-			t.Skipf("no agy state bin under host trusted homes %v; trustedHomeDir() is not redirectable in-process and host .gemini must not be touched", hostTrustedHomes)
+
+		paths := resolvePaths()
+		for _, name := range agyStateBinMembers {
+			hostPath := filepath.Join(binDir, name)
+			norm, err := sandbox.NormalizePath(hostPath)
+			if err != nil {
+				t.Fatalf("NormalizePath %s: %v", hostPath, err)
+			}
+			if !containsPath(paths, norm) {
+				t.Fatalf("host agy state binary %s must be in EntryAgents under isolated HOME (trusted home %s), got %v", norm, hostHome, paths)
+			}
 		}
 	})
 
@@ -2251,7 +2270,7 @@ func TestResolveEntryAgentPathsIsolatedHomeKeepsAgyStateBin(t *testing.T) {
 		origPath := os.Getenv("PATH")
 		t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
 
-		paths := sandbox.ResolveEntryAgentPaths()
+		paths := resolvePaths()
 		normLink, err := sandbox.NormalizePath(fixtureLink)
 		if err != nil {
 			t.Fatalf("NormalizePath fixture link: %v", err)
@@ -2390,4 +2409,94 @@ func subprocReviewerAgentClaudeProjects() {
 	}
 
 	os.Exit(0)
+}
+
+// TestApplyOptionalReadWriteTransientMissing 回归 [pattern:verifier-transient-fail]：
+// appendAgyStateReadWrite 经 ReadDir 快照枚举的根级瞬态状态文件（如宿主 agy
+// 的 conversation_summaries.db-shm）在枚举与 Apply 之间被 WAL checkpoint
+// 删除时，修复前整个 sandbox.Apply 以 ENOENT 崩溃（sbx 报
+// 'apply sandbox policy failed: sandbox: open "...db-shm": no such file or directory'）。
+// 修复后登记在 OptionalReadWrite 的瞬态路径在 Apply 时 ENOENT 安全跳过，
+// Apply 干净返回 0；反向断言：未登记 OptionalReadWrite 的普通 ReadWrite
+// 缺失路径仍按原契约 ENOENT 报错（fail-closed 不变）。
+//
+// 瞬态消失无法在同进程内重演（Apply 不可逆），改用两个子进程分别实证：
+//   - optional_rw_transient：缺失的 .db-shm 同时在 ReadWrite 与
+//     OptionalReadWrite（等价于「枚举时被收录、Apply 前被删除」的快照后消失
+//     终态），Apply 必须成功退出 0；
+//   - missing_rw_strict：同样的缺失 .db-shm 仅在 ReadWrite，Apply 必须
+//     ENOENT 失败（与显式 --rw <missing> 同口径的 fail-closed 回归）。
+func TestApplyOptionalReadWriteTransientMissing(t *testing.T) {
+	requireLandlock(t)
+
+	tmp := t.TempDir()
+	dbShm := filepath.Join(tmp, "conversation_summaries.db-shm")
+	// 模拟快照枚举后瞬态文件被宿主删除的终态：确保路径不存在。
+	if err := os.Remove(dbShm); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove transient fixture: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		testSubprocEnv+"=optional_rw_transient",
+		"TEST_TRANSIENT_SHM="+dbShm,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("optional_rw_transient subprocess failed: %v\noutput:\n%s", err, string(out))
+	}
+
+	cmd = exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		testSubprocEnv+"=missing_rw_strict",
+		"TEST_TRANSIENT_SHM="+dbShm,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("missing_rw_strict subprocess unexpectedly succeeded; output:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "no such file or directory") {
+		t.Fatalf("missing_rw_strict output must report ENOENT, got:\n%s", string(out))
+	}
+}
+
+// subprocOptionalRWTransient 在子进程内 Apply：缺失的 .db-shm 同时在
+// ReadWrite 与 OptionalReadWrite（模拟 ReadDir 快照收录后于 Apply 前被
+// 宿主删除的瞬态状态文件），修复前 Apply ENOENT 崩溃，修复后干净成功。
+func subprocOptionalRWTransient() {
+	shm := os.Getenv("TEST_TRANSIENT_SHM")
+	if shm == "" {
+		fmt.Fprintln(os.Stderr, "missing TEST_TRANSIENT_SHM")
+		os.Exit(2)
+	}
+	p := sandbox.Policy{
+		ReadOnly:          []string{"/"},
+		ReadWrite:         []string{shm},
+		OptionalReadWrite: []string{shm},
+	}
+	if err := sandbox.Apply(p); err != nil {
+		fmt.Fprintf(os.Stderr, "Apply must tolerate transient missing OptionalReadWrite path, got: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// subprocMissingRWStrict 在子进程内 Apply：同样的缺失 .db-shm 仅在
+// ReadWrite（未登记 OptionalReadWrite，与显式 --rw <missing> 同口径），
+// 必须按原契约 ENOENT 失败。退出码 2 表示路径意外被容忍（安全回归）。
+func subprocMissingRWStrict() {
+	shm := os.Getenv("TEST_TRANSIENT_SHM")
+	if shm == "" {
+		fmt.Fprintln(os.Stderr, "missing TEST_TRANSIENT_SHM")
+		os.Exit(3)
+	}
+	p := sandbox.Policy{
+		ReadOnly:  []string{"/"},
+		ReadWrite: []string{shm},
+	}
+	if err := sandbox.Apply(p); err != nil {
+		fmt.Fprintf(os.Stderr, "expected ENOENT for non-optional missing ReadWrite: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintln(os.Stderr, "SECURITY REGRESSION: Apply succeeded for non-optional missing ReadWrite path")
+	os.Exit(2)
 }

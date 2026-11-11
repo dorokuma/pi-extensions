@@ -149,9 +149,28 @@ func (c *answerChannel) Close(questionnaire *OpenQuestionnaire) {
 }
 
 // Handle processes one inbound `rpiv:ask-user:answer` payload and publishes
-// exactly one verdict. It mirrors the listener registered by
-// registerAnswerChannel; the order of the guards is part of the contract.
+// exactly one verdict on the channel's constructor-bound bus. It mirrors the
+// listener registered by registerAnswerChannel; the order of the guards is
+// part of the contract.
 func (c *answerChannel) Handle(data any) {
+	c.handle(data, c.emit)
+}
+
+// HandleEmit is Handle with the verdict emit rebound: a bus listener calls it
+// with dispatchCtx.Events().Emit so the reply rides the same request context
+// as the dispatch (the SDK docs Context.Events — an unbound emit waits behind
+// the extension's other non-request calls). A nil emit falls back to the
+// constructor-bound bus.
+func (c *answerChannel) HandleEmit(data any, emit func(channel string, payload any) error) {
+	if emit == nil {
+		emit = c.emit
+	}
+	c.handle(data, emit)
+}
+
+// handle is the shared verdict path of Handle/HandleEmit: emit carries the
+// one verdict per inbound payload.
+func (c *answerChannel) handle(data any, emit func(channel string, payload any) error) {
 	payload, isObject := isRecord(data)
 	if !isObject {
 		payload = map[string]any{}
@@ -159,18 +178,18 @@ func (c *answerChannel) Handle(data any) {
 
 	requestID, hasRequestID := payload["requestId"].(string)
 	if _, present := payload["requestId"]; present && !hasRequestID {
-		c.reply(nil, nil, RejectInvalidPayload, "requestId must be a string")
+		reply(emit, nil, nil, RejectInvalidPayload, "requestId must be a string")
 		return
 	}
 	toolCallID, hasToolCallID := payload["toolCallId"].(string)
 
 	if !isObject {
-		c.reply(optString(requestID, hasRequestID), optString(toolCallID, hasToolCallID),
+		reply(emit, optString(requestID, hasRequestID), optString(toolCallID, hasToolCallID),
 			RejectInvalidPayload, "payload must be an object")
 		return
 	}
 	if !hasToolCallID {
-		c.reply(optString(requestID, hasRequestID), nil, RejectInvalidPayload, "toolCallId must be a string")
+		reply(emit, optString(requestID, hasRequestID), nil, RejectInvalidPayload, "toolCallId must be a string")
 		return
 	}
 
@@ -179,38 +198,38 @@ func (c *answerChannel) Handle(data any) {
 	c.mu.Unlock()
 
 	if target == nil || target.Settled() != nil {
-		c.reply(optString(requestID, hasRequestID), strPtr(toolCallID), RejectNotFound,
+		reply(emit, optString(requestID, hasRequestID), strPtr(toolCallID), RejectNotFound,
 			"no open questionnaire for tool call "+toolCallID)
 		return
 	}
 	if target.hostOf() == AnswerHostRPC {
-		c.reply(optString(requestID, hasRequestID), strPtr(toolCallID), RejectUnsupportedHost,
+		reply(emit, optString(requestID, hasRequestID), strPtr(toolCallID), RejectUnsupportedHost,
 			"this host shows the questions in its own dialogs")
 		return
 	}
 
 	outcome := ResolveExternalAnswer(target.Questions, payload)
 	if !outcome.OK {
-		c.reply(optString(requestID, hasRequestID), strPtr(toolCallID), outcome.Code, outcome.Reason)
+		reply(emit, optString(requestID, hasRequestID), strPtr(toolCallID), outcome.Code, outcome.Reason)
 		return
 	}
 	if !target.Settle(outcome.Result) {
-		c.reply(optString(requestID, hasRequestID), strPtr(toolCallID), RejectNotFound,
+		reply(emit, optString(requestID, hasRequestID), strPtr(toolCallID), RejectNotFound,
 			"tool call "+toolCallID+" is already answered")
 		return
 	}
-	c.reply(optString(requestID, hasRequestID), strPtr(toolCallID), "", "")
+	reply(emit, optString(requestID, hasRequestID), strPtr(toolCallID), "", "")
 }
 
-// reply publishes one verdict. An empty code means ok.
-func (c *answerChannel) reply(requestID, toolCallID *string, code AskUserAnswerRejectCode, reason string) {
+// reply publishes one verdict. An empty code means ok; a nil emit drops it.
+func reply(emit func(channel string, payload any) error, requestID, toolCallID *string, code AskUserAnswerRejectCode, reason string) {
 	verdict := AnswerResultEventPayload{OK: code == "", RequestID: requestID, ToolCallID: toolCallID}
 	if code != "" {
 		verdict.Code = &code
 		verdict.Reason = strPtr(reason)
 	}
-	if c.emit != nil {
-		_ = c.emit(AskUserAnswerResultEvent, verdict)
+	if emit != nil {
+		_ = emit(AskUserAnswerResultEvent, verdict)
 	}
 }
 
