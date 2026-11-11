@@ -427,10 +427,9 @@ var ReviewerAgentTools = append(append([]string{}, DefaultReviewerTools...),
 	"mkdir", "cp", "touch",
 )
 
-// trustedAgentHomes 返回代理安装根前缀判定专用的受信 home 根列表
-// （去重、保持顺序）：homeDir()（当前 $HOME）在前、trustedHomeDir()（被隔离
-// 覆盖的 $HOME 下仍解析到宿主真实 HOME）在后。trustedHomeDir 不可解析时的
-// 兜底 "/" 不作 home 根（否则 join 出 /.local/bin 等无意义路径），跳过。
+// dedupeTrustedHomes 归并受信 home 根（去重、保持顺序）：空串、"." 与 "/"
+// 一律跳过（"/" 是 trustedHomeDir 不可解析时的兜底，作 home 根会 join 出
+// /.local/bin 等无意义路径）。
 //
 // 信任边界口径：安装根前缀含 homeDir() 系既有信任口径（软链目标只当其
 // 位于这些根之下才可经「含 /<查找名>/ 路径段」判定放行），维持不改；
@@ -438,10 +437,10 @@ var ReviewerAgentTools = append(append([]string{}, DefaultReviewerTools...),
 // 版本化 pig glob / agyStateBin）一律改用 trustedLookupHomes()，不读 $HOME——
 // $HOME 是调用方可控输入，不得作为二进制收录的信任边界输入（与 warm.go
 // trustedHomeDir 注释口径一致）。
-func trustedAgentHomes() []string {
+func dedupeTrustedHomes(candidates []string) []string {
 	var homes []string
-	seen := make(map[string]struct{}, 2)
-	for _, home := range []string{homeDir(), trustedHomeDir()} {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, home := range candidates {
 		home = filepath.Clean(strings.TrimSpace(home))
 		if home == "" || home == "." || home == "/" {
 			continue
@@ -453,6 +452,14 @@ func trustedAgentHomes() []string {
 		homes = append(homes, home)
 	}
 	return homes
+}
+
+// trustedAgentHomesFor 返回代理安装根前缀判定专用的受信 home 根列表
+// （去重、保持顺序）：homeDir()（当前 $HOME）在前、调用方显式给定的宿主 home
+// 在后（生产始终传 trustedHomeDir()；测试传入夹具宿主 home，使安装根判定
+// 可在无真实 claude/agy 的干净 CI 上确定性覆盖）。
+func trustedAgentHomesFor(hostHome string) []string {
+	return dedupeTrustedHomes([]string{homeDir(), hostHome})
 }
 
 // trustedLookupHomes 返回二进制查找/收录面专用的受信 home 根列表
@@ -471,20 +478,14 @@ func trustedAgentHomes() []string {
 // homeDir() 枚举环境 $HOME，收紧后同样撤销该项——非受信 $HOME 下原本可经
 // homeDir() 收录的合法路径不再收录，此为用户批准的收紧方案一部分。
 func trustedLookupHomes() []string {
-	var homes []string
-	seen := make(map[string]struct{}, 3)
-	for _, home := range []string{trustedHomeDir(), "/root", "/root/.agy-pro-home"} {
-		home = filepath.Clean(strings.TrimSpace(home))
-		if home == "" || home == "." || home == "/" {
-			continue
-		}
-		if _, ok := seen[home]; ok {
-			continue
-		}
-		seen[home] = struct{}{}
-		homes = append(homes, home)
-	}
-	return homes
+	return trustedLookupHomesFor(trustedHomeDir())
+}
+
+// trustedLookupHomesFor 与 trustedLookupHomes 同口径，但 trustedHomeDir() 位置
+// 由调用方显式给定（生产始终传 trustedHomeDir()；测试传入夹具宿主 home，
+// 使二进制收录面枚举可在无真实 claude/agy 的干净 CI 上确定性覆盖）。
+func trustedLookupHomesFor(hostHome string) []string {
+	return dedupeTrustedHomes([]string{hostHome, "/root", "/root/.agy-pro-home"})
 }
 
 // agentLookupDirs 是解析 agy/pig/pi/claude 时除 PATH 与 standardBinDirs 外额外搜索的目录。
@@ -492,6 +493,13 @@ func trustedLookupHomes() []string {
 // 在隔离 HOME 下同样完整；绝不读 $HOME（调用方可控输入不作二进制收录的
 // 信任边界输入），绝不纳入任意 PATH/TMPDIR 目录。
 func agentLookupDirs() []string {
+	return agentLookupDirsForHomes(trustedLookupHomes())
+}
+
+// agentLookupDirsForHomes 与 agentLookupDirs 同口径，但受信 home 根由调用方
+// 显式给定；/root 两项作为既有底底显式补入（lookupHomes 已含 /root 时去重
+// 后不重复）。
+func agentLookupDirsForHomes(lookupHomes []string) []string {
 	var out []string
 	seen := make(map[string]struct{}, 8)
 	add := func(d string) {
@@ -505,11 +513,11 @@ func agentLookupDirs() []string {
 		seen[d] = struct{}{}
 		out = append(out, d)
 	}
-	for _, home := range trustedLookupHomes() {
+	for _, home := range lookupHomes {
 		add(filepath.Join(home, ".local", "bin"))
 		add(filepath.Join(home, ".pig", "bin"))
 	}
-	// /root 已在 trustedLookupHomes() 内，显式补两项仅作既有兜底，去重后不重复。
+	// /root 已在受信 home 根内，显式补两项仅作既有底底，去重后不重复。
 	add("/root/.local/bin")
 	add("/root/.pig/bin")
 	return out
@@ -745,6 +753,16 @@ func ResolveMCPServerPaths() []string {
 // ResolveEntryAgentPaths 解析宿主上的 agy / pig / pi / claude 及其符号链接目标，供 ReviewerAgent 顶层启动。
 // 不把 dispatch-agent / grok 纳入；嵌套禁止无法靠 Landlock 一次性放行实现，见 ReviewerAgent 注释。
 func ResolveEntryAgentPaths() []string {
+	return resolveEntryAgentPaths(trustedHomeDir())
+}
+
+// resolveEntryAgentPaths 是 ResolveEntryAgentPaths 的可注入宿主 home 版本：
+// hostHome 取代 trustedHomeDir() 的位置参与安装根前缀判定（trustedAgentHomesFor）
+// 与二进制收录面枚举（trustedLookupHomesFor）。生产路径传入真实宿主 HOME
+// （/etc/passwd 解析，不读 $HOME），行为与内联调用 trustedHomeDir() 完全等价；
+// 单测经包内 test seam 传入夹具宿主 home，使版本化 claude 安装根放行与
+// agyStateBin 枚举断言摆脱宿主真实安装状态。
+func resolveEntryAgentPaths(hostHome string) []string {
 	// entryAgentAllowedNames 是软链目标身份白名单：names 成员外加 agy 状态目录下的
 	// agentapi / webm_encoder（它们是 agy 本体经软链解析后可能命中的真实文件名）。
 	// 已知边界：身份校验第 1 档（allowedTargets basename 命中）无条件放行、不看路径
@@ -760,12 +778,14 @@ func ResolveEntryAgentPaths() []string {
 
 	// entryAgentInstallRoots 枚举已知安装根前缀（含尾部分隔符）：软链
 	// 解析目标只有位于这些根之下，才可经「含 /<查找名>/ 路径段」判定放行。
-	// 根覆盖全部 trustedAgentHomes()（当前 $HOME 与 trustedHomeDir() 宿主真实
-	// HOME，后者在隔离测试或 systemd 单元改 HOME 时仍解析到宿主
-	// /root/.local/share 等真实安装根）与硬编码 /root 两个形态，去重。
+	// 根覆盖全部 trustedAgentHomesFor(hostHome)（当前 $HOME 与调用方给定宿主
+	// home——生产即 trustedHomeDir() 宿主真实 HOME，在隔离测试或 systemd 单元
+	// 改 HOME 时仍解析到宿主 /root/.local/share 等真实安装根）与硬编码 /root
+	// 两个形态，去重。
 	// 安装根含 homeDir() 系既有信任口径，维持不改；下方版本化 pig glob 与
 	// agyStateBin 属二进制收录面，改用 trustedLookupHomes()（不读 $HOME）。
-	trustedHomesWithRoot := dedupeStrings(append(append([]string{}, trustedAgentHomes()...), "/root"))
+	lookupHomes := trustedLookupHomesFor(hostHome)
+	trustedHomesWithRoot := dedupeStrings(append(append([]string{}, trustedAgentHomesFor(hostHome)...), "/root"))
 	entryAgentInstallRoots := func() []string {
 		sep := string(filepath.Separator)
 		var roots []string
@@ -790,7 +810,7 @@ func ResolveEntryAgentPaths() []string {
 		for _, d := range standardBinDirs {
 			addRoot(d)
 		}
-		for _, d := range agentLookupDirs() {
+		for _, d := range agentLookupDirsForHomes(lookupHomes) {
 			addRoot(d)
 		}
 		return roots
@@ -893,7 +913,7 @@ func ResolveEntryAgentPaths() []string {
 		for _, dir := range standardBinDirs {
 			add(name, filepath.Join(dir, name))
 		}
-		for _, dir := range agentLookupDirs() {
+		for _, dir := range agentLookupDirsForHomes(lookupHomes) {
 			add(name, filepath.Join(dir, name))
 		}
 	}
@@ -901,7 +921,7 @@ func ResolveEntryAgentPaths() []string {
 	// （passwd-HOME + 硬编码 /root 与 /root/.agy-pro-home，不读 $HOME——$HOME
 	// 是调用方可控输入，不得作为二进制收录的信任边界输入），隔离 HOME 下
 	// 仍能命中宿主 opt。
-	for _, globHome := range trustedLookupHomes() {
+	for _, globHome := range lookupHomes {
 		if matches, err := filepath.Glob(filepath.Join(globHome, ".local", "opt", "pig", "*", "pig")); err == nil {
 			for _, m := range matches {
 				add("pig", m)
@@ -911,7 +931,7 @@ func ResolveEntryAgentPaths() []string {
 	// agy stub (…/.local/bin/agy) 会再 exec 到 antigravity-cli/bin/agy（动态链接真实本体）；
 	// agyStateBin 属二进制收录面，按 trustedLookupHomes() 枚举（不读 $HOME；含
 	// /root/.agy-pro-home 显式项），隔离 HOME 下仍定位宿主状态目录。
-	for _, agyHome := range trustedLookupHomes() {
+	for _, agyHome := range lookupHomes {
 		agyStateBin := filepath.Join(agyHome, ".gemini", "antigravity-cli", "bin")
 		for _, name := range []string{"agy", "agentapi", "webm_encoder"} {
 			add(name, filepath.Join(agyStateBin, name))
@@ -963,6 +983,12 @@ func agyAntigravityStateDirs() []string {
 }
 
 // appendAgyStateReadWrite 为每个 antigravity-cli 状态根开放数据子目录与根级状态文件写权限（不含 bin/）。
+// 根级状态文件是 os.ReadDir 快照枚举的瞬态面——宿主 agy 可能在枚举与
+// Landlock Apply 的毫秒级窗口内经 WAL checkpoint 删除
+// *.db-shm/*.db-wal/*.db-journal 或临时原子写文件，修复前此类瞬态消失
+// 会在 Apply 时以 ENOENT 击穿整个沙盒（TOCTOU 竞态）。因此枚举出的根级
+// 文件除加入 ReadWrite 外同步登记 OptionalReadWrite，Apply 时缺失仅安全
+// 跳过；目录子项（含 agyStateDataSubdirs）保持严格 fail-closed 不登记。
 func appendAgyStateReadWrite(p *Policy) {
 	for _, agyStateDir := range agyAntigravityStateDirs() {
 		for _, sub := range agyStateDataSubdirs {
@@ -978,8 +1004,13 @@ func appendAgyStateReadWrite(p *Policy) {
 				if ent.IsDir() || name == "bin" {
 					continue
 				}
-				// 根级状态文件（settings.json / history.jsonl / antigravity-oauth-token / *.db 等）
-				p.ReadWrite = append(p.ReadWrite, filepath.Join(agyStateDir, name))
+				// 根级状态文件（settings.json / history.jsonl / antigravity-oauth-token /
+				// *.db 及其 SQLite 瞬态伴侣 *.db-shm / *.db-wal / *.db-journal 等）
+				rw := filepath.Join(agyStateDir, name)
+				p.ReadWrite = append(p.ReadWrite, rw)
+				// 快照枚举文件属瞬态面：Apply 时若已被宿主进程删除，仅按
+				// OptionalReadWrite 容忍 ENOENT 跳过（见 Policy.OptionalReadWrite）。
+				p.OptionalReadWrite = append(p.OptionalReadWrite, rw)
 			}
 		}
 	}

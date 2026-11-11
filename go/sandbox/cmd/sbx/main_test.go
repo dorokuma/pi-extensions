@@ -24,6 +24,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/dorokuma/pi-extensions/go/sandbox"
 )
 
 const envTestWantSbxMain = "GO_WANT_SBX_MAIN"
@@ -672,6 +674,32 @@ func TestReportRelayValidation(t *testing.T) {
 		want := pad + reportTruncSuffix
 		if got != want {
 			t.Fatalf("truncated = %q (len %d), want len %d", got[len(got)-40:], len(got), len(want))
+		}
+	})
+
+	t.Run("report_addr_regex", func(t *testing.T) {
+		// 与 dispatch-agent 地址校验完全一致的 ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$：
+		// 首字符必须字母或数字（拒绝 "-" 开头的 hc send flag 注入），禁 `:` 与 `/`。
+		cases := []struct {
+			name string
+			addr string
+			want bool
+		}{
+			{"dash_prefix_rejected", "-bad", false}, // 首字符 '-' 会被 hc send 当 flag
+			{"colon_rejected", "ws:p7", false},      // 禁 ':'
+			{"slash_rejected", "a/../x", false},     // 禁 '/' 与路径形态
+			{"empty_rejected", "", false},
+			{"over_64_rejected", strings.Repeat("a", 65), false},
+			{"plain_id", "t13z", true},
+			{"dashed_id", "scout-t1", true},
+			{"bare_name", "probe", true},
+			{"dot_underscore", "a.b_c", true},
+			{"max_64", strings.Repeat("a", 64), true},
+		}
+		for _, tc := range cases {
+			if got := reportAddrRe.MatchString(tc.addr); got != tc.want {
+				t.Errorf("%s: reportAddrRe.MatchString(%q) = %v, want %v", tc.name, tc.addr, got, tc.want)
+			}
 		}
 	})
 
@@ -1667,4 +1695,128 @@ func TestSbxCwdRebindAfterCover(t *testing.T) {
 	} else {
 		t.Log("host /run/user/0/herdr-core absent; fail-closed case not applicable")
 	}
+}
+
+// TestChildSpecOptionalReadWriteEndToEnd 回归 [pattern:verifier-transient-fail]：
+// OptionalReadWrite 必须随 childExecSpec 经 PI_SANDBOX_INTERNAL_CHILD_SPEC
+// 100% 透传到受限子进程——宿主 agy 的 conversation_summaries.db-shm 等
+// 快照枚举瞬态文件在 Apply 前被 WAL checkpoint 删除时，修复前子进程
+// Apply ENOENT 崩溃（sbx: apply sandbox policy failed: sandbox: open
+// "...db-shm": no such file or directory），修复后干净退 0；未登记
+// OptionalReadWrite 的 ReadWrite 缺失路径保持 fail-closed 非零拒绝。
+func TestChildSpecOptionalReadWriteEndToEnd(t *testing.T) {
+	// spec JSON 正反向映射：OptionalReadWrite 序列化后完整回读。
+	t.Run("spec_json_roundtrip", func(t *testing.T) {
+		spec := childExecSpec{
+			Bin:               "/bin/sh",
+			Command:           []string{"/bin/sh", "-c", "true"},
+			ReadWrite:         []string{"/tmp/x.db-shm"},
+			OptionalReadWrite: []string{"/tmp/x.db-shm"},
+		}
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatalf("marshal spec: %v", err)
+		}
+		var back childExecSpec
+		if err := json.Unmarshal(raw, &back); err != nil {
+			t.Fatalf("unmarshal spec: %v", err)
+		}
+		if len(back.OptionalReadWrite) != 1 || back.OptionalReadWrite[0] != "/tmp/x.db-shm" {
+			t.Fatalf("OptionalReadWrite lost in JSON roundtrip: %v (raw=%s)", back.OptionalReadWrite, raw)
+		}
+	})
+
+	selfExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(selfExe); err == nil && resolved != "" {
+		selfExe = resolved
+	}
+
+	// execSelfWithSpec 以 envSbxChildSpecKey 驱动测试二进制进入
+	// runChildFromEnv（TestMain 分支），端到端验证 spec 的 Apply 行为。
+	execSelfWithSpec := func(t *testing.T, spec childExecSpec) (string, int) {
+		t.Helper()
+		specBytes, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatalf("marshal spec: %v", err)
+		}
+		env := mergeEnv(stripSandboxEnv(os.Environ()),
+			[]string{envSbxChildSpecKey + "=" + string(specBytes)})
+		cmd := exec.Command(selfExe)
+		cmd.Env = env
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			return out.String(), exitCodeFromWaitErr(err)
+		}
+		return out.String(), 0
+	}
+
+	missingShm := filepath.Join(t.TempDir(), "conversation_summaries.db-shm")
+
+	t.Run("optional_transient_passes", func(t *testing.T) {
+		if _, ok := sandbox.Supported(); !ok {
+			t.Skip("Landlock not supported on this kernel")
+		}
+		spec := childExecSpec{
+			Bin:               "/bin/sh",
+			Command:           []string{"/bin/sh", "-c", "echo transient_ok"},
+			ReadOnly:          []string{"/"},
+			ReadWrite:         []string{missingShm},
+			OptionalReadWrite: []string{missingShm},
+			Exec:              []string{"/bin/sh"},
+			MountNS:           false,
+		}
+		out, code := execSelfWithSpec(t, spec)
+		if code != 0 {
+			t.Fatalf("child spec with optional transient missing file exit = %d, want 0; output:\n%s", code, out)
+		}
+		if !strings.Contains(out, "transient_ok") {
+			t.Fatalf("expected transient_ok in output, got:\n%s", out)
+		}
+	})
+
+	t.Run("non_optional_missing_fails_closed", func(t *testing.T) {
+		if _, ok := sandbox.Supported(); !ok {
+			t.Skip("Landlock not supported on this kernel")
+		}
+		spec := childExecSpec{
+			Bin:       "/bin/sh",
+			Command:   []string{"/bin/sh", "-c", "echo SHOULD_NOT_REACH"},
+			ReadOnly:  []string{"/"},
+			ReadWrite: []string{missingShm},
+			Exec:      []string{"/bin/sh"},
+			MountNS:   false,
+		}
+		out, code := execSelfWithSpec(t, spec)
+		if code == 0 || strings.Contains(out, "SHOULD_NOT_REACH") {
+			t.Fatalf("non-optional missing ReadWrite must fail closed (exit=%d); output:\n%s", code, out)
+		}
+		if !strings.Contains(out, "no such file or directory") {
+			t.Fatalf("expected ENOENT error in output, got:\n%s", out)
+		}
+	})
+
+	t.Run("cli_rw_missing_fails_closed", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("strict mode mount namespace requires CAP_SYS_ADMIN (euid 0)")
+		}
+		if _, ok := sandbox.Supported(); !ok {
+			t.Skip("Landlock not supported on this kernel")
+		}
+		// 显式 --rw 的缺失路径绝不进入 OptionalReadWrite：严格模式 fail-closed。
+		out, code := invokeSbxSubprocess(t, nil,
+			"--rw", missingShm,
+			"--", "/bin/sh", "-c", "echo SHOULD_NOT_REACH",
+		)
+		if code == 0 || strings.Contains(out, "SHOULD_NOT_REACH") {
+			t.Fatalf("explicit --rw missing path must fail closed (exit=%d); output:\n%s", code, out)
+		}
+		if !strings.Contains(out, "no such file or directory") {
+			t.Fatalf("expected ENOENT error in output, got:\n%s", out)
+		}
+	})
 }

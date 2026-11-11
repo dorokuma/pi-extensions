@@ -82,7 +82,11 @@ const reportAcceptMaxConsecErrs = 100
 // 生产构建不注入时为空，hc 只在固定可信位置解析，绝不走 PATH 或环境变量。
 var hcPathOverride = ""
 
-var reportAddrRe = regexp.MustCompile(`^[A-Za-z0-9._:/-]{1,64}$`)
+// reportAddrRe 与 dispatch-agent 的地址校验完全一致：首字符必须是字母或
+// 数字（拒绝 "-bad" 这类会被 hc send 当作 flag 注入的地址），后续允许
+// 字母数字与 `.` `_` `-`，总长 1-64；不含 `:` 与 `/`（拒绝 ws:p7、a/../x
+// 这类伪装 ws 地址或路径形态的注入）。
+var reportAddrRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // reportRequest 是沙盒内 hc 客户端发送到 report.sock 的请求体。
 type reportRequest struct {

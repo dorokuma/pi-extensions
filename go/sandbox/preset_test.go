@@ -1901,3 +1901,79 @@ func TestPreparePrivateClaudeConfigDirProjectsSymlink(t *testing.T) {
 		t.Fatalf("projects symlink must not be created when shared root parent is a symlink, err=%v", lerr)
 	}
 }
+
+// TestAppendAgyStateReadWriteMarksRootFilesOptional 覆盖 [pattern:verifier-transient-fail] 修复的
+// 标记口径：appendAgyStateReadWrite 快照枚举的根级状态文件（含 SQLite 瞬态
+// *.db-shm/*.db-wal/*.db-journal 与临时原子写文件）必须同时进 ReadWrite
+// （授权不变）与 OptionalReadWrite（Apply 时 ENOENT 容忍）；数据子目录、
+// bin/ 软链绝不进 OptionalReadWrite——保持严格 fail-closed ENOENT 报错。
+func TestAppendAgyStateReadWriteMarksRootFilesOptional(t *testing.T) {
+	const fixture = "conversation_summaries.db-shm"
+	var roots []string
+	var fixturePaths []string
+	for _, dir := range agyAntigravityStateDirs() {
+		if st, err := os.Lstat(dir); err == nil && st.IsDir() {
+			roots = append(roots, dir)
+			fp := filepath.Join(dir, fixture)
+			fixturePaths = append(fixturePaths, fp)
+			if err := os.WriteFile(fp, []byte("x"), 0o600); err != nil {
+				t.Fatalf("write fixture %s: %v", fp, err)
+			}
+			t.Cleanup(func() { _ = os.Remove(fp) })
+		}
+	}
+	if len(roots) == 0 {
+		t.Skip("host has no antigravity-cli state root")
+	}
+
+	var p Policy
+	appendAgyStateReadWrite(&p)
+
+	rwSet := make(map[string]struct{}, len(p.ReadWrite))
+	for _, rp := range p.ReadWrite {
+		if n, err := NormalizePath(rp); err == nil {
+			rwSet[n] = struct{}{}
+		}
+	}
+	orwSet := make(map[string]struct{}, len(p.OptionalReadWrite))
+	for _, op := range p.OptionalReadWrite {
+		if n, err := NormalizePath(op); err == nil {
+			orwSet[n] = struct{}{}
+		}
+	}
+
+	for _, fp := range fixturePaths {
+		n, err := NormalizePath(fp)
+		if err != nil {
+			t.Fatalf("NormalizePath %q: %v", fp, err)
+		}
+		if _, ok := rwSet[n]; !ok {
+			t.Fatalf("snapshot-enumerated root file %q missing from ReadWrite", fp)
+		}
+		if _, ok := orwSet[n]; !ok {
+			t.Fatalf("snapshot-enumerated root file %q missing from OptionalReadWrite", fp)
+		}
+	}
+	// agyStateDataSubdirs 数据子目录只进 ReadWrite、绝不进 OptionalReadWrite（fail-closed 不变）。
+	for _, root := range roots {
+		for _, sub := range agyStateDataSubdirs {
+			n, err := NormalizePath(filepath.Join(root, sub))
+			if err != nil {
+				t.Fatalf("NormalizePath subdir: %v", err)
+			}
+			if _, ok := rwSet[n]; !ok {
+				t.Fatalf("data subdir %s/%s missing from ReadWrite", root, sub)
+			}
+			if _, ok := orwSet[n]; ok {
+				t.Fatalf("data subdir %s/%s must NOT be in OptionalReadWrite", root, sub)
+			}
+		}
+	}
+}
+
+// ── export_test 段：供外部测试包 sandbox_test 使用 ────────────────────────
+// sandbox_test.go 属 package sandbox_test，无法访问包内未导出符号。本段
+// 仅存在于测试二进制中（非生产 API）：resolveEntryAgentPaths 的 hostHome
+// 参数取代 trustedHomeDir()，使「隔离 HOME 下宿主受信安装根/收录面」相关
+// 断言能用 t.TempDir() 夹具确定性实跑，摆脱宿主真实 claude/agy 安装状态。
+var ResolveEntryAgentPathsForTest = resolveEntryAgentPaths

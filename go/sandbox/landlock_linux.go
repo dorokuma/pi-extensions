@@ -251,9 +251,15 @@ func supported() (int, bool) {
 }
 
 type pathRuleEntry struct {
-	path     string
-	access   uint64
+	path   string
+	access uint64
+	// optional 为软可选系统路径（ELF 解释器/共享库目录//proc//dev/*）：
+	// 打开失败时容忍 ENOENT/ENOTDIR/EACCES。
 	optional bool
+	// transient 仅对 Policy.OptionalReadWrite 登记的瞬态状态文件生效：
+	// 打开返回 ENOENT（含悬空软链/快照枚举后被宿主删除）时安全跳过；
+	// 不授予任何额外权限，也绝不放宽普通 ReadWrite 条目的 fail-closed 语义。
+	transient bool
 }
 
 func applyPolicy(p Policy) error {
@@ -378,7 +384,7 @@ func createAndPopulateRuleset(p Policy, abi int, hasFS, enforceNet bool) (int, e
 			return -1, err
 		}
 		for _, entry := range entries {
-			if err := addPathRule(rulesetFD, entry.path, entry.access, abi, entry.optional, p); err != nil {
+			if err := addPathRule(rulesetFD, entry.path, entry.access, abi, entry.optional, entry.transient, p); err != nil {
 				_ = unix.Close(rulesetFD)
 				return -1, err
 			}
@@ -391,7 +397,17 @@ func buildPathRuleEntries(p Policy, abi int) ([]pathRuleEntry, error) {
 	indexByPath := make(map[string]int)
 	var entries []pathRuleEntry
 
-	addEntry := func(raw string, access uint64, optional bool) error {
+	// optionalRWSet 归一化 Policy.OptionalReadWrite 为规范化路径集合：
+	// 仅对其中登记的瞬态路径在 Apply 打开时容忍 ENOENT。NormalizePaths
+	// 失败（非法路径本应在 Validate 被拦截）时保守置空，不扩大容忍面。
+	optionalRWSet := make(map[string]struct{}, len(p.OptionalReadWrite))
+	if normORW, err := NormalizePaths(p.OptionalReadWrite); err == nil {
+		for _, op := range normORW {
+			optionalRWSet[op] = struct{}{}
+		}
+	}
+
+	addEntry := func(raw string, access uint64, optional bool, transient bool) error {
 		norm, err := NormalizePath(raw)
 		if err != nil {
 			return err
@@ -408,12 +424,16 @@ func buildPathRuleEntries(p Policy, abi int) ([]pathRuleEntry, error) {
 				if !optional {
 					entries[idx].optional = false
 				}
+				if !transient {
+					entries[idx].transient = false
+				}
 			} else {
 				indexByPath[c] = len(entries)
 				entries = append(entries, pathRuleEntry{
-					path:     c,
-					access:   access,
-					optional: optional,
+					path:      c,
+					access:    access,
+					optional:  optional,
+					transient: transient,
 				})
 			}
 		}
@@ -422,21 +442,25 @@ func buildPathRuleEntries(p Policy, abi int) ([]pathRuleEntry, error) {
 
 	roMask := accessReadOnly()
 	for _, path := range p.ReadOnly {
-		if err := addEntry(path, roMask, false); err != nil {
+		if err := addEntry(path, roMask, false, false); err != nil {
 			return nil, err
 		}
 	}
 
 	rwMask := accessReadWrite(abi)
 	for _, path := range p.ReadWrite {
-		if err := addEntry(path, rwMask, false); err != nil {
+		// 快照枚举的瞬态状态文件（OptionalReadWrite 成员）在 Apply 时允许
+		// ENOENT 跳过；普通 ReadWrite 条目保持 fail-closed ENOENT 报错。
+		normRW, _ := NormalizePath(path)
+		_, transient := optionalRWSet[normRW]
+		if err := addEntry(path, rwMask, false, transient); err != nil {
 			return nil, err
 		}
 	}
 
 	execMask := accessExec()
 	for _, path := range p.Exec {
-		if err := addEntry(path, execMask, false); err != nil {
+		if err := addEntry(path, execMask, false, false); err != nil {
 			return nil, err
 		}
 	}
@@ -445,29 +469,34 @@ func buildPathRuleEntries(p Policy, abi int) ([]pathRuleEntry, error) {
 	// 与基础共享库目录（只读），并通过 seccomp 守卫拦截用户态直接调用 ld-linux 的行为。
 	if len(p.Exec) > 0 {
 		for _, interp := range defaultELFInterpreters {
-			_ = addEntry(interp, landlockAccessFSExecute|landlockAccessFSReadFile, true)
+			_ = addEntry(interp, landlockAccessFSExecute|landlockAccessFSReadFile, true, false)
 		}
 		for _, libPath := range defaultSharedLibPaths {
-			_ = addEntry(libPath, roMask, true)
+			_ = addEntry(libPath, roMask, true, false)
 		}
-		_ = addEntry("/proc", roMask, true)
+		_ = addEntry("/proc", roMask, true, false)
 	}
 
 	if len(p.ReadOnly) > 0 || len(p.ReadWrite) > 0 || len(p.Exec) > 0 {
 		for _, dev := range defaultNullDevices {
-			_ = addEntry(dev, rwMask, true)
+			_ = addEntry(dev, rwMask, true, false)
 		}
 		for _, dev := range defaultRandomDevices {
-			_ = addEntry(dev, roMask, true)
+			_ = addEntry(dev, roMask, true, false)
 		}
 	}
 
 	return entries, nil
 }
 
-func addPathRule(rulesetFD int, path string, access uint64, abi int, optional bool, p Policy) error {
+func addPathRule(rulesetFD int, path string, access uint64, abi int, optional, transient bool, p Policy) error {
 	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
+		if transient && errors.Is(err, unix.ENOENT) {
+			// OptionalReadWrite 登记的瞬态状态文件（如 agy .db-shm）：
+			// 枚举快照后已被宿主删除（含悬空软链）时安全跳过，不击穿 Apply。
+			return nil
+		}
 		if optional && (errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.EACCES)) {
 			return nil
 		}
@@ -753,15 +782,16 @@ func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string, entryAgents [
 }
 
 type helperConfig struct {
-	ReadOnly      []string `json:"ro"`
-	ReadWrite     []string `json:"rw"`
-	Exec          []string `json:"exec"`
-	DenyNet       bool     `json:"deny_net"`
-	GoExecDir     string   `json:"go_exec_dir"`
-	RealGoBin     string   `json:"real_go_bin"`
-	NonExecRWDirs []string `json:"non_exec_rw"`
-	EntryAgents   []string `json:"entry_agents"`
-	HasBroker     bool     `json:"has_broker"`
+	ReadOnly          []string `json:"ro"`
+	ReadWrite         []string `json:"rw"`
+	OptionalReadWrite []string `json:"orw"`
+	Exec              []string `json:"exec"`
+	DenyNet           bool     `json:"deny_net"`
+	GoExecDir         string   `json:"go_exec_dir"`
+	RealGoBin         string   `json:"real_go_bin"`
+	NonExecRWDirs     []string `json:"non_exec_rw"`
+	EntryAgents       []string `json:"entry_agents"`
+	HasBroker         bool     `json:"has_broker"`
 }
 
 func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error) {
@@ -812,15 +842,16 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error)
 	}
 
 	cfg := helperConfig{
-		ReadOnly:      p.ReadOnly,
-		ReadWrite:     p.ReadWrite,
-		Exec:          p.Exec,
-		DenyNet:       p.DenyNet,
-		GoExecDir:     goExecDir,
-		RealGoBin:     realGoBin,
-		NonExecRWDirs: computeNonExecRWDirs(p),
-		EntryAgents:   append([]string(nil), p.EntryAgents...),
-		HasBroker:     hasBroker,
+		ReadOnly:          p.ReadOnly,
+		ReadWrite:         p.ReadWrite,
+		OptionalReadWrite: p.OptionalReadWrite,
+		Exec:              p.Exec,
+		DenyNet:           p.DenyNet,
+		GoExecDir:         goExecDir,
+		RealGoBin:         realGoBin,
+		NonExecRWDirs:     computeNonExecRWDirs(p),
+		EntryAgents:       append([]string(nil), p.EntryAgents...),
+		HasBroker:         hasBroker,
 	}
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
@@ -927,10 +958,11 @@ func runHelperProcess() {
 			)
 		}
 		helperPolicy := Policy{
-			ReadOnly:  cfg.ReadOnly,
-			ReadWrite: helperRW,
-			Exec:      cfg.Exec,
-			DenyNet:   cfg.DenyNet,
+			ReadOnly:          cfg.ReadOnly,
+			ReadWrite:         helperRW,
+			OptionalReadWrite: cfg.OptionalReadWrite,
+			Exec:              cfg.Exec,
+			DenyNet:           cfg.DenyNet,
 		}
 		if rulesetFD, err := createAndPopulateRuleset(helperPolicy, abi, true, cfg.DenyNet && abi >= 4); err == nil {
 			_ = enforceRuleset(rulesetFD)
@@ -1310,10 +1342,11 @@ func runTestRunnerClient(goExecDir string) int {
 		if err := json.Unmarshal([]byte(rawCfg), &cfg); err == nil {
 			if abi, ok := supported(); ok {
 				reviewerPolicy := Policy{
-					ReadOnly:  cfg.ReadOnly,
-					ReadWrite: cfg.ReadWrite,
-					Exec:      cfg.Exec,
-					DenyNet:   cfg.DenyNet,
+					ReadOnly:          cfg.ReadOnly,
+					ReadWrite:         cfg.ReadWrite,
+					OptionalReadWrite: cfg.OptionalReadWrite,
+					Exec:              cfg.Exec,
+					DenyNet:           cfg.DenyNet,
 				}
 				if rulesetFD, err := createAndPopulateRuleset(reviewerPolicy, abi, true, cfg.DenyNet && abi >= 4); err == nil {
 					_ = enforceRuleset(rulesetFD)
