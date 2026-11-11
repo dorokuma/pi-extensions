@@ -1,6 +1,9 @@
 package rpivaskuserquestion
 
 import (
+	"encoding/binary"
+	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -570,5 +573,212 @@ func TestExtensionDefersBusSubscriptionToOnLoaded(t *testing.T) {
 		t.Fatal("Extension() opened the host socket from the factory: the bus subscription must be deferred to OnLoaded")
 	case <-time.After(5 * time.Second):
 		t.Fatal("Extension() did not return: a factory-time host call blocks the reload")
+	}
+}
+
+// ── frame IO for the wire-level host harness ────────────────────────────────
+
+// readWireFrame reads one length-prefixed JSON frame off the wire, matching the
+// SDK conn's own framing (protocol.go).
+func readWireFrame(r io.Reader) (map[string]any, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	data := make([]byte, binary.BigEndian.Uint32(header[:]))
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+	var msg map[string]any
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// writeWireFrame writes one length-prefixed JSON frame.
+func writeWireFrame(w io.Writer, msg map[string]any) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
+	_, err = w.Write(append(header[:], data...))
+	return err
+}
+
+// TestAnswerDispatchVerdictRidesTheDispatchContext drives the real Extension()
+// over a net.Pipe through the genuine wire path: register → ready → the
+// OnLoaded ctx.Events().On subscription → an events.dispatch request carrying a
+// rpiv:ask-user:answer payload → the verdict emit back to the host. The verdict
+// must be bound to the dispatch's own request context: the emit call frame's
+// parent_request_id has to equal the dispatch request id. With the pre-fix
+// answers.Handle(payload) (a constructor-bound Extension.Events().Emit) the
+// frame carries an empty parent_request_id and this test fails. Harness shape
+// follows go/ctxmode/test_helpers_test.go's sdkHost.
+func TestAnswerDispatchVerdictRidesTheDispatchContext(t *testing.T) {
+	t.Setenv("PIG_EXT_SOCKET", "")
+	// A temp HOME keeps the extension's LoadConfig deterministic: the sandbox's
+	// config store must not leak into the run.
+	t.Setenv("HOME", t.TempDir())
+
+	hostEnd, extEnd := net.Pipe()
+	defer func() { _ = hostEnd.Close() }()
+	runDone := make(chan error, 1)
+	go func() { runDone <- Extension().RunWithConn(extEnd) }()
+
+	// No frame should take longer than this; a hang anywhere fails the test
+	// instead of stalling the suite.
+	deadline := func() { _ = hostEnd.SetDeadline(time.Now().Add(15 * time.Second)) }
+	defer func() { _ = hostEnd.SetDeadline(time.Time{}) }()
+	deadline()
+
+	next := func() map[string]any {
+		deadline()
+		msg, err := readWireFrame(hostEnd)
+		if err != nil {
+			t.Fatalf("read host frame: %v", err)
+		}
+		return msg
+	}
+	replyCall := func(id string) {
+		t.Helper()
+		if err := writeWireFrame(hostEnd, map[string]any{
+			"type": "call_result", "id": id,
+			"call_result": map[string]any{"result": nil},
+		}); err != nil {
+			t.Fatalf("answer host call %s: %v", id, err)
+		}
+	}
+
+	// Handshake: the extension registers first, the host answers ready.
+	reg := next()
+	if reg["type"] != "register" {
+		t.Fatalf("first frame = %v, want register", reg)
+	}
+	if err := writeWireFrame(hostEnd, map[string]any{
+		"type":  "ready",
+		"ready": map[string]any{"cwd": t.TempDir(), "mode": "tui", "width": 80},
+	}); err != nil {
+		t.Fatalf("send ready: %v", err)
+	}
+
+	const dispatchID = "req-dispatch-1"
+	var (
+		handlerID   string
+		dispatched  bool
+		responded   bool
+		emitSeen    bool
+		emitParent  string
+		emitVerdict map[string]any
+	)
+	// Serve the wire until the dispatch was answered and the verdict emit was
+	// captured. request_state frames and stray pong/notify frames carry no
+	// payload the test needs and are skipped; every call is answered so the
+	// extension never stalls waiting for the host.
+	for !responded || !emitSeen {
+		msg := next()
+		switch msg["type"] {
+		case "call":
+			call, _ := msg["call"].(map[string]any)
+			method, _ := call["method"].(string)
+			args, _ := call["args"].(map[string]any)
+			callID, _ := msg["id"].(string)
+			switch method {
+			case "events.on":
+				if channel, _ := args["channel"].(string); channel == AskUserAnswerEvent {
+					handlerID, _ = args["handlerId"].(string)
+					if handlerID == "" {
+						t.Fatalf("events.on for %s carried no handlerId: %v", channel, args)
+					}
+				}
+				replyCall(callID)
+				if handlerID != "" && !dispatched {
+					dispatched = true
+					// A dispatch the Host sends while the extension loads is
+					// served without waiting for OnLoaded to finish
+					// (serveLoadingEnvelope / the loop's loadedDone gate), so
+					// sending it right after answering events.on exercises the
+					// same ordering the real host produces.
+					payload, err := json.Marshal(map[string]any{
+						"toolCallId": "call-1",
+						"requestId":  "req-9",
+						"answers":    []any{map[string]any{"questionIndex": 0, "optionIndexes": []any{0}}},
+					})
+					if err != nil {
+						t.Fatalf("marshal answer payload: %v", err)
+					}
+					dispatchArgs, err := json.Marshal(map[string]any{
+						"handlerId": handlerID,
+						"channel":   AskUserAnswerEvent,
+						"json":      json.RawMessage(payload),
+					})
+					if err != nil {
+						t.Fatalf("marshal dispatch args: %v", err)
+					}
+					if err := writeWireFrame(hostEnd, map[string]any{
+						"type": "request", "id": dispatchID,
+						"request": map[string]any{
+							"method": "events.dispatch",
+							"args":   json.RawMessage(dispatchArgs),
+						},
+					}); err != nil {
+						t.Fatalf("send dispatch: %v", err)
+					}
+				}
+			case "events.emit":
+				emitSeen = true
+				emitParent, _ = call["parent_request_id"].(string)
+				emitVerdict, _ = args["json"].(map[string]any)
+				if channel, _ := args["channel"].(string); channel != AskUserAnswerResultEvent {
+					t.Fatalf("verdict emitted on %q, want %q", channel, AskUserAnswerResultEvent)
+				}
+				replyCall(callID)
+			default:
+				replyCall(callID)
+			}
+		case "response":
+			if id, _ := msg["id"].(string); id == dispatchID {
+				responded = true
+				if resp, _ := msg["response"].(map[string]any); resp["error"] != nil {
+					t.Fatalf("dispatch response carried an error: %v", resp["error"])
+				}
+			}
+		default:
+			// request_state / notify / pong frames need no action.
+		}
+	}
+
+	// The verdict rode the dispatch's request context: an unbound emit would
+	// carry an empty parent_request_id.
+	if emitParent != dispatchID {
+		t.Fatalf("verdict emit parent_request_id = %q, want %q (the dispatch request id)", emitParent, dispatchID)
+	}
+	// And the verdict content is the channel's not_found reply for the unknown
+	// tool call, proof the real answer-channel ran end to end.
+	if emitVerdict == nil {
+		t.Fatal("events.emit carried no verdict payload")
+	}
+	if ok, _ := emitVerdict["ok"].(bool); ok {
+		t.Fatalf("verdict ok = true, want the not_found reject for the unopened tool call: %v", emitVerdict)
+	}
+	if code, _ := emitVerdict["code"].(string); code != string(RejectNotFound) {
+		t.Fatalf("verdict code = %q, want %q: %v", code, RejectNotFound, emitVerdict)
+	}
+	if reqID, _ := emitVerdict["requestId"].(string); reqID != "req-9" {
+		t.Fatalf("verdict requestId = %q, want req-9: %v", reqID, emitVerdict)
+	}
+
+	if err := writeWireFrame(hostEnd, map[string]any{"type": "shutdown"}); err != nil {
+		t.Fatalf("send shutdown: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("RunWithConn returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("extension did not stop after shutdown")
 	}
 }

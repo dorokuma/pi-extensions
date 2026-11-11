@@ -457,3 +457,26 @@ func TestAnswerChannelConcurrentOpenClose(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// HandleEmit rebinds the verdict emit to the caller's bus (a dispatch-bound
+// ctx.Events().Emit in production) instead of the constructor-bound one; the
+// nil emit keeps the constructor bus, matching Handle.
+func TestAnswerChannelHandleEmitOverride(t *testing.T) {
+	ctorBus := newFakeBus()
+	channel := NewAnswerChannel(ctorBus.Emit)
+
+	dispatchBus := newFakeBus()
+	channel.HandleEmit(map[string]any{}, dispatchBus.Emit)
+
+	if got := dispatchBus.verdicts(); len(got) != 1 || got[0].OK {
+		t.Fatalf("dispatch-bus verdicts = %+v, want one reject verdict", got)
+	}
+	if got := ctorBus.verdicts(); len(got) != 0 {
+		t.Fatalf("constructor bus received verdicts = %+v, want none", got)
+	}
+
+	channel.HandleEmit(map[string]any{}, nil)
+	if got := ctorBus.verdicts(); len(got) != 1 {
+		t.Fatalf("nil-emit fallback verdicts = %+v, want one on the constructor bus", got)
+	}
+}
