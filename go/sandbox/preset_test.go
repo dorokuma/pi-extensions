@@ -724,6 +724,7 @@ func (f *warmTestFixture) warmEnvLogScript(cellSnippet, extraSnippet string) str
   echo "PIG_HOME=${PIG_HOME-<unset>}"
   echo "GOPROXY=${GOPROXY-<unset>}"
   echo "GOWORK=${GOWORK-<unset>}"
+  echo "GOCMD=$(command -v go 2>/dev/null || echo none)"
 } >> '%[1]s'
 %[2]s
 %[3]s
@@ -905,7 +906,16 @@ func TestWarmGoExtensionCellsBundledColdStart(t *testing.T) {
 	if childPath == "" || strings.Contains(childPath, filepath.Dir(fx.fakePig)) {
 		t.Fatalf("untrusted host PATH leaked into warm subprocess: %q", childPath)
 	}
-	for _, seg := range strings.Split(childPath, string(os.PathListSeparator)) {
+	// 受控 PATH 白名单：仅固定可信目录 + 首个条目允许为沙盒对齐的真实 go
+	// 所在目录（resolveRealGoBinary 与沙盒同口径选出，保证 cell 摘要命中）。
+	realGoDir := ""
+	if rg := resolveRealGoBinary(""); rg != "" {
+		realGoDir = filepath.Dir(rg)
+	}
+	for i, seg := range strings.Split(childPath, string(os.PathListSeparator)) {
+		if i == 0 && realGoDir != "" && seg == realGoDir {
+			continue
+		}
 		switch seg {
 		case "/usr/local/go/bin", "/usr/lib/go/bin", "/root/.local/bin",
 			"/usr/local/bin", "/usr/bin", "/bin":
@@ -1748,6 +1758,52 @@ func TestWarmGoExtensionCellsSettingsExternalExtPath(t *testing.T) {
 	MaybeWarmGoExtensionCells("reviewer-agent", []string{"pig"}, nil)
 	if n := fx.warmInvocations(t); n != 2 {
 		t.Fatalf("external settings-declared extension change should re-warm, invocations=%d", n)
+	}
+}
+
+// TestWarmGoExtensionCellsGoToolchainAlign 是 .build-* EACCES 授权缺口的回归：
+// 沙盒内 pig 经 goExecDir 包装器由 resolveRealGoBinary 解析真实 go（宿主
+// PATH 顺序）；预热子进程原先只用 controlledWarmPath 的固定目录顺序，在
+// /usr/local/go 优先而宿主 PATH 先命中 /usr/bin 的机器上解析出不同 go——
+// goPackedCellHash 折进 toolchain 的 commandVersion/goroot/compiler，两侧
+// toolchain 不一致则 cell 摘要错配，沙盒内 pig 被迫在 cells/go 下建
+// .build-* scratch 而撞 W^X 只读（15 个 Go 扩展全加载失败、exit 1）。
+// 本测试在宿主 PATH 最前置一个伪 go 并断言预热子进程 command -v go 恰好
+// 解析到它（与 resolveRealGoBinary 同口径），证明两侧 toolchain 对齐。
+func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
+	// 在宿主 PATH 最前植入伪 go：resolveRealGoBinary 按宿主 PATH 顺序先命中它，
+	// 预热子进程的 command -v go 也必须命中它（而非 controlledWarmPath 固定目录）。
+	fakeGoBin := t.TempDir()
+	fakeGo := filepath.Join(fakeGoBin, "go")
+	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\necho fake-go\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile fake go: %v", err)
+	}
+	t.Setenv("PATH", fakeGoBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	fx := newWarmTestFixture(t, "", true)
+	fx.setPigScript(t, fx.warmEnvLogScript(bundledCellSnippet, ""))
+	useWarmHook(t, &warmGoCellTestHook{PigBin: fx.fakePig})
+
+	if code := MaybeWarmGoExtensionCells("reviewer-agent", []string{"pig"}, nil); code != 0 {
+		t.Fatalf("warm-up returned non-zero exit code %d", code)
+	}
+	if n := fx.warmInvocations(t); n == 0 {
+		t.Fatal("cold start: fake pig was not invoked")
+	}
+
+	// 沙盒侧将选中的真实 go 与预热子进程实际解析到的 go 必须一致。
+	realGo := resolveRealGoBinary("")
+	if realGo == "" {
+		t.Skip("no real go on host PATH; cannot assert toolchain alignment")
+	}
+	wantGoDir := filepath.Dir(realGo)
+	gotGo := fx.warmLogEnv(t, "GOCMD")
+	if gotGo == "" || gotGo == "none" {
+		t.Fatalf("warm subprocess did not resolve any go: %q", gotGo)
+	}
+	// command -v go 返回 PATH 中首个 go；其所在目录必须是 realGo 所在目录。
+	if gotDir := filepath.Dir(gotGo); gotDir != wantGoDir {
+		t.Fatalf("warm subprocess resolved go at %q (dir %q), want sandbox-aligned real go dir %q; cell digest would mismatch and force .build-* rebuild under read-only cells/go", gotGo, gotDir, wantGoDir)
 	}
 }
 

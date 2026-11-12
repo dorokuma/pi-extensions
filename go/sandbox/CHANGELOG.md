@@ -85,6 +85,22 @@
 
 ### Fixed
 
+- **reviewer-agent 预热 cell 与沙盒内实际构建 toolchain 错配，导致 pig
+  扩展在只读 `cells/go` 下重建 `.build-*` scratch 撞 `permission denied`**：
+  `goPackedCellHash` 把 Go 工具链的 `commandVersion`/`goroot`/`compiler`
+  折进 cell 摘要——预热 `pig --help` 与沙盒内 pig 必须解析到**同一个 go**
+  才会命中同一个 `cells/go/<digest>/runner`。沙盒内 `go` 经 `goExecDir`
+  包装器由 `resolveRealGoBinary`（宿主 `PATH` 顺序）选出真实 go；预热子进程
+  原先只用 `controlledWarmPath()` 的固定目录顺序（`/usr/local/go/bin` 在
+  `/usr/bin` 之前），在宿主 `PATH` 先命中 `/usr/bin/go` 的机器上解析出
+  不同 go → cell 摘要必然错配 → 沙盒内 pig 在 `cells/go` 下
+  `os.MkdirTemp(".build-*")` 重建被拒（`cells/go` 本身不在 ReadWrite，
+  只放行 `.locks` 与已构建 artifact），15 个 Go 扩展全部加载失败、进程
+  `exit 1`。修复：`runPigWarmSubprocess` 在与沙盒同口径 `resolveRealGoBinary("")`
+  解析出真实 go 后，把其所在目录提前到受控 `PATH` 之首，保证预热/沙盒两侧
+  `exec.LookPath("go")` 解析一致、cell 摘要命中宿主已构建 cell。
+  **未放宽整个 `cells/go`、未把 `cells/go` 加入 ReadWrite 或 Exec，
+  W^X 断言（`cells/go` 不得同时 ReadWrite+Exec）不变。**
 - **`[pattern:verifier-transient-fail]` 结案（agy 瞬态状态文件 TOCTOU 击穿
   `sbx`）**：`appendAgyStateReadWrite` 经 `os.ReadDir` 快照枚举
   antigravity-cli 状态根下的根级文件（`settings.json`/`history.jsonl`/

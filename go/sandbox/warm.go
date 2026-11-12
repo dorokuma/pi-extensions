@@ -877,6 +877,24 @@ func runPigWarmSubprocess(sigCtx context.Context, pigBin, pigHome, srcAgentDir s
 		"NO_COLOR=1",
 		"PATH=" + controlledWarmPath(),
 	}
+	// Go 工具链对齐：goPackedCellHash 把 toolchain 的 commandVersion/goroot/
+	// compiler 折进 cell 摘要，预热 cell 与沙盒内 pig 实际构建的 cell 必须用
+	// 同一个 go 才能命中同一 <digest>/runner。沙盒内 go 经 goExecDir 包装器
+	// 派发 resolveRealGoBinary（宿主 PATH 顺序）选出的真实 go；预热子进程若
+	// 用 controlledWarmPath() 的固定目录顺序解析出不同 go（如 /usr/local/go
+	// 优先而宿主 PATH 先命中 /usr/bin），cell 摘要必然错配、沙盒内被迫在
+	// cells/go 下重建 .build-* 而撞 W^X 只读。因此把沙盒将要选中的真实 go
+	// 所在目录提前到受控 PATH 之首，保证 exec.LookPath("go") 两侧解析一致。
+	if realGo := resolveRealGoBinary(""); realGo != "" {
+		if goDir := filepath.Dir(realGo); goDir != "" {
+			for i, kv := range env {
+				if strings.HasPrefix(kv, "PATH=") {
+					env[i] = "PATH=" + goDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+					break
+				}
+			}
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(sigCtx, timeout)
 	defer cancel()
