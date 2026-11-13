@@ -232,6 +232,13 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 				wd = "."
 			}
 			policy = sandbox.ReviewerAgentWithEnv(wd, cfg.Env)
+			// 启动前 fail-closed：本次目标集（宿主已构建的有效 Go 缓存单元）经
+			// ReviewerAgentWithEnv 枚举与投影校验；有 Go 扩展但宿主产物为 0，或
+			// 存在未成功投影/Exec 未命中的目标时，此处返回错误拒绝启动并指名
+			// 缺失项，绝不进入「沙盒内 build 成功但 exec 失败」的不完全兼容态。
+			if err := sandbox.ReviewerAgentCellTargetError(); err != nil {
+				return sandbox.Policy{}, fmt.Errorf("sbx: reviewer-agent pig cell target check failed: %w", err)
+			}
 			// ReviewerAgentWithEnv 把与预热对齐的 PIG_HOME 固定注入 Policy.Env；
 			// 记下来供 mergeEnv 之后回钉（--env PIG_HOME= 空覆盖会把空串写进
 			// 最终 env，导致沙盒内 pig 按外部 HOME 另算缓存根打穿预热对齐）。
