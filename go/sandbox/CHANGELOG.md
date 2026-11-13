@@ -6,6 +6,21 @@
 
 ### Added
 
+- **reviewer-agent 私有 PIG_HOME + 宿主产物软链投影 + 启动前 fail-closed**：
+  `ReviewerAgentWithEnv` 不再把 `Policy.Env["PIG_HOME"]` 指向宿主 `<PIG_HOME>`，
+  改为指向 `<privateTmpDir>/pig-home`（0700，进 `ReadWrite` 不进 `Exec`）。
+  私有 `bin`/`docs`/`state` 以软链指向宿主同名目录（pig 读 SDK/文档/本体
+  均落宿主只读域，SDK 物理路径与宿主 prepare 完全一致）；`cache/cells/<lang>`
+  与 `cache/ext` 为真实可写目录承载 `.build-*` 构建 scratch 与 `.locks`
+  （目录本身不进 `Exec`，冷路径自建产物不可执行，W^X 不破）；宿主已构建的
+  有效缓存单元经同名软链投影进私有 `cells/<lang>/<digest>` 与 `ext/<entry>`，
+  沙盒内 pig 命中后经软链 exec 宿主真实 runner（已逐文件枚举进 `Policy.Exec`），
+  修复原「宿主 cache 只读致 `.build-*` scratch 创建 EACCES」缺陷。新增
+  `ReviewerAgentCellTargetError`/`ReviewerAgentCellTargets`：`buildPolicy` 在
+  启动前对「扩展集（`sourceAgentGoExtensionDirs`）× 宿主有效产物集
+  （`cellCacheEntryDirs`+`validCellEntryDir`）× 投影/Exec 命中」做完整性
+  校验——有 Go 扩展但宿主产物为 0 或存在未成功投影/Exec 未命中项时启动前
+  报错拒绝并指名缺失项，不进入「build 成功但 exec 失败」的不完全兼容态。
 - **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
   `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`（Go
   `Cloneflags`，受限子进程直接以新 PID ns 的 PID 1 启动，并同时获得

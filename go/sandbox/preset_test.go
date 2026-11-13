@@ -1213,12 +1213,15 @@ func TestWarmGoExtensionCellsEnvPigHome(t *testing.T) {
 
 	// ReviewerAgentWithEnv 引用的缓存根同样是 pigHome2：
 	// 其中已构建的 ext 产物进 Exec，env PIG_HOME 下的（空）缓存不产生条目；
-	// Policy.Env 固定注入 PIG_HOME=pigHome2（防 --env 空覆盖/子进程 HOME 漂移）。
+	// Policy.Env 固定注入 PIG_HOME=<privateTmpDir>/pig-home 私有根（沙盒内 pig
+	// 经私有根访问投影的宿主产物；宿主 pigHome2 产物仍逐文件枚举进 Exec）。
 	workdir := t.TempDir()
 	p := ReviewerAgentWithEnv(workdir, cfgEnv)
 	t.Cleanup(func() { removePresetTempDirs(t, p) })
-	if got := lookupEnvValue(p.Env, "PIG_HOME"); got != pigHome2 {
-		t.Fatalf("Policy.Env must pin PIG_HOME=%q, got %q (env=%v)", pigHome2, got, p.Env)
+	tmpdir := lookupEnvValue(p.Env, "TMPDIR")
+	wantPrivatePigHome := filepath.Join(tmpdir, "pig-home")
+	if got := lookupEnvValue(p.Env, "PIG_HOME"); got != wantPrivatePigHome {
+		t.Fatalf("Policy.Env must pin PIG_HOME=%q (private root), got %q (env=%v)", wantPrivatePigHome, got, p.Env)
 	}
 	wantArtifact := filepath.Join(pigHome2, "cache", "ext", "fake-ext-digestext01", "bin")
 	found := false
@@ -1543,6 +1546,110 @@ func TestCountValidExecutableGoArtifactsLanguageGate(t *testing.T) {
 	}
 }
 
+// TestPreparePrivatePigHomeProjection 验证私有 PIG_HOME 投影结构：
+// 宿主有效缓存单元经同名软链投影进私有 cells/<lang>/ext（私有目录本身可写
+// 承载 scratch/locks）；每个投影 artifact 经软链解析后的宿主真实路径须已入
+// 传入 execSet，否则记入 missing。无效单元（无 ready.json）不投影。
+func TestPreparePrivatePigHomeProjection(t *testing.T) {
+	hostPigHome := t.TempDir()
+	hostCache := filepath.Join(hostPigHome, "cache")
+	writeFakeCellEntry(t, filepath.Join(hostCache, "cells", "go", "deadbeef0001"), "deadbeef0001", "runner", "")
+	writeFakeCellEntry(t, filepath.Join(hostCache, "ext", "fake-ext-cafe0001"), "cafe0001", "bin", "go")
+	// 无效单元（无 ready.json）：不投影。
+	if err := os.MkdirAll(filepath.Join(hostCache, "cells", "go", "no-ready-9999"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 宿主 bin/docs/state/toolchains。
+	for _, sub := range []string{"bin", "docs", "state"} {
+		if err := os.MkdirAll(filepath.Join(hostPigHome, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(hostCache, "toolchains"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostCache, "toolchains", "tc-1.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// execSet：含两个有效单元的 artifact 解析后真实路径（模拟 appendCellCachePolicy
+	// 已把宿主产物枚举进 Policy.Exec）。
+	execSet := map[string]struct{}{}
+	for _, rel := range []string{
+		filepath.Join("cells", "go", "deadbeef0001", "runner"),
+		filepath.Join("ext", "fake-ext-cafe0001", "bin"),
+	} {
+		hostArtifact := filepath.Join(hostCache, rel)
+		if norm, err := NormalizePath(hostArtifact); err == nil {
+			execSet[filepath.Clean(norm)] = struct{}{}
+		}
+	}
+
+	privateTmpDir := t.TempDir()
+	privatePigHome, missing := preparePrivatePigHome(privateTmpDir, hostPigHome, execSet)
+	if len(missing) != 0 {
+		t.Fatalf("unexpected missing: %v", missing)
+	}
+	if filepath.Base(privatePigHome) != "pig-home" {
+		t.Fatalf("private pig-home path = %q", privatePigHome)
+	}
+	// bin/docs/state 是软链→宿主。
+	for _, sub := range []string{"bin", "docs", "state"} {
+		linkPath := filepath.Join(privatePigHome, sub)
+		li, err := os.Lstat(linkPath)
+		if err != nil || li.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s must be symlink to host, err=%v mode=%v", sub, err, li.Mode())
+		}
+		if tgt, _ := os.Readlink(linkPath); tgt != filepath.Join(hostPigHome, sub) {
+			t.Fatalf("%s -> %q, want %q", sub, tgt, filepath.Join(hostPigHome, sub))
+		}
+	}
+	// cells/go/<digest> 与 ext/<entry> 是软链→宿主对应单元；cells/go 目录本身可写。
+	for _, rel := range []string{
+		filepath.Join("cache", "cells", "go", "deadbeef0001"),
+		filepath.Join("cache", "ext", "fake-ext-cafe0001"),
+	} {
+		li, err := os.Lstat(filepath.Join(privatePigHome, rel))
+		if err != nil || li.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s must be projected symlink, err=%v", rel, err)
+		}
+	}
+	if li, err := os.Lstat(filepath.Join(privatePigHome, "cache", "cells", "go")); err != nil || !li.IsDir() || li.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("cells/go must be real writable dir, err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(privatePigHome, "cache", "cells", "go", ".locks")); err != nil {
+		t.Fatalf("cells/go/.locks must exist for build locks: %v", err)
+	}
+	// 无效单元不投影。
+	if _, err := os.Lstat(filepath.Join(privatePigHome, "cache", "cells", "go", "no-ready-9999")); !os.IsNotExist(err) {
+		t.Fatalf("invalid cell entry must not be projected, err=%v", err)
+	}
+	// toolchains 条目投影 + 目录可写。
+	if _, err := os.Lstat(filepath.Join(privatePigHome, "cache", "toolchains", "tc-1.json")); err != nil {
+		t.Fatalf("toolchains record must be projected: %v", err)
+	}
+
+	// 反向用例：execSet 缺某 artifact → missing 指名该项（供启动前 fail-closed）。
+	privateTmpDir2 := t.TempDir()
+	execSetMissing := map[string]struct{}{}
+	if norm, err := NormalizePath(filepath.Join(hostCache, "cells", "go", "deadbeef0001", "runner")); err == nil {
+		execSetMissing[filepath.Clean(norm)] = struct{}{}
+	}
+	_, missing2 := preparePrivatePigHome(privateTmpDir2, hostPigHome, execSetMissing)
+	if len(missing2) == 0 {
+		t.Fatalf("expected missing entry for ext artifact not in execSet")
+	}
+	found := false
+	for _, m := range missing2 {
+		if strings.Contains(m, "fake-ext-cafe0001") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing must name the uncovered ext entry, got %v", missing2)
+	}
+}
+
 // TestWarmGoExtensionCellsEmbeddedAssetInvalidation 验证 M2：扩展内非 .go
 // 常规文件（//go:embed 静态资产，如 tools.json）变更同样使墓碑指纹失效重热。
 func TestWarmGoExtensionCellsEmbeddedAssetInvalidation(t *testing.T) {
@@ -1689,8 +1796,12 @@ func TestResolvePigHomeAndSourceAgentDirSemantics(t *testing.T) {
 		workdir := t.TempDir()
 		p := ReviewerAgentWithEnv(workdir, cfgEnv)
 		t.Cleanup(func() { removePresetTempDirs(t, p) })
-		if got := lookupEnvValue(p.Env, "PIG_HOME"); got != fx.pigHome {
-			t.Fatalf("Policy.Env must pin PIG_HOME=%q, got %q", fx.pigHome, got)
+		// 私有 PIG_HOME 重定向：Policy.Env["PIG_HOME"] 指向 <TMPDIR>/pig-home
+		// 私有根；宿主 fx.pigHome 经 resolvePigHomeDir 参与预热对齐与产物投影。
+		tmpdir := lookupEnvValue(p.Env, "TMPDIR")
+		wantPrivate := filepath.Join(tmpdir, "pig-home")
+		if got := lookupEnvValue(p.Env, "PIG_HOME"); got != wantPrivate {
+			t.Fatalf("Policy.Env must pin private PIG_HOME=%q, got %q", wantPrivate, got)
 		}
 	})
 }

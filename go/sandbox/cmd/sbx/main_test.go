@@ -284,8 +284,12 @@ func TestBuildPolicyRepinsPigHome(t *testing.T) {
 	defer cleanupPresetTempDirsFromPolicy(policy)
 
 	got := envListValue(policy.Env, "PIG_HOME")
-	if got != fakeHome {
-		t.Fatalf("PIG_HOME must be re-pinned to resolved %q, got %q (env=%v)", fakeHome, got, policy.Env)
+	// 私有 PIG_HOME 重定向：最终 env 的 PIG_HOME 指向 <TMPDIR>/pig-home 私有根
+	//（非 cfgEnv 的宿主 fakeHome；fakeHome 仅参与预热对齐与产物投影）。
+	tmpdir := envListValue(policy.Env, "TMPDIR")
+	wantPrivate := filepath.Join(tmpdir, "pig-home")
+	if got != wantPrivate {
+		t.Fatalf("PIG_HOME must be re-pinned to private root %q, got %q (env=%v)", wantPrivate, got, policy.Env)
 	}
 	// 同名键只保留一个条目。
 	count := 0

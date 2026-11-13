@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -1187,7 +1188,6 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// 显式 AgentDir 与预热同口径解析，不可信（软链/权限/属主不符）时回退默认
 	// <pigHome>/agent——沙盒侧只复制其配置文件，不做预热级硬拒绝。
 	pigHome := resolvePigHomeDir(cfgEnv)
-	p.Env = overrideEnvKey(p.Env, "PIG_HOME", pigHome)
 	srcAgentDir, customAgentDir := resolveSourcePigAgentDir(pigHome, cfgEnv)
 	if customAgentDir && !validateTrustedPigDir(srcAgentDir, "AgentDir") {
 		srcAgentDir = filepath.Join(pigHome, "agent")
@@ -1195,10 +1195,49 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	preparePrivatePigAgentDirFromAgent(filepath.Join(privateTmpDir, "pig-agent"), srcAgentDir)
 	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"))
 
-	// 安全细则三：宿主态预刷新缓存单元 usage.json（沙盒内 TouchUsage 命中 <1h 只读短路），
-	// 只放行锁目录与已构建产物，严守 W^X。
+	// 安全细则三：私有 PIG_HOME（<privateTmpDir>/pig-home，0700，RW，不进 Exec）。
+	// 宿主 PIG_HOME 保持只读；宿主态预刷新宿主缓存单元 usage.json（沙盒内
+	// TouchUsage 命中 <1h 只读短路），并把宿主已构建缓存单元产物逐文件枚举进
+	// Policy.Exec——这两步仍针对宿主 pigHome（缓存单元本体在宿主），与
+	// appendCellCachePolicy 内部 resolvePolicyPathWithin 的 W^X 校验口径一致。
+	// 之后把 PIG_HOME env 重定向到私有根：私有 cache 下 cells/<lang> 与 ext 是
+	// 真实可写目录，承载 .build-* scratch 与 .locks；宿主已构建 <digest>/<entry>
+	// 经同名软链投影进私有目录，沙盒内 pig 命中软链后 exec 的是宿主真实 runner
+	// 路径（已在 Exec 白名单），而 cells/<lang>/ext 目录本身不进 Exec——私有新建的
+	// 自建产物没有可执行授权，私有可写区维持 W^X。
 	refreshCellUsageMetadata(pigHome, time.Now())
 	appendCellCachePolicy(&p, pigHome)
+
+	// 目标集枚举与完整性校验（启动前 fail-closed 输入）：扩展集经
+	// sourceAgentGoExtensionDirs 枚举（与预热指纹/沙盒内扩展发现同口径）；宿主
+	// 有效缓存单元产物经 cellCacheEntryDirs+validCellEntryDir 枚举。逐项把宿主
+	// 产物以软链投影进私有 cache，并校验每个 artifact 经软链解析后的宿主真实
+	// 路径已入 Policy.Exec。校验结果记入 reviewerAgentCellTargetState，由
+	// buildPolicy 在启动前读取：有 Go 扩展但宿主产物为 0，或存在未成功投影/Exec
+	// 未命中项时，返回错误拒绝启动并指名缺失项。
+	execSet := make(map[string]struct{}, len(p.Exec))
+	for _, ep := range p.Exec {
+		execSet[filepath.Clean(ep)] = struct{}{}
+		if resolved, err := filepath.EvalSymlinks(ep); err == nil && resolved != "" {
+			execSet[filepath.Clean(resolved)] = struct{}{}
+		}
+	}
+	settings := readAgentSettings(srcAgentDir)
+	extDirs := sourceAgentGoExtensionDirs(srcAgentDir, settings)
+	hostCache := filepath.Join(pigHome, "cache")
+	total := 0
+	for _, dir := range cellCacheEntryDirs(hostCache) {
+		if _, _, ok := validCellEntryDir(dir); ok {
+			total++
+		}
+	}
+	privatePigHome, missing := preparePrivatePigHome(privateTmpDir, pigHome, execSet)
+	setReviewerAgentCellTargets(&reviewerAgentCellTargets{
+		hasGoExt: len(extDirs) > 0,
+		total:    total,
+		missing:  missing,
+	})
+	p.Env = overrideEnvKey(p.Env, "PIG_HOME", privatePigHome)
 
 	// 安全细则四：XDG_RUNTIME_DIR 私有隔离。宿主 /run/user/0 内含 systemd user bus、
 	// keyring 等敏感套接字，绝不加入 ReadWrite；改为在 privateTmpDir 下预建 0700 的
@@ -1535,6 +1574,223 @@ func preparePrivatePigAgentDirFromAgent(dir, srcAgentDir string) string {
 		}
 	}
 	return dst
+}
+
+// preparePrivatePigHome 在 <privateTmpDir>/pig-home（0700）构造私有 PIG_HOME：
+// 宿主 PIG_HOME 保持 100% 只读，沙盒内 pig 经重定向的 PIG_HOME env 指向该私有根。
+//
+// 目录布局：
+//   - bin/docs/state：直接以软链指向宿主同名目录（pig 读 SDK/文档 bundle/本体，
+//     均落在宿主只读域内）；
+//   - cache：真实可写目录，承载沙盒内 pig 的写面（顶层 *.lock、logs、toolchains
+//     锁文件等）；
+//   - cache/cells/<lang> 与 cache/ext：真实可写目录，承载 .build-* 构建 scratch 与
+//     .locks 锁目录；目录本身绝不进 Exec——沙盒内 pig 若脱靶预热转冷路径自建产物，
+//     产物落在无 Exec 授权的可写目录下、不可执行（W^X 不破）；
+//   - cache/cells/<lang>/<entry> 与 cache/ext/<entry>：以同名软链把宿主已构建的
+//     有效缓存单元（validCellEntryDir）投影进私有目录。沙盒内 pig 命中投影后经
+//     软链 exec 的是宿主真实 runner 路径（已由 appendCellCachePolicy 逐文件枚举进
+//     Policy.Exec）。
+//   - cache/toolchains：真实可写目录，宿主各版本记录 (*.json/*.json.lock) 以软链
+//     投影；pig 新建 *.json.lock 落在可写目录。
+//   - cache 其余宿主子目录（logs/jiti/node-compile 等）：建同名可写目录并软链投影
+//     宿主既有条目，pig 可写新文件、读旧产物。
+//
+// 返回私有 PIG_HOME 路径与 missing 清单：missing 是「应命中宿主产物但未能成功
+// 投影/未能确认其 artifact 已入 Exec 白名单」的缓存单元目标（相对宿主 cacheRoot
+// 的路径），供启动前 fail-closed 判定；无缺失返回 nil。仅在 hostPigHome 校验不
+// 通过或私有根无法创建时回退为空私有根。
+func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string]struct{}) (string, []string) {
+	privatePigHome := filepath.Join(privateTmpDir, "pig-home")
+	if err := os.MkdirAll(privatePigHome, 0o700); err != nil {
+		return privatePigHome, []string{"pig-home: " + err.Error()}
+	}
+	_ = os.Chmod(privatePigHome, 0o700)
+
+	// 只读投影：bin/docs/state 软链到宿主（pig 读 SDK/文档/本体，宿主只读域内）。
+	// 宿主对应目录非目录或缺失时跳过——pig 会在私有可写根下按需自建。
+	for _, sub := range []string{"bin", "docs", "state"} {
+		host := filepath.Join(hostPigHome, sub)
+		if st, err := os.Lstat(host); err == nil && st.IsDir() && st.Mode()&os.ModeSymlink == 0 {
+			linkPath := filepath.Join(privatePigHome, sub)
+			if _, lerr := os.Lstat(linkPath); os.IsNotExist(lerr) {
+				_ = os.Symlink(host, linkPath)
+			}
+		}
+	}
+
+	hostCache := filepath.Join(hostPigHome, "cache")
+	privCache := filepath.Join(privatePigHome, "cache")
+	if err := os.MkdirAll(privCache, 0o700); err != nil {
+		return privatePigHome, []string{"pig-home/cache: " + err.Error()}
+	}
+
+	var missing []string
+	projectEntry := func(hostEntryDir, privParent string) {
+		name := filepath.Base(hostEntryDir)
+		linkPath := filepath.Join(privParent, name)
+		if _, lerr := os.Lstat(linkPath); lerr == nil {
+			// 已存在（理论上私有根新建不会发生）；跳过不覆盖。
+			return
+		}
+		if err := os.Symlink(hostEntryDir, linkPath); err != nil {
+			missing = append(missing, relToCache(hostCache, hostEntryDir)+": symlink: "+err.Error())
+			return
+		}
+		// 校验投影 artifact 经软链解析后的宿主真实路径已入 Exec 白名单。
+		if _, artifactPath, ok := validCellEntryDir(linkPath); ok {
+			if norm, err := NormalizePath(artifactPath); err == nil {
+				if resolved, rerr := filepath.EvalSymlinks(norm); rerr == nil && resolved != "" {
+					norm = resolved
+				}
+				if _, hit := execSet[norm]; !hit {
+					missing = append(missing, relToCache(hostCache, hostEntryDir)+": artifact not in Exec whitelist: "+norm)
+				}
+			}
+		}
+	}
+
+	// cells/<lang>：可写目录承载 .build-* scratch 与 .locks；<entry> 软链投影。
+	cellsRoot := filepath.Join(privCache, "cells")
+	hostCellsRoot := filepath.Join(hostCache, "cells")
+	_ = os.MkdirAll(cellsRoot, 0o700)
+	if langs, err := os.ReadDir(hostCellsRoot); err == nil {
+		for _, lang := range langs {
+			if lang.Type()&os.ModeSymlink != 0 || !lang.IsDir() || strings.HasPrefix(lang.Name(), ".") {
+				continue
+			}
+			hostLang := filepath.Join(hostCellsRoot, lang.Name())
+			privLang := filepath.Join(cellsRoot, lang.Name())
+			_ = os.MkdirAll(privLang, 0o700)
+			_ = os.MkdirAll(filepath.Join(privLang, ".locks"), 0o700)
+			entries, err := os.ReadDir(hostLang)
+			if err != nil {
+				continue
+			}
+			for _, ent := range entries {
+				if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
+					continue
+				}
+				if strings.HasPrefix(ent.Name(), ".") && !strings.HasPrefix(ent.Name(), ".tombstone-") {
+					continue
+				}
+				hostEntry := filepath.Join(hostLang, ent.Name())
+				if _, _, ok := validCellEntryDir(hostEntry); !ok {
+					continue
+				}
+				projectEntry(hostEntry, privLang)
+			}
+		}
+	}
+
+	// ext：可写目录承载单扩展构建产物与 .locks；<entry> 软链投影。
+	extRoot := filepath.Join(privCache, "ext")
+	hostExtRoot := filepath.Join(hostCache, "ext")
+	_ = os.MkdirAll(extRoot, 0o700)
+	_ = os.MkdirAll(filepath.Join(extRoot, ".locks"), 0o700)
+	if entries, err := os.ReadDir(hostExtRoot); err == nil {
+		for _, ent := range entries {
+			if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
+				continue
+			}
+			if strings.HasPrefix(ent.Name(), ".") && !strings.HasPrefix(ent.Name(), ".tombstone-") {
+				continue
+			}
+			hostEntry := filepath.Join(hostExtRoot, ent.Name())
+			if _, _, ok := validCellEntryDir(hostEntry); !ok {
+				continue
+			}
+			projectEntry(hostEntry, extRoot)
+		}
+	}
+
+	// toolchains：可写目录承载 *.json.lock；宿主各记录软链投影（pig 读记录+写锁）。
+	// 其余宿主 cache 子目录（logs/jiti/node-compile 等）：可写目录 + 软链投影条目。
+	for _, sub := range []string{"toolchains", "logs", "jiti", "node-compile"} {
+		hostSub := filepath.Join(hostCache, sub)
+		st, err := os.Lstat(hostSub)
+		if err != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+			// 宿主无该目录时仍建空可写目录，供 pig 写 logs/锁。
+			_ = os.MkdirAll(filepath.Join(privCache, sub), 0o700)
+			continue
+		}
+		privSub := filepath.Join(privCache, sub)
+		_ = os.MkdirAll(privSub, 0o700)
+		if entries, rerr := os.ReadDir(hostSub); rerr == nil {
+			for _, ent := range entries {
+				linkPath := filepath.Join(privSub, ent.Name())
+				if _, lerr := os.Lstat(linkPath); os.IsNotExist(lerr) {
+					_ = os.Symlink(filepath.Join(hostSub, ent.Name()), linkPath)
+				}
+			}
+		}
+	}
+	return privatePigHome, missing
+}
+
+// relToCache 返回 path 相对 cacheRoot 的路径（供 missing 清单可读化）。
+func relToCache(cacheRoot, path string) string {
+	if rel, err := filepath.Rel(cacheRoot, path); err == nil && rel != "" && rel != "." {
+		return rel
+	}
+	return path
+}
+
+// reviewerAgentCellTargets 描述沙盒内 pig 本次运行的目标集完整性校验结果。
+type reviewerAgentCellTargets struct {
+	hasGoExt bool     // 扩展集是否含 Go 扩展（无扩展时目标集为空，不强制产物）
+	total    int      // 宿主有效缓存单元产物数（投影目标数）
+	missing  []string // 未能成功投影/Exec 未命中的目标（相对宿主 cacheRoot 路径）
+}
+
+// reviewerAgentCellTargetErr 记录最近一次 ReviewerAgentWithEnv 私有 PIG_HOME 目标集
+// 完整性校验结果；main 经 buildPolicy 在启动前读取并做 fail-closed 判定。
+// 用 mutex 保护，避免与预热/测试并发写竞态。
+var reviewerAgentCellTargetState = struct {
+	sync.Mutex
+	result *reviewerAgentCellTargets
+}{}
+
+// setReviewerAgentCellTargets 记录本次目标集校验结果。
+func setReviewerAgentCellTargets(t *reviewerAgentCellTargets) {
+	reviewerAgentCellTargetState.Lock()
+	defer reviewerAgentCellTargetState.Unlock()
+	reviewerAgentCellTargetState.result = t
+}
+
+// ReviewerAgentCellTargetError 返回本次 reviewer-agent 预设私有 PIG_HOME 目标集
+// 完整性校验的失败原因（含指名缺失项），无缺失返回 nil。供 buildPolicy 在启动前
+// fail-closed：有 Go 扩展但宿主无有效产物，或投影/Exec 校验存在缺失项时返回 error。
+func ReviewerAgentCellTargetError() error {
+	reviewerAgentCellTargetState.Lock()
+	defer reviewerAgentCellTargetState.Unlock()
+	t := reviewerAgentCellTargetState.result
+	if t == nil {
+		return nil
+	}
+	if !t.hasGoExt {
+		return nil
+	}
+	if t.total == 0 {
+		return fmt.Errorf("no valid Go extension cell artifact under host PIG_HOME cache (warm-up produced none)")
+	}
+	if len(t.missing) > 0 {
+		return fmt.Errorf("pig cell target(s) not covered by host-build projection: %s", strings.Join(t.missing, "; "))
+	}
+	return nil
+}
+
+// ReviewerAgentCellTargets 返回本次目标集枚举与逐项命中清单（供报告/诊断）。
+// hasGoExt 为 false 表示扩展集无 Go 扩展（目标集为空）。逐项以相对宿主
+// cacheRoot 的路径表示；missing 为未命中/未成功投影项。
+func ReviewerAgentCellTargets() (hasGoExt bool, total int, missing []string) {
+	reviewerAgentCellTargetState.Lock()
+	defer reviewerAgentCellTargetState.Unlock()
+	if reviewerAgentCellTargetState.result == nil {
+		return false, 0, nil
+	}
+	t := reviewerAgentCellTargetState.result
+	return t.hasGoExt, t.total, append([]string(nil), t.missing...)
 }
 
 // injectHostExtensionsSetting 向私有 settings.json 注入宿主扩展目录 hostExtDir，
