@@ -55,6 +55,69 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestForbiddenExecNamesClaudeFamily(t *testing.T) {
+	// claude-pty / claude-code 精确派生名必须命中禁名（isForbiddenBaseName
+	// 前缀派生只对长度 ≥ 5 的禁名生效——"claude-pty" 作为独立成员是
+	// 精确名而非 "claude" 的派生）。
+	for _, name := range []string{"claude-pty", "claude-code"} {
+		if !sandbox.IsForbiddenExec(name) {
+			t.Fatalf("expected %q to be forbidden (ForbiddenExecNames 精确名)", name)
+		}
+		// 长名前缀派生形态同样命中。
+		if !sandbox.IsForbiddenExec(name + "-extra") {
+			t.Fatalf("expected %q to be forbidden (前缀派生)", name+"-extra")
+		}
+	}
+	// 裸 "claude" 不在 ForbiddenExecNames：顶层 `sbx -- claude` 走 EntryAgents
+	// 白名单放行，加裸名会与入口代理放行自锁。
+	if sandbox.IsForbiddenExec("claude") {
+		t.Fatal("bare \"claude\" must NOT be in ForbiddenExecNames（顶层 EntryAgents 放行避免自锁）")
+	}
+}
+
+func TestDefaultReviewerToolsDispatchReport(t *testing.T) {
+	// dispatch-report 是只读角色的回报通道，必须在默认白名单内。
+	found := false
+	for _, tool := range sandbox.DefaultReviewerTools {
+		if tool == "dispatch-report" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected dispatch-report in DefaultReviewerTools（只读回报通道白名单）")
+	}
+}
+
+func TestIsEntryAgentPathClaudeVersionedTarget(t *testing.T) {
+	// /claude/versions/<ver> 软链目标命中「含 /<name>/ 段 + 安装根前缀」
+	// 分支的版本化安装形态：basename 是版本号，须作为 EntryAgent 路径放行。
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, ".local", "share", "claude", "versions", "2.1.319")
+	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+		t.Fatalf("mkdir versions dir: %v", err)
+	}
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write versioned claude: %v", err)
+	}
+	link := filepath.Join(tmp, "claude")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink claude: %v", err)
+	}
+	// EntryAgents 清单含软链本身与解析目标（ResolveEntryAgentPaths 收录形态）。
+	agents := []string{link, real}
+	if !sandbox.IsEntryAgentPath(agents, link) {
+		t.Fatal("versioned claude symlink must match EntryAgents")
+	}
+	if !sandbox.IsEntryAgentPath(agents, real) {
+		t.Fatal("versioned claude resolved target must match EntryAgents")
+	}
+	// basename 形态（无路径分隔符）按清单 basename 匹配。
+	if !sandbox.IsEntryAgentPath(agents, "claude") {
+		t.Fatal("bare claude basename must match EntryAgents")
+	}
+}
+
 func TestNormalizePathsAndValidate(t *testing.T) {
 	if _, err := sandbox.NormalizePath(""); !errors.Is(err, sandbox.ErrInvalidPolicy) {
 		t.Fatalf("expected ErrInvalidPolicy for empty path, got %v", err)

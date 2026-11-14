@@ -55,6 +55,10 @@ var ForbiddenExecNames = []string{
 	"herdr",
 	"herdr-core",
 	"herdr-mobile-bridge",
+	// claude 衍生本体形态：裸 "claude" 不加（否则顶层 `sbx -- claude` 启动
+	// 会与 EntryAgents 白名单对 claude 的放行形成自锁）；只列精确派生名。
+	"claude-pty",
+	"claude-code",
 }
 
 // DefaultReviewerTools 定义只读审查子代理默认允许执行的常用只读检查与开发工具列表。
@@ -72,6 +76,8 @@ var DefaultReviewerTools = []string{
 	"pwd", "dirname", "basename", "realpath", "readlink", "which",
 	"date", "uname", "id", "whoami", "printf", "echo", "test",
 	"sha256sum", "md5sum",
+	// 只读角色回报通道
+	"dispatch-report",
 }
 
 // standardBinDirs 是除 PATH 外用于查找白名单工具的标准系统二进制目录。

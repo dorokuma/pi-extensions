@@ -767,7 +767,10 @@ func shouldDenyExecMmap(req *seccompNotif, nonExecRWDirs []string, entryAgents [
 		if fd >= 0 {
 			if fdTarget, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd)); err == nil && fdTarget != "" {
 				fdTarget = strings.TrimSuffix(fdTarget, " (deleted)")
-				if IsForbiddenExec(fdTarget) {
+				// 与 exe 检查同口径：EntryAgents 成员（agy/pig/pi/claude 及其
+				// 过身份校验的软链目标）自身被 PROT_EXEC 映射属合法运行期行为，
+				// 不得与毒软链目标一同被拒。
+				if IsForbiddenExec(fdTarget) && !IsEntryAgentPath(entryAgents, fdTarget) {
 					return true
 				}
 				for _, rwDir := range nonExecRWDirs {

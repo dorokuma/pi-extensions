@@ -541,9 +541,10 @@ func ReadAncestorChain(pid int, maxHops int, readStat func(int) (int, bool), rea
 	return chain
 }
 
-var reAgentRuntime = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js`)
+var reAgentRuntime = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js|(?:^|/)claude/versions/`)
 
-// IsAgentRuntimeCmdline determines if a cmdline indicates an agent runtime process (pi, pig, ctxmode, or wrapper).
+// IsAgentRuntimeCmdline determines if a cmdline indicates an agent runtime process
+// (pi, pig, ctxmode, claude/claude-code/claude-pty, or wrapper).
 func IsAgentRuntimeCmdline(cmdline string) bool {
 	if cmdline == "" {
 		return false
@@ -555,7 +556,8 @@ func IsAgentRuntimeCmdline(cmdline string) bool {
 	if lastSlash >= 0 {
 		base = argv0[lastSlash+1:]
 	}
-	if base == "pi" || base == "pig" || base == "ctxmode" {
+	if base == "pi" || base == "pig" || base == "ctxmode" ||
+		base == "claude" || base == "claude-code" || base == "claude-pty" {
 		return true
 	}
 	return reAgentRuntime.MatchString(cmdline)
