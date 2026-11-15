@@ -957,12 +957,16 @@ func TestReviewerAgentPreset(t *testing.T) {
 	}
 
 	foundSession := false
+	foundReports := false
 	foundAgyProHome := false
 	foundTTY := false
 	foundBinRW := false
 	for _, rw := range policy.ReadWrite {
 		if rw == "/tmp/herdr-role-sessions" {
 			foundSession = true
+		}
+		if rw == "/tmp/herdr-role-reports" {
+			foundReports = true
 		}
 		if strings.Contains(rw, "/root/.agy-pro-home/.gemini/antigravity-cli/") {
 			foundAgyProHome = true
@@ -978,6 +982,9 @@ func TestReviewerAgentPreset(t *testing.T) {
 	}
 	if !foundSession {
 		t.Fatal("expected /tmp/herdr-role-sessions in ReadWrite")
+	}
+	if !foundReports {
+		t.Fatal("expected /tmp/herdr-role-reports in ReadWrite")
 	}
 	if !foundAgyProHome {
 		t.Fatalf("expected /root/.agy-pro-home/.gemini/antigravity-cli in ReadWrite, got %v", policy.ReadWrite)
