@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- `identity.go`: extend `forbiddenExecutableBases` with `claude` /
+  `claude-code` / `claude-pty` / `dispatch-agent-go`, and
+  `forbiddenPathPattern` with the `/claude/versions/` path segment, so a
+  claude-family runtime appearing between the process and the pane shell
+  fails closed in both extension and `cmd/jev-mcp` (MCP) modes.
+- `exclude-tools-guard` (`go` + `extensions/*.ts`): add claude /
+  claude-code / claude-pty basenames and the `/claude/versions/` segment to
+  `IsAgentRuntimeCmdline` / `isAgentRuntimeCmdline`.
+
+### Fixed
+
+- `cmd/jev-mcp`: tolerate `tools/call` `params.arguments` delivered as a
+  JSON-encoded string (possibly nested, e.g. `"{\"a\":1}"` or
+  `"\"{\\\"a\\\":1}\""`) instead of the spec-required object — observed
+  from lazy tool bridges whose `Arguments` param is declared `type:string`.
+  New `unwrapToolArguments` unwraps up to `maxArgStringLayers` (3) string
+  layers; the previous silent `{}` fallback let malformed calls run with
+  fabricated empty input, and non-object/non-JSON values now return an
+  explicit tool error instead.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

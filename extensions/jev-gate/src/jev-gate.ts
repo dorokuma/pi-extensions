@@ -892,13 +892,13 @@ function readAncestorChain(pid: number, maxHops: number): AncestorProcess[] {
   return chain
 }
 
-/** 是否为 agent 运行时进程（pi / ctxmode 本体或包装形态）。 */
+/** 是否为 agent 运行时进程（pi / ctxmode / claude 家族本体或包装形态）。 */
 function isAgentRuntimeCmdline(cmdline: string): boolean {
   if (!cmdline) return false
   const argv0 = cmdline.split(" ")[0] ?? ""
   const base = argv0.slice(argv0.lastIndexOf("/") + 1)
-  if (base === "pi" || base === "ctxmode") return true
-  return /pi-coding-agent|bundle\/cli\.js/u.test(cmdline)
+  if (base === "pi" || base === "ctxmode" || base === "claude" || base === "claude-code" || base === "claude-pty") return true
+  return /pi-coding-agent|bundle\/cli\.js|(?:^|\/)claude\/versions\//u.test(cmdline)
 }
 
 /** 命中负向标记则返回描述，否则 null。 */

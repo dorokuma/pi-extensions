@@ -408,10 +408,16 @@ var (
 	// never appear between this process and the pane shell. pi/pig are NOT
 	// here: they are the host-runtime set (isPiPigTokens), which the MCP mode
 	// counts separately and the extension mode resolves as the host anchor.
+	// claude 全家族（claude / claude-code / claude-pty，另加 /claude/versions/
+	// 路径段见 forbiddenPathPattern）同样不得作为祖先层出现。
 	forbiddenExecutableBases = map[string]bool{
-		"ctxmode":        true,
-		"dispatch-agent": true,
-		"grok":           true,
+		"claude":            true,
+		"claude-code":       true,
+		"claude-pty":        true,
+		"ctxmode":           true,
+		"dispatch-agent":    true,
+		"dispatch-agent-go": true,
+		"grok":              true,
 	}
 	// interpreterBases are executable basenames penetrated to find the script
 	// actually being run (node/foo.js, env wrappers, versioned pythons/shells).
@@ -443,7 +449,7 @@ var (
 	shellVariantPattern = regexp.MustCompile(`^(?:ba|da|z|k|a)?sh$`)
 	// forbiddenPathPattern matches forbidden runtimes reached by path or
 	// module name (mirrors jev-mcp.mjs FORBIDDEN_PATH_PATTERN).
-	forbiddenPathPattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js|(?:^|/)dispatch-agent$`)
+	forbiddenPathPattern = regexp.MustCompile(`pi-coding-agent|bundle/cli\.js|(?:^|/)dispatch-agent$|(?:^|/)claude/versions/`)
 	// agyPathPattern matches the antigravity-cli agy entry reached via a
 	// node-wrapped script path.
 	agyPathPattern = regexp.MustCompile(`/antigravity-cli/bin/agy$`)

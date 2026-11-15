@@ -18,6 +18,12 @@ const ReviewerReportSubdir = "reports"
 // 的 ReadWrite 白名单内（见 ReviewerAgentWithEnv）。
 const herdrRoleSessionsRoot = "/tmp/herdr-role-sessions"
 
+// herdrRoleReportsRoot 是 dispatch-agent 派发报告文档（DISPATCH_REPORT_PATH）
+// 的共享可写根，同样在 ReviewerAgent 预设的 ReadWrite 白名单内
+// （见 ReviewerAgentWithEnv）；与 herdrRoleSessionsRoot 并列独立，
+// 会话目录与报告目录分根管理。
+const herdrRoleReportsRoot = "/tmp/herdr-role-reports"
+
 // claudeSharedProjectsRoot 是 Claude Code 项目会话日志（projects/）的共享根。
 // 落在 herdrRoleSessionsRoot 之下，随其 ReadWrite 白名单天然可写，沙盒内
 // claude 经 <CLAUDE_CONFIG_DIR>/projects/<project-slug>/<uuid>.jsonl 写入的
@@ -55,6 +61,10 @@ var ForbiddenExecNames = []string{
 	"herdr",
 	"herdr-core",
 	"herdr-mobile-bridge",
+	// claude 衍生本体形态：裸 "claude" 不加（否则顶层 `sbx -- claude` 启动
+	// 会与 EntryAgents 白名单对 claude 的放行形成自锁）；只列精确派生名。
+	"claude-pty",
+	"claude-code",
 }
 
 // DefaultReviewerTools 定义只读审查子代理默认允许执行的常用只读检查与开发工具列表。
@@ -72,6 +82,8 @@ var DefaultReviewerTools = []string{
 	"pwd", "dirname", "basename", "realpath", "readlink", "which",
 	"date", "uname", "id", "whoami", "printf", "echo", "test",
 	"sha256sum", "md5sum",
+	// 只读角色回报通道
+	"dispatch-report",
 }
 
 // standardBinDirs 是除 PATH 外用于查找白名单工具的标准系统二进制目录。
@@ -1028,7 +1040,8 @@ func appendAgyStateReadWrite(p *Policy) {
 //     注册会话/上报 agent.turn.completed；
 //   - Exec：pig / agy MCP 生态服务二进制（ctxmode / codegraph-go / jev-mcp / jev-mcp-go /
 //     agy-recall，含软链解析目标），仍不整目录放行 ~/.local/bin；
-//   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）；agy 状态为 ~/.gemini/antigravity-cli
+//   - ReadWrite：/tmp/herdr-role-sessions（pig --session-dir）与
+//     /tmp/herdr-role-reports（dispatch-agent 派发报告文档根）；agy 状态为 ~/.gemini/antigravity-cli
 //     与 /root/.agy-pro-home/.gemini/antigravity-cli 下数据子目录 + 根目录已有状态文件
 //     （不含 bin/，避免对可执行文件 W^X 写穿）；以及 /dev/tty（dispatch-agent-go 对 agy 使用
 //     --prompt-interactive / -i，bubbletea 需要打开控制终端）；
@@ -1100,12 +1113,15 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	p.Exec = append(p.Exec, agents...)
 	p.Exec = append(p.Exec, hooks...)
 
-	sessionRoot := herdrRoleSessionsRoot
-	_ = os.MkdirAll(sessionRoot, 0o700)
-	// Lstat 确认 sessionRoot 是真实目录而非预置符号链接后才放行写权，
+	// 共享可写根白名单：会话根（pig --session-dir）与报告根
+	//（dispatch-agent DISPATCH_REPORT_PATH 落盘目录）分根并列；两者均先
+	// MkdirAll 再 Lstat 确认本体是真实目录而非预置符号链接后才放行写权，
 	// 防止软链指向宿主任意路径时把共享写面旁路过去（容忍降级）。
-	if st, lstatErr := os.Lstat(sessionRoot); lstatErr == nil && st.Mode().IsDir() {
-		p.ReadWrite = append(p.ReadWrite, sessionRoot)
+	for _, sharedRoot := range []string{herdrRoleSessionsRoot, herdrRoleReportsRoot} {
+		_ = os.MkdirAll(sharedRoot, 0o700)
+		if st, lstatErr := os.Lstat(sharedRoot); lstatErr == nil && st.Mode().IsDir() {
+			p.ReadWrite = append(p.ReadWrite, sharedRoot)
+		}
 	}
 
 	// agy 状态：只开放数据子目录，不开放 bin/（真实 ELF 在 bin/agy，须保持只读+Exec，避免 W^X 被写穿）。

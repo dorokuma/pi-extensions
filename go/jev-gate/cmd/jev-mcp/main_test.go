@@ -1159,3 +1159,56 @@ func TestWriteFileAtomicConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestUnwrapToolArguments(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      any
+		wantErr string // "" means success
+		wantKey string // key expected in result when success
+	}{
+		{"nil defaults empty", nil, "", ""},
+		{"object passthrough", map[string]any{"task": "x"}, "", "task"},
+		{"one string layer", `{"task":"x"}`, "", "task"},
+		{"two string layers", `"{\"task\":\"x\"}"`, "", "task"},
+		{"three string layers", `"\"{\\\"task\\\":\\\"x\\\"}\""`, "", "task"},
+		{"plain non-json string", "hello", "not valid JSON", ""},
+		{"string array", `[1,2]`, "decodes to array", ""},
+		{"string number", `42`, "decodes to number", ""},
+		{"non-string non-object", []any{1}, "arguments is array", ""},
+		{"number", float64(5), "arguments is number", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := unwrapToolArguments(tc.in)
+			if tc.wantErr != "" {
+				if err == "" || !strings.Contains(err, tc.wantErr) {
+					t.Fatalf("err = %q, want containing %q", err, tc.wantErr)
+				}
+				if got != nil {
+					t.Fatalf("got %v on error, want nil", got)
+				}
+				return
+			}
+			if err != "" {
+				t.Fatalf("unexpected err %q", err)
+			}
+			if tc.wantKey != "" {
+				if _, ok := got[tc.wantKey]; !ok {
+					t.Fatalf("result %v missing key %q", got, tc.wantKey)
+				}
+			}
+		})
+	}
+}
+
+func TestUnwrapToolArgumentsDepthCap(t *testing.T) {
+	in := `{"a":1}`
+	for i := 0; i < maxArgStringLayers+1; i++ {
+		b, _ := json.Marshal(in)
+		in = string(b)
+	}
+	if got, err := unwrapToolArguments(in); err == "" || got != nil {
+		t.Fatalf("expected depth-cap error, got %v err %q", got, err)
+	}
+}

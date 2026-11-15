@@ -468,9 +468,10 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMo
 		w.sendResult(id, toolErrorResult(fmt.Sprintf("jev-mcp: unknown tool %q", name)), framingMode)
 		return
 	}
-	rawArgs, _ := params["arguments"].(map[string]any)
-	if rawArgs == nil {
-		rawArgs = map[string]any{}
+	rawArgs, argErr := unwrapToolArguments(params["arguments"])
+	if argErr != "" {
+		w.sendResult(id, toolErrorResult("jev-mcp: invalid arguments: "+argErr), framingMode)
+		return
 	}
 
 	// The call executes on its own goroutine so readLoop can keep reading
@@ -511,6 +512,63 @@ func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMo
 		}
 		w.sendResult(id, sdkResultToMCP(result.Content, result.Details, result.StructuredContent, result.IsError), framingMode)
 	}()
+}
+
+// unwrapToolArguments tolerates MCP clients that deliver params.arguments as
+// a JSON-encoded string (possibly nested) instead of the spec-required object —
+// observed from lazy tool bridges whose Arguments param is declared
+// type:string, where the model may emit "{...}" or a double-encoded
+// "\"{...}\"". The previous silent {} fallback let malformed calls run with
+// fabricated empty input; failures now return a non-empty error the caller
+// must surface.
+func unwrapToolArguments(v any) (map[string]any, string) {
+	switch t := v.(type) {
+	case nil:
+		return map[string]any{}, ""
+	case map[string]any:
+		return t, ""
+	case string:
+		cur := t
+		for depth := 0; depth < maxArgStringLayers; depth++ {
+			var decoded any
+			if err := json.Unmarshal([]byte(cur), &decoded); err != nil {
+				return nil, "arguments is a string but not valid JSON"
+			}
+			switch d := decoded.(type) {
+			case map[string]any:
+				fmt.Fprintf(os.Stderr, "[jev-mcp] tools/call: unwrapped %d extra JSON string layer(s) in arguments\n", depth+1)
+				return d, ""
+			case string:
+				cur = d
+			default:
+				return nil, fmt.Sprintf("arguments decodes to %s, want object", jsonTypeName(decoded))
+			}
+		}
+		return nil, fmt.Sprintf("arguments nested beyond %d JSON string layers", maxArgStringLayers)
+	default:
+		return nil, fmt.Sprintf("arguments is %s, want object", jsonTypeName(v))
+	}
+}
+
+const maxArgStringLayers = 3
+
+func jsonTypeName(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case float64, int, int64, json.Number:
+		return "number"
+	case string:
+		return "string"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", v)
+	}
 }
 
 // ---------------------------------------------------------------------------

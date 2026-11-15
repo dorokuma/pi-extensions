@@ -397,6 +397,32 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
+	t.Run("forbidden_claude_ancestor_rejected", func(t *testing.T) {
+		// claude 全家族（claude / claude-code / claude-pty）与版本化
+		// /claude/versions/<ver> 路径段同属禁名：作为 jev-mcp 与宿主
+		// 之间的中间祖先时必须 fail-closed，不得穿透进 host layer。
+		for _, cmd := range []string{
+			"/usr/local/bin/claude",
+			"/usr/local/bin/claude-code",
+			"/usr/local/bin/claude-pty",
+			"/root/.local/share/claude/versions/2.1.319",
+		} {
+			chain := []AncestorProcess{
+				{PID: 100, PPID: 150, Cmdline: "jev-mcp"},
+				{PID: 150, PPID: 200, Cmdline: cmd},
+				{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
+				{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
+			}
+			environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+			isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
+			if !isSubagent {
+				t.Fatalf("claude ancestor %q must be rejected, reason=%q", cmd, reason)
+			}
+			if !strings.Contains(reason, "agent/tool runtime ancestor pid=150") {
+				t.Fatalf("claude ancestor %q rejected for wrong reason: %q", cmd, reason)
+			}
+		}
+	})
 	t.Run("unknown_intermediate_shell_rejected", func(t *testing.T) {
 		// An extra `bash -c` hop between jev-mcp and agy is not the host and
 		// not a transparent interpreter wrapper: fail closed.
