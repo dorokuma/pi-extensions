@@ -364,5 +364,34 @@
         }
       }
     }
+  },
+  {
+    "name": "ctx_report",
+    "label": "CTX Report",
+    "exposure": "model-only",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "description": "派发角色交付最终报告的唯一标准入口（底层委托授信 dispatch-report helper 完成加锁、原子写盘、父终端回执与 .sent 去重）。仅传单参数 content：1 字节至 1 MiB 的完整 UTF-8 报告正文；目标路径与父终端 ID 由服务端从 DISPATCH_REPORT_PATH / DISPATCH_REPORT_PARENT 读取，全角色（含严格只读）均可调用。仅当派发器设置了 DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT 时可用。",
+    "promptSnippet": "Deliver the dispatched role's completion report via the trusted dispatch-report helper",
+    "promptGuidelines": [
+      "Use ctx_report with a single content argument = the complete UTF-8 report body (1 byte .. 1 MiB); it is the standard one-shot delivery entry for a dispatched role's final report.",
+      "ctx_report: never pass a parent field and never send the report body through a shell command or hc send; the server reads DISPATCH_REPORT_PATH/DISPATCH_REPORT_PARENT itself."
+    ],
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "Complete UTF-8 report body (1 byte .. 1 MiB), written verbatim to the dispatch report file"
+        }
+      },
+      "required": [
+        "content"
+      ]
+    }
   }
 ]

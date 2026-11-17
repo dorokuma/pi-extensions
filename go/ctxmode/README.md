@@ -2,7 +2,9 @@
 
 将原版 Pi 的 ctxmode 桥移植为 Go factory 扩展。桥启动现有 `ctxmode` 二进制，使用
 JSON-RPC 2.0 / MCP over stdio，注册 `ctx_run`、`ctx_fs`、`ctx_git`、`ctx_kb`、
-`ctx_bg`、`ctx_stats` 六个原生工具；**本目录不重写 ctxmode 服务端**。
+`ctx_bg`、`ctx_stats`、`ctx_report` 七个原生工具（`ctx_report` 以 `model-only`
+exposure 注册：始终作为模型顶层直连工具暴露，不注入 codemode `tools.*`，也不会
+在 codemode.mode=="only" 时被隐藏）；**本目录不重写 ctxmode 服务端**。
 
 ## 来源与加载约定
 
@@ -27,20 +29,21 @@ JSON-RPC 2.0 / MCP over stdio，注册 `ctx_run`、`ctx_fs`、`ctx_git`、`ctx_k
 |---|---|
 | 环境配置、`stripANSI`、`clampUtf16Index`、`compressToolText` | `text.go:14` `envString` / `text.go:26` `envNumber` / `text.go:42` `envPositiveNumber` / `text.go:60` `StripANSI` / `text.go:67` `clampUtf16Index` / `text.go:84` `CompressToolText` |
 | `READONLY_ROLES` / `resolveRoleEnv` | `text.go:114` `ResolveRoleEnv` / `text.go:144` `roleEnviron` |
-| `diagLog`、降级提示、目录恢复、`.1/.2` 轮转、INFO/DEBUG 过滤 | `diag.go:28` `DiagLog` / `diag.go:77` `isInterestingStderrLine` |
-| `CtxmodeClient`、握手与 MCP 数据结构 | `client.go:71` `CtxmodeClient` / `client.go:100` `Start` / `client.go:125` `doStart` |
-| stdout 响应匹配、最近 20 行 stderr、跨 chunk carry、异常退出 dump | `client.go:224` `readOutput` / `client.go:240` `acceptResponseLocked` / `client.go:260` `readStderr` / `client.go:300` `dumpStderrBufferLocked` |
-| `disposeProc` / `shutDownProc` / `cleanup` / `stop` | `client.go:340` `disposeProc` / `client.go:371` `shutDownProc` / `client.go:332` `cleanupLocked` / `client.go:390` `Stop`；`Stop` 为终态，旧进程以身份校验隔离 |
-| 请求预算、超时取消、Esc 取消、disconnect 重连但不重放 | `client.go:578` `timeoutForTool` / `client.go:498` `sendRequest` / `client.go:562` `writeRequest` / `client.go:464`/`479` `cancelRequestLocked`/`cancelPendingLocked` / `client.go:610` `CallTool` / `client.go:672` `reconnect` |
-| 三个事件、两个 slash command、延迟一次注册工具 | `extension.go:120` `Extension` / `extension.go:35` `extensionState` / `extension.go:56` `start` |
-| 六个工具的全部元数据与 TypeBox schema | `tools.json`（从 TS 定义提取后嵌入）/ `extension.go:27` `definitions` / `extension.go:107` `registerTools` |
-| 文本结果与取消 error 的区别 | `extension.go:87` `run` / `extension.go:84` `textResult` |
+| `diagLog`、降级提示、目录恢复、`.1/.2` 轮转、INFO/DEBUG 过滤 | `diag.go:28` `DiagLog` / `diag.go:83` `isInterestingStderrLine` |
+| `CtxmodeClient`、握手与 MCP 数据结构 | `client.go:82` `CtxmodeClient` / `client.go:111` `Start` / `client.go:136` `doStart` |
+| stdout 响应匹配、最近 20 行 stderr、跨 chunk carry、异常退出 dump | `client.go:235` `readOutput` / `client.go:251` `acceptResponseLocked` / `client.go:271` `readStderr` / `client.go:311` `dumpStderrBufferLocked` |
+| `disposeProc` / `shutDownProc` / `cleanup` / `stop` | `client.go:351` `disposeProc` / `client.go:382` `shutDownProc` / `client.go:343` `cleanupLocked` / `client.go:401` `Stop`；`Stop` 为终态，旧进程以身份校验隔离 |
+| 请求预算、超时取消、Esc 取消、disconnect 重连但不重放 | `client.go:589` `timeoutForTool` / `client.go:509` `sendRequest` / `client.go:573` `writeRequest` / `client.go:475`/`490` `cancelRequestLocked`/`cancelPendingLocked` / `client.go:627` `CallTool` / `client.go:706` `reconnect`；`ctx_report` 预算保底 45000ms（服务端 35s helper + 3s drain） |
+| MCP `result.isError` 透传 | `client.go:34` `mcpResult.IsError` / `client.go:634` `CallToolResult` 返回 `CallToolOutcome{Text, IsError}`（`client.go:40`），原 `CallTool` 签名不变只是丢弃标志 |
+| 三个事件、两个 slash command、延迟一次注册工具 | `extension.go:149` `Extension` / `extension.go:37` `extensionState` / `extension.go:58` `start` |
+| 七个工具的全部元数据与 TypeBox schema | `tools.json`（从 TS 定义提取后嵌入，含 `exposure`/`annotations`）/ `extension.go:29` `definitions` / `extension.go:135` `registerTools` |
+| 文本结果与取消 error 的区别 | `extension.go:112` `run` / `extension.go:104` `textResult`；客户端/服务端失败以线键 `is_error=true` 返回（`errorResult`，宿主只解码 snake_case），Esc 仍是 Go error |
 
 ### 生命周期与取消不变量
 
 - 启动参数保持 `ctxmode -workdir <absolute workdir>`，注入 `ResolveRoleEnv`；
-  `extensionState.start` 传 `filepath.Abs(workdir)`（`extension.go:62`）而 notify 文案
-  用原始 `workdir` 字符串（`extension.go:132`），两条命令与 session_start 共用该闭包。
+  `extensionState.start` 传 `filepath.Abs(workdir)`（`extension.go:64`）而 notify 文案
+  用原始 `workdir` 字符串（`extension.go:161`），两条命令与 session_start 共用该闭包。
 - 握手保持协议版本 `2024-11-05`、客户端 `pi-ctxmode` / `1.0.0`；记录服务端
   instructions，依次发送 initialized 通知与 tools/list。initialize/tools/list 失败
   **或超时**都在 `Start()` 返回错误前同步回收子进程（SIGTERM → `CTXMODE_DISPOSE_WAIT_MS`
@@ -69,7 +72,7 @@ JSON-RPC 2.0 / MCP over stdio，注册 `ctx_run`、`ctx_fs`、`ctx_git`、`ctx_k
 | `CTXMODE_BIN` | `ctxmode` |
 | `CTXMODE_WORKDIR` | 会话 `ctx.Cwd()`；客户端用 `filepath.Abs`，notify 文案用原值 |
 | `CTXMODE_START_TIMEOUT_MS` | `15000`；仅 `> 0` 生效，`"0"`/负数回退默认值 |
-| `CTXMODE_REQUEST_TIMEOUT_MS` | `120000`；长工具预算另加服务端缓冲，最大 `3660000`；仅 `> 0` 生效 |
+| `CTXMODE_REQUEST_TIMEOUT_MS` | `120000`；长工具预算另加服务端缓冲，最大 `3660000`；仅 `> 0` 生效。`ctx_report` 固定保底 45000ms（服务端 ctxReportTimeout 35s + ctxReportWaitDelay 3s 内不允许客户端先超时杀 dispatch-report） |
 | `CTXMODE_OUTPUT_CHARS` | `50000`，按 UTF-16 code unit 计算，不拆代理对 |
 | `CTXMODE_OUTPUT_LINES` | `500`，按 TS 的最低 40 行头 / 15 行尾逻辑压缩 |
 | `CTXMODE_DEBUG` | 非空时直接写 stderr，不写日志文件 |
@@ -104,6 +107,34 @@ JSON-RPC 2.0 / MCP over stdio，注册 `ctx_run`、`ctx_fs`、`ctx_git`、`ctx_k
    `CTXMODE_DISPOSE_WAIT_MS` 仍按 TS 语义允许 `"0"`。
 6. smoke 使用模拟 MCP 服务端，无真实模型请求、无真实服务端命令执行；不等同于
    ctxmode 服务端各工具的独立集成验收。
+7. ctx_report 接入（第 7 个工具）：`tools.json` 允许可选 `exposure`（透传 `sdk.ToolExposure`，
+   `ctx_report` 用 `model-only`）与 `annotations`（透传 `*sdk.ToolAnnotations`）。
+   `mcpResult` 解析 `result.isError`；`CallToolResult` 返回 `CallToolOutcome{Text, IsError}`，
+   原 `CallTool` 保持 `(string, error)` 兼容。`extensionState.run` 在客户端未运行、
+   CallTool 非 Esc 错误、或服务端 isError=true 时返回 `IsError:true` 的 toolResult
+   （序列化线键为 `is_error`，PiG 子进程宿主只解码 snake_case，见
+   `ref/PiG/.../subprocess/protocol.go` `ToolResult` 的 `json:\"is_error,omitempty\"`；
+   Go `encoding/json` 的大小写折叠不含下划线，`isError` 键匹配不上）。
+   三点契约（有意登记，勿单边改动）：
+   ① 全部 7 个工具在客户端未运行、非 Esc 的调用失败、或服务端 `result.isError=true`
+   时统一置线键 `is_error: true`——对齐上游 `AgentToolResult.isError`（TS 原版不置
+   `is_error` 键，此处为对齐宿主 `AgentToolResult.isError` 而对 TS 做的有意偏离），
+   成功调用与 Esc 取消（Go error）不置位；`toolResult.Content` 用具名 `contentBlock` 结构体切片
+   （`extension.go:85`），保证线级成员顺序精确为 `type` 在前、`text` 在后
+   （Go map 序列化按字典序会输出 `text` 在前，偏离 TS 原始线形）。
+   ② `ctx_report` 依赖宿主安装的 `/root/.local/bin/ctxmode` 二进制
+   **>= 5.6.0**（带 `ctx_report` 工具与 dispatch-report 委托）；完整单入口封禁形态
+   随同批锁步变更的 ctxmode **>= 6.0.0** 生效。旧版本宿主启动的服务端无 `ctx_report` 工具，调用会以
+   `is_error` 回执失败而不是静默成功。
+   ③ `ctx_report` 成功单行回执（`!result.isError`）原样透传、不经
+   `CompressToolText`（dispatch-report receipt 是机器校验的单行状态行，
+   不可被头尾折叠改写）；失败回执（`isError=true`，可能拼入超长 stderr）
+   仍走 `CompressToolText` 压缩防上下文放大（`client.go:690` 区）。
+   `timeoutForTool` 对 `ctx_report` 保底 **45000ms**：与服务端
+   `ctx_report.go` 的 `ctxReportTimeout(35s) + ctxReportWaitDelay(3s)`
+   跨仓锁步——客户端 45000ms 保底保证在服务端 38s 窗口内不先超时并发出
+   `notifications/cancelled`（那会 SIGKILL 交付半途的 dispatch-report）；
+   **服务端若上调这两个常数，此处保底必须同步上调**。
 
 ## 原版测试逐条对应
 
@@ -143,7 +174,7 @@ ANSI 原版 12 条在 `TestStripANSIOriginal` 中逐条为：`RIS`、`DECALN`、
 `CharacterSet`、`PercentAndSaveRestore`、`DCS_ST`、`DCS_BEL`、`SOS_PM_APC`、
 `DCS_Unterminated`、`OSC_BEL_ST`、`CSI`、`Plain`、`Mixed`。ST 显式写为 `"\x1b\\"`。
 
-补充十八个审查/边界用例：`TestCompressionBoundaries`、`TestTimeoutAndRoleBoundaries`、
+补充二十个审查/边界用例：`TestCompressionBoundaries`、`TestTimeoutAndRoleBoundaries`、
 `TestDiagOptInsAndFiltering`、`TestHandshakeListFailureAndAbort`、`TestStopDuringStart`、
 `TestSDKCancellationAndCommands`、`TestExtensionStartupFailureLevels`，
 以及 R2 回归：`TestStartTimeoutReapsBeforeReturn`、`TestCallToolCancelUnblocksBlockedWrite`、
@@ -151,11 +182,14 @@ ANSI 原版 12 条在 `TestStripANSIOriginal` 中逐条为：`RIS`、`DECALN`、
 `TestEnvNumberZeroAndFallbackSemantics`、`TestDiagMaxBytesZeroRotatesEveryWrite`、
 `TestWorkdirNotifyKeepsRawValue`，以及 R3 回归：
 `TestCallToolNormalCompletionNoGoroutineLeak`、`TestReconnectCancelDisposesHandshakeChild`、
-`TestTimeoutKnobsIgnoreNonPositive`、`TestCompressToolTextZeroCaps`。
+`TestTimeoutKnobsIgnoreNonPositive`、`TestCompressToolTextZeroCaps`，以及 ctx_report 接入：
+`TestExtensionReportRegistered`（七工具、model-only exposure、annotations、closed content schema）、
+`TestExtensionReportIsError`（服务端 isError、客户端失败、未运行均带 isError=true）。
 
-Go 总计 **57 个叶子行为用例**（46 个顶层测试名，其中 1 个容器下有 12 个子用例；
-顶层 `--- PASS` 46 + 子用例 12 = 58 条 PASS 行），不是将 ANSI 容器本身再重复计数。
-测试与台架 1538 行，生产 Go 1089 行另加元数据 JSON，未超过实现改动的三倍。
+Go 总计 **59 个叶子行为用例 / 60 条 PASS 行**（48 个顶层测试函数，其中 1 个表驱动
+容器 `TestStripANSIOriginal` 含 12 个子用例：叶子用例 47 + 12 = 59 个，`go test -v`
+输出 48 + 12 = 60 条 `--- PASS` 行），不是将 ANSI 容器本身再重复计数。
+测试与台架 1739 行，生产 Go 1220 行另加元数据 JSON，未超过实现改动的三倍。
 模拟服务端由测试二进制自身提供，所有 PID/请求/日志在临时目录，
 SDK 台架通过真实长度前缀 IPC 和 `Extension().RunWithConn` 完成握手与晚注册。
 
@@ -163,12 +197,12 @@ SDK 台架通过真实长度前缀 IPC 和 `Extension().RunWithConn` 完成握�
 
 | 项 | 问题 | 修复 | 回归用例（先 FAIL 后 PASS） |
 |---|---|---|---|
-| P1-1 握手失败同步收尸 | 需要确认失败/超时路径在 `Start()` 返回前已回收子进程 | 无需改代码：`doStart` 的 `defer`（`client.go:164`）在返回错误前同步跑完 `shutDownProc`→`disposeProc`（SIGTERM→等待窗口→SIGKILL→等 `cmd.Wait`）。补超时路径用例钉住 | `TestStartTimeoutReapsBeforeReturn`（新，直接断言 `Start()` 返回后 pid 已 ESRCH） |
-| P1-2 取消被写入阻塞 | `sendRequest` 原在状态锁内同步 `Write`（`client.go:498` 区），stdin 塞满时 `ctx.Done()` 永远看不到 | 请求行改到 `writeRequest` goroutine；`writeMu` 只包住 `Write`；取消通知等 `entry.written` 后再发（写未完成则延后），调用方立即返回取消错误 | `TestCallToolCancelUnblocksBlockedWrite`（新）：修复前 2.00s 超时失败 |
-| P1-2 重连忽略取消 | 断连重连分支同步 `Start()`，Esc 后仍得等两段 `START_TIMEOUT_MS` | `reconnect`（`client.go:672`）把 `Start()` 放 goroutine，`ctx.Done()` 胜出即返回取消错误；无人接收的 start 错误仍写诊断日志 | `TestReconnectHandshakeHonoursCancel`（新）：修复前 1.996s 才返回 |
+| P1-1 握手失败同步收尸 | 需要确认失败/超时路径在 `Start()` 返回前已回收子进程 | 无需改代码：`doStart` 的 `defer`（`client.go:175`）在返回错误前同步跑完 `shutDownProc`→`disposeProc`（SIGTERM→等待窗口→SIGKILL→等 `cmd.Wait`）。补超时路径用例钉住 | `TestStartTimeoutReapsBeforeReturn`（新，直接断言 `Start()` 返回后 pid 已 ESRCH） |
+| P1-2 取消被写入阻塞 | `sendRequest` 原在状态锁内同步 `Write`（`client.go:509` 区），stdin 塞满时 `ctx.Done()` 永远看不到 | 请求行改到 `writeRequest` goroutine；`writeMu` 只包住 `Write`；取消通知等 `entry.written` 后再发（写未完成则延后），调用方立即返回取消错误 | `TestCallToolCancelUnblocksBlockedWrite`（新）：修复前 2.00s 超时失败 |
+| P1-2 重连忽略取消 | 断连重连分支同步 `Start()`，Esc 后仍得等两段 `START_TIMEOUT_MS` | `reconnect`（`client.go:706`）把 `Start()` 放 goroutine，`ctx.Done()` 胜出即返回取消错误；无人接收的 start 错误仍写诊断日志 | `TestReconnectHandshakeHonoursCancel`（新）：修复前 1.996s 才返回 |
 | P2-1 数值旋钮 `"0"` | 四个旋钮共用的 `envNumber` 需对齐 `Number(process.env.X \|\| DEFAULT)` | 空串回退默认值、`"0"` 解析为 0 不回退（原实现已对），并把 NaN/±Infinity 从归 0 改为回退默认值 | `TestEnvNumberZeroAndFallbackSemantics`、`TestDisposeWaitZeroEscalates`、`TestDiagMaxBytesZeroRotatesEveryWrite` |
 | P2-2 空串 `CTXMODE_ROLE` | 需按 TS `if (baseEnv.CTXMODE_ROLE) return baseEnv`，空串视为未设置 | 无需改代码：`ResolveRoleEnv`（`text.go:114`）的 `!= ""` 判断已是该语义；补空串用例钉住 | `TestResolveRoleEnvOriginal` 新增空串分支 |
-| P2-3 workdir 文案 | 需 `NewClient` 收绝对路径、notify 用原始字符串 | 无需改代码：`extension.go:62` 做 `filepath.Abs`，`extension.go:132` notify 用原始 `workdir`；补用例钉住两条路径 | `TestWorkdirNotifyKeepsRawValue` |
+| P2-3 workdir 文案 | 需 `NewClient` 收绝对路径、notify 用原始字符串 | 无需改代码：`extension.go:64` 做 `filepath.Abs`，`extension.go:161` notify 用原始 `workdir`；补用例钉住两条路径 | `TestWorkdirNotifyKeepsRawValue` |
 
 P1-2 的“取消优先”是对 TS 的**有意偏离**：TS 在重连分支会先 `await this.start()` 再抛原
 错误，此时 Esc 只是不再等待（本地已 reject），而 Go 版在 `ctx.Done()` 胜出时直接返回取消
@@ -179,8 +213,8 @@ P1-2 的“取消优先”是对 TS 的**有意偏离**：TS 在重连分支会�
 
 | 项 | 问题 | 修复 | 回归用例（先 FAIL 后 PASS） |
 |---|---|---|---|
-| P1-1 取消监听 goroutine 退出 | `sendRequest` 里监听 `ctx.Done()` 的 watcher 在调用自行结束（拿到响应或超时）时无人唤醒，会永久挂起 | watcher 同时等 `ctx.Done()` 与 `reqDone`：`reqDone`（`client.go:518`）由 `defer close(reqDone)`（`client.go:519`）在每条返回路径关闭，`ctxDone`（`client.go:517`）只由 watcher 关闭 | `TestCallToolNormalCompletionNoGoroutineLeak`（新）：去掉 `reqDone` 分支后 25 次正常完成调用留下 25 个 goroutine，6.13s 超时 FAIL；加回后 0.14s PASS |
-| P1-2 重连取消留在途握手 | `reconnect` 在 Esc 胜出时只返回错误，正在握手的子进程要等 `CTXMODE_START_TIMEOUT_MS`（15s 级）才被回收 | `ctx.Done()` 分支先 `c.shutDownProc()`（`client.go:684`），握手 goroutine 回话失败再补一次（`client.go:688`）；`shutDownProc` 标 `intentional`、**不**置 `c.stopped`（那是 `/ctxmode-stop` 的语义），重连不再遗留僵尸握手进程 | `TestReconnectCancelDisposesHandshakeChild`（新）：取消后 1.5s 子进程仍在 → FAIL（1.52s）；修复后 0.02s 内 ESRCH → PASS |
+| P1-1 取消监听 goroutine 退出 | `sendRequest` 里监听 `ctx.Done()` 的 watcher 在调用自行结束（拿到响应或超时）时无人唤醒，会永久挂起 | watcher 同时等 `ctx.Done()` 与 `reqDone`：`reqDone`（`client.go:529`）由 `defer close(reqDone)`（`client.go:530`）在每条返回路径关闭，`ctxDone`（`client.go:528`）只由 watcher 关闭 | `TestCallToolNormalCompletionNoGoroutineLeak`（新）：去掉 `reqDone` 分支后 25 次正常完成调用留下 25 个 goroutine，6.13s 超时 FAIL；加回后 0.14s PASS |
+| P1-2 重连取消留在途握手 | `reconnect` 在 Esc 胜出时只返回错误，正在握手的子进程要等 `CTXMODE_START_TIMEOUT_MS`（15s 级）才被回收 | `ctx.Done()` 分支先 `c.shutDownProc()`（`client.go:718`），握手 goroutine 回话失败再补一次（`client.go:723`）；`shutDownProc` 标 `intentional`、**不**置 `c.stopped`（那是 `/ctxmode-stop` 的语义），重连不再遗留僵尸握手进程 | `TestReconnectCancelDisposesHandshakeChild`（新）：取消后 1.5s 子进程仍在 → FAIL（1.52s）；修复后 0.02s 内 ESRCH → PASS |
 | P2-1 输出上限 `0`/负数 | `CTXMODE_OUTPUT_CHARS=0` / `CTXMODE_OUTPUT_LINES=0` 必须按 TS 截断而不是跳过，负数不得越界切片 | `CompressToolText`（`text.go:84`）本就没有 `charCap <= 0` 跳过，与 TS 一致；把 head/tail 偏移显式夹到 `>= 0`（`text.go:107`/`108`），越界防护不再只依赖代理对钳位；marker 保留 TS 的原始 cap 值 | `TestCompressToolTextZeroCaps`（新）：char cap 0 只剩 marker、负 cap 不 panic 且 marker 照 TS 写原值、line cap 0 = 40 头 + 15 尾 |
 | P2-2 超时旋钮 `0`/负数 | `CTXMODE_START_TIMEOUT_MS="0"` 让 `Start()` 立刻以 `initialize timed out after 0ms` 失败，`CTXMODE_REQUEST_TIMEOUT_MS="0"` 同理使每次调用立刻超时 | 新增 `envPositiveNumber`（`text.go:42`）：两个超时旋钮只在 `> 0` 时采用环境变量值，否则回退默认值；输出上限与 `DIAG_MAX_BYTES`/`DISPOSE_WAIT_MS` 仍允许 `"0"` | `TestTimeoutKnobsIgnoreNonPositive`（新）：改回 `envNumber` 即 `initialize timed out after 0ms` FAIL；修复后 PASS，且 `CTXMODE_REQUEST_TIMEOUT_MS="0"` 仍回退 `120000` |
 
@@ -221,7 +255,8 @@ PASS
 ok github.com/dorokuma/pi-extensions/go/ctxmode 4.949s
 ```
 
-全部 57 个叶子用例 PASS，最终完整 race 输出 **0 DATA RACE**。
+全部 59 个叶子行为用例 PASS（`go test -v` 共 60 条 `--- PASS` 行：48 顶层 + 12 子用例），
+最终完整 race 输出 **0 DATA RACE**。
 
 ### R3 回归证据（先 FAIL 后 PASS）
 

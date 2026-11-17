@@ -18,7 +18,7 @@ import (
 const cancelledMessage = "ctxmode tool call cancelled (user pressed esc)"
 const stoppedMessage = "ctxmode client was stopped; create a new client (e.g. /ctxmode-start) instead"
 
-var toolNames = []string{"ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg", "ctx_stats"}
+var toolNames = []string{"ctx_run", "ctx_fs", "ctx_git", "ctx_kb", "ctx_bg", "ctx_stats", "ctx_report"}
 
 type mcpResult struct {
 	Content []struct {
@@ -29,6 +29,17 @@ type mcpResult struct {
 		Name string `json:"name"`
 	} `json:"tools"`
 	Instructions *string `json:"instructions"`
+	// IsError mirrors the MCP result's isError flag (tools/call answers that
+	// failed on the server carry result.isError=true, not a JSON-RPC error).
+	IsError bool `json:"isError"`
+}
+
+// CallToolOutcome is the full result of one tools/call: the text the extension
+// returns to the model plus the server's isError flag, which CallTool's
+// (string, error) signature cannot carry.
+type CallToolOutcome struct {
+	Text    string
+	IsError bool
 }
 type reply struct {
 	result mcpResult
@@ -604,47 +615,60 @@ func timeoutForTool(name string, args map[string]any) int {
 		budget(150000, 30000)
 	case name == "ctx_bg" && action == "wait":
 		budget(60000, 15000)
+	case name == "ctx_report":
+		// 35s helper bound + 3s post-cancel drain on the server side; the client
+		// must not fire its own timeout (and the notifications/cancelled that
+		// would SIGKILL dispatch-report mid-delivery) inside that window, even
+		// when CTXMODE_REQUEST_TIMEOUT_MS is tuned below 38s.
+		budget(38000, 7000)
 	}
 	return min(base, 3660000)
 }
 func (c *CtxmodeClient) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	outcome, err := c.CallToolResult(ctx, name, args)
+	return outcome.Text, err
+}
+
+// CallToolResult is CallTool with the server's isError flag preserved. The
+// text is identical either way; only the flag is added.
+func (c *CtxmodeClient) CallToolResult(ctx context.Context, name string, args map[string]any) (CallToolOutcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
-		return "", errors.New(cancelledMessage)
+		return CallToolOutcome{}, errors.New(cancelledMessage)
 	}
 	c.mu.Lock()
 	initialized := c.initialized
 	c.mu.Unlock()
 	if !initialized {
 		if err := c.Start(); err != nil {
-			return "", err
+			return CallToolOutcome{}, err
 		}
 		if ctx.Err() != nil {
-			return "", errors.New(cancelledMessage)
+			return CallToolOutcome{}, errors.New(cancelledMessage)
 		}
 	}
 	c.mu.Lock()
 	initialized = c.initialized
 	c.mu.Unlock()
 	if !initialized {
-		return "", errors.New("ctxmode not initialized")
+		return CallToolOutcome{}, errors.New("ctxmode not initialized")
 	}
 	result, err := c.sendRequest(ctx, "tools/call", map[string]any{"name": name, "arguments": args}, timeoutForTool(name, args))
 	if err != nil {
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "cancelled") || strings.Contains(msg, "timed out") {
-			return "", err
+			return CallToolOutcome{}, err
 		}
 		if isDisconnectMessage(msg) {
 			// Reconnect without replaying tools/call (execute/batch are not
 			// idempotent), but never let that handshake swallow an Esc.
 			if c.reconnect(ctx) {
-				return "", errors.New(cancelledMessage)
+				return CallToolOutcome{}, errors.New(cancelledMessage)
 			}
 		}
-		return "", err
+		return CallToolOutcome{}, err
 	}
 	c.mu.Lock()
 	c.restartAttempts = 0
@@ -653,7 +677,17 @@ func (c *CtxmodeClient) CallTool(ctx context.Context, name string, args map[stri
 	for _, content := range result.Content {
 		texts = append(texts, content.Text)
 	}
-	return CompressToolText(strings.Join(texts, "\n")), nil
+	joined := strings.Join(texts, "\n")
+	if name == "ctx_report" {
+		// A successful dispatch-report reply is the machine-checked one-line
+		// receipt; pass it through verbatim, never through CompressToolText's
+		// head/tail folding. A failed reply may carry a long stderr tail, so it
+		// still goes through the compressor to bound the context cost.
+		if !result.IsError {
+			return CallToolOutcome{Text: joined}, nil
+		}
+	}
+	return CallToolOutcome{Text: CompressToolText(joined), IsError: result.IsError}, nil
 }
 
 // isDisconnectMessage reports errors that mean the connection is gone; only those
