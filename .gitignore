@@ -40,3 +40,6 @@ Thumbs.db
 # 过程笔记（.agents/notes/）磁盘保留、不入库，用 .gitignore 排除。
 # 切勿忽略 .agents/history/（no-tables 三段式还原的输入源），其下两份只读快照正常跟踪。
 .agents/notes/
+
+# codegraph-go 审查时在仓库根生成的本地索引，不入库、不污染 git status。
+.codegraph/

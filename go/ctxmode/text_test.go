@@ -60,6 +60,7 @@ func TestTimeoutForToolFetch(t *testing.T) {
 		{"ctx_kb", map[string]any{"action": "fetch"}, 180000},
 		{"ctx_kb", map[string]any{"action": "fetch", "timeout_ms": 200000}, 230000},
 		{"ctx_run", map[string]any{"action": "run_task", "timeout_ms": 400000}, 430000},
+		{"ctx_report", map[string]any{}, 45000},
 	} {
 		if got := timeoutForTool(tc.name, tc.args); got < tc.min {
 			t.Fatalf("got %d, want >=%d", got, tc.min)
@@ -125,7 +126,7 @@ func TestTimeoutAndRoleBoundaries(t *testing.T) {
 		name, action string
 		n, want      int
 	}{
-		{"ctx_run", "run_task", 0, 330000}, {"ctx_run", "execute", 0, 150000}, {"ctx_bg", "wait", 0, 75000}, {"ctx_git", "status", 0, 10}, {"ctx_run", "execute", 3600001, 3630001}, {"ctx_kb", "fetch", 9999999, 3660000},
+		{"ctx_run", "run_task", 0, 330000}, {"ctx_run", "execute", 0, 150000}, {"ctx_bg", "wait", 0, 75000}, {"ctx_report", "", 0, 45000}, {"ctx_git", "status", 0, 10}, {"ctx_run", "execute", 3600001, 3630001}, {"ctx_kb", "fetch", 9999999, 3660000},
 	} {
 		if got := timeoutForTool(tc.name, map[string]any{"action": tc.action, "timeout_ms": tc.n}); got != tc.want {
 			t.Fatalf("%+v got %d", tc, got)

@@ -248,6 +248,14 @@ func respond(c *CtxmodeClient, id int, text string) {
 	data, _ := json.Marshal(map[string]any{"id": id, "result": map[string]any{"content": []map[string]string{{"type": "text", "text": text}}}})
 	c.acceptResponseLocked(string(data))
 }
+
+// respondIsError is respond with the MCP result's isError flag set.
+func respondIsError(c *CtxmodeClient, id int, text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data, _ := json.Marshal(map[string]any{"id": id, "result": map[string]any{"isError": true, "content": []map[string]string{{"type": "text", "text": text}}}})
+	c.acceptResponseLocked(string(data))
+}
 func pendingCount(c *CtxmodeClient) int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.pending) }
 func decodeRequest(t *testing.T, s string) map[string]any {
 	t.Helper()
