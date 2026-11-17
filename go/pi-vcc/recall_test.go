@@ -487,6 +487,73 @@ func TestSearchEntries_Base64RunFilteredOnRegexPath(t *testing.T) {
 	}
 }
 
+// TestSearchEntries_BlobDocLeavesPlainOrderUnchanged is the Go twin of
+// tests/recall-output-cap.test.ts's "leaves the order of the other entries
+// unchanged" (0.11.2): dropping a doc whose content is a base64 run into the
+// corpus must not change the relative ranking of the plain docs. Without
+// searchableText the run would count as one word, collapse the corpus's
+// avgDL and shift every score; filtered to "…" it only lifts avgDL, which
+// BM25's ratio form absorbs uniformly.
+func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
+	// A short doc with one hit and a long doc with many: their order depends
+	// on the average doc length.
+	texts := []string{
+		"set max to 3",
+		strings.Repeat("filler ", 60) + " max max max max",
+		"the max retries value",
+		strings.Repeat("note ", 20) + " max max",
+	}
+	plainEntries := make([]RenderedEntry, 0, len(texts))
+	plainMessages := make([]map[string]any, 0, len(texts))
+	for i, text := range texts {
+		plainEntries = append(plainEntries, RenderedEntry{Index: i, Role: "user", Summary: text})
+		plainMessages = append(plainMessages, map[string]any{"role": "user", "content": text})
+	}
+	blobEntries := append(append([]RenderedEntry(nil), plainEntries...),
+		RenderedEntry{Index: 9, Role: "tool_result", Summary: "[other_tool]"})
+	blobMessages := append(append([]map[string]any(nil), plainMessages...),
+		map[string]any{"role": "toolResult", "toolName": "other_tool",
+			"content": []any{map[string]any{"type": "text", "text": "max " + encodedRun(2*1024*1024)}}})
+
+	order := func(entries []RenderedEntry, messages []map[string]any) []int {
+		out := make([]int, 0, len(entries))
+		for _, hit := range SearchEntries(entries, messages, "max") {
+			if hit.Index != 9 {
+				out = append(out, hit.Index)
+			}
+		}
+		return out
+	}
+	withBlob := order(blobEntries, blobMessages)
+	without := order(plainEntries, plainMessages)
+	if len(withBlob) == 0 || len(withBlob) != len(without) {
+		t.Fatalf("order changed shape: with blob %v, without %v", withBlob, without)
+	}
+	for i := range without {
+		if withBlob[i] != without[i] {
+			t.Fatalf("the blob doc changed the plain-doc order: %v → %v", without, withBlob)
+		}
+	}
+}
+
+// TestSearchEntries_JoinedIdentifiersStaySearchable is the Go twin of
+// "keeps long joined identifiers searchable" (0.11.2): a long word built
+// from concatenated identifiers carries both cases and digits in name
+// fragments, yet looksEncoded must not filter it — a substring of one
+// identifier still matches.
+func TestSearchEntries_JoinedIdentifiersStaySearchable(t *testing.T) {
+	joined := strings.Repeat("capturedNormalCompletionRecordOrdinaryObjectCreateDataProperty", 30)
+	entries := []RenderedEntry{{Index: 0, Role: "tool_result", Summary: ""}}
+	messages := []map[string]any{
+		{"role": "toolResult", "toolName": "bash",
+			"content": []any{map[string]any{"type": "text", "text": joined}}},
+	}
+	hits := SearchEntries(entries, messages, "OrdinaryObjectCreate")
+	if len(hits) != 1 || hits[0].Index != 0 {
+		t.Fatalf("the joined identifier was filtered: %#v", hits)
+	}
+}
+
 // ── format recall ───────────────────────────────────────────────────────────
 
 func TestShortPath(t *testing.T) {
