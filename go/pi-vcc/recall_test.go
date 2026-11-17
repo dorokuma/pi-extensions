@@ -490,10 +490,11 @@ func TestSearchEntries_Base64RunFilteredOnRegexPath(t *testing.T) {
 // TestSearchEntries_BlobDocLeavesPlainOrderUnchanged is the Go twin of
 // tests/recall-output-cap.test.ts's "leaves the order of the other entries
 // unchanged" (0.11.2): dropping a doc whose content is a base64 run into the
-// corpus must not change the relative ranking of the plain docs. Without
-// searchableText the run would count as one word, collapse the corpus's
-// avgDL and shift every score; filtered to "…" it only lifts avgDL, which
-// BM25's ratio form absorbs uniformly.
+// corpus must not change the relative ranking of the plain docs, and the run
+// itself must stay invisible to every query. Without searchableText the run
+// would count as one word, collapse the corpus's avgDL, shift every score and
+// match short terms inside the blob; filtered to "…" it only lifts avgDL,
+// which BM25's ratio form absorbs uniformly.
 func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
 	// A short doc with one hit and a long doc with many: their order depends
 	// on the average doc length.
@@ -509,11 +510,12 @@ func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
 		plainEntries = append(plainEntries, RenderedEntry{Index: i, Role: "user", Summary: text})
 		plainMessages = append(plainMessages, map[string]any{"role": "user", "content": text})
 	}
+	blob := encodedRun(2 * 1024 * 1024)
 	blobEntries := append(append([]RenderedEntry(nil), plainEntries...),
 		RenderedEntry{Index: 9, Role: "tool_result", Summary: "[other_tool]"})
 	blobMessages := append(append([]map[string]any(nil), plainMessages...),
 		map[string]any{"role": "toolResult", "toolName": "other_tool",
-			"content": []any{map[string]any{"type": "text", "text": "max " + encodedRun(2*1024*1024)}}})
+			"content": []any{map[string]any{"type": "text", "text": "max " + blob}}})
 
 	order := func(entries []RenderedEntry, messages []map[string]any) []int {
 		out := make([]int, 0, len(entries))
@@ -532,6 +534,27 @@ func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
 	for i := range without {
 		if withBlob[i] != without[i] {
 			t.Fatalf("the blob doc changed the plain-doc order: %v → %v", without, withBlob)
+		}
+	}
+
+	// searchableText must drop the run to "…": no query term — even a short
+	// substring living only inside the blob — may reach it through either the
+	// regex path or the BM25 path, and its match position must never surface
+	// in a snippet. Without the filter the blob is searchable text and a
+	// short term hits inside it hundreds of times.
+	if got := searchableText(blobMessages[4], blobEntries[4]); got != "max …" {
+		t.Fatalf("the blob doc was not filtered: %q…", got[:80])
+	}
+	needle := blob[len(blob)-5:]
+	for _, query := range []string{needle, needle + "+"} {
+		for i, hit := range SearchEntries(blobEntries, blobMessages, query) {
+			if hit.Index == 9 {
+				t.Fatalf("query %q matched inside the filtered blob (hit %d)", query, i)
+			}
+			if hit.HasSnippet && strings.Contains(hit.Snippet, needle) {
+				t.Fatalf("query %q leaked the filtered run into a snippet: %q",
+					query, hit.Snippet[:120])
+			}
 		}
 	}
 }
