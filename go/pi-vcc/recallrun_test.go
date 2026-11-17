@@ -454,10 +454,10 @@ func TestRunRecall_ExpandCapsAt50KB(t *testing.T) {
 		Action: RecallAction{Kind: ActionExpand, Indices: []int{0, 1, 2}},
 	}, view, recallHints)
 	if !strings.HasPrefix(out, "Warning: output clipped at ") {
-		t.Fatalf("an expand over 50 KB was not clipped:\n%.200s", out)
+		t.Fatalf("an expand over 50 KB was not clipped:\n%.200s", clip(out, 200))
 	}
 	if !strings.HasSuffix(out, "\n...[clipped at 50 KB]") {
-		t.Fatalf("the tail marker is missing:\n%s", out[len(out)-120:])
+		t.Fatalf("the tail marker is missing:\n%s", clip(out[len(out)-min(len(out), 120):], 120))
 	}
 	// The warning and marker add a bounded amount around the capped body.
 	if jsLen(out) > RecallOutputChars+512 {
@@ -465,7 +465,7 @@ func TestRunRecall_ExpandCapsAt50KB(t *testing.T) {
 	}
 	// The clipped body still starts with the first expanded entry.
 	if !strings.Contains(out, "#0 [user]") {
-		t.Fatalf("the first entry was lost:\n%.400s", out)
+		t.Fatalf("the first entry was lost:\n%.400s", clip(out, 400))
 	}
 }
 
@@ -477,7 +477,49 @@ func TestRunRecall_IgnoredNoteSurvivesTheCap(t *testing.T) {
 		Dropped: []string{"expand"},
 	}, view, recallHints)
 	if !strings.HasPrefix(out, "Ignored: expand.") {
-		t.Fatalf("the note is missing under the cap:\n%.200s", out)
+		t.Fatalf("the note is missing under the cap:\n%.200s", clip(out, 200))
+	}
+}
+
+// TestRunRecall_CapsA600KBSingleLine is the Go twin of
+// tests/recall-output-cap.test.ts's end-to-end shape (0.11.2 / issue #63):
+// one entry holds a ~600 KB single line that is not base64 (minified-style
+// text with separators), so searchableText keeps it whole and only the 50 KB
+// output cap bounds the recall. needle_mark sits inside the kept window so
+// the hit itself survives the clip.
+func TestRunRecall_CapsA600KBSingleLine(t *testing.T) {
+	// ~600 KB on one line: "a1,"/"b2," runs are not base64 (the commas break
+	// base64RunRe and the digit/upper/lower mix fails looksEncoded), so the
+	// search corpus keeps the line; only capOutput bounds the answer.
+	long := strings.Repeat("a1,", 400) + "needle_mark" + strings.Repeat("b2,", 199600)
+	sessionFile, entries := writeSessionFile(t,
+		`{"type":"message","id":"e1","parentId":"","message":{"role":"user","content":`+strconvQuote(long)+`}}`,
+	)
+	view := OpenRecallView(sessionFile, ScopeAll, fakeManager{branch: entries})
+
+	// Searching finds the entry through the unfiltered text.
+	search := RunRecall(RecallRequest{
+		Action: RecallAction{Kind: ActionSearch, Query: "needle_mark", Page: 1},
+	}, view, recallHints)
+	if !strings.Contains(search, "#0") || !strings.Contains(search, "needle_mark") {
+		t.Fatalf("the search lost the needle entry:\n%s", clip(search, 400))
+	}
+
+	// Expanding it renders the full line, which only the 50 KB cap stops.
+	out := RunRecall(RecallRequest{
+		Action: RecallAction{Kind: ActionExpand, Indices: []int{0}},
+	}, view, recallHints)
+	if !strings.HasPrefix(out, "Warning: output clipped at ") {
+		t.Fatalf("a ~600 KB entry was not clipped:\n%.200s", clip(out, 200))
+	}
+	if !strings.HasSuffix(out, "\n...[clipped at 50 KB]") {
+		t.Fatalf("the tail marker is missing:\n%s", clip(out[len(out)-min(len(out), 120):], 120))
+	}
+	if jsLen(out) > RecallOutputChars+512 {
+		t.Fatalf("the capped output is still %d units", jsLen(out))
+	}
+	if !strings.Contains(out, "#0 [user]") || !strings.Contains(out, "needle_mark") {
+		t.Fatalf("the hit was lost inside the clip:\n%.400s", clip(out, 400))
 	}
 }
 

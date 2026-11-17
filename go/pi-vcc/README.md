@@ -1,16 +1,16 @@
 # pi-vcc — PiG Go 移植
 
-将 `@sting8k/pi-vcc@0.11.1`（pi 的算法式对话压缩扩展）及其在 eqi12 上随附的两个本地
+将 `@sting8k/pi-vcc@0.11.2`（pi 的算法式对话压缩扩展）及其在 eqi12 上随附的两个本地
 补丁移植为 Go factory 扩展。压缩由 `session_before_compact` 产出的结构化摘要驱动，
 `vcc_recall` 工具/命令提供压缩前后内容的召回。**本目录只重写 pi-vcc 自身逻辑的 Go 版本，
 不改其对外契约。**
 
 ## 来源与加载约定
 
-- 原版：npm `@sting8k/pi-vcc@0.11.1`，`src/` 37 个 `.ts` 加根 `index.ts`，逐一有 Go 对应物
+- 原版：npm `@sting8k/pi-vcc@0.11.2`，`src/` 37 个 `.ts` 加根 `index.ts`，逐一有 Go 对应物
   （完整对照清单见 `go/reports/batch-4-pi-vcc.md` §3）。0.11.1 相对 0.10.2 的上游变更已同步，
-  摘要小节构成随之改变，见下文「摘要小节」；本轮同步的逐项落地对照（表 A–N）与实测证据见
-  `go/reports/batch-4b-sync-0.11.1.md`。
+  摘要小节构成随之改变，见下文「摘要小节」；0.11.1 与 0.11.2 两轮同步的逐项落地对照与实测证据见
+  `go/reports/batch-4b-sync-0.11.1.md` 与 `go/reports/batch-4c-sync-0.11.2.md`。
 - module：`github.com/dorokuma/pi-extensions/go/pi-vcc`，`go 1.26`，仅依赖标准库与
   `github.com/MichaelKinsy/PiG/extensions/sdk v0.0.0`。
 - 所有 Go 文件使用 `package pivcc`，入口为 `func Extension() *sdk.Extension`
@@ -39,7 +39,7 @@
 - `context` 事件把 auto-continue 的不可见续跑标记（按 `customType` 匹配）从 LLM 载荷里剔除；
   `before_agent_start` 清 pending auto-continue 定时器。
 
-## 摘要小节（0.11.1）
+## 摘要小节（0.11.1 起，0.11.2 未变）
 
 `formatSummary()` 按此顺序渲染，缺项整段省略：
 
@@ -76,16 +76,17 @@
 `buildRecallNoteRe()` 由该常量动态生成正则、`summarize.go:451` `StripRecallNote()` 在合并前剥离旧尾注，
 故尾注不随压缩叠加。测试：`patchRecallNote_test.go`。
 
-## 与 TS 0.11.1 的行为差异
+## 与 TS 0.11.2 的行为差异
 
 按"可观测行为"口径列；以下偏差均在代码注释或测试里钉住。完整差异清单见
-`go/reports/batch-4-pi-vcc.md` §10；同步到 0.11.1 后的差异复核与遗留项见
-`go/reports/batch-4b-sync-0.11.1.md`。
+`go/reports/batch-4-pi-vcc.md` §10；同步到 0.11.1 / 0.11.2 后的差异复核与遗留项分别见
+`go/reports/batch-4b-sync-0.11.1.md` 与 `go/reports/batch-4c-sync-0.11.2.md`。
 
-### D1 配置路径解析（`settings.go:79`）
+### D1 配置路径解析（`agentdir.go`）
 
-TS 固定读 `homedir()/.pi/agent/pi-vcc-config.json`；Go 侧 `AgentDir()`（`settings.go`）按
-`PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pi/agent` 解析，
+TS 固定读 `homedir()/.pi/agent/pi-vcc-config.json`；Go 侧 `AgentDir()`（`settings.go:91`，委托
+`agentdir.go` 的 `resolveAgentDir`）按
+`PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pig/agent` 解析，
 且 `SettingsPath()` 额外认 `$PI_VCC_CONFIG_PATH` 显式覆盖。目的是隔离 PiG 运行时绝不读写
 生产 `~/.pi/agent` 配置（迁移硬规则），也是测试围栏的基础（`extension_test.go` 的 `TestMain`
 把 `PI_VCC_CONFIG_PATH` 指向临时文件）。
@@ -120,7 +121,8 @@ TS 用 `new Intl.Segmenter(undefined, { granularity: "word" })` 数字，Go 无 
   被渲染成 `1.0`。
 
 未发现"Go 侧行为与 TS 不一致"的实质偏差；如发现，按 `go/reports/batch-4-pi-vcc.md` §5 的用例逐条对照定位，
-0.11.1 同步后的对照结果记在 `go/reports/batch-4b-sync-0.11.1.md`。
+0.11.1 / 0.11.2 同步后的对照结果分别记在 `go/reports/batch-4b-sync-0.11.1.md` 与
+`go/reports/batch-4c-sync-0.11.2.md`。
 
 ## 验证
 
@@ -139,6 +141,7 @@ ok github.com/dorokuma/pi-extensions/go/pi-vcc
 完整竞态输出 0 DATA RACE；测试与行为差异的逐条对照见 `go/reports/batch-4-pi-vcc.md`。
 隔离加载实测（`go/bin/pig-test -e ./pi-vcc`，`PIG_HOME=/root/.pig-test`）通过，`vcc_recall`
 工具在隔离会话中被实际调用并返回真实结果（见 batch-4 报告 §8；0.11.1 同步后的复测输出原文
-与退出码见 `go/reports/batch-4b-sync-0.11.1.md`）。
+与退出码见 `go/reports/batch-4b-sync-0.11.1.md`）。0.11.2 同步（`2eb4e7e`）与本轮文档/测试补齐
+的验证记录见 `go/reports/batch-4c-sync-0.11.2.md`。
 
 未提交、未部署。以上为 worker 验证，仍需 reviewer / verifier 独立核验。

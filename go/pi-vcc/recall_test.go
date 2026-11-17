@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+// clip shortens s to at most n bytes for failure diagnostics, so a shorter-
+// than-expected value cannot panic the test with a slice-out-of-range before
+// the real message is printed.
+func clip(s string, n int) string {
+	return s[:min(len(s), n)]
+}
+
 // Tests for the recall subsystem: src/core/recall-scope.ts, render-entries.ts,
 // search-entries.ts and format-recall.ts.
 
@@ -459,7 +466,7 @@ func TestSearchEntries_Base64RunCannotDominateBM25(t *testing.T) {
 	// The filtered run never reaches a snippet.
 	for _, hit := range hits {
 		if hit.HasSnippet && strings.Contains(hit.Snippet, run[:80]) {
-			t.Fatalf("the base64 run leaked into a snippet: %q", hit.Snippet[:120])
+			t.Fatalf("the base64 run leaked into a snippet: %q", clip(hit.Snippet, 120))
 		}
 	}
 }
@@ -484,6 +491,96 @@ func TestSearchEntries_Base64RunFilteredOnRegexPath(t *testing.T) {
 	hits = SearchEntries(entries, messages, "needle")
 	if len(hits) != 1 || hits[0].Index != 1 {
 		t.Fatalf("hits = %#v", hits)
+	}
+}
+
+// TestSearchEntries_BlobDocLeavesPlainOrderUnchanged is the Go twin of
+// tests/recall-output-cap.test.ts's "leaves the order of the other entries
+// unchanged" (0.11.2): dropping a doc whose content is a base64 run into the
+// corpus must not change the relative ranking of the plain docs, and the run
+// itself must stay invisible to every query. Without searchableText the run
+// would count as one word, collapse the corpus's avgDL, shift every score and
+// match short terms inside the blob; filtered to "…" it only lifts avgDL,
+// which BM25's ratio form absorbs uniformly.
+func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
+	// A short doc with one hit and a long doc with many: their order depends
+	// on the average doc length.
+	texts := []string{
+		"set max to 3",
+		strings.Repeat("filler ", 60) + " max max max max",
+		"the max retries value",
+		strings.Repeat("note ", 20) + " max max",
+	}
+	plainEntries := make([]RenderedEntry, 0, len(texts))
+	plainMessages := make([]map[string]any, 0, len(texts))
+	for i, text := range texts {
+		plainEntries = append(plainEntries, RenderedEntry{Index: i, Role: "user", Summary: text})
+		plainMessages = append(plainMessages, map[string]any{"role": "user", "content": text})
+	}
+	blob := encodedRun(2 * 1024 * 1024)
+	blobEntries := append(append([]RenderedEntry(nil), plainEntries...),
+		RenderedEntry{Index: 9, Role: "tool_result", Summary: "[other_tool]"})
+	blobMessages := append(append([]map[string]any(nil), plainMessages...),
+		map[string]any{"role": "toolResult", "toolName": "other_tool",
+			"content": []any{map[string]any{"type": "text", "text": "max " + blob}}})
+
+	order := func(entries []RenderedEntry, messages []map[string]any) []int {
+		out := make([]int, 0, len(entries))
+		for _, hit := range SearchEntries(entries, messages, "max") {
+			if hit.Index != 9 {
+				out = append(out, hit.Index)
+			}
+		}
+		return out
+	}
+	withBlob := order(blobEntries, blobMessages)
+	without := order(plainEntries, plainMessages)
+	if len(withBlob) == 0 || len(withBlob) != len(without) {
+		t.Fatalf("order changed shape: with blob %v, without %v", withBlob, without)
+	}
+	for i := range without {
+		if withBlob[i] != without[i] {
+			t.Fatalf("the blob doc changed the plain-doc order: %v → %v", without, withBlob)
+		}
+	}
+
+	// searchableText must drop the run to "…": no query term — even a short
+	// substring living only inside the blob — may reach it through either the
+	// regex path or the BM25 path, and its match position must never surface
+	// in a snippet. Without the filter the blob is searchable text and a
+	// short term hits inside it hundreds of times.
+	if got := searchableText(blobMessages[4], blobEntries[4]); got != "max …" {
+		t.Fatalf("the blob doc was not filtered: %q…", clip(got, 80))
+	}
+	needle := blob[len(blob)-5:]
+	for _, query := range []string{needle, needle + "+"} {
+		for i, hit := range SearchEntries(blobEntries, blobMessages, query) {
+			if hit.Index == 9 {
+				t.Fatalf("query %q matched inside the filtered blob (hit %d)", query, i)
+			}
+			if hit.HasSnippet && strings.Contains(hit.Snippet, needle) {
+				t.Fatalf("query %q leaked the filtered run into a snippet: %q",
+					query, clip(hit.Snippet, 120))
+			}
+		}
+	}
+}
+
+// TestSearchEntries_JoinedIdentifiersStaySearchable is the Go twin of
+// "keeps long joined identifiers searchable" (0.11.2): a long word built
+// from concatenated identifiers carries both cases and digits in name
+// fragments, yet looksEncoded must not filter it — a substring of one
+// identifier still matches.
+func TestSearchEntries_JoinedIdentifiersStaySearchable(t *testing.T) {
+	joined := strings.Repeat("capturedNormalCompletionRecordOrdinaryObjectCreateDataProperty", 30)
+	entries := []RenderedEntry{{Index: 0, Role: "tool_result", Summary: ""}}
+	messages := []map[string]any{
+		{"role": "toolResult", "toolName": "bash",
+			"content": []any{map[string]any{"type": "text", "text": joined}}},
+	}
+	hits := SearchEntries(entries, messages, "OrdinaryObjectCreate")
+	if len(hits) != 1 || hits[0].Index != 0 {
+		t.Fatalf("the joined identifier was filtered: %#v", hits)
 	}
 }
 
