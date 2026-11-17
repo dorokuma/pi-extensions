@@ -73,7 +73,7 @@ date: 2026-11-17
 | 提交 | Go 落点 | 说明 |
 |---|---|---|
 | `0258c34`（context_edit） | `beforecompact.go:358` `contextEditSpec`、`:369` `collectContextEdits`、`:398` `applyContextEditToMessage`、`:427` `appendLiveMessage` | `CollectLiveMessages`（`:456` 起）不再一遇 `context_edit` 即返回 nil，改为应用 Pi/PiG 的 omit-or-replace 语义，pig worker 会话可压缩；`settings.go` `AgentDir()` 优先 `sdk.AgentDir()`（`PIG_EXT_HOST_INFO.agentDir`） |
-| `9807ddf`（agentdir） | **新增** `agentdir.go:30` `resolveAgentDir`、`:52` `expandAgentDirHome`；`settings.go:91` `AgentDir` 委托之、`settings.go:84` `SettingsPath` 拼 `pi-vcc-config.json` | 解析链 `PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pig/agent`，**绝不回退 `~/.pi`**；README 差异 D1 已据此处更正 |
+| `9807ddf`（agentdir） | **新增** `agentdir.go:30` `resolveAgentDir`、`:52` `expandAgentDirHome`；`settings.go:91` `AgentDir` 委托之、`settings.go:80` `SettingsPath` 拼 `pi-vcc-config.json` | 解析链 `PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` → `$PIG_HOME/agent` → `~/.pig/agent`，**绝不回退 `~/.pi`**；README 差异 D1 已据此处更正 |
 | `b287a63`（recover） | `hook.go:374` `globalIndexFor` 内 `:379` `defer func() { recover() }`；`hook.go:311` 另有一处 `recover` | 会话树异常时 `#N` 索引回退为空表而不是让 recall panic |
 | `264743b` / `aafbbc0` | `tokenestimate_test.go` | `settings` 路径测试的环境变量隔离（`PIG_EXT_HOST_INFO` 与 coding-agent-dir 覆盖项清理），属测试基建，无生产语义 |
 
@@ -132,7 +132,7 @@ install-test / examples-*`，本轮按任务书执行 `go vet` + `go test`（显
 - 未部署、未触碰 `/root/.pi|/.pig/agent/extensions` 任何部署副本；未合并、未推送。
 - 行号引用（`recallrun.go:22,173,179`、`searchentries.go:226,232,255,322,327,352,567,594,623`、
   `extension.go:47,57,61`、`beforecompact.go:358,369,398,427,456`、`agentdir.go:30,52`、
-  `settings.go:84,91`、`hook.go:311,374,379`）均为本分支 HEAD 实测，未抄外部报告。
+  `settings.go:80,91`、`hook.go:311,374,379`）均为本分支 HEAD 实测，未抄外部报告。
 
 ## 8. 遗留 / 未做
 
