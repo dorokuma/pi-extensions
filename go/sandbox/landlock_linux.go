@@ -262,6 +262,13 @@ type pathRuleEntry struct {
 	transient bool
 }
 
+// errSeccompFilterInstalled 标记 seccomp PROT_EXEC 过滤器已装入当前进程
+// 之后发生的下游失败（notify FD 转发给 helper 失败）。过滤器一经安装即
+// 不可撤销：即使 BestEffort 也不得降级继续——否则后续 PROT_EXEC 映射会
+// 永远阻塞在等待无人服务的 notify 应答上。该标记只用于内部分型，不构成
+// 新的公开协议；Apply 返回的错误仍包装 ErrSeccomp。
+var errSeccompFilterInstalled = errors.New("seccomp PROT_EXEC filter already installed (unrecoverable)")
+
 func applyPolicy(p Policy) error {
 	if err := p.Validate(); err != nil {
 		return err
@@ -305,7 +312,10 @@ func applyPolicy(p Policy) error {
 	// BestEffort 模式下输出告警并降级继续施加 Landlock 规则。
 	if len(p.Exec) > 0 {
 		if err := setupHelperAndSeccomp(p, goExecDir, realGoBin); err != nil {
-			if !p.BestEffort {
+			// 过滤器已装入本进程（post-install）的失败不可撤销：任何模式
+			// （含 BestEffort）都必须上抛，拒绝继续；安装前失败仍遵循
+			// BestEffort 降级契约。
+			if !p.BestEffort || errors.Is(err, errSeccompFilterInstalled) {
 				return fmt.Errorf("%w: %v", ErrSeccomp, err)
 			}
 			p.warnf("sandbox: seccomp PROT_EXEC guard unavailable (%v); degrading without ld-linux mmap restriction", err)
@@ -342,7 +352,9 @@ func setupHelperAndSeccomp(p Policy, goExecDir, realGoBin string) error {
 
 	if err := sendNotifyFDToHelper(ctrlFD, notifyFD); err != nil {
 		_ = unix.Close(notifyFD)
-		if (!p.BestEffort || goExecDir == "") && lifeWFD >= 0 {
+		// fail-closed：关闭存活管道终止 helper，避免留下无 seccomp
+		// 守卫的 broker/辅助进程继续服务。
+		if lifeWFD >= 0 {
 			_ = unix.Close(lifeWFD)
 		}
 		return fmt.Errorf("transfer seccomp notify fd to helper: %w", err)
@@ -795,6 +807,10 @@ type helperConfig struct {
 	NonExecRWDirs     []string `json:"non_exec_rw"`
 	EntryAgents       []string `json:"entry_agents"`
 	HasBroker         bool     `json:"has_broker"`
+	// BestEffort 透传父策略降级口径：缺省 false 会让 helper 对 BestEffort
+	// 策略内的瞬态缺失路径（OptionalReadWrite 之外的 ENOENT）fail-closed，
+	// 与父进程已接受的降级语义不一致（oracle FM-5）。
+	BestEffort bool `json:"best_effort"`
 }
 
 func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error) {
@@ -842,6 +858,19 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error)
 			}
 			_ = unixLn.Close()
 		}
+		if !hasBroker {
+			// 请求了 Go 构建代理但监听器未能建立：fail-closed，
+			// 不得悄悄以无 broker 形态继续启动。
+			_ = lifeR.Close()
+			_ = unix.Close(lifeWFD)
+			_ = unix.Close(ctrlParentFD)
+			_ = ctrlChildFile.Close()
+			if brokerSockFile != nil {
+				_ = brokerSockFile.Close()
+			}
+			_ = os.Remove(sockPath)
+			return -1, -1, fmt.Errorf("create go broker listener at %q failed", sockPath)
+		}
 	}
 
 	cfg := helperConfig{
@@ -855,6 +884,7 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error)
 		NonExecRWDirs:     computeNonExecRWDirs(p),
 		EntryAgents:       append([]string(nil), p.EntryAgents...),
 		HasBroker:         hasBroker,
+		BestEffort:        p.BestEffort,
 	}
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
@@ -900,43 +930,105 @@ func startHelperProcess(p Policy, goExecDir, realGoBin string) (int, int, error)
 		_ = brokerSockFile.Close()
 	}
 
+	waitCh := make(chan error, 1)
 	go func() {
-		_ = cmd.Wait()
+		waitCh <- cmd.Wait()
 	}()
 
 	var ack [1]byte
-	if _, err := unix.Read(ctrlParentFD, ack[:]); err != nil {
+	n, err := readRetryEINTR(ctrlParentFD, ack[:])
+	if err != nil || n != 1 || ack[0] != '1' {
+		// helper 就绪握手失败：读错误、EOF（n=0）或非 '1' 字节均视为
+		// 拒绝启动。杀死子进程并 wait 收割，完整回收控制与存活管道。
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		_ = unix.Close(ctrlParentFD)
 		_ = unix.Close(lifeWFD)
-		return -1, -1, err
+		_ = <-waitCh
+		if err != nil {
+			return -1, -1, fmt.Errorf("read helper readiness ack: %w", err)
+		}
+		return -1, -1, fmt.Errorf("helper rejected startup (ack: n=%d byte=%q)", n, ack[0])
 	}
 	return ctrlParentFD, lifeWFD, nil
 }
 
+// readRetryEINTR 包装阻塞式 unix.Read：Go 运行时的异步抢占信号 SIGURG
+// 会打断无 SA_RESTART 的 socket/pipe 读，EINTR 属可重试中断而非失败，
+// 未包裹时会被误判为 helper 握手 IO 失败（oracle FM-5）。
+func readRetryEINTR(fd int, b []byte) (int, error) {
+	for {
+		n, err := unix.Read(fd, b)
+		if !errors.Is(err, unix.EINTR) {
+			return n, err
+		}
+	}
+}
+
 func sendNotifyFDToHelper(ctrlFD int, notifyFD int) error {
 	oob := unix.UnixRights(notifyFD)
-	if err := unix.Sendmsg(ctrlFD, []byte("N"), oob, nil, 0); err != nil {
-		return err
+	var err error
+	for {
+		err = unix.Sendmsg(ctrlFD, []byte("N"), oob, nil, 0)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("send seccomp notify fd: %w: %w", errSeccompFilterInstalled, err)
 	}
 	var ack [1]byte
-	_, err := unix.Read(ctrlFD, ack[:])
-	return err
+	n, err := readRetryEINTR(ctrlFD, ack[:])
+	if err != nil {
+		return fmt.Errorf("read helper notify-fd ack: %w: %w", errSeccompFilterInstalled, err)
+	}
+	if n != 1 || ack[0] != '1' {
+		return fmt.Errorf("helper rejected seccomp notify fd (ack: n=%d byte=%q): %w", n, ack[0], errSeccompFilterInstalled)
+	}
+	return nil
+}
+
+// helperFailf 报告辅助进程启动失败并退出（退出码 1，区别于就绪 ACK）。
+// 关闭控制通道使父进程读 ACK 收到 EOF/非 '1'，再关闭存活管道退出。
+func helperFailf(ctrlFD int, lifeR *os.File, brokerLn net.Listener, format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "sandbox helper: "+format+"\n", args...)
+	if ctrlFD >= 0 {
+		_ = unix.Close(ctrlFD)
+		ctrlFD = -1
+	}
+	if lifeR != nil {
+		_ = lifeR.Close()
+	}
+	if brokerLn != nil {
+		_ = brokerLn.Close()
+	}
+	os.Exit(1)
 }
 
 func runHelperProcess() {
+	// 控制通道与存活管道从 ExtraFiles 继承；缺失即无法向父进程报到，直接退出。
+	lifeR := os.NewFile(3, "life-r")
+	ctrlFD := 4
+	if lifeR == nil {
+		fmt.Fprintln(os.Stderr, "sandbox helper: missing inherited lifetime pipe")
+		os.Exit(1)
+	}
+	unix.CloseOnExec(3)
+	unix.CloseOnExec(ctrlFD)
+
+	fail := func(format string, args ...any) {
+		helperFailf(ctrlFD, lifeR, nil, format, args...)
+	}
+
 	rawCfg := os.Getenv(envBrokerCfgKey)
 	if rawCfg == "" {
-		return
+		fail("missing %s configuration", envBrokerCfgKey)
 	}
 	var cfg helperConfig
 	if err := json.Unmarshal([]byte(rawCfg), &cfg); err != nil {
-		return
+		fail("invalid %s configuration: %v", envBrokerCfgKey, err)
 	}
-
-	lifeR := os.NewFile(3, "life-r")
-	ctrlFD := 4
-	unix.CloseOnExec(3)
-	unix.CloseOnExec(ctrlFD)
 
 	var brokerLn net.Listener
 	if cfg.HasBroker {
@@ -949,35 +1041,49 @@ func runHelperProcess() {
 			}
 			_ = f.Close()
 		}
+		if brokerLn == nil {
+			fail("re-attach broker listener failed")
+		}
 	}
 
 	// 1. 辅助进程自身施加 Landlock 约束，仅额外允许向 goExecDir/work 与 goExecDir/cache 写入编译产物。
-	if abi, ok := supported(); ok {
-		helperRW := append([]string{}, cfg.ReadWrite...)
-		if cfg.GoExecDir != "" {
-			helperRW = append(helperRW,
-				filepath.Join(cfg.GoExecDir, "work"),
-				filepath.Join(cfg.GoExecDir, "cache"),
-			)
-		}
-		helperPolicy := Policy{
-			ReadOnly:          cfg.ReadOnly,
-			ReadWrite:         helperRW,
-			OptionalReadWrite: cfg.OptionalReadWrite,
-			Exec:              cfg.Exec,
-			DenyNet:           cfg.DenyNet,
-		}
-		if rulesetFD, err := createAndPopulateRuleset(helperPolicy, abi, true, cfg.DenyNet && abi >= 4); err == nil {
-			_ = enforceRuleset(rulesetFD)
-			_ = unix.Close(rulesetFD)
-		}
+	// 任一步失败即 fail-closed：helper 不得在未受限状态下 ACK 并对外提供服务。
+	abi, ok := supported()
+	if !ok {
+		fail("landlock not supported")
 	}
+	helperRW := append([]string{}, cfg.ReadWrite...)
+	if cfg.GoExecDir != "" {
+		helperRW = append(helperRW,
+			filepath.Join(cfg.GoExecDir, "work"),
+			filepath.Join(cfg.GoExecDir, "cache"),
+		)
+	}
+	helperPolicy := Policy{
+		ReadOnly:          cfg.ReadOnly,
+		ReadWrite:         helperRW,
+		OptionalReadWrite: cfg.OptionalReadWrite,
+		Exec:              cfg.Exec,
+		DenyNet:           cfg.DenyNet,
+		BestEffort:        cfg.BestEffort,
+	}
+	rulesetFD, err := createAndPopulateRuleset(helperPolicy, abi, true, cfg.DenyNet && abi >= 4)
+	if err != nil {
+		fail("create landlock ruleset: %v", err)
+	}
+	if err := enforceRuleset(rulesetFD); err != nil {
+		_ = unix.Close(rulesetFD)
+		fail("enforce landlock ruleset: %v", err)
+	}
+	_ = unix.Close(rulesetFD)
 
 	// 2. 辅助进程为自身派生的子进程（如 go test）安装 seccomp PROT_EXEC 守卫。
-	if selfNotifyFD, err := installSeccompExecGuard(); err == nil && selfNotifyFD >= 0 {
-		unix.CloseOnExec(selfNotifyFD)
-		go serveSeccompNotifications(selfNotifyFD, cfg.NonExecRWDirs, cfg.EntryAgents)
+	selfNotifyFD, err := installSeccompExecGuard()
+	if err != nil || selfNotifyFD < 0 {
+		fail("install seccomp exec guard: %v", err)
 	}
+	unix.CloseOnExec(selfNotifyFD)
+	go serveSeccompNotifications(selfNotifyFD, cfg.NonExecRWDirs, cfg.EntryAgents)
 
 	if brokerLn != nil {
 		go serveGoBroker(brokerLn, cfg)
@@ -986,12 +1092,21 @@ func runHelperProcess() {
 	// 通知父进程辅助进程已就绪
 	_, _ = unix.Write(ctrlFD, []byte("1"))
 
-	// 接收父进程传递过来的 seccomp notifyFD
+	// 接收父进程传递过来的 seccomp notifyFD；仅当完整收到 notify FD
+	// 并启动 serving goroutine 后才向父进程回 ACK，任一步骤失败则
+	// 不写入字节——父进程将 EOF/非 '1' 视为握手失败并终止本进程。
 	go func() {
 		defer unix.Close(ctrlFD)
 		buf := make([]byte, 16)
 		oob := make([]byte, unix.CmsgSpace(4))
-		_, oobn, _, _, err := unix.Recvmsg(ctrlFD, buf, oob, 0)
+		var oobn int
+		var err error
+		for {
+			_, oobn, _, _, err = unix.Recvmsg(ctrlFD, buf, oob, 0)
+			if !errors.Is(err, unix.EINTR) {
+				break
+			}
+		}
 		if err != nil || oobn <= 0 {
 			return
 		}
@@ -999,14 +1114,19 @@ func runHelperProcess() {
 		if err != nil {
 			return
 		}
+		received := false
 		for _, scm := range scms {
 			fds, err := unix.ParseUnixRights(&scm)
 			if err == nil {
 				for _, fd := range fds {
 					unix.CloseOnExec(fd)
 					go serveSeccompNotifications(fd, cfg.NonExecRWDirs, cfg.EntryAgents)
+					received = true
 				}
 			}
+		}
+		if !received {
+			return
 		}
 		_, _ = unix.Write(ctrlFD, []byte("1"))
 	}()
@@ -1339,32 +1459,48 @@ func runTestRunnerClient(goExecDir string) int {
 	}
 
 	// 在启动测试二进制前叠加审查员自身的 Landlock 规则集，收回对 goExecDir/work 与 goExecDir/cache 的写权限。
-	var reviewerRW []string
-	if rawCfg := os.Getenv(envBrokerCfgKey); rawCfg != "" {
-		var cfg helperConfig
-		if err := json.Unmarshal([]byte(rawCfg), &cfg); err == nil {
-			if abi, ok := supported(); ok {
-				reviewerPolicy := Policy{
-					ReadOnly:          cfg.ReadOnly,
-					ReadWrite:         cfg.ReadWrite,
-					OptionalReadWrite: cfg.OptionalReadWrite,
-					Exec:              cfg.Exec,
-					DenyNet:           cfg.DenyNet,
-				}
-				if rulesetFD, err := createAndPopulateRuleset(reviewerPolicy, abi, true, cfg.DenyNet && abi >= 4); err == nil {
-					_ = enforceRuleset(rulesetFD)
-					_ = unix.Close(rulesetFD)
-				}
-			}
-			reviewerRW = cfg.ReadWrite
-		}
+	// fail-closed：配置缺失/损坏或任一限制步骤失败即拒绝执行目标二进制，绝不裸 exec。
+	rawCfg := os.Getenv(envBrokerCfgKey)
+	if rawCfg == "" {
+		fmt.Fprintf(os.Stderr, "pi-test-runner: missing %s configuration\n", envBrokerCfgKey)
+		return 126
 	}
+	var cfg helperConfig
+	if err := json.Unmarshal([]byte(rawCfg), &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "pi-test-runner: invalid %s configuration: %v\n", envBrokerCfgKey, err)
+		return 126
+	}
+	abi, ok := supported()
+	if !ok {
+		fmt.Fprintln(os.Stderr, "pi-test-runner: landlock not supported")
+		return 126
+	}
+	reviewerPolicy := Policy{
+		ReadOnly:          cfg.ReadOnly,
+		ReadWrite:         cfg.ReadWrite,
+		OptionalReadWrite: cfg.OptionalReadWrite,
+		Exec:              cfg.Exec,
+		DenyNet:           cfg.DenyNet,
+		BestEffort:        cfg.BestEffort,
+	}
+	rulesetFD, err := createAndPopulateRuleset(reviewerPolicy, abi, true, cfg.DenyNet && abi >= 4)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pi-test-runner: create landlock ruleset failed: %v\n", err)
+		return 126
+	}
+	if err := enforceRuleset(rulesetFD); err != nil {
+		_ = unix.Close(rulesetFD)
+		fmt.Fprintf(os.Stderr, "pi-test-runner: enforce landlock ruleset failed: %v\n", err)
+		return 126
+	}
+	_ = unix.Close(rulesetFD)
 
-	// 将 GOTMPDIR 与 GOCACHE 恢复为审查员私有临时目录下的路径
+	// 将 GOTMPDIR 与 GOCACHE 恢复为审查员私有临时目录下的路径：私有目录
+	// 从环境 TMPDIR 判定（ReviewerAgentWithEnv/ReadOnlyReviewer 已注入
+	// TMPDIR=<privateTmpDir>），不再硬编码用 reviewerRW[1]——ReadWrite
+	// 列表已移除 <workdir>/reports（oracle SF-2），按位置取会错位。
 	env := os.Environ()
-	if len(reviewerRW) >= 2 {
-		privateTmp := reviewerRW[1]
-		env = overrideEnvKey(env, "TMPDIR", privateTmp)
+	if privateTmp := lookupEnvValue(env, "TMPDIR"); privateTmp != "" {
 		env = overrideEnvKey(env, "GOTMPDIR", filepath.Join(privateTmp, "go-tmp"))
 		env = overrideEnvKey(env, "GOCACHE", filepath.Join(privateTmp, "go-cache"))
 	}

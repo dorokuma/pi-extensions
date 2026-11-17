@@ -265,7 +265,7 @@ func TestInjectPigCodingAgentDirPiDirs(t *testing.T) {
 		t.Setenv("PIG_USE_PI_DIRS", "1")
 		unsetEnv(t, "PI_CODING_AGENT_DIR")
 		unsetEnv(t, "PIG_CODING_AGENT_DIR")
-		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private)
+		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private, nil)
 		m := parseEnvSlice(got)
 		if m["PIG_CODING_AGENT_DIR"] != private {
 			t.Fatalf("PIG_CODING_AGENT_DIR = %q", m["PIG_CODING_AGENT_DIR"])
@@ -280,59 +280,75 @@ func TestInjectPigCodingAgentDirPiDirs(t *testing.T) {
 		unsetEnv(t, "PI_CODING_AGENT_DIR")
 		unsetEnv(t, "PIG_CODING_AGENT_DIR")
 		env := append(append([]string(nil), baseEnv...), "PIG_USE_PI_DIRS=1")
-		got := injectPigCodingAgentDir(env, private)
+		got := injectPigCodingAgentDir(env, private, nil)
 		m := parseEnvSlice(got)
 		if m["PI_CODING_AGENT_DIR"] != private {
 			t.Fatalf("expected PI_CODING_AGENT_DIR injected via Policy.Env flag, env=%v", got)
 		}
 	})
 
-	t.Run("PI_CODING_AGENT_DIR already set in env not overridden", func(t *testing.T) {
+	t.Run("PI_CODING_AGENT_DIR stale env value is overridden by private dir", func(t *testing.T) {
+		// 宿主残留/非 cfgEnv 显式声明的 PI_CODING_AGENT_DIR（如被塞进
+		// Policy.Env 的旧值或宿主环境变量）不得被 pig 包装器后置的
+		// export PIG_USE_PI_DIRS=1 激活，必须无条件回钉私有目录。
 		t.Setenv("PIG_USE_PI_DIRS", "1")
 		unsetEnv(t, "PIG_CODING_AGENT_DIR")
 		env := append(append([]string(nil), baseEnv...), "PI_CODING_AGENT_DIR=/custom/pi-agent")
-		got := injectPigCodingAgentDir(env, private)
+		got := injectPigCodingAgentDir(env, private, nil)
 		m := parseEnvSlice(got)
-		if m["PI_CODING_AGENT_DIR"] != "/custom/pi-agent" {
-			t.Fatalf("PI_CODING_AGENT_DIR must be preserved, got %q", m["PI_CODING_AGENT_DIR"])
+		if m["PI_CODING_AGENT_DIR"] != private {
+			t.Fatalf("stale PI_CODING_AGENT_DIR must be pinned to private, got %q", m["PI_CODING_AGENT_DIR"])
 		}
 	})
 
-	t.Run("PI_CODING_AGENT_DIR host env not overridden", func(t *testing.T) {
+	t.Run("PI_CODING_AGENT_DIR host env overridden by private dir", func(t *testing.T) {
+		// 宿主环境 PI_CODING_AGENT_DIR（未在 cfgEnv 显式声明、未激活
+		// PIG_USE_PI_DIRS 自定义语境）会被包装器后来启用 PIG_USE_PI_DIRS
+		// 时激活，必须回钉为私有目录。
 		t.Setenv("PIG_USE_PI_DIRS", "1")
 		t.Setenv("PI_CODING_AGENT_DIR", "/host/pi-agent")
 		unsetEnv(t, "PIG_CODING_AGENT_DIR")
-		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private)
+		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private, nil)
 		m := parseEnvSlice(got)
-		if m["PI_CODING_AGENT_DIR"] != "" {
-			t.Fatalf("PI_CODING_AGENT_DIR must not be injected when host env set, got %q", m["PI_CODING_AGENT_DIR"])
+		if m["PI_CODING_AGENT_DIR"] != private {
+			t.Fatalf("host PI_CODING_AGENT_DIR must be pinned to private, got %q", m["PI_CODING_AGENT_DIR"])
 		}
 		if m["PIG_CODING_AGENT_DIR"] != private {
 			t.Fatalf("PIG_CODING_AGENT_DIR = %q", m["PIG_CODING_AGENT_DIR"])
 		}
 	})
 
-	t.Run("PIG_USE_PI_DIRS unset no symmetric injection", func(t *testing.T) {
+	t.Run("PIG_USE_PI_DIRS unset both pinned to private dir", func(t *testing.T) {
+		// 新口径：未设 PIG_USE_PI_DIRS 时默认同时注入双变量，均回钉私有
+		// 目录——防止 pig 包装器后置 export PIG_USE_PI_DIRS=1 激活宿主残留。
 		unsetEnv(t, "PIG_USE_PI_DIRS")
 		unsetEnv(t, "PI_CODING_AGENT_DIR")
 		unsetEnv(t, "PIG_CODING_AGENT_DIR")
-		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private)
+		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private, nil)
 		m := parseEnvSlice(got)
-		if m["PI_CODING_AGENT_DIR"] != "" {
-			t.Fatalf("PI_CODING_AGENT_DIR must not be injected without PIG_USE_PI_DIRS, got %v", got)
+		if m["PI_CODING_AGENT_DIR"] != private {
+			t.Fatalf("PI_CODING_AGENT_DIR must be injected to private by default, env=%v", got)
 		}
 		if m["PIG_CODING_AGENT_DIR"] != private {
 			t.Fatalf("PIG_CODING_AGENT_DIR = %q", m["PIG_CODING_AGENT_DIR"])
 		}
 	})
 
-	t.Run("PIG_CODING_AGENT_DIR set short-circuits both", func(t *testing.T) {
+	t.Run("PIG_CODING_AGENT_DIR host env overridden; cfgEnv explicit custom preserved", func(t *testing.T) {
+		// 宿主 PIG_CODING_AGENT_DIR 属残留面：非 cfgEnv 显式声明时一律
+		// 回钉私有目录（防宿主残留被包装器后置 PIG_USE_PI_DIRS=1 激活）。
 		t.Setenv("PIG_USE_PI_DIRS", "1")
 		t.Setenv("PIG_CODING_AGENT_DIR", "/custom/agent")
-		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private)
+		got := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private, nil)
 		m := parseEnvSlice(got)
-		if m["PIG_CODING_AGENT_DIR"] != "" || m["PI_CODING_AGENT_DIR"] != "" {
-			t.Fatalf("explicit PIG_CODING_AGENT_DIR must short-circuit, env=%v", got)
+		if m["PIG_CODING_AGENT_DIR"] != private {
+			t.Fatalf("host PIG_CODING_AGENT_DIR must be pinned to private, got %q", m["PIG_CODING_AGENT_DIR"])
+		}
+		// cfgEnv 显式声明非空 PIG_CODING_AGENT_DIR 时保持其优先级（可信自定义）。
+		got2 := injectPigCodingAgentDir(append([]string(nil), baseEnv...), private, []string{"PIG_CODING_AGENT_DIR=/custom/agent"})
+		m2 := parseEnvSlice(got2)
+		if m2["PIG_CODING_AGENT_DIR"] != "" {
+			t.Fatalf("cfgEnv explicit PIG_CODING_AGENT_DIR must not be overridden by inject, got %q", m2["PIG_CODING_AGENT_DIR"])
 		}
 	})
 }
@@ -1340,6 +1356,10 @@ func TestStderrScanWriterSplitMarker(t *testing.T) {
 // SIGINT 时取消子进程 ctx、SIGKILL 整个进程组，让函数正常退栈跑完
 // 所有 defer（/tmp/sbx-warm-* 零残留、释放锁），返回 130 给 runMain 退出。
 func TestWarmGoExtensionCellsSignalInterrupt(t *testing.T) {
+	// 隔离 TMPDIR：预热临时目录走 os.MkdirTemp("", "sbx-warm-*") 遵循
+	// os.TempDir()，用独立目录避免宿主 /tmp 中历史诊断文件
+	// （如 sbx-warm-scratch-repair-*.txt）污染零残留 glob 断言。
+	t.Setenv("TMPDIR", t.TempDir())
 	fx := newWarmTestFixture(t, "", true)
 	hangScript := fmt.Sprintf(`#!/bin/sh
 echo $$ > '%[1]s.pid'
@@ -2144,3 +2164,56 @@ func TestAppendAgyStateReadWriteMarksRootFilesOptional(t *testing.T) {
 // 参数取代 trustedHomeDir()，使「隔离 HOME 下宿主受信安装根/收录面」相关
 // 断言能用 t.TempDir() 夹具确定性实跑，摆脱宿主真实 claude/agy 安装状态。
 var ResolveEntryAgentPathsForTest = resolveEntryAgentPaths
+
+// TestReviewerAgentCellTargetErrorNodeRuntimeGate 覆盖 oracle FM-2C：
+// reviewer-agent cell 目标集 fail-closed 必须按 language=go 且可执行产物
+// 过滤——宿主 cache 仅有 node-runtime-*（language:"node"）产物而 Go 扩展
+// 存在时，total 不得被 node cell 充数假通过，ReviewerAgentCellTargetError
+// 必须返回错误（冷缓存下 Go cell 缺失应 fail-closed）。
+func TestReviewerAgentCellTargetErrorNodeRuntimeGate(t *testing.T) {
+	// 隔离宿主 pig home：构造仅含 Go 扩展源码 + node-runtime cell 的假 PIG_HOME。
+	fakePigHome := t.TempDir()
+	agentDir := filepath.Join(fakePigHome, "agent")
+	goExtDir := filepath.Join(agentDir, "extensions", "fake-go-ext")
+	if err := os.MkdirAll(goExtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goExtDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(fakePigHome, "cache")
+	// 仅 node-runtime 产物（language:"node"），无任何 Go cell。
+	writeFakeCellEntry(t, filepath.Join(cacheRoot, "ext", "node-runtime-deadbeef01"), "deadbeef01", "bin", "node")
+
+	t.Setenv("PIG_HOME", fakePigHome)
+	unsetEnv(t, "PIG_CODING_AGENT_DIR")
+	unsetEnv(t, "PI_CODING_AGENT_DIR")
+	unsetEnv(t, "PIG_USE_PI_DIRS")
+
+	workdir := t.TempDir()
+	policy := ReviewerAgentWithEnv(workdir, nil)
+	// 手动清理 pi-reviewer-* 私有临时目录（内部包无 cleanupReviewerTempDirs）。
+	t.Cleanup(func() {
+		for _, kv := range policy.Env {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "TMPDIR" && strings.Contains(v, "pi-reviewer-") {
+				_ = os.RemoveAll(v)
+			}
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "PI_SANDBOX_GO_EXEC_DIR" && strings.Contains(v, "pi-reviewer-exec-") {
+				_ = os.RemoveAll(v)
+			}
+		}
+	})
+
+	// hasGoExt 必须为 true（Go 扩展存在）；total 必须是 0（node cell 不计入）。
+	hasGoExt, total, _ := ReviewerAgentCellTargets()
+	if !hasGoExt {
+		t.Fatalf("hasGoExt = false, want true (Go extension present)")
+	}
+	if total != 0 {
+		t.Fatalf("total = %d, want 0: node-runtime cell must not count toward Go target set", total)
+	}
+	// fail-closed：有 Go 扩展但无有效 Go 产物 → 返回错误拒绝启动。
+	if err := ReviewerAgentCellTargetError(); err == nil {
+		t.Fatalf("ReviewerAgentCellTargetError = nil, want error: node-runtime cell must not satisfy Go cell completeness gate")
+	}
+}

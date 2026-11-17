@@ -6,6 +6,29 @@
 
 ### Added
 
+- **reviewer-agent fd3（claude-pty debugW）CLOEXEC 收口 + ExtraFiles 单路转发**：
+  `runMain` 入口对 agent 预设继承的 fd3 置 `FD_CLOEXEC`（`sealInheritedFD3`），
+  杜绝其泄漏进 `MaybeWarmGoExtensionCells` 预热子进程、`codegraph-go
+  -warm-daemon` 常驻 daemon、`reportRelay` 的 `hc send` 及 `sandbox.Apply`
+  派生的 helper/broker（无 CLOEXEC 的 debugW 写端被常驻 daemon 继承会永久
+  劫持 `claude-pty` `drainDebug` 的 EOF）。`newChildCmd` 与 `runAsSandboxInit`
+  经 `ExtraFiles` 显式单路转发给最终目标进程，父进程 `Start()` 后立即关闭
+  自身 fd3 副本；无 mountns 的 `syscall.Exec` 分支在 `Exec` 前恢复
+  `FD_CLOEXEC=0` 透传。`childExecSpec` 新增 `FD3Forward` 标记跨两跳传递；
+  非 agent 预设不改变 fd3 语义。
+- **helper 握手与限制施加 fail-closed + BestEffort 透传 + EINTR 重试**：
+  `landlock_linux.go` 引入 `errSeccompFilterInstalled` 标记 seccomp
+  PROT_EXEC 过滤器装入后的下游失败——post-install 失败不可撤销，
+  BestEffort 也不得降级（否则 PROT_EXEC 映射永久阻塞在无人服务的 notify
+  应答上）。helper 就绪握手 ACK 需 `n==1 && byte=='1'`，读错/EOF/非法字节
+  均视为拒绝启动并 kill+wait 回收；broker 监听器未建立、`createAndPopulate
+  Ruleset`/`enforceRuleset`/`installSeccompExecGuard` 失败均 fail-closed
+  退出（`helperFailf`），绝不以未受限状态 ACK 继续服务；`runTestRunnerClient`
+  配置缺失/损坏/必需路径不存在即返回 126 拒绝执行目标，绝不裸 exec。
+  `helperConfig` 新增 `BestEffort` 透传父策略降级口径（缺省 false 会让
+  helper 对 BestEffort 策略内容许的瞬态缺失路径 fail-closed，语义不一致）；
+  `helperPolicy`/`reviewerPolicy` 均携带。握手链 `unix.Read`/`Sendmsg`/
+  `Recvmsg` 包 `EINTR` 重试（SIGURG 异步抢占打断阻塞读不再误判为握手失败）。
 - **reviewer-agent 私有 PIG_HOME + 宿主产物软链投影 + 启动前 fail-closed**：
   `ReviewerAgentWithEnv` 不再把 `Policy.Env["PIG_HOME"]` 指向宿主 `<PIG_HOME>`，
   改为指向 `<privateTmpDir>/pig-home`（0700，进 `ReadWrite` 不进 `Exec`）。
@@ -100,6 +123,43 @@
 
 ### Fixed
 
+- **reviewer-agent cell 校验三处缺陷（oracle FM-2）**：① cell 校验失败时
+  `buildPolicy` 丢弃已创建 `policy` 返回空结构，早于
+  `cleanupPresetTempDirsFromPolicy` defer——`/tmp/pi-reviewer-*`（含
+  `0600` `pig-agent/auth.json` 凭据副本）与 `pi-reviewer-exec-*` 永久
+  泄漏；修复为 fail-closed 前先清理。② fail-closed 对所有
+  `reviewer-agent` 命令无条件执行——`claude`/`agy`/`sh` 等非 pig 命令
+  `MaybeWarmGoExtensionCells` 不预热，冷缓存下被误拒启动；修复为仅对
+  真实 pig 入口（`IsPigEntryCommand`，与预热同口径）执行校验。③
+  `total` 用 `validCellEntryDir` 统计漏掉 `language=="go"` 与可执行位
+  门禁——宿主 `cache/ext/node-runtime-*`（`language:"node"`）即让
+  `total>0` 假通过；修复为改用 `countValidExecutableGoArtifacts`
+  （语言门 + `mode&0o111`）。
+- **`PIG_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` 注入三缺陷（oracle FM-4）**：
+  ① `injectPigCodingAgentDir` 未接 `cfgEnv`，`--env PIG_CODING_AGENT_DIR=`
+  空覆盖屏蔽宿主变量后函数仍见宿主 `os.Getenv` 非空提前返回，空串写进
+  最终 env；② 宿主残留恶意/旧 `PI_CODING_AGENT_DIR` 会在 pig 包装器后置
+  `export PIG_USE_PI_DIRS=1` 时被激活生效；③ 仅 `PIG_USE_PI_DIRS=1` 时
+  才对称注入 `PI_CODING_AGENT_DIR`。修复：函数接收 `cfgEnv`，「显式自定义」
+  仅认 `cfgEnv`（`--env` 显式声明）；默认可信 `AgentDir` 下双变量一律经
+  `overrideEnvKey` 回钉私有 `pig-agent`（空覆盖不再产生空路径）；宿主
+  残留变量一律覆写。
+- **reviewer-agent 在 `<workdir>/reports` 创建目录污染目标工作树
+  （oracle SF-2）**：`ReadOnlyReviewer` 原在 `os.MkdirAll(<workdir>/reports)`
+  并将其放入 `ReadWrite[0]`——目标 Git 工作树未忽略 `reports/` 时每次
+  启动 sbx 都弄脏 `git status`，且使只读角色在源仓内拥有可写子目录。
+  报告根已统一收敛 `/tmp/herdr-role-reports`，故移除该创建与写权限；
+  `runTestRunnerClient` 取私有 `TMPDIR` 不再硬编码 `reviewerRW[1]`（
+  ReadWrite 列表移除 reports 后按位置取会错位），改从 env `TMPDIR` 判定。
+- **arm64 测试夹具（`fix-sbx-portable-baseline` 移植 + TMPDIR 隔离）**：
+  `sandbox_test.go` 系统只读目录枚举改为必需目录存在性校验 + 可选库目录
+  （`/lib64`/`/usr/lib64`，x86-64 专属）按实际存在追加——arm64 rootfs 无
+  `/lib64`，原硬编码致 `addPathRule` 对非 optional 路径 ENOENT fail-closed；
+  `TestReviewerAgentAgyHooks` 改 `t.TempDir` 夹具 + `HERDSMAN_GO_BIN`/`PATH`
+  注入，不再依赖已退役的 `/root/.local/bin/herdsman`；
+  `TestWarmGoExtensionCellsSignalInterrupt` 用 `t.Setenv("TMPDIR",
+  t.TempDir())` 隔离 `os.TempDir()`，消除宿主 `/tmp` 历史 `sbx-warm-*`
+  诊断文件污染零残留 glob 断言。
 - **reviewer-agent 预热 cell 与沙盒内实际构建 toolchain 错配，导致 pig
   扩展在只读 `cells/go` 下重建 `.build-*` scratch 撞 `permission denied`**：
   `goPackedCellHash` 把 Go 工具链的 `commandVersion`/`goroot`/`compiler`

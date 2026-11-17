@@ -323,6 +323,23 @@ func trustedPigCandidateFile(candidate string) (string, bool) {
 	return resolved, true
 }
 
+// IsPigEntryCommand 判定 command 是否指向真实 pig 入口（与
+// MaybeWarmGoExtensionCells 同口径）：空命令或非 pig 返回 false。
+// 供 buildPolicy 决定 reviewer-agent 的 cell 目标集 fail-closed 是否生效
+// ——claude/agy/sh 等非 pig 命令不会被预热，冷缓存下无条件校验会误杀
+// 启动（oracle FM-2B）。
+func IsPigEntryCommand(command []string) bool {
+	if len(command) == 0 {
+		return false
+	}
+	if warmGoCellHook != nil && warmGoCellHook.PigBin != "" {
+		if filepath.Base(command[0]) == "pig" {
+			return true
+		}
+	}
+	return resolvePigEntryBinary(command[0]) != ""
+}
+
 // resolvePigEntryBinary 仅在固定可信目录（trustedPigSearchDirs）中解析
 // pig 入口二进制，绝不调用 exec.LookPath 或读取调用方 PATH：
 //   - 命令名含路径分隔符：basename 必须为 pig，真实文件落在可信前缀内且

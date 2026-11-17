@@ -1824,3 +1824,143 @@ func TestChildSpecOptionalReadWriteEndToEnd(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// fd3（claude-pty debugW 写端）显式转发与 CLOEXEC 收口回归（oracle FM-3）。
+//
+// 背景：claude-pty 经 ExtraFiles 把 debugW 传入 sbx 为 fd3（无 CLOEXEC）。
+// 修复必须同时满足：
+//   1. fd3 显式经 ExtraFiles 单路转发到最终目标进程（read reviewer-agent
+//      目标能读到 fd3 内容）——证明转发链 newChildCmd→runAsSandboxInit
+//      生效；
+//   2. fd3 不泄漏给 helper/broker/预热子进程等中间进程（在 sbx 入口已
+//      置 CLOEXEC）——用「目标进程检测自身 fd3 是否打开」作判据：
+//      agent preset 下目标应能打开 /dev/fd/3 或读到 fd3；非 agent preset
+//      或未传入 fd3 时目标侧 fd3 应不存在。
+// 这里用「目标进程内 openat('/dev/fd/3')/readlink('/proc/self/fd/3')」
+// 作真实探针（不依赖宿主 /dev/fd 存在则用 /proc/self/fd）。
+
+// invokeSbxSubprocessWithFD3 与 invokeSbxSubprocess 相同，但额外把调用方
+// 提供的 *os.File 作为 ExtraFiles 传入 sbx（子进程内即 fd3），模拟
+// claude-pty 的 debugW 写端继承。返回 sbx 退出码与目标侧 fd3 探测输出。
+func invokeSbxSubprocessWithFD3(t *testing.T, extraFile *os.File, extraEnv []string, args ...string) (string, int) {
+	t.Helper()
+	selfExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(selfExe, args...)
+	env := append(os.Environ(), envTestWantSbxMain+"=1")
+	env = append(env, extraEnv...)
+	cmd.Env = env
+	if extraFile != nil {
+		cmd.ExtraFiles = []*os.File{extraFile}
+	}
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err = cmd.Run()
+	return out.String(), exitCodeFromWaitErr(err)
+}
+
+// TestFD3ExplicitForwardAndNoLeak 覆盖 fd3 显式转发（agent preset）与
+// 收口不泄漏（非 agent preset / 目标侧探测）。
+func TestFD3ExplicitForwardAndNoLeak(t *testing.T) {
+	if _, ok := sandbox.Supported(); !ok {
+		t.Skip("Landlock not supported on this kernel")
+	}
+	workdir := t.TempDir()
+
+	// 目标侧探针：readlink /proc/self/fd/3 判定 fd3 是否打开。
+	// 目标进程内 fd3 有效则 readlink 成功并打印非空目标；fd3 关闭或
+	// 未转发则 readlink ENOENT 失败打印 FD3_CLOSED。
+	fd3Probe := `if readlink /proc/self/fd/3 >/dev/null 2>&1; then
+	echo "FD3_OPEN:$(readlink /proc/self/fd/3)"
+else
+	echo "FD3_CLOSED"
+fi`
+
+	t.Run("agent_preset_forwards_fd3_to_target", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		defer r.Close()
+		out, code := invokeSbxSubprocessWithFD3(t, w,
+			nil,
+			"--best-effort", "--preset", "reviewer-agent", "--workdir", workdir,
+			"--", "/bin/sh", "-c", fd3Probe,
+		)
+		_ = w.Close()
+		if code != 0 {
+			t.Fatalf("reviewer-agent exit = %d; output:\n%s", code, out)
+		}
+		if !strings.Contains(out, "FD3_OPEN:") {
+			t.Fatalf("agent preset must forward fd3 to target via ExtraFiles; output:\n%s", out)
+		}
+	})
+
+	t.Run("fd3_write_end_fully_released_on_sbx_exit", func(t *testing.T) {
+		// 无泄漏判据（claude-pty drainDebug 语义）：传入 debugW 写端给
+		// sbx，测试侧持有读端。sbx 及其全部子进程（helper/broker/init/
+		// 目标）退出后，若任一中间进程残留持有 fd3 写端，读端 Read 永远
+		// 收不到 EOF（oracle FM-3 的 daemon 劫持缺陷）。收口正确时 sbx
+		// 退出即全部写端关闭，读端立即 EOF。
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		defer r.Close()
+		out, code := invokeSbxSubprocessWithFD3(t, w,
+			nil,
+			"--best-effort", "--preset", "reviewer-agent", "--workdir", workdir,
+			"--", "/bin/sh", "-c", fd3Probe,
+		)
+		_ = w.Close()
+		if code != 0 {
+			t.Fatalf("reviewer-agent exit = %d; output:\n%s", code, out)
+		}
+		// sbx 进程已退出：读端设超时读，须在限时内收到 EOF（证明写端
+		// 无残留持有者——helper/broker/daemon 均未继承 fd3）。
+		_ = r.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 8)
+		n, rerr := r.Read(buf)
+		if rerr == nil && n > 0 {
+			t.Fatalf("unexpected data on debug pipe read end: %q", buf[:n])
+		}
+		if rerr != io.EOF {
+			t.Fatalf("fd3 write end leaked: read end did not see EOF after sbx exit (err=%v); output:\n%s", rerr, out)
+		}
+	})
+}
+
+// TestReviewerAgentCellCheckOnlyPigEntry 覆盖 oracle FM-2B：reviewer-agent 的
+// cell 目标集 fail-closed 仅对真实 pig 入口生效——非 pig 命令（sh/agy/claude）
+// 在冷缓存（无有效 Go cell）下不得被 ReviewerAgentCellTargetError 误拒启动。
+func TestReviewerAgentCellCheckOnlyPigEntry(t *testing.T) {
+	if _, ok := sandbox.Supported(); !ok {
+		t.Skip("Landlock not supported on this kernel")
+	}
+	workdir := t.TempDir()
+	// 冷缓存隔离 pig home：含 Go 扩展但无任何有效 Go cell（触发 cell 校验
+	// 失败的场景），非 pig 命令仍须正常启动不被误拒。
+	fakePigHome := t.TempDir()
+	goExtDir := filepath.Join(fakePigHome, "agent", "extensions", "fake-go-ext")
+	if err := os.MkdirAll(goExtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goExtDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("sh_command_not_rejected_by_cell_check", func(t *testing.T) {
+		out, code := invokeSbxSubprocess(t,
+			[]string{"PIG_HOME=" + fakePigHome},
+			"--best-effort", "--preset", "reviewer-agent", "--workdir", workdir,
+			"--", "/bin/sh", "-c", "echo NONPIG_OK",
+		)
+		if code != 0 || !strings.Contains(out, "NONPIG_OK") {
+			t.Fatalf("non-pig command must not be rejected by cell check (exit=%d); output:\n%s", code, out)
+		}
+	})
+}

@@ -342,8 +342,10 @@ func resolveRealGoBinary(skipDir string) string {
 
 // ReadOnlyReviewer 构造针对"只读审查员/体检员"子代理的预设沙盒策略：
 //   - 整个根文件系统 "/" 只读；
-//   - 仅开放 workdir 下的报告目录 (<workdir>/reports) 与 /tmp 下的私有子目录 (/tmp/pi-reviewer-*) 可写；
-//   - 严格实施 W^X：所有可写目录（含 <workdir>/reports、TMPDIR、GOTMPDIR、GOCACHE）均不授予执行权限，
+//   - 仅开放 /tmp 下的私有子目录 (/tmp/pi-reviewer-*) 可写；报告统一走
+//     /tmp/herdr-role-reports（ReviewerAgentWithEnv 共享根），绝不在
+//     <workdir> 下创建 reports/ 子目录污染目标 Git 工作树（oracle SF-2）；
+//   - 严格实施 W^X：所有可写目录（TMPDIR、GOTMPDIR、GOCACHE）均不授予执行权限，
 //     彻底封堵将可读 ELF（如 agy、pi、dispatch-agent）拷贝至可写临时目录后再执行的绕过路径；
 //   - 建立独立的只读可执行目录 (/tmp/pi-reviewer-exec-*) 并注入受控的 go 包装器，
 //     使 go build / go vet / go test 在受控的构建域中生成和运行测试二进制，且测试二进制运行前自动降权回只读审查域。
@@ -351,16 +353,10 @@ func ReadOnlyReviewer(workdir string) Policy {
 	if strings.TrimSpace(workdir) == "" {
 		workdir = "."
 	}
-	absWorkdir, err := NormalizePath(workdir)
-	if err != nil {
-		absWorkdir = filepath.Clean(workdir)
-	}
-
-	reportDir := filepath.Join(absWorkdir, ReviewerReportSubdir)
-	// 若 workdir 已存在于磁盘，预先创建报告子目录以便 Landlock O_PATH 打开绑定规则。
-	if st, err := os.Stat(absWorkdir); err == nil && st.IsDir() {
-		_ = os.MkdirAll(reportDir, 0o755)
-	}
+	// workdir 不再用于创建 <workdir>/reports：报告根已统一收敛到
+	// /tmp/herdr-role-reports（ReviewerAgentWithEnv 共享根），避免在目标
+	// Git 工作树内凭空创建 reports/ 子目录、弄脏 git status 或使只读角色
+	// 在源仓内拥有可写子目录（oracle SF-2）。保留 workdir 参数维持 API。
 
 	privateTmpDir, err := os.MkdirTemp("/tmp", "pi-reviewer-*")
 	if err != nil {
@@ -428,7 +424,7 @@ func ReadOnlyReviewer(workdir string) Policy {
 
 	return Policy{
 		ReadOnly:  []string{"/"},
-		ReadWrite: []string{reportDir, privateTmpDir},
+		ReadWrite: []string{privateTmpDir},
 		Exec:      execList,
 		DenyNet:   false,
 		Env:       envList,
@@ -1193,7 +1189,7 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 		srcAgentDir = filepath.Join(pigHome, "agent")
 	}
 	preparePrivatePigAgentDirFromAgent(filepath.Join(privateTmpDir, "pig-agent"), srcAgentDir)
-	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"))
+	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"), cfgEnv)
 
 	// 安全细则三：私有 PIG_HOME（<privateTmpDir>/pig-home，0700，RW，不进 Exec）。
 	// 宿主 PIG_HOME 保持只读；宿主态预刷新宿主缓存单元 usage.json（沙盒内
@@ -1225,12 +1221,11 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	settings := readAgentSettings(srcAgentDir)
 	extDirs := sourceAgentGoExtensionDirs(srcAgentDir, settings)
 	hostCache := filepath.Join(pigHome, "cache")
-	total := 0
-	for _, dir := range cellCacheEntryDirs(hostCache) {
-		if _, _, ok := validCellEntryDir(dir); ok {
-			total++
-		}
-	}
+	// total 必须按「language=go 且可执行产物」过滤：宿主 cache/ext 下
+	// node-runtime-* 等非 Go 产物（language!="go"）或无执行位的条目
+	// 绝不能计入目标集，否则冷缓存 + 非 Go cell 会让 total>0 假通过，
+	// fail-closed 被完全旁路（oracle FM-2C）。
+	total := countValidExecutableGoArtifacts(hostCache)
 	privatePigHome, missing := preparePrivatePigHome(privateTmpDir, pigHome, execSet)
 	setReviewerAgentCellTargets(&reviewerAgentCellTargets{
 		hasGoExt: len(extDirs) > 0,
@@ -1951,26 +1946,50 @@ func mustMarshalJSON(v any) []byte {
 	return data
 }
 
-// injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR=<privatePigAgentDir>：
-// 仅当调用方未显式将 PIG_CODING_AGENT_DIR（或 Policy.Env 同名键）指向其它可写目录时生效。
-// 对称地，当宿主环境或 env 中 PIG_USE_PI_DIRS == "1"（pig 以 PI_* 变量名读取 AgentDir）
-// 且 PI_CODING_AGENT_DIR 在宿主环境与 env 中均未设置时，追加
-// PI_CODING_AGENT_DIR=<privatePigAgentDir>，保持私有隔离不被宿主默认路径打穿。
-func injectPigCodingAgentDir(env []string, privatePigAgentDir string) []string {
-	if strings.TrimSpace(os.Getenv("PIG_CODING_AGENT_DIR")) != "" {
+// injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR 与
+// PI_CODING_AGENT_DIR 指向 <privatePigAgentDir>。
+//
+// 判定口径与 resolveSourcePigAgentDir 完全对齐（cfgEnv 最后一项含空覆盖语义，
+// 显式空串屏蔽宿主同名变量）：
+//   - PIG_CODING_AGENT_DIR：cfgEnv 或宿主环境有非空值（即 customAgentDir=true
+//     的来源）时保持其优先级，不覆写、不注入；否则无条件 overrideEnvKey
+//     回钉为私有目录（override 语义保证 --env PIG_CODING_AGENT_DIR= 空覆盖
+//     不会把空串写进最终 env，oracle FM-4）。
+//   - PI_CODING_AGENT_DIR：只要 PIG_CODING_AGENT_DIR 无显式非空值，一律
+//     无条件 overrideEnvKey 回钉为私有目录——宿主残留的恶意/旧
+//     PI_CODING_AGENT_DIR 不得在 pig 包装器后来 export PIG_USE_PI_DIRS=1
+//     时被激活生效（任务书口径）；仅当调用方显式声明可信自定义
+//     PI_CODING_AGENT_DIR（有效 PIG_USE_PI_DIRS=1 下非空）时保持其优先级。
+func injectPigCodingAgentDir(env []string, privatePigAgentDir string, cfgEnv []string) []string {
+	// 「显式自定义」仅认 cfgEnv（--env KEY=VALUE 显式声明）：宿主环境
+	// PIG_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / PIG_USE_PI_DIRS 属残留面，
+	// 宿主残留 PI_CODING_AGENT_DIR 会在 pig 包装器后置 export
+	// PIG_USE_PI_DIRS=1 时被激活生效，必须无条件回钉为私有目录
+	//（oracle FM-4）。空覆盖（--env KEY=）屏蔽宿主同名变量后仍注入
+	// 私有目录，不产生空路径。
+	pigCustom := false
+	if v, ok := cfgEnvLastValue(cfgEnv, "PIG_CODING_AGENT_DIR"); ok {
+		pigCustom = strings.TrimSpace(v) != ""
+	}
+	if pigCustom {
+		// 显式自定义目录保持最高优先级：既不覆写该键，也不注入
+		// PI_CODING_AGENT_DIR 抢占（与 resolveSourcePigAgentDir 一致，
+		// PIG_CODING_AGENT_DIR 优先于 PI_* 变量）。
 		return env
 	}
-	if lookupEnvValue(env, "PIG_CODING_AGENT_DIR") != "" {
-		return env
-	}
-	env = append(env, "PIG_CODING_AGENT_DIR="+privatePigAgentDir)
+	env = overrideEnvKey(env, "PIG_CODING_AGENT_DIR", privatePigAgentDir)
 
-	usePiDirs := os.Getenv("PIG_USE_PI_DIRS") == "1" || lookupEnvValue(env, "PIG_USE_PI_DIRS") == "1"
-	if usePiDirs {
-		if strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")) == "" &&
-			lookupEnvValue(env, "PI_CODING_AGENT_DIR") == "" {
-			env = append(env, "PI_CODING_AGENT_DIR="+privatePigAgentDir)
+	// PI_CODING_AGENT_DIR：仅当调用方经 cfgEnv 同时声明 PIG_USE_PI_DIRS=1
+	// 与非空 PI_CODING_AGENT_DIR（显式可信自定义）时保持其优先级；
+	// 其余情形（含宿主残留）一律回钉私有目录。
+	piCustom := false
+	if v, ok := cfgEnvLastValue(cfgEnv, "PIG_USE_PI_DIRS"); ok && strings.TrimSpace(v) == "1" {
+		if pv, ok := cfgEnvLastValue(cfgEnv, "PI_CODING_AGENT_DIR"); ok && strings.TrimSpace(pv) != "" {
+			piCustom = true
 		}
+	}
+	if !piCustom {
+		env = overrideEnvKey(env, "PI_CODING_AGENT_DIR", privatePigAgentDir)
 	}
 	return env
 }

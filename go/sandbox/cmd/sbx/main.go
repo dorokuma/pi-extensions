@@ -79,6 +79,11 @@ type childExecSpec struct {
 	// 子进程才执行挂载命名空间内的 socket 白名单视图（--best-effort 下
 	// unshare 失败回退不 unshare 时绝不碰宿主挂载命名空间）。
 	MountNS bool `json:"mount_ns"`
+	// FD3Forward 标记 agent 预设下 fd3（claude-pty debugW 写端）须经
+	// ExtraFiles 显式单路转发给最终目标进程：内层子进程在 Apply（派生
+	// helper/broker）前先对 fd3 置 CLOEXEC，再由 runAsSandboxInit 经
+	// ExtraFiles 传给目标，杜绝辅助进程/常驻 daemon 继承（oracle FM-3）。
+	FD3Forward bool `json:"fd3_forward"`
 }
 
 const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] [--report-to ID] -- COMMAND [ARGS...]"
@@ -236,8 +241,16 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// ReviewerAgentWithEnv 枚举与投影校验；有 Go 扩展但宿主产物为 0，或
 			// 存在未成功投影/Exec 未命中的目标时，此处返回错误拒绝启动并指名
 			// 缺失项，绝不进入「沙盒内 build 成功但 exec 失败」的不完全兼容态。
-			if err := sandbox.ReviewerAgentCellTargetError(); err != nil {
-				return sandbox.Policy{}, fmt.Errorf("sbx: reviewer-agent pig cell target check failed: %w", err)
+			// fail-closed 仅对真实 pig 入口生效：claude/agy/sh 等非 pig 命令
+			// MaybeWarmGoExtensionCells 不会预热，冷缓存下无条件校验会把它们
+			// 误拒启动（oracle FM-2B）。校验失败时必须先清理已创建的
+			// pi-reviewer-*/pi-reviewer-exec-*（含 pig-agent/auth.json 凭据副本），
+			// 再返回错误，不得在 /tmp 泄漏私有目录（oracle FM-2A）。
+			if sandbox.IsPigEntryCommand(cfg.Command) {
+				if err := sandbox.ReviewerAgentCellTargetError(); err != nil {
+					cleanupPresetTempDirsFromPolicy(policy)
+					return sandbox.Policy{}, fmt.Errorf("sbx: reviewer-agent pig cell target check failed: %w", err)
+				}
 			}
 			// ReviewerAgentWithEnv 把与预热对齐的 PIG_HOME 固定注入 Policy.Env；
 			// 记下来供 mergeEnv 之后回钉（--env PIG_HOME= 空覆盖会把空串写进
@@ -364,6 +377,50 @@ func main() {
 	os.Exit(runMain(os.Args[1:]))
 }
 
+// agentPreset 统一判定需要 fd3（claude-pty debugW 写端）显式单路转发的
+// agent 预设：reviewer-agent。未来 exec-agent 同名加入。非 agent 预设
+// 不改变 fd3 语义。
+func isAgentPreset(name string) bool {
+	return name == "reviewer-agent"
+}
+
+// fd3Active 探测 fd 3 是否为有效打开描述符（F_GETFD）。
+func fd3Active() bool {
+	_, err := unix.FcntlInt(3, unix.F_GETFD, 0)
+	return err == nil
+}
+
+// sealInheritedFD3 在 agent 预设入口对继承的 fd3 置 FD_CLOEXEC：claude-pty
+// 经 ExtraFiles 传入的 debugW 写端进入 sbx 时无 CLOEXEC，若不收口会被
+// 后续派生的 codegraph-go -warm-daemon 常驻 daemon、pig 预热子进程与
+// reportRelay hc send 子进程继承，永久劫持 drainDebug 的 EOF（oracle FM-3）。
+// 返回 fd3 是否有效（供转发决策）；非 agent 预设不动。
+func sealInheritedFD3(preset string) bool {
+	if !isAgentPreset(preset) || !fd3Active() {
+		return false
+	}
+	unix.CloseOnExec(3)
+	return true
+}
+
+// forwardFD3ToChild 在 agent 预设下把 fd3 经 ExtraFiles 显式单路转发给目标
+// 子进程。调用方负责在 cmd.Start() 成功后关闭本进程侧 fd3（closeFD3）。
+func forwardFD3ToChild(cmd *exec.Cmd, active bool) {
+	if !active {
+		return
+	}
+	if f := os.NewFile(3, "claude-debug"); f != nil {
+		cmd.ExtraFiles = []*os.File{f}
+	}
+}
+
+// closeFD3 关闭父进程侧 fd3 副本（Start 后调用），解除 drainDebug 的 EOF 悬挂。
+func closeFD3(active bool) {
+	if active {
+		_ = unix.Close(3)
+	}
+}
+
 func runMain(args []string) int {
 	cfg, err := parseArgs(args)
 	if err != nil {
@@ -385,6 +442,13 @@ func runMain(args []string) int {
 		fmt.Printf("sbx: Landlock supported (ABI v%d)\n", abi)
 		return 0
 	}
+
+	// agent 预设入口先对继承 fd3 置 FD_CLOEXEC：claude-pty 经 ExtraFiles
+	// 传入的 debugW 写端无 CLOEXEC，不收口会被 MaybeWarmGoExtensionCells
+	// 预热子进程、codegraph-go -warm-daemon 常驻 daemon 及 reportRelay
+	// hc send 继承，永久劫持 drainDebug 的 EOF。仅在真实有效时记录
+	// active 供 runSandboxedChild/runAsSandboxInit 经 ExtraFiles 单路转发。
+	fd3Fwd := sealInheritedFD3(cfg.Preset)
 
 	// reviewer-agent 启动 pig 前：宿主态按需预热 Go 扩展 cell，确保
 	// appendCellCachePolicy 在 buildPolicy 内扫描时能命中已构建 runner。
@@ -435,7 +499,7 @@ func runMain(args []string) int {
 		}
 	}
 
-	return runSandboxedChild(bin, cfg, policy)
+	return runSandboxedChild(bin, cfg, policy, fd3Fwd)
 }
 
 // runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与目标命令启动；
@@ -450,7 +514,7 @@ func runMain(args []string) int {
 // 白名单视图见 mountns_linux.go）；
 // --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
 // <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
-func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
+func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd bool) int {
 	selfExe, err := os.Executable()
 	if err != nil || selfExe == "" {
 		fmt.Fprintf(os.Stderr, "sbx: resolve executable failed: %v\n", err)
@@ -477,6 +541,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 		BestEffort:        policy.BestEffort,
 		EntryAgents:       policy.EntryAgents,
 		MountNS:           sysProcAttr != nil,
+		FD3Forward:        fd3Fwd,
 	}
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
@@ -494,6 +559,9 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 		cmd.Stderr = os.Stderr
 		cmd.Env = childEnv
 		cmd.SysProcAttr = sysProcAttr
+		// agent 预设：fd3 经 ExtraFiles 显式单路转发给子进程（继承 fd3 已在
+		// runMain 入口置 CLOEXEC，不转发即不会泄漏到子进程树）。
+		forwardFD3ToChild(cmd, fd3Fwd)
 		return cmd
 	}
 	cmd := newChildCmd()
@@ -523,6 +591,9 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 			return 126
 		}
 	}
+	// 父进程 Start 成功后立即关闭自身 fd3 副本：debugW 仅剩目标子进程树
+	// 持有的写端，claude-pty drainDebug 在目标退出后能正确收到 EOF。
+	closeFD3(fd3Fwd)
 
 	waitCh := make(chan error, 1)
 	go func() {
@@ -586,6 +657,12 @@ func runChildFromEnv() int {
 			return 1
 		}
 	}
+	// agent 预设：fd3 经外层 ExtraFiles 传入后为非 CLOEXEC，必须在
+	// sandbox.Apply 派生 helper/broker 前置 CLOEXEC，杜绝辅助进程继承
+	// debugW 写端；目标进程由 runAsSandboxInit 经 ExtraFiles 显式接收。
+	if spec.FD3Forward && fd3Active() {
+		unix.CloseOnExec(3)
+	}
 	if err := sandbox.Apply(policy); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: apply sandbox policy failed: %v\n", err)
 		return 1
@@ -598,7 +675,14 @@ func runChildFromEnv() int {
 	// 顶替 PID 1（业务进程作为 PID 1 会忽略默认未捕获信号，且无人回收孤儿
 	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生目标子进程。
 	if spec.MountNS {
-		return runAsSandboxInit(spec.Bin, spec.Command, execEnv)
+		return runAsSandboxInit(spec.Bin, spec.Command, execEnv, spec.FD3Forward)
+	}
+	// 无 mountns 分支直接 syscall.Exec：agent 预设下恢复 fd3 的
+	// FD_CLOEXEC=0，让内核 exec 保留 fd3 透传到目标进程（替代
+	// ExtraFiles——syscall.Exec 无 ExtraFiles 概念）；目标退出后
+	// drainDebug 收到 EOF。非 agent 预设保持 CLOEXEC 不转发。
+	if spec.FD3Forward && fd3Active() {
+		_, _ = unix.FcntlInt(3, unix.F_SETFD, 0)
 	}
 	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", spec.Bin, err)
@@ -626,7 +710,7 @@ func runChildFromEnv() int {
 // ECHILD（无任何子进程，含目标子进程已被收割）时直接返回 0，绝不落入
 // <-sigCh 空转阻塞。cmd.Process.Release() 避免 os/exec 的
 // pidfd Wait 路径与 Wait4(-1) 竞争 ECHILD。
-func runAsSandboxInit(bin string, argv []string, env []string) int {
+func runAsSandboxInit(bin string, argv []string, env []string, fd3Fwd bool) int {
 	sigCh := make(chan os.Signal, 16)
 	signal.Notify(sigCh,
 		syscall.SIGCHLD, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP,
@@ -641,10 +725,15 @@ func runAsSandboxInit(bin string, argv []string, env []string) int {
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
 	}
+	// agent 预设：fd3 经 ExtraFiles 显式单路转发给目标进程（已在 Apply 前
+	// 置 CLOEXEC 阻断 helper/broker 继承；此处显式放行最终目标）。
+	forwardFD3ToChild(cmd, fd3Fwd)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
 		return 126
 	}
+	// PID 1 父进程 Start 后关闭自身 fd3 副本：目标进程树独占写端。
+	closeFD3(fd3Fwd)
 	childPid := cmd.Process.Pid
 	_ = cmd.Process.Release()
 
