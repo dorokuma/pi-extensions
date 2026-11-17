@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+// clip shortens s to at most n bytes for failure diagnostics, so a shorter-
+// than-expected value cannot panic the test with a slice-out-of-range before
+// the real message is printed.
+func clip(s string, n int) string {
+	return s[:min(len(s), n)]
+}
+
 // Tests for the recall subsystem: src/core/recall-scope.ts, render-entries.ts,
 // search-entries.ts and format-recall.ts.
 
@@ -459,7 +466,7 @@ func TestSearchEntries_Base64RunCannotDominateBM25(t *testing.T) {
 	// The filtered run never reaches a snippet.
 	for _, hit := range hits {
 		if hit.HasSnippet && strings.Contains(hit.Snippet, run[:80]) {
-			t.Fatalf("the base64 run leaked into a snippet: %q", hit.Snippet[:120])
+			t.Fatalf("the base64 run leaked into a snippet: %q", clip(hit.Snippet, 120))
 		}
 	}
 }
@@ -543,7 +550,7 @@ func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
 	// in a snippet. Without the filter the blob is searchable text and a
 	// short term hits inside it hundreds of times.
 	if got := searchableText(blobMessages[4], blobEntries[4]); got != "max …" {
-		t.Fatalf("the blob doc was not filtered: %q…", got[:80])
+		t.Fatalf("the blob doc was not filtered: %q…", clip(got, 80))
 	}
 	needle := blob[len(blob)-5:]
 	for _, query := range []string{needle, needle + "+"} {
@@ -553,7 +560,7 @@ func TestSearchEntries_BlobDocLeavesPlainOrderUnchanged(t *testing.T) {
 			}
 			if hit.HasSnippet && strings.Contains(hit.Snippet, needle) {
 				t.Fatalf("query %q leaked the filtered run into a snippet: %q",
-					query, hit.Snippet[:120])
+					query, clip(hit.Snippet, 120))
 			}
 		}
 	}
