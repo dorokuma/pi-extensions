@@ -18,6 +18,7 @@
   （非 `main` 包名 + 导出 `Extension()`），PiG 为其生成 runner。
 - 本地 build/vet/test 经 `go/go.work`（含 `./pi-vcc`）解析到本地 `go/pigsdk`；PiG 加载时
   使用 staged SDK。未修改生产扩展目录或 TS 部署副本。
+- 版本与变更记录：本模块独立按 SemVer 编号（与上游版本号无对应关系），见 `CHANGELOG.md`。
 
 ## 注册面（对外契约）
 
@@ -143,5 +144,3 @@ ok github.com/dorokuma/pi-extensions/go/pi-vcc
 工具在隔离会话中被实际调用并返回真实结果（见 batch-4 报告 §8；0.11.1 同步后的复测输出原文
 与退出码见 `go/reports/batch-4b-sync-0.11.1.md`）。0.11.2 同步（`2eb4e7e`）与本轮文档/测试补齐
 的验证记录见 `go/reports/batch-4c-sync-0.11.2.md`。
-
-未提交、未部署。以上为 worker 验证，仍需 reviewer / verifier 独立核验。
