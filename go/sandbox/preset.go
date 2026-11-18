@@ -1185,11 +1185,24 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// <pigHome>/agent——沙盒侧只复制其配置文件，不做预热级硬拒绝。
 	pigHome := resolvePigHomeDir(cfgEnv)
 	srcAgentDir, customAgentDir := resolveSourcePigAgentDir(pigHome, cfgEnv)
-	if customAgentDir && !validateTrustedPigDir(srcAgentDir, "AgentDir") {
+	trustedCustom := customAgentDir && validateTrustedPigDir(srcAgentDir, "AgentDir")
+	if customAgentDir && !trustedCustom {
 		srcAgentDir = filepath.Join(pigHome, "agent")
 	}
 	preparePrivatePigAgentDirFromAgent(filepath.Join(privateTmpDir, "pig-agent"), srcAgentDir)
-	p.Env = injectPigCodingAgentDir(p.Env, filepath.Join(privateTmpDir, "pig-agent"), cfgEnv)
+	privatePigAgentDir := filepath.Join(privateTmpDir, "pig-agent")
+	// 预先在 Policy.Env 写入有效 AgentDir 判定结果，供 buildPolicy 在
+	// cfgEnv merge 后统一归一化：
+	//   - trustedCustom：有效目录 = srcAgentDir（受信自定义保留）；
+	//   - 其余：有效目录 = privatePigAgentDir（不可信被拒/缺省回钉）。
+	// 不可信路径不得经 cfgEnv merge 原样生效（oracle FM-4/M2）。
+	effectiveAgentDir := privatePigAgentDir
+	if trustedCustom {
+		effectiveAgentDir = srcAgentDir
+	}
+	p.Env = overrideEnvKey(p.Env, "PIG_CODING_AGENT_DIR", effectiveAgentDir)
+	p.Env = overrideEnvKey(p.Env, "PI_CODING_AGENT_DIR", effectiveAgentDir)
+	p.Env = injectPigCodingAgentDir(p.Env, privatePigAgentDir, cfgEnv)
 
 	// 安全细则三：私有 PIG_HOME（<privateTmpDir>/pig-home，0700，RW，不进 Exec）。
 	// 宿主 PIG_HOME 保持只读；宿主态预刷新宿主缓存单元 usage.json（沙盒内
@@ -1621,7 +1634,11 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 	}
 
 	var missing []string
-	projectEntry := func(hostEntryDir, privParent string) {
+	// projectEntry 投影缓存单元；checkExec 为 true 时同时校验该 artifact 已入
+	// Exec 白名单（Exec 完整性 missing 只对预注册的可执行目标集合计算——
+	// 与 countValidExecutableGoArtifacts 同口径，非 Go/非执行条目只投影不参与
+	// missing，否则无关条目会撑大 missing 分母误拒 pig，oracle M5）。
+	projectEntry := func(hostEntryDir, privParent string, checkExec bool) {
 		name := filepath.Base(hostEntryDir)
 		linkPath := filepath.Join(privParent, name)
 		if _, lerr := os.Lstat(linkPath); lerr == nil {
@@ -1629,17 +1646,21 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 			return
 		}
 		if err := os.Symlink(hostEntryDir, linkPath); err != nil {
-			missing = append(missing, relToCache(hostCache, hostEntryDir)+": symlink: "+err.Error())
+			if checkExec {
+				missing = append(missing, relToCache(hostCache, hostEntryDir)+": symlink: "+err.Error())
+			}
 			return
 		}
 		// 校验投影 artifact 经软链解析后的宿主真实路径已入 Exec 白名单。
-		if _, artifactPath, ok := validCellEntryDir(linkPath); ok {
-			if norm, err := NormalizePath(artifactPath); err == nil {
-				if resolved, rerr := filepath.EvalSymlinks(norm); rerr == nil && resolved != "" {
-					norm = resolved
-				}
-				if _, hit := execSet[norm]; !hit {
-					missing = append(missing, relToCache(hostCache, hostEntryDir)+": artifact not in Exec whitelist: "+norm)
+		if checkExec {
+			if _, artifactPath, ok := validCellEntryDir(linkPath); ok {
+				if norm, err := NormalizePath(artifactPath); err == nil {
+					if resolved, rerr := filepath.EvalSymlinks(norm); rerr == nil && resolved != "" {
+						norm = resolved
+					}
+					if _, hit := execSet[norm]; !hit {
+						missing = append(missing, relToCache(hostCache, hostEntryDir)+": artifact not in Exec whitelist: "+norm)
+					}
 				}
 			}
 		}
@@ -1670,10 +1691,17 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 					continue
 				}
 				hostEntry := filepath.Join(hostLang, ent.Name())
-				if _, _, ok := validCellEntryDir(hostEntry); !ok {
+				meta, artifactPath, ok := validCellEntryDir(hostEntry)
+				if !ok {
 					continue
 				}
-				projectEntry(hostEntry, privLang)
+				// Exec 完整性 missing 仅对预注册的可执行目标集合计算：
+				// cells/go 条目（lang=="go"）且 language 缺省或 "go"，artifact
+				// 带执行位；其他语言/非执行条目只投影不参与 missing（M5）。
+				checkExec := lang.Name() == "go" &&
+					(meta.Language == "" || meta.Language == "go") &&
+					isExecutableFile(artifactPath)
+				projectEntry(hostEntry, privLang, checkExec)
 			}
 		}
 	}
@@ -1692,10 +1720,17 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 				continue
 			}
 			hostEntry := filepath.Join(hostExtRoot, ent.Name())
-			if _, _, ok := validCellEntryDir(hostEntry); !ok {
+			meta, artifactPath, ok := validCellEntryDir(hostEntry)
+			if !ok {
 				continue
 			}
-			projectEntry(hostEntry, extRoot)
+			// Exec 完整性 missing 仅对预注册的可执行目标集合计算：
+			// cache/ext 必须 ready.json 显式 language=="go"（排除宿主
+			// node-runtime-* 等非 Go 产物）且 artifact 带执行位；其他条目
+			// 只投影不参与 missing（与 countValidExecutableGoArtifacts
+			// 同口径，M5）。
+			checkExec := meta.Language == "go" && isExecutableFile(artifactPath)
+			projectEntry(hostEntry, extRoot, checkExec)
 		}
 	}
 
@@ -1721,6 +1756,14 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 		}
 	}
 	return privatePigHome, missing
+}
+
+// isExecutableFile 判定 path 是否为带执行位的普通文件（非目录）。
+// 供 preparePrivatePigHome 区分「可执行 Go 目标（参与 missing）」与
+// 「非执行缓存条目（只投影不参与 missing）」（oracle M5）。
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
 // relToCache 返回 path 相对 cacheRoot 的路径（供 missing 清单可读化）。

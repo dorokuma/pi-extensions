@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -276,6 +277,10 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	policy.ReadOnly = append(policy.ReadOnly, cfg.ReadOnly...)
 	policy.ReadWrite = append(policy.ReadWrite, cfg.ReadWrite...)
 	policy.Exec = append(policy.Exec, cfg.Exec...)
+	// 记录 ReviewerAgentWithEnv 对 AgentDir 的判定结果（cfgEnv merge 前）：
+	// 非空 = 显式自定义且可信被拒后回钉的私有目录 / 预注入的私有目录；
+	// 供 merge 后统一归一化区分「受信自定义」与「不可信被拒回钉私有」。
+	policyEnvAgentDirs := envListValue(policy.Env, "PIG_CODING_AGENT_DIR")
 	policy.Env = mergeEnv(policy.Env, cfg.Env)
 	if cfg.Preset == "reviewer-agent" && pigHome != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PIG_HOME=" + pigHome})
@@ -292,6 +297,13 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	if cfg.Preset == "reviewer-agent" && goExecDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PI_SANDBOX_GO_EXEC_DIR=" + goExecDir})
 	}
+	// M1/M2：cfgEnv 合并完成后统一归一化有效 AgentDir。显式空串（含重复
+	// 键末项为空）不得把空串写进最终 env（M1）；显式非空自定义分支也须
+	// 清理宿主残留的 PI_CODING_AGENT_DIR / PIG_USE_PI_DIRS（M2），否则 pig
+	// 包装器后置 export PIG_USE_PI_DIRS=1 时会激活宿主 PI 残留。
+	if cfg.Preset == "reviewer-agent" {
+		policy.Env = normalizeEffectiveAgentDirs(policy.Env, privateAgentDirFromPolicy(policy), policyEnvAgentDirs)
+	}
 	if cfg.DenyNet {
 		policy.DenyNet = true
 	}
@@ -299,6 +311,89 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 		policy.BestEffort = true
 	}
 	return policy, nil
+}
+
+// privateAgentDirFromPolicy 返回 ReviewerAgentWithEnv 在 policy.Env 中预建的
+// 私有 pig-agent 目录（<TMPDIR>/pig-agent）；TMPDIR 缺失时返回空串。
+func privateAgentDirFromPolicy(p sandbox.Policy) string {
+	tmp := envListValue(p.Env, "TMPDIR")
+	if tmp == "" {
+		return ""
+	}
+	return filepath.Join(tmp, "pig-agent")
+}
+
+// normalizeEffectiveAgentDirs 统一归一化最终 env 中两个 AgentDir 键与
+// PIG_USE_PI_DIRS：
+//   - 显式且经 ReviewerAgentWithEnv 校验为非空的 PIG_CODING_AGENT_DIR
+//     保留为有效目录；PI_CODING_AGENT_DIR 归一到同一目录（宿主残留 PI 键
+//     不得生效），PIG_USE_PI_DIRS 不再注入（sbx 直接给定绝对路径）。
+//   - 其余情形（键缺失 / 显式空串 / 不可信被拒）两个键都回钉私有
+//     pig-agent；PIG_USE_PI_DIRS 不注入。
+//
+// cfgEnv 空覆盖语义：显式空串屏蔽宿主同名变量后仍归一化回钉，不得把
+// 空串写进最终 env（M1）。
+func normalizeEffectiveAgentDirs(env []string, privatePigAgentDir, preMergePigDir string) []string {
+	// 「受信自定义」的判定以 ReviewerAgentWithEnv 注入 policy.Env 的值为
+	// 准（preMergePigDir）：cfgEnv merge 会把不可信自定义路径写进最终
+	// env，但 preMergePigDir 已被 ReviewerAgentWithEnv 回钉私有目录——
+	// 不可信路径不得被误认为受信自定义保留（M2）。
+	trustedCustom := preMergePigDir != "" &&
+		preMergePigDir != privatePigAgentDir &&
+		envListValue(env, "PIG_CODING_AGENT_DIR") == preMergePigDir
+	if trustedCustom {
+		// 受信自定义 PIG 目录保留为唯一有效目录：PI_CODING_AGENT_DIR 归一到
+		// 同一值（消除宿主 PI 残留），PIG_USE_PI_DIRS 不注入。
+		eff := envListValue(env, "PIG_CODING_AGENT_DIR")
+		env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", eff)
+		env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", eff)
+		env = removeEnvKey(env, "PIG_USE_PI_DIRS")
+		return env
+	}
+	// 非受信自定义（含不可信被拒 / 显式空串 / 键缺失）：两键统一回钉私有
+	// pig-agent；显式空串被归一化覆盖，不再把空串写进最终 env（M1）。
+	// PIG_USE_PI_DIRS 不注入。
+	env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", privatePigAgentDir)
+	env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", privatePigAgentDir)
+	env = removeEnvKey(env, "PIG_USE_PI_DIRS")
+	return env
+}
+
+// overrideEnvKeyLocal 与 sandbox.overrideEnvKey 同语义（package main 无法
+// 访问未导出符号）：替换首个 key= 条目并去除重复，未命中则追加。
+func overrideEnvKeyLocal(env []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			if replaced {
+				continue
+			}
+			out = append(out, prefix+val)
+			replaced = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !replaced {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
+// removeEnvKey 从 env 切片中删除所有 key= 前缀条目（mergeEnv 无法删除键，
+// 只能覆盖——清理宿主 PIG_USE_PI_DIRS 残留需真正的删除）。
+func removeEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // envListValue 返回 env 中首个 KEY= 前缀条目的值；未命中返回空串。
@@ -403,21 +498,66 @@ func sealInheritedFD3(preset string) bool {
 	return true
 }
 
+// fd3Owner 持有 fd3（claude-pty debugW 写端）在父进程生命周期内的唯一
+// *os.File 包装器，保证 forwardFD3ToChild 跨 mountns 重试复用同一 owner
+// （不产生第二个带终结器的 wrapper），releaseFd3File 显式 Close 后终结器
+// 被撤销——杜绝旧 wrapper 的 GC 终结器在重试前关闭仍需转发的 fd3，或关闭
+// 被复用的 fd3 槽位（oracle FM-3）。
+var fd3Owner struct {
+	sync.Mutex
+	f *os.File
+}
+
+// acquireFd3File 返回 fd3 的唯一 owner *os.File；首次调用建立 owner，后续
+// 调用直接复用（不新建 wrapper）。fd3 无效时返回错误。
+func acquireFd3File() (*os.File, error) {
+	fd3Owner.Lock()
+	defer fd3Owner.Unlock()
+	if fd3Owner.f != nil {
+		return fd3Owner.f, nil
+	}
+	if !fd3Active() {
+		return nil, errors.New("fd3 not open")
+	}
+	f := os.NewFile(3, "claude-debug")
+	if f == nil {
+		return nil, errors.New("fd3 not open")
+	}
+	fd3Owner.f = f
+	return f, nil
+}
+
+// releaseFd3File 显式 Close fd3 owner：Close 撤销 (*file).close 终结器，
+// 后续 GC 不会对已关闭的整数 3 二次关闭，也不会关闭被复用的 fd3 槽位。
+// 仅在确认子进程已接管（Start 成功）或明确放弃时调用。
+func releaseFd3File() error {
+	fd3Owner.Lock()
+	defer fd3Owner.Unlock()
+	if fd3Owner.f == nil {
+		return nil
+	}
+	err := fd3Owner.f.Close()
+	fd3Owner.f = nil
+	return err
+}
+
 // forwardFD3ToChild 在 agent 预设下把 fd3 经 ExtraFiles 显式单路转发给目标
-// 子进程。调用方负责在 cmd.Start() 成功后关闭本进程侧 fd3（closeFD3）。
+// 子进程。调用方负责在 cmd.Start() 成功后调用 releaseFd3File 关闭本进程侧
+// fd3 owner（解除 drainDebug 的 EOF 悬挂）。
 func forwardFD3ToChild(cmd *exec.Cmd, active bool) {
 	if !active {
 		return
 	}
-	if f := os.NewFile(3, "claude-debug"); f != nil {
+	if f, err := acquireFd3File(); err == nil && f != nil {
 		cmd.ExtraFiles = []*os.File{f}
 	}
 }
 
-// closeFD3 关闭父进程侧 fd3 副本（Start 后调用），解除 drainDebug 的 EOF 悬挂。
+// closeFD3 关闭父进程侧 fd3 owner（Start 后调用），解除 drainDebug 的 EOF
+// 悬挂；同时撤销 owner 的终结器，杜绝幽灵关闭复用槽位。
 func closeFD3(active bool) {
 	if active {
-		_ = unix.Close(3)
+		_ = releaseFd3File()
 	}
 }
 

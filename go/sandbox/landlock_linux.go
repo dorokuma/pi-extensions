@@ -989,6 +989,26 @@ func sendNotifyFDToHelper(ctrlFD int, notifyFD int) error {
 	return nil
 }
 
+// helperWriteAll 向控制通道写完整 len(b) 字节：unix.Write 遇 EINTR（Go
+// 运行时的异步抢占信号 SIGURG 会打断无 SA_RESTART 的 socket 写）重试，
+// 短写续写直至写完；真正失败（含 EPIPE/ECONNRESET——父进程已撤）返回
+// 错误。就绪 ACK 与 notify-fd ACK 共用本路径：返回值被丢弃时，EINTR 中断
+// 未写出会让父进程阻塞读 ACK 而 helper 在 Recvmsg 等 notifyFD——双方互等；
+// 第二 ACK 写中断时 defer 关通道让父进程把正常启动误判失败（oracle M4）。
+func helperWriteAll(fd int, b []byte) error {
+	for len(b) > 0 {
+		n, err := unix.Write(fd, b)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // helperFailf 报告辅助进程启动失败并退出（退出码 1，区别于就绪 ACK）。
 // 关闭控制通道使父进程读 ACK 收到 EOF/非 '1'，再关闭存活管道退出。
 func helperFailf(ctrlFD int, lifeR *os.File, brokerLn net.Listener, format string, args ...any) {
@@ -1089,8 +1109,14 @@ func runHelperProcess() {
 		go serveGoBroker(brokerLn, cfg)
 	}
 
-	// 通知父进程辅助进程已就绪
-	_, _ = unix.Write(ctrlFD, []byte("1"))
+	// 通知父进程辅助进程已就绪：EINTR 重试并校验完整 1 字节写出；写
+	// 失败（父进程已撤/通道关闭）直接退出，不再进入 Recvmsg 等待——
+	// 父进程读不到 ACK 不会推进到 notifyFD 转发，helper 必须 fail-closed。
+	if err := helperWriteAll(ctrlFD, []byte("1")); err != nil {
+		_ = unix.Close(ctrlFD)
+		ctrlFD = -1
+		fail("write readiness ack: %v", err)
+	}
 
 	// 接收父进程传递过来的 seccomp notifyFD；仅当完整收到 notify FD
 	// 并启动 serving goroutine 后才向父进程回 ACK，任一步骤失败则
@@ -1128,7 +1154,10 @@ func runHelperProcess() {
 		if !received {
 			return
 		}
-		_, _ = unix.Write(ctrlFD, []byte("1"))
+		// notify-fd ACK 同口径：EINTR 重试、校验完整写出；写失败时
+		// defer unix.Close(ctrlFD) 让父进程收 EOF（把正常启动判失败比
+		// 静默丢失 ACK 更符合 fail-closed，且父进程有超时兜底）。
+		_ = helperWriteAll(ctrlFD, []byte("1"))
 	}()
 
 	if lifeR != nil {

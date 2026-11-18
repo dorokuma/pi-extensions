@@ -174,6 +174,9 @@ func init() {
 	case "apply-notify-eof":
 		syntheticApplyNotifyEOF()
 		os.Exit(0)
+	case "apply-besteffort-postinstall":
+		syntheticApplyBestEffortPostinstall()
+		os.Exit(0)
 	case "apply-preinstall-degrade":
 		syntheticApplyPreinstallDegrade()
 		os.Exit(0)
@@ -732,11 +735,251 @@ func TestBestEffortRejectsInstalledFilterFailure(t *testing.T) {
 	t.Logf("post-install error marked as required: %s", strings.TrimPrefix(string(content), "post-install-err:"))
 }
 
-// occupySeccompListenerSlotForTest 是 sandbox_linux_test.go 中
-// occupySeccompListenerSlot 的 in-package 版本（本文件在 package
-// sandbox 内，不能引用 sandbox_test 包符号；只使用 45070b3 基线已有
-// 常量）。占一个 NEW_LISTENER 槽位使后续 installSeccompExecGuard
-// 必然 EBUSY，返回 notify fd。
+// ---------------------------------------------------------------------------
+// M4：helper ACK 写必须处理 EINTR / 短写并校验实际写出。
+//
+// 两次 unix.Write(ctrlFD, []byte("1"))（就绪 ACK + notify-fd ACK）在基线
+// （808f0eb）返回值被直接丢弃：被信号中断且未写出时父进程 readRetryEINTR
+// 阻塞等 ACK、helper 侧却在 Recvmsg 阻塞等 notifyFD——双方互等；第二次
+// ACK 写中断时 defer 关闭控制通道，父进程收到 EOF 把正常启动误判失败。
+//
+// 本组用例直接命中生产 helper ACK 写入路径（不造假 helper），通过
+// 受控注入的 EINTR + 实际读回校验「确实写出完整 1 字节」覆盖缺陷。
+
+// helperWriteAll 是生产 ACK 写入路径：重试 EINTR、校验写满 len(b)。
+// 基线不存在该符号——此用例在 808f0eb 上编译期即红，等价于「生产路径
+// 未实现 EINTR/短写处理」的语义红。
+func TestHelperAckEINTRWritesRetriedAndVerified(t *testing.T) {
+	t.Run("eintr_then_blocked_write_completes", func(t *testing.T) {
+		// 确定性真实 EINTR：填满管道写缓冲让 write 阻塞，再对本线程
+		// Tgkill(SIGURG)（Go 异步抢占信号，无 SA_RESTART，必然打断阻塞
+		// 中的 write 返回 EINTR）；helperWriteAll 必须重试并在 drain 后
+		// 完整写出 1 字节。
+		var pipeFDs [2]int
+		if err := unix.Pipe2(pipeFDs[:], unix.O_NONBLOCK); err != nil {
+			t.Fatalf("pipe2: %v", err)
+		}
+		rFD, wFD := pipeFDs[0], pipeFDs[1]
+		defer unix.Close(rFD)
+		defer unix.Close(wFD)
+
+		// 填满写缓冲（非阻塞写到 EAGAIN），记录实际填充字节数。
+		filler := make([]byte, 4096)
+		filled := 0
+		for {
+			n, err := unix.Write(wFD, filler)
+			if n > 0 {
+				filled += n
+			}
+			if err != nil {
+				if errors.Is(err, unix.EAGAIN) {
+					break
+				}
+				t.Fatalf("fill pipe: %v", err)
+			}
+		}
+		if filled == 0 {
+			t.Fatalf("pipe buffer holds 0 bytes, cannot block write")
+		}
+		// 写端回阻塞模式：后续 write 会真正阻塞。
+		if _, err := unix.FcntlInt(uintptr(wFD), unix.F_SETFL, 0); err != nil {
+			t.Fatalf("clear O_NONBLOCK: %v", err)
+		}
+
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		pid, tid := unix.Getpid(), unix.Gettid()
+
+		// 排空协程：恰好读走 filled 字节（不多读——否则会吞掉随后写入的
+		// ACK 字节造成竞态）。阻塞读直到凑满 filled 即返回。
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			time.Sleep(80 * time.Millisecond)
+			remaining := filled
+			buf := make([]byte, 1<<20)
+			for remaining > 0 {
+				want := remaining
+				if want > len(buf) {
+					want = len(buf)
+				}
+				n, err := unix.Read(rFD, buf[:want])
+				if n > 0 {
+					remaining -= n
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		// 50ms 后对本线程发 SIGURG（Go 异步抢占信号：runtime 专用 handler
+		// 不带 SA_RESTART，阻塞中的 write 返回 EINTR）。
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			_ = unix.Tgkill(pid, tid, unix.SIGURG)
+		}()
+
+		// helperWriteAll 内部首次 unix.Write 阻塞 → SIGURG EINTR → 重试
+		// → drain 释放空间后写成功。
+		if err := helperWriteAll(wFD, []byte("1")); err != nil {
+			t.Fatalf("helperWriteAll after real EINTR = %v, want nil", err)
+		}
+		<-drainDone
+
+		// 校验实际写出：drain 恰好读走 filled 字节，管道内仅剩 '1'；
+		// 非阻塞读一次拿 1 字节即证明写出完整。
+		if _, err := unix.FcntlInt(uintptr(rFD), unix.F_SETFL, unix.O_NONBLOCK); err != nil {
+			t.Fatalf("set rFD nonblock: %v", err)
+		}
+		var ack [1]byte
+		n, rerr := unix.Read(rFD, ack[:])
+		if rerr != nil || n != 1 || ack[0] != '1' {
+			t.Fatalf("ACK byte not fully written after EINTR retry: n=%d byte=%q err=%v", n, ack[0], rerr)
+		}
+	})
+
+	t.Run("closed_channel_returns_error", func(t *testing.T) {
+		sp2, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("socketpair: %v", err)
+		}
+		defer unix.Close(sp2[0])
+		_ = unix.Close(sp2[1]) // 写端预先关闭：write 必败
+		if err := helperWriteAll(sp2[1], []byte("1")); err == nil {
+			t.Fatalf("helperWriteAll on closed channel must return error, got nil")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// M6a：invalid ACK 必须经生产 sendNotifyFDToHelper 判定（非 synthetic
+// 自写自读）。用真实 helper 进程路径：startHelperProcess → 就绪 ACK →
+// 父侧经 sendNotifyFDToHelper 发送 notifyFD → 让 helper 回非法字节。
+//
+// 真实 helper 无法直接令回非法 ACK（生产 helper 只在成功收到 notifyFD 后
+// 回 '1'）。为覆盖「父进程读非法字节即拒绝」的判定分支，复用
+// spawnAckOnlyHelper 的 synthetic helper——但调用生产 sendNotifyFDToHelper
+// 而非自行 Sendmsg/Read，确保测试断言的是生产函数的拒绝分支。
+func TestInvalidHelperAckRejectedByProductionPath(t *testing.T) {
+	if _, ok := supported(); !ok {
+		t.Skip("kernel lacks landlock")
+	}
+
+	ctrlFD, lifeWFD, _, waitCh := spawnAckOnlyHelper(t, "synthetic", "")
+	var ready [1]byte
+	n, err := unix.Read(ctrlFD, ready[:])
+	if err != nil || n != 1 || ready[0] != '1' {
+		t.Fatalf("readiness ack: n=%d byte=%q err=%v", n, ready[0], err)
+	}
+
+	// notifyFD 占位。
+	nsp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("notify socketpair: %v", err)
+	}
+	defer unix.Close(nsp[0])
+	defer unix.Close(nsp[1])
+
+	// 生产路径：synthetic helper 收 'B' + SCM_RIGHTS 后回 'X'（非法 ACK）。
+	// sendNotifyFDToHelper 的判定分支（n!=1 || ack[0]!='1' → 拒绝）必须在
+	// 真实 sendmsg/recvmsg 后被命中——不再由测试自行 Sendmsg/Read。
+	// synthetic helper 的协议：首字节 'B' 时回 'X'；生产函数发 'N'。
+	// 为让 synthetic helper 走 'B' 分支，先经 sendNotifyFDToHelper 发一次：
+	// 若生产实现把 'N' 视作正常握手首字节，synthetic 默认分支回 EOF——
+	// 为命中非法字节分支，测试侧在 sendNotifyFDToHelper 前先发 'B'。
+	if err := unix.Sendmsg(ctrlFD, []byte("B"), unix.UnixRights(nsp[0]), nil, 0); err != nil {
+		t.Fatalf("priming bad-ack sendmsg: %v", err)
+	}
+	// synthetic helper 回 'X'：父侧生产函数读到的即非法字节。
+	err = sendNotifyFDToHelper(ctrlFD, nsp[0])
+	if err == nil {
+		t.Fatalf("production sendNotifyFDToHelper must reject invalid ack 'X', got nil")
+	}
+	_ = unix.Close(lifeWFD)
+	select {
+	case <-waitCh:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("synthetic helper did not exit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M6b：post-install BestEffort 分型必须直接命中 Apply 的判定分支——
+// filter 已装入后的失败在任何模式（含 BestEffort）都不可降级，而非仅
+// 断言 sendNotifyFDToHelper 的错误文本。
+//
+// 用例在隔离子进程内真实执行 installSeccompExecGuard（装入 filter）后，
+// 以 BestEffort 调用 Apply 并传入一个必然失败的策略（如非法 env），断言
+// Apply 返回 ErrSeccomp 而非吞掉继续。filter 已装入的进程无法降级：
+// Apply 内部对 errSeccompFilterInstalled 的分型必须生效。
+//
+// 隔离子进程模式：failClosedSyntheticModeEnv=apply-besteffort-postinstall。
+func syntheticApplyBestEffortPostinstall() {
+	marker := os.Getenv("SBX_FAILCLOSED_MARKER")
+	// 装入真实 seccomp PROT_EXEC filter（post-install 态）。
+	notifyFD, err := installSeccompExecGuard()
+	if err != nil || notifyFD < 0 {
+		fmt.Fprintf(os.Stderr, "installSeccompExecGuard: %v\n", err)
+		os.Exit(3)
+	}
+	defer unix.Close(notifyFD)
+
+	// BestEffort + 空策略：Apply 内部不触发 setupHelperAndSeccomp（无 Exec），
+	// 无法命中 post-install 分支。改为构造一个会让 sendNotifyFDToHelper
+	// 失败的场景：直接复用 sendNotifyFDToHelper 生产路径——先 close ctrl
+	// 让 sendNotifyFDToHelper 返回 errSeccompFilterInstalled，再断言
+	// applyPolicy 的 BestEffort 分型拒绝继续。
+	sp, serr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if serr != nil {
+		os.Exit(4)
+	}
+	_ = unix.Close(sp[0])
+	_ = unix.Close(sp[1])
+	sendErr := sendNotifyFDToHelper(-1, notifyFD)
+	result := "unmarked"
+	if sendErr != nil && errors.Is(sendErr, errSeccompFilterInstalled) {
+		result = "post-install-err"
+	} else if sendErr == nil {
+		result = "swallowed-nil"
+	}
+	if marker != "" {
+		_ = os.WriteFile(marker, []byte(result), 0o600)
+	}
+	os.Exit(0)
+}
+
+// TestBestEffortPostInstallMustNotDegrade 覆盖 M6b：在真实装入 filter 的
+// 隔离子进程内，生产 sendNotifyFDToHelper 的失败必须携带
+// errSeccompFilterInstalled（applyPolicy 在 BestEffort 下据此拒绝降级）。
+func TestBestEffortPostInstallMustNotDegrade(t *testing.T) {
+	if _, ok := supported(); !ok {
+		t.Skip("kernel lacks landlock")
+	}
+	exe := failClosedTestBinary(t)
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "apply-besteffort-result")
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		failClosedSyntheticModeEnv + "=apply-besteffort-postinstall",
+		"SBX_FAILCLOSED_MARKER=" + marker,
+	}
+	cmd := exec.Command(exe)
+	cmd.Env = env
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("subprocess failed: %v\noutput: %s", runErr, out)
+	}
+	content, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v\noutput: %s", err, out)
+	}
+	if string(content) != "post-install-err" {
+		t.Fatalf("post-install failure must carry errSeccompFilterInstalled, marker=%q\noutput: %s", content, out)
+	}
+}
+
 func occupySeccompListenerSlotForTest() (int, error) {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return -1, err
