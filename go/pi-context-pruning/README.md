@@ -1,5 +1,11 @@
 # pi-context-pruning (Go 移植版)
 
+> **已归档退役**：本组件已从部署目录 `~/.pig/agent/extensions` 下线，上游 GitHub 仓库
+> [dorokuma/pi-context-pruning](https://github.com/dorokuma/pi-context-pruning) 已归档，并列入
+> `go/Makefile` 的 `RETIRED_COMPONENTS`。源码保留在本目录与 `go/go.work` 中备查，**不再参与
+> 默认 `make build`/`make vet`/`make test` 循环**；如需验证归档源码，请在本目录手动执行
+> `go build/vet/test ./...`。
+
 本扩展是原 TS 版 `pi-context-pruning`（[dorokuma/pi-context-pruning](https://github.com/dorokuma/pi-context-pruning)）向 PiG Go 扩展体系的行为等价移植实现。
 
 ## 背景与设计初衷

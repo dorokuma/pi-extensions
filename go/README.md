@@ -12,7 +12,7 @@ pi 全面 Go 化迁移工程（eqi12 开发机环境）。
 
 批次推进概要（详见 [go/PLAN.md](PLAN.md)）：
 - 第 0 批：并行环境搭建（PiG 部署、隔离配置目录、仓库骨架）
-- 第 1 批：小件扩展移植（herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish、pi-context-pruning；gemini-safety 已弃用并删除）
+- 第 1 批：小件扩展移植（herdr-agent-state、exclude-tools-guard、no-tables、pi-env、pi-tinyfish、pi-context-pruning〔已退役归档，见 `go/Makefile` `RETIRED_COMPONENTS`〕；gemini-safety 已弃用并删除）
 - 第 2 批：中件扩展移植（moshi-hooks〔已退役归档，见 `go/Makefile` `RETIRED_COMPONENTS`〕、ctxmode、jev-gate、ctx-orchestrate、auto-continue、codegraph-go）
 - 第 3 批：界面类扩展移植（cache-stats、pi-my-compact-ui）
 - 第 4 批：大件扩展移植（pi-vcc、rpiv-ask-user-question、herdsman 扩展侧）
