@@ -1899,17 +1899,19 @@ func TestWarmGoExtensionCellsSettingsExternalExtPath(t *testing.T) {
 // goPackedCellHash 折进 toolchain 的 commandVersion/goroot/compiler，两侧
 // toolchain 不一致则 cell 摘要错配，沙盒内 pig 被迫在 cells/go 下建
 // .build-* scratch 而撞 W^X 只读（15 个 Go 扩展全加载失败、exit 1）。
-// 本测试在宿主 PATH 最前置一个伪 go 并断言预热子进程 command -v go 恰好
-// 解析到它（与 resolveRealGoBinary 同口径），证明两侧 toolchain 对齐。
+// 本测试在工作树内放一个「假 go」并把宿主 PATH 前置到它，断言预热子进程
+// command -v go 仍解析到可信的真实 go（不得前置该不可信父目录），同时断言
+// 可信解析与沙盒侧 resolveRealGoBinary 在多版本工具链下仍对齐同一实体。
 func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
-	// 在宿主 PATH 最前植入伪 go：resolveRealGoBinary 按宿主 PATH 顺序先命中它，
-	// 预热子进程的 command -v go 也必须命中它（而非 controlledWarmPath 固定目录）。
-	fakeGoBin := t.TempDir()
-	fakeGo := filepath.Join(fakeGoBin, "go")
-	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\necho fake-go\n"), 0o755); err != nil {
+	// 在工作树（不可信父目录）内植入假 go：resolveSandboxRealGoBinary 必须
+	// 拒绝把它（或其所在不可信父目录）前置进预热 PATH——旧实现只按宿主 PATH
+	// 顺序取首个可执行 go，预热子进程在 Landlock 生效前就会以宿主权限执行它。
+	untrustedDir := t.TempDir()
+	fakeGo := filepath.Join(untrustedDir, "go")
+	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\necho untrusted-fake-go\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile fake go: %v", err)
 	}
-	t.Setenv("PATH", fakeGoBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PATH", untrustedDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	fx := newWarmTestFixture(t, "", true)
 	fx.setPigScript(t, fx.warmEnvLogScript(bundledCellSnippet, ""))
@@ -1922,19 +1924,41 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 		t.Fatal("cold start: fake pig was not invoked")
 	}
 
-	// 沙盒侧将选中的真实 go 与预热子进程实际解析到的 go 必须一致。
-	realGo := resolveRealGoBinary("")
-	if realGo == "" {
-		t.Skip("no real go on host PATH; cannot assert toolchain alignment")
+	// 受信解析：resolveSandboxRealGoBinary 跳过不可信 PATH 前置的假 go，
+	// 命中固定可信工具链前缀内的真实 go；其所在目录即被前置进预热 PATH。
+	wantRealGo := resolveSandboxRealGoBinary("")
+	if wantRealGo == "" {
+		t.Skip("no trusted real go resolvable on host; cannot assert toolchain alignment")
 	}
-	wantGoDir := filepath.Dir(realGo)
+	wantGoDir := filepath.Dir(wantRealGo)
 	gotGo := fx.warmLogEnv(t, "GOCMD")
 	if gotGo == "" || gotGo == "none" {
 		t.Fatalf("warm subprocess did not resolve any go: %q", gotGo)
 	}
-	// command -v go 返回 PATH 中首个 go；其所在目录必须是 realGo 所在目录。
+	// command -v go 返回 PATH 中首个 go；其所在目录必须是受信真实 go 目录，
+	// 不得是不可信父目录 untrustedDir（旧实现会把整个不可信目录前置进 PATH）。
+	if filepath.Dir(gotGo) == untrustedDir {
+		t.Fatalf("warm subprocess resolved untrusted fake go at %q (dir %q); untrusted parent dir must not be prepended to warm PATH", gotGo, untrustedDir)
+	}
 	if gotDir := filepath.Dir(gotGo); gotDir != wantGoDir {
-		t.Fatalf("warm subprocess resolved go at %q (dir %q), want sandbox-aligned real go dir %q; cell digest would mismatch and force .build-* rebuild under read-only cells/go", gotGo, gotDir, wantGoDir)
+		t.Fatalf("warm subprocess resolved go at %q (dir %q), want trusted real go dir %q; cell digest would mismatch and force .build-* rebuild under read-only cells/go", gotGo, gotDir, wantGoDir)
+	}
+	// 多版本工具链对齐能力保留：预热命中的真实 go（EvalSymlinks 后）必须与
+	// resolveSandboxRealGoBinary 选中的是同一个真实 go 实体。
+	resolvedWarm, err := filepath.EvalSymlinks(gotGo)
+	if err != nil || resolvedWarm == "" {
+		resolvedWarm = gotGo
+	}
+	resolvedWant, err := filepath.EvalSymlinks(wantRealGo)
+	if err != nil || resolvedWant == "" {
+		resolvedWant = wantRealGo
+	}
+	if filepath.Clean(resolvedWarm) != filepath.Clean(resolvedWant) {
+		t.Fatalf("warm go %q (resolved %q) and trusted resolver %q (resolved %q) must be the same real go for cell digest alignment", gotGo, resolvedWarm, wantRealGo, resolvedWant)
+	}
+	// 受信前缀断言：选中 go 的真实路径位于可信工具链前缀内（回归点本身）。
+	if !pathWithinPrefixes(resolvedWant, trustedGoToolchainPrefixes()) {
+		t.Fatalf("trusted resolver returned %q outside trusted toolchain prefixes", resolvedWant)
 	}
 }
 
@@ -2165,6 +2189,125 @@ func TestAppendAgyStateReadWriteMarksRootFilesOptional(t *testing.T) {
 // 断言能用 t.TempDir() 夹具确定性实跑，摆脱宿主真实 claude/agy 安装状态。
 var ResolveEntryAgentPathsForTest = resolveEntryAgentPaths
 
+// ---------------------------------------------------------------------------
+// N7：受信自定义目录判定不得误丢合法值——解析后的规范化路径与 cfg 原始
+// 字符串相等判定会把通过校验的相对路径/冗余分隔/点段写法丢弃；明确 PI
+// 自定义入口（PIG_USE_PI_DIRS=1 + PI_CODING_AGENT_DIR）同样必须保留。
+// 断言对象：ReviewerAgentWithEnv 产出的 Policy.Env 有效 AgentDir 键。
+
+// trustedCustomDirFixture 建一个 0700 属主=euid 的可信自定义目录（通过
+// validateTrustedPigDir），返回其规范化绝对路径与另一种拼写形式。
+func trustedCustomDirFixture(t *testing.T, join ...string) (canon, spelled string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range join {
+		dir = filepath.Join(dir, j)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canon = filepath.Clean(dir)
+	return canon, dir
+}
+
+// unsetAgentDirEnv 隔离全部 AgentDir 相关宿主变量。
+func unsetAgentDirEnv(t *testing.T) {
+	t.Helper()
+	unsetEnv(t, "PIG_CODING_AGENT_DIR")
+	unsetEnv(t, "PI_CODING_AGENT_DIR")
+	unsetEnv(t, "PIG_USE_PI_DIRS")
+	t.Setenv("PIG_HOME", t.TempDir())
+}
+
+func TestTrustedCustomAgentDirSpellingsPreserved(t *testing.T) {
+	unsetAgentDirEnv(t)
+	workdir := t.TempDir()
+
+	cases := []struct {
+		name    string
+		cfgEnv  func(canon, spelled string) []string
+		wantDir func(canon, spelled string) string
+	}{
+		{
+			name: "relative_path",
+			// 相对路径经 absCleanPath 规范化后必须保留，不得因
+			// 「规范化值 != cfg 原始串」被丢弃。
+			cfgEnv: func(canon, spelled string) []string {
+				return []string{"PIG_CODING_AGENT_DIR=" + spelled}
+			},
+			wantDir: func(canon, spelled string) string { return canon },
+		},
+		{
+			name: "redundant_separator",
+			cfgEnv: func(canon, spelled string) []string {
+				return []string{"PIG_CODING_AGENT_DIR=" + spelled}
+			},
+			wantDir: func(canon, spelled string) string { return canon },
+		},
+		{
+			name: "dot_segments",
+			cfgEnv: func(canon, spelled string) []string {
+				return []string{"PIG_CODING_AGENT_DIR=" + spelled}
+			},
+			wantDir: func(canon, spelled string) string { return canon },
+		},
+		{
+			name: "pi_explicit_custom_entry",
+			// 明确 PI 自定义入口：PIG_USE_PI_DIRS=1 + PI_CODING_AGENT_DIR
+			// 须保留为有效目录，不再被 PIG 预值遮蔽。
+			cfgEnv: func(canon, spelled string) []string {
+				return []string{"PIG_USE_PI_DIRS=1", "PI_CODING_AGENT_DIR=" + canon}
+			},
+			wantDir: func(canon, spelled string) string { return canon },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetAgentDirEnv(t)
+			canon, spelled := trustedCustomDirFixture(t, "custom-agent")
+			switch tc.name {
+			case "relative_path":
+				// 构造相对 cwd 的拼写：把 t.TempDir 子目录指为相对路径。
+				parent := filepath.Dir(canon)
+				if rel, err := filepath.Rel(mustGetwd(t), canon); err == nil && !filepath.IsAbs(rel) {
+					spelled = rel
+				} else {
+					// 兜底：./<base> 相对 parent 的 cwd 写法不可控，改用 ./ 前缀。
+					spelled = "." + string(filepath.Separator) + filepath.Join(parent, filepath.Base(canon))
+				}
+			case "redundant_separator":
+				spelled = filepath.Dir(canon) + string(filepath.Separator) + "." + string(filepath.Separator) + filepath.Base(canon)
+			case "dot_segments":
+				spelled = canon + string(filepath.Separator) + "sub" + string(filepath.Separator) + ".."
+			}
+			p := ReviewerAgentWithEnv(workdir, tc.cfgEnv(canon, spelled))
+			t.Cleanup(func() { removePresetTempDirs(t, p) })
+			want := tc.wantDir(canon, spelled)
+			gotPig := lookupEnvValue(p.Env, "PIG_CODING_AGENT_DIR")
+			gotPi := lookupEnvValue(p.Env, "PI_CODING_AGENT_DIR")
+			if gotPig != want {
+				t.Fatalf("PIG_CODING_AGENT_DIR = %q, want trusted custom %q (spelling %q)", gotPig, want, spelled)
+			}
+			if gotPi != want {
+				t.Fatalf("PI_CODING_AGENT_DIR = %q, want %q (spelling %q)", gotPi, want, spelled)
+			}
+		})
+	}
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	return wd
+}
+
 // TestReviewerAgentCellTargetErrorNodeRuntimeGate 覆盖 oracle FM-2C：
 // reviewer-agent cell 目标集 fail-closed 必须按 language=go 且可执行产物
 // 过滤——宿主 cache 仅有 node-runtime-*（language:"node"）产物而 Go 扩展
@@ -2215,5 +2358,70 @@ func TestReviewerAgentCellTargetErrorNodeRuntimeGate(t *testing.T) {
 	// fail-closed：有 Go 扩展但无有效 Go 产物 → 返回错误拒绝启动。
 	if err := ReviewerAgentCellTargetError(); err == nil {
 		t.Fatalf("ReviewerAgentCellTargetError = nil, want error: node-runtime cell must not satisfy Go cell completeness gate")
+	}
+}
+
+// TestReviewerAgentCellTargetSymlinkCellsLangGate 覆盖 oracle N4：cell 目标
+// 枚举必须单一化——countValidExecutableGoArtifacts 的 total 不得再直接
+// ReadDir(cells/go) 跟随语言根软链而投影/Exec 侧跳过它。构造宿主
+// cells/go 为指向「含有效可执行 Go cell 的外部目录」的符号链接，并混入
+// .tombstone-* 合法墓碑目录：旧实现 total>0 而投影为空、missing 为空，
+// 完整性门禁零投影假放行；修复后 total 同样跳过该软链，
+// ReviewerAgentCellTargetError 返回明确错误拒绝启动。
+func TestReviewerAgentCellTargetSymlinkCellsLangGate(t *testing.T) {
+	fakePigHome := t.TempDir()
+	agentDir := filepath.Join(fakePigHome, "agent")
+	goExtDir := filepath.Join(agentDir, "extensions", "fake-go-ext")
+	if err := os.MkdirAll(goExtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goExtDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 宿主 cache/cells/go 是指向「含有效 Go cell 的外部目录」的符号链接。
+	hostCells := filepath.Join(fakePigHome, "cache", "cells")
+	if err := os.MkdirAll(hostCells, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	externalCellsGo := filepath.Join(t.TempDir(), "cells-go-target")
+	writeFakeCellEntry(t, filepath.Join(externalCellsGo, "deadbeef0001"), "deadbeef0001", "runner", "")
+	// .tombstone-* 合法墓碑目录（旧实现 projection 接纳但 total 跳过）。
+	writeFakeCellEntry(t, filepath.Join(externalCellsGo, ".tombstone-aaaa0001"), "aaaa0001", "runner", "")
+	if err := os.Symlink(externalCellsGo, filepath.Join(hostCells, "go")); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PIG_HOME", fakePigHome)
+	unsetEnv(t, "PIG_CODING_AGENT_DIR")
+	unsetEnv(t, "PI_CODING_AGENT_DIR")
+	unsetEnv(t, "PIG_USE_PI_DIRS")
+
+	workdir := t.TempDir()
+	policy := ReviewerAgentWithEnv(workdir, nil)
+	t.Cleanup(func() {
+		for _, kv := range policy.Env {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "TMPDIR" && strings.Contains(v, "pi-reviewer-") {
+				_ = os.RemoveAll(v)
+			}
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "PI_SANDBOX_GO_EXEC_DIR" && strings.Contains(v, "pi-reviewer-exec-") {
+				_ = os.RemoveAll(v)
+			}
+		}
+	})
+
+	hasGoExt, total, missing := ReviewerAgentCellTargets()
+	if !hasGoExt {
+		t.Fatalf("hasGoExt = false, want true (Go extension present)")
+	}
+	// 软链语言根不得被 total 单独计入（枚举口径与投影/Exec 一致）。
+	if total != 0 {
+		t.Fatalf("total = %d, want 0: cells/go symlink root must not be counted toward Go target set", total)
+	}
+	// 完整性校验必须拒绝放行（零投影假通过）并给出明确错误。
+	if err := ReviewerAgentCellTargetError(); err == nil {
+		t.Fatalf("ReviewerAgentCellTargetError = nil, want error: cells/go symlink projection must not be allowed to satisfy completeness gate")
+	} else if !strings.Contains(err.Error(), "no valid Go extension cell artifact") && len(missing) == 0 {
+		t.Fatalf("ReviewerAgentCellTargetError = %v, want fail-closed error naming missing/empty projection", err)
 	}
 }

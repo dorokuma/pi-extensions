@@ -511,45 +511,6 @@ func syntheticHelperAckOnly() {
 	os.Exit(0)
 }
 
-// spawnSyntheticHelperChild 在子进程内（无 *testing.T）派生 ack-only
-// synthetic helper，与 spawnAckOnlyHelper 同布局；供 syntheticApplyNotifyEOF
-// 自举使用。失败打印 stderr 并 os.Exit。
-func spawnSyntheticHelperChild() (ctrlFD, lifeWFD int, waitCh chan error) {
-	var pipeFDs [2]int
-	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
-		fmt.Fprintf(os.Stderr, "pipe2: %v\n", err)
-		os.Exit(2)
-	}
-	lifeR := os.NewFile(uintptr(pipeFDs[0]), "life-r")
-	lifeWFD = pipeFDs[1]
-
-	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "socketpair: %v\n", err)
-		os.Exit(2)
-	}
-	ctrlFD = sp[0]
-	ctrlChild := os.NewFile(uintptr(sp[1]), "ctrl-sock")
-
-	selfExe, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "os.Executable: %v\n", err)
-		os.Exit(2)
-	}
-	cmd := exec.Command(selfExe)
-	cmd.Env = append(os.Environ(), failClosedSyntheticModeEnv+"=helper-ack-only")
-	cmd.ExtraFiles = []*os.File{lifeR, ctrlChild}
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "start synthetic helper: %v\n", err)
-		os.Exit(2)
-	}
-	waitCh = make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-	_ = lifeR.Close()
-	_ = ctrlChild.Close()
-	return ctrlFD, lifeWFD, waitCh
-}
-
 // TestStartHelperProcessNotifyAckEOF 实际覆盖生产 sendNotifyFDToHelper
 // 的 notify ACK EOF 与非法字节两个拒绝分支：synthetic helper 就绪 ACK
 // 后接 "N"+SCM_RIGHTS——EOF 变体不回 ACK 直接退出，invalid-byte 变体
@@ -616,11 +577,14 @@ func TestStartHelperProcessNotifyAckEOF(t *testing.T) {
 		var badAck [1]byte
 		n, rerr := unix.Read(ctrlFD, badAck[:])
 		if rerr != nil || n != 1 || badAck[0] != 'X' {
-			t.Fatalf("bad-ack variant read: n=%d byte=%q err=%v", n, badAck[0], rerr)
+			t.Fatalf("bad-ack variant read: n=%d byte=%q err=%v (want production rejection on 'X')", n, badAck[0], rerr)
 		}
 		if badAck[0] == '1' {
 			t.Fatalf("helper unexpectedly acked '1' on bad-ack variant")
 		}
+		// 非法字节拒绝证据链完整：helper 在收到 'B'+SCM_RIGHTS 后真实
+		// 回了 'X' 并保持连接直到父侧读取完成；EPIPE/ECONNRESET/EOF 均
+		// 不满足 n==1 && byte=='X'，删除非法字节拒绝分支本断言即红。
 		_ = unix.Close(lifeWFD)
 		select {
 		case <-waitCh:
@@ -649,12 +613,51 @@ func TestStartHelperProcessNotifyAckEOF(t *testing.T) {
 // 命中 EOF，断言携带 post-install 标记的错误被产生。这不是
 // unit-mock 错误分型——filter 原语与握手协议都是真实内核路径。
 
+// spawnSyntheticHelperChild 在子进程内（无 *testing.T）派生 ack-only
+// synthetic helper，与 spawnAckOnlyHelper 同布局；供 syntheticApplyNotifyEOF
+// 自举使用。失败打印 stderr 并 os.Exit。
+func spawnSyntheticHelperChild() (ctrlFD, lifeWFD int, waitCh chan error) {
+	var pipeFDs [2]int
+	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
+		fmt.Fprintf(os.Stderr, "pipe2: %v\n", err)
+		os.Exit(2)
+	}
+	lifeR := os.NewFile(uintptr(pipeFDs[0]), "life-r")
+	lifeWFD = pipeFDs[1]
+
+	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "socketpair: %v\n", err)
+		os.Exit(2)
+	}
+	ctrlFD = sp[0]
+	ctrlChild := os.NewFile(uintptr(sp[1]), "ctrl-sock")
+
+	selfExe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "os.Executable: %v\n", err)
+		os.Exit(2)
+	}
+	cmd := exec.Command(selfExe)
+	cmd.Env = append(os.Environ(), failClosedSyntheticModeEnv+"=helper-ack-only")
+	cmd.ExtraFiles = []*os.File{lifeR, ctrlChild}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start synthetic helper: %v\n", err)
+		os.Exit(2)
+	}
+	waitCh = make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	_ = lifeR.Close()
+	_ = ctrlChild.Close()
+	return ctrlFD, lifeWFD, waitCh
+}
+
 // syntheticApplyNotifyEOF 在隔离子进程内重放生产 setupHelperAndSeccomp
 // 后半段：派生 ack-only synthetic helper（生产 ExtraFiles 布局）、读
 // 就绪 ACK、真实 installSeccompExecGuard 装入 filter、真实
-// sendNotifyFDToHelper 命中 EOF。断言返回错误携带 post-install
-// 标记后写 marker 退出——真实安装 filter 的隔离进程退出后资源由
-// 内核回收，不自锁测试进程。
+// sendNotifyFDToHelper 命中 EOF（helper 收到 'N' 消息后立即退出让父侧
+// 读不到 ACK）。断言返回错误携带 post-install 标记后写 marker 退出——
+// 真实安装 filter 的隔离进程退出后资源由内核回收，不自锁测试进程。
 func syntheticApplyNotifyEOF() {
 	marker := os.Getenv("SBX_FAILCLOSED_MARKER")
 	ctrlFD, lifeWFD, waitCh := spawnSyntheticHelperChild()
@@ -713,6 +716,9 @@ func TestBestEffortRejectsInstalledFilterFailure(t *testing.T) {
 
 	// 隔离子进程真实装 filter + 真实握手；env 受控小集合，
 	// 不含 envInternalModeKey（避免真实 helper 分发）。
+	// 子进程内 startHelperProcess 用 os.Executable()（即本测试二进制）
+	// 自身经 envInternalModeKey=helper 分发为真实 helper——无需额外注入。
+	// helper 标准错误与父侧一致（默认继承 stderr）便于失败诊断。
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),

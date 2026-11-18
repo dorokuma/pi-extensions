@@ -340,6 +340,88 @@ func resolveRealGoBinary(skipDir string) string {
 	return ""
 }
 
+// resolveSandboxRealGoBinary 是 reviewer-agent 预热（含后续任何把所选真实
+// go 目录前置进受控 PATH 的用途）共用的可信 go 解析：绝不把由调用方可控
+// 输入（宿主 PATH 前置目录、PI_SANDBOX_REAL_GO）解析出的二进制直接以宿主
+// 权限喂给预热子进程——工作树/任意目录内放个「假 go」+ 宿主 PATH 前置，旧
+// 实现在 Landlock 生效前就已在宿主权限下把它前置进预热 PATH 被执行
+// （controlledWarmPath 刻意不读调用方 PATH 的既有防线由此被打穿）。
+//
+// 可信判定分两步：先经 resolveRealGoBinary(skipDir) 做常规「非目录且有执行位」
+// 解析（Env 覆盖 → 调用方 PATH → 固定目录回退）得到沙盒侧将选中的同一个
+// go（cell 摘要对齐的来源），再对其做受信校验——EvalSymlinks 后的真实
+// 路径必须位于固定可信工具链前缀（trustedGoToolchainPrefixes）之下。命中
+// 不可信前缀时**不再继续探测下一候选**，直接回退固定可信目录顺序解析：
+// 预热子进程 PATH 本就以 /usr/local/go/bin 等固定目录起头，回退到固定目录
+// 首个可信 go 仍与沙盒侧同口径对齐（两侧均落同一真实工具链根），而「跳过
+// PATH 命中改用 PATH 内下一目录」反而会让预热与沙盒内包装器（resolveRealGoBinary
+// 仍按宿主 PATH 命中同一不可信目录）解析出不同 go——cell 摘要错配。于是
+// 折中：PATH 命中不可信时放弃 PATH 对齐、回退固定可信目录首个 go（该目录
+// 同样在沙盒 resolveRealGoBinary 的固定目录回退列表内，兜底一致），同时
+// 杜绝不可信父目录被前置进预热 PATH。
+//
+// skipDir 与 resolveRealGoBinary 同语义（沙盒内 go 包装器跳过 goExecBinDir
+// 自身）。
+func resolveSandboxRealGoBinary(skipDir string) string {
+	// 第一步：与沙盒同口径 resolveRealGoBinary 解析（PI_SANDBOX_REAL_GO →
+	// 调用方 PATH → 固定目录回退），得到沙盒侧将选中的同一个 go。
+	if realGo := resolveRealGoBinary(skipDir); realGo != "" {
+		if trusted, ok := trustedRealGoCandidate(realGo); ok {
+			return trusted
+		}
+		// PATH/Env 命中不可信：放弃该候选，继续回退固定可信目录，
+		// 不把不可信父目录前置进预热 PATH。
+	}
+	// 回退：固定可信工具链目录顺序，与 controlledWarmPath 前缀一致。
+	for _, dir := range []string{"/usr/local/go/bin", "/usr/lib/go/bin", "/usr/bin", "/bin"} {
+		if trusted, ok := trustedRealGoCandidate(filepath.Join(dir, "go")); ok {
+			return trusted
+		}
+	}
+	return ""
+}
+
+// trustedGoToolchainPrefixes 返回真实 go（EvalSymlinks 后）允许落入的固定
+// 可信工具链前缀：版本化/系统 Go 安装根 bin 目录与 trustedPigSearchDirs
+// 同源的标准 bin 目录。绝不纳入调用方可控 PATH / TMPDIR / 工作树目录。
+func trustedGoToolchainPrefixes() []string {
+	trustedHome := trustedHomeDir()
+	prefixes := []string{
+		"/usr/local/go/bin",
+		"/usr/lib/go/bin",
+		"/usr/lib",
+		"/usr/share",
+		filepath.Join(trustedHome, ".local", "opt"),
+		"/root/.local/opt",
+	}
+	return append(prefixes, standardBinDirs...)
+}
+
+// trustedRealGoCandidate 校验单个 go 候选：存在、非目录、带执行位，且
+// EvalSymlinks 后的真实路径位于 trustedGoToolchainPrefixes 之下；命中返回
+// 解析后的真实路径，否则返回 ("", false)。
+func trustedRealGoCandidate(candidate string) (string, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return "", false
+	}
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil || resolved == "" {
+		resolved = candidate
+	}
+	st, err := os.Stat(resolved)
+	if err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+		return "", false
+	}
+	if !pathWithinPrefixes(resolved, trustedGoToolchainPrefixes()) {
+		return "", false
+	}
+	if abs, err := filepath.Abs(resolved); err == nil {
+		resolved = abs
+	}
+	return resolved, true
+}
+
 // ReadOnlyReviewer 构造针对"只读审查员/体检员"子代理的预设沙盒策略：
 //   - 整个根文件系统 "/" 只读；
 //   - 仅开放 /tmp 下的私有子目录 (/tmp/pi-reviewer-*) 可写；报告统一走
@@ -1185,24 +1267,35 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// <pigHome>/agent——沙盒侧只复制其配置文件，不做预热级硬拒绝。
 	pigHome := resolvePigHomeDir(cfgEnv)
 	srcAgentDir, customAgentDir := resolveSourcePigAgentDir(pigHome, cfgEnv)
-	trustedCustom := customAgentDir && validateTrustedPigDir(srcAgentDir, "AgentDir")
-	if customAgentDir && !trustedCustom {
+	// 结构化受信判定（N1/N7）：srcAgentDir 是配置复制与扩展发现的来源
+	//（resolver 口径，含宿主环境变量声明）；srcTrusted 记录它是否通过
+	// validateTrustedPigDir 校验。只有「cfgEnv 显式声明 + 受信」的自定义
+	// 目录才能成为最终有效 AgentDir——宿主环境同名键属残留面，仅能作
+	// 复制源，不得成为有效目录（FM-4 口径）；明确 PI 自定义入口
+	//（PIG_USE_PI_DIRS=1 + PI_CODING_AGENT_DIR）与 PIG 入口同权，不再被
+	// PIG 预值遮蔽（N7）。
+	srcTrusted := customAgentDir && validateTrustedPigDir(srcAgentDir, "AgentDir")
+	if customAgentDir && !srcTrusted {
 		srcAgentDir = filepath.Join(pigHome, "agent")
 	}
+	trustedCustom := srcTrusted && customFromCfgEnv(cfgEnv)
 	preparePrivatePigAgentDirFromAgent(filepath.Join(privateTmpDir, "pig-agent"), srcAgentDir)
 	privatePigAgentDir := filepath.Join(privateTmpDir, "pig-agent")
 	// 预先在 Policy.Env 写入有效 AgentDir 判定结果，供 buildPolicy 在
 	// cfgEnv merge 后统一归一化：
-	//   - trustedCustom：有效目录 = srcAgentDir（受信自定义保留）；
+	//   - trustedCustom：有效目录 = srcAgentDir（受信自定义保留；经
+	//     absCleanPath 规范化，相对路径/冗余分隔/点段写法同样生效）；
 	//   - 其余：有效目录 = privatePigAgentDir（不可信被拒/缺省回钉）。
 	// 不可信路径不得经 cfgEnv merge 原样生效（oracle FM-4/M2）。
+	// 写入顺序：inject 先行（清理宿主残留 PI 键、钉私有），有效目录随后
+	// 覆盖——预热、配置复制与最终 exec 使用同一个 srcAgentDir 解析结果。
 	effectiveAgentDir := privatePigAgentDir
 	if trustedCustom {
 		effectiveAgentDir = srcAgentDir
 	}
+	p.Env = injectPigCodingAgentDir(p.Env, privatePigAgentDir, cfgEnv)
 	p.Env = overrideEnvKey(p.Env, "PIG_CODING_AGENT_DIR", effectiveAgentDir)
 	p.Env = overrideEnvKey(p.Env, "PI_CODING_AGENT_DIR", effectiveAgentDir)
-	p.Env = injectPigCodingAgentDir(p.Env, privatePigAgentDir, cfgEnv)
 
 	// 安全细则三：私有 PIG_HOME（<privateTmpDir>/pig-home，0700，RW，不进 Exec）。
 	// 宿主 PIG_HOME 保持只读；宿主态预刷新宿主缓存单元 usage.json（沙盒内
@@ -1237,9 +1330,47 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// total 必须按「language=go 且可执行产物」过滤：宿主 cache/ext 下
 	// node-runtime-* 等非 Go 产物（language!="go"）或无执行位的条目
 	// 绝不能计入目标集，否则冷缓存 + 非 Go cell 会让 total>0 假通过，
-	// fail-closed 被完全旁路（oracle FM-2C）。
+	// fail-closed 被完全旁路（oracle FM-2C）。枚举谓词与投影/Exec 完整性
+	// 校验完全一致（cellEntryHiddenOrSymlink）：cells/go 语言根为软链时
+	// total 同样不计入，杜绝「投影为空但 total>0 假放行」的软链逃逸。
 	total := countValidExecutableGoArtifacts(hostCache)
 	privatePigHome, missing := preparePrivatePigHome(privateTmpDir, pigHome, execSet)
+	// 完整性校验复用同一目标枚举：total 与 missing 都必须只覆盖可执行
+	// Go 目标——投影侧已把非执行/非 Go 条目仅作可读投影不计入 missing。
+	// 再显式复核「宿主可执行 Go 产物 × 私有投影」一致性：宿主任一有效
+	// Go 产物的相对路径在私有 cache 下必须是软链投影（validCellEntryDir
+	// 可解析到 artifact），否则意味着枚举口径不一致（如 cells/go 软链
+	// 被 total 计入而投影跳过），必须记入 missing fail-closed，而非让
+	// 零投影门禁假放行。该检查只走 cellCacheEntryDirs 同一枚举，不重扫。
+	if len(extDirs) > 0 && total > 0 {
+		privCacheRoot := filepath.Join(privatePigHome, "cache")
+		for _, hostEntry := range cellCacheEntryDirs(hostCache) {
+			meta, _, ok := validCellEntryDir(hostEntry)
+			if !ok {
+				continue
+			}
+			// 与 total/checkExec 同口径：仅可执行 Go 产物参与复核。
+			rel := relToCache(hostCache, hostEntry)
+			inCellsGo := strings.HasPrefix(rel, "cells"+string(filepath.Separator)+"go"+string(filepath.Separator))
+			if inCellsGo {
+				if meta.Language != "" && meta.Language != "go" {
+					continue
+				}
+			} else {
+				if meta.Language != "go" {
+					continue
+				}
+			}
+			artifact := filepath.Join(hostEntry, meta.Artifact)
+			if !isExecutableFile(artifact) {
+				continue
+			}
+			projPath := filepath.Join(privCacheRoot, rel)
+			if _, _, ok := validCellEntryDir(projPath); !ok {
+				missing = append(missing, rel+": host Go artifact not projected into private cache (enumeration/symlink mismatch)")
+			}
+		}
+	}
 	setReviewerAgentCellTargets(&reviewerAgentCellTargets{
 		hasGoExt: len(extDirs) > 0,
 		total:    total,
@@ -1667,6 +1798,9 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 	}
 
 	// cells/<lang>：可写目录承载 .build-* scratch 与 .locks；<entry> 软链投影。
+	// 与 total / Exec 完整性校验共用同一谓词 cellEntryHiddenOrSymlink：
+	// 语言根本身是软链、隐藏目录（.tombstone-* 除外）、非目录一律跳过，
+	// 与 cellCacheEntryDirs / countValidExecutableGoArtifacts 口径严格一致。
 	cellsRoot := filepath.Join(privCache, "cells")
 	hostCellsRoot := filepath.Join(hostCache, "cells")
 	_ = os.MkdirAll(cellsRoot, 0o700)
@@ -1684,10 +1818,7 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 				continue
 			}
 			for _, ent := range entries {
-				if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
-					continue
-				}
-				if strings.HasPrefix(ent.Name(), ".") && !strings.HasPrefix(ent.Name(), ".tombstone-") {
+				if cellEntryHiddenOrSymlink(ent) {
 					continue
 				}
 				hostEntry := filepath.Join(hostLang, ent.Name())
@@ -1713,10 +1844,7 @@ func preparePrivatePigHome(privateTmpDir, hostPigHome string, execSet map[string
 	_ = os.MkdirAll(filepath.Join(extRoot, ".locks"), 0o700)
 	if entries, err := os.ReadDir(hostExtRoot); err == nil {
 		for _, ent := range entries {
-			if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
-				continue
-			}
-			if strings.HasPrefix(ent.Name(), ".") && !strings.HasPrefix(ent.Name(), ".tombstone-") {
+			if cellEntryHiddenOrSymlink(ent) {
 				continue
 			}
 			hostEntry := filepath.Join(hostExtRoot, ent.Name())
@@ -1989,6 +2117,24 @@ func mustMarshalJSON(v any) []byte {
 	return data
 }
 
+// customFromCfgEnv 判定 cfgEnv 是否显式声明了自定义 AgentDir（与
+// resolveSourcePigAgentDir 的 custom 判定同口径、但仅认 cfgEnv，不读宿主
+// 环境变量——宿主残留键仅作复制源，不得成为有效目录）：
+//   - cfgEnv 最后一项 PIG_CODING_AGENT_DIR 非空 → true；
+//   - 否则有效 PIG_USE_PI_DIRS=="1" 且 cfgEnv 最后一项 PI_CODING_AGENT_DIR
+//     非空 → true（明确 PI 自定义入口，不再被 PIG 预值遮蔽）。
+func customFromCfgEnv(cfgEnv []string) bool {
+	if v, ok := cfgEnvLastValue(cfgEnv, "PIG_CODING_AGENT_DIR"); ok {
+		return strings.TrimSpace(v) != ""
+	}
+	if v, ok := cfgEnvLastValue(cfgEnv, "PIG_USE_PI_DIRS"); ok && strings.TrimSpace(v) == "1" {
+		if pv, ok := cfgEnvLastValue(cfgEnv, "PI_CODING_AGENT_DIR"); ok && strings.TrimSpace(pv) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // injectPigCodingAgentDir 在 env 中注入 PIG_CODING_AGENT_DIR 与
 // PI_CODING_AGENT_DIR 指向 <privatePigAgentDir>。
 //
@@ -2128,6 +2274,12 @@ func touchUsageJSON(entryDir string, now time.Time) error {
 
 // cellCacheEntryDirs 返回缓存根下全部缓存单元目录（ext/<entry> 与 cells/<lang>/<entry>）。
 // 与 PiG runtimecell.cacheEntryPaths 同构：跳过点开头目录，tombstone 除外。
+// 单一目标枚举实体：total（countValidExecutableGoArtifacts）、投影
+// （preparePrivatePigHome）与 Exec 完整性校验（validCellEntryDir 逐项）全部
+// 复用本函数与 cellEntryHiddenOrSymlink 谓词，保证三面口径一致——
+// cells/<lang> 语言根本身是符号链接时整个语言根的枚举被跳过（与投影侧
+// lang.Type()&ModeSymlink != 0 拒绝一致），total 不得再因 ReadDir 跟随
+// cells/go 软链而单独计入假通过。
 func cellCacheEntryDirs(cacheRoot string) []string {
 	var paths []string
 	addEntries := func(root string) {
@@ -2136,15 +2288,10 @@ func cellCacheEntryDirs(cacheRoot string) []string {
 			return
 		}
 		for _, ent := range entries {
-			// DirEntry.IsDir 对符号链接为 false，软链条目一律跳过（防逃逸）。
-			if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
+			if cellEntryHiddenOrSymlink(ent) {
 				continue
 			}
-			name := ent.Name()
-			if strings.HasPrefix(name, ".") && !strings.HasPrefix(name, ".tombstone-") {
-				continue
-			}
-			paths = append(paths, filepath.Join(root, name))
+			paths = append(paths, filepath.Join(root, ent.Name()))
 		}
 	}
 	addEntries(filepath.Join(cacheRoot, "ext"))
@@ -2158,6 +2305,18 @@ func cellCacheEntryDirs(cacheRoot string) []string {
 		}
 	}
 	return paths
+}
+
+// cellEntryHiddenOrSymlink 是 total / 投影 / Exec 完整性校验三方共用的
+// 隐藏/软链谓词：条目为符号链接（DirEntry.IsDir 对软链返回 false）、
+// 非目录，或名以 . 开头（.tombstone-* 除外——PiG runtimecell 的墓碑条目
+// 属合法缓存单元命名）一律排除，保证三面对同一目标集取同一谓词。
+func cellEntryHiddenOrSymlink(ent os.DirEntry) bool {
+	if ent.Type()&os.ModeSymlink != 0 || !ent.IsDir() {
+		return true
+	}
+	name := ent.Name()
+	return strings.HasPrefix(name, ".") && !strings.HasPrefix(name, ".tombstone-")
 }
 
 // refreshCellUsageMetadata 在进入 Landlock 前（宿主态）把 <pigHome>/cache 下

@@ -670,6 +670,11 @@ func computeGoCellFingerprint(tracked []string, extDirs, sdkDirs []goDirEntry, s
 // cache/ext/*（单扩展编译产物）。语言门禁：cache/ext 必须 ready.json 显式
 // 声明 language=="go"（排除宿主 node-runtime-* 等非 Go 产物）；cells/go
 // 目录本身已限定 go，允许 language 缺省或 =="go"。不扫描无关语言 cells/python 等。
+//
+// 枚举口径必须与 cellCacheEntryDirs / preparePrivatePigHome 投影完全一致：
+// cells/go 语言根本身是符号链接时跳过整个语言根的枚举（投影/Exec 同样不跟随
+// 该软链），否则 total 会因直接 ReadDir(cells/go) 跟随软链而计入投影为空的
+// 目标，造成完整性门禁零投影假放行。
 func countValidExecutableGoArtifacts(cacheRoot string) int {
 	count := 0
 	for _, root := range []struct {
@@ -679,12 +684,17 @@ func countValidExecutableGoArtifacts(cacheRoot string) int {
 		{filepath.Join(cacheRoot, "cells", "go"), false},
 		{filepath.Join(cacheRoot, "ext"), true},
 	} {
+		// cells/<lang> 语言根本身是符号链接时跳过（与投影侧一致）；
+		// cache/ext 目录同理不接受软链本体。
+		if isSymlinkPath(root.path) {
+			continue
+		}
 		entries, err := os.ReadDir(root.path)
 		if err != nil {
 			continue
 		}
 		for _, ent := range entries {
-			if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
+			if cellEntryHiddenOrSymlink(ent) {
 				continue
 			}
 			dir := filepath.Join(root.path, ent.Name())
@@ -902,7 +912,13 @@ func runPigWarmSubprocess(sigCtx context.Context, pigBin, pigHome, srcAgentDir s
 	// 优先而宿主 PATH 先命中 /usr/bin），cell 摘要必然错配、沙盒内被迫在
 	// cells/go 下重建 .build-* 而撞 W^X 只读。因此把沙盒将要选中的真实 go
 	// 所在目录提前到受控 PATH 之首，保证 exec.LookPath("go") 两侧解析一致。
-	if realGo := resolveRealGoBinary(""); realGo != "" {
+	//
+	// 所选真实 go 必须经 resolveSandboxRealGoBinary 受信解析（真实路径位于
+	// 固定可信工具链前缀内）——绝不把 resolveRealGoBinary 直接按宿主 PATH /
+	// PI_SANDBOX_REAL_GO 选中的任意父目录前置进预热 PATH：调用方可控目录内
+	// 的「假 go」会在 Landlock 生效前以宿主权限被预热子进程执行
+	//（controlledWarmPath 刻意不读调用方 PATH 的既有防线由此被打穿）。
+	if realGo := resolveSandboxRealGoBinary(""); realGo != "" {
 		if goDir := filepath.Dir(realGo); goDir != "" {
 			for i, kv := range env {
 				if strings.HasPrefix(kv, "PATH=") {

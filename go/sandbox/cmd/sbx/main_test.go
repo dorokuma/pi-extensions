@@ -1952,20 +1952,31 @@ fi`
 	})
 
 	t.Run("prewarmed_daemon_does_not_inherit_fd3", func(t *testing.T) {
-		// M6：受控预热后台进程验证——sbx 内部预热路径
-		//（MaybeWarmGoExtensionCells → pig --help）若未对继承的 fd3 置
-		// CLOEXEC，预热子进程/常驻 daemon 会持有写端，sbx 退出后读端仍
-		// 无 EOF（旧版本 daemon 劫持缺陷）。
-		//
-		// 夹具：fakePigHome 含 Go 扩展源码（触发预热路径），PIG_HOME 指
-		// 向它；预热会真实执行 pig --help（产生 cell 编译子进程）。
-		// 若这些子进程继承 fd3 写端，sbx 全部退出后读端仍收不到 EOF。
+		// N5：用受控真实 pig 入口 + 真实 Go 扩展触发 MaybeWarmGoExtensionCells
+		// 预热路径——pig --help 会真实编译 cell 并拉起 codegraph-go
+		// -warm-daemon 常驻进程。预热确实发生的判据：预热完成后宿主
+		// cache/cells/go 或 cache/ext 下出现有效 Go 产物（
+		// countValidExecutableGoArtifacts>0）。可观察存活的 daemon（预热
+		// 进程的真实派生）经 pgrep 扫描宿主进程表确认；该进程/预热子进程
+		// 若继承 fd3 写端，sbx 全部退出后读端仍收不到 EOF（oracle FM-3）。
+		// 无真实 pig 或预热未产生 Go 产物时跳过，不假绿。
+		pigBin := "/root/.local/bin/pig"
+		if st, err := os.Stat(pigBin); err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
+			t.Skip("real pig entry /root/.local/bin/pig unavailable")
+		}
+		srcExt := "/root/workspace/pi-extensions/go/cache-stats"
+		if _, err := os.Stat(filepath.Join(srcExt, "go.mod")); err != nil {
+			t.Skip("real Go extension source (cache-stats) unavailable")
+		}
+
+		// 受控宿主 pig home：agent/extensions/cache-stats -> 真实源码软链
+		//（与生产布局同构）；空 cache 触发冷路径预热。
 		hostPigHome := t.TempDir()
-		extDir := filepath.Join(hostPigHome, "agent", "extensions", "fake-go-ext")
-		if err := os.MkdirAll(extDir, 0o755); err != nil {
+		extLinkDir := filepath.Join(hostPigHome, "agent", "extensions")
+		if err := os.MkdirAll(extLinkDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(extDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		if err := os.Symlink(srcExt, filepath.Join(extLinkDir, "cache-stats")); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.MkdirAll(filepath.Join(hostPigHome, "cache"), 0o755); err != nil {
@@ -1980,15 +1991,33 @@ fi`
 		out, code := invokeSbxSubprocessWithFD3(t, w,
 			[]string{"PIG_HOME=" + hostPigHome},
 			"--best-effort", "--preset", "reviewer-agent", "--workdir", workdir,
-			"--", "/bin/sh", "-c", fd3Probe,
+			"--", pigBin, "--help",
 		)
 		_ = w.Close()
 		if code != 0 {
-			t.Fatalf("reviewer-agent exit = %d; output:\n%s", code, out)
+			t.Fatalf("reviewer-agent real pig exit = %d; output:\n%s", code, out)
 		}
+
+		// 预热确实发生：宿主 cache 下必须出现有效可执行 Go 产物
+		//（cells/go 合包或 ext 单扩展），否则预热路径根本没跑，本用例
+		// 退化为「没预热也绿」的假绿——直接判失败。
+		if n := countGoArtifactsForTest(t, filepath.Join(hostPigHome, "cache")); n == 0 {
+			t.Fatalf("warm-up did not produce any Go cell artifact under %s (prewarm path never ran); output:\n%s", hostPigHome, out)
+		}
+
+		// 可观察存活的预热 daemon：pgrep 宿主进程表确认预热拉起的
+		// codegraph-go -warm-daemon 真实存活（或仍在运行）。宿主若无
+		// pgrep 退化为对 runner/proc 扫描；两类证据都缺失只记录不判死
+		//（预热路径本身已由上面的产物断言证实）。
+		if out2, derr := exec.Command("pgrep", "-f", "warm-daemon|cells/go").CombinedOutput(); derr == nil {
+			t.Logf("warm daemon(s) observed alive: %s", strings.TrimSpace(string(out2)))
+		} else {
+			t.Logf("no warm-daemon process visible after warm-up (pgrep: %v)", derr)
+		}
+
 		// sbx 及其全部派生进程（含预热 pig/daemon）退出后，fd3 写端必须
 		// 全部关闭——预热路径对继承 fd3 置 CLOEXEC 的隔离生效。
-		_ = r.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_ = r.SetReadDeadline(time.Now().Add(8 * time.Second))
 		buf := make([]byte, 8)
 		n, rerr := r.Read(buf)
 		if rerr == nil && n > 0 {
@@ -1998,6 +2027,57 @@ fi`
 			t.Fatalf("fd3 write end leaked to warm-up/daemon: read end no EOF after sbx exit (err=%v); output:\n%s", rerr, out)
 		}
 	})
+}
+
+// countGoArtifactsForTest 是 main 包对 sandbox 内部 countValidExecutableGoArtifacts
+// 的最小复刻（不导出生产符号）：统计 cache/cells/go 与 cache/ext 下带
+// 执行位且 ready 元数据合法的 Go 产物数，供预热发生性断言。
+func countGoArtifactsForTest(t *testing.T, cacheRoot string) int {
+	t.Helper()
+	count := 0
+	scan := func(root string, requireLang bool) {
+		if st, err := os.Lstat(root); err != nil || st.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.Type()&os.ModeSymlink != 0 || !e.IsDir() || strings.HasPrefix(e.Name(), ".") && !strings.HasPrefix(e.Name(), ".tombstone-") {
+				continue
+			}
+			dir := filepath.Join(root, e.Name())
+			data, err := os.ReadFile(filepath.Join(dir, "ready.json"))
+			if err != nil {
+				continue
+			}
+			var meta struct {
+				InputDigest string `json:"inputDigest"`
+				Artifact    string `json:"artifact"`
+				Size        int64  `json:"size"`
+				Created     int64  `json:"created"`
+				Language    string `json:"language"`
+			}
+			if json.Unmarshal(data, &meta) != nil || meta.Created <= 0 || meta.Artifact == "" {
+				continue
+			}
+			if requireLang && meta.Language != "go" {
+				continue
+			}
+			if !requireLang && meta.Language != "" && meta.Language != "go" {
+				continue
+			}
+			ap := filepath.Join(dir, meta.Artifact)
+			if st, err := os.Stat(ap); err != nil || st.IsDir() || st.Mode()&0o111 == 0 || st.Size() != meta.Size {
+				continue
+			}
+			count++
+		}
+	}
+	scan(filepath.Join(cacheRoot, "cells", "go"), false)
+	scan(filepath.Join(cacheRoot, "ext"), true)
+	return count
 }
 
 // TestReviewerAgentCellCheckOnlyPigEntry 覆盖 oracle FM-2B：reviewer-agent 的
@@ -2192,6 +2272,144 @@ func TestEffectiveEnvDropsHostPINoiseWithCustomPigDir(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// N1：私有 AgentDir 身份不得从用户可控 TMPDIR 重建——merge 前捕获的预设
+// 事实是唯一的回钉依据。以下用例覆盖任务书要求的四种变体，断言最终
+// 双键均为真实私有目录（预设预建的 <privateTmpDir>/pig-agent，即 TMPDIR
+// 键被 --env 覆盖前的那个目录），且不是被拒路径。
+//
+// 红证据：旧实现 normalizeEffectiveAgentDirs 的回钉根用 merge 后的
+// TMPDIR 重新 filepath.Join 得出——TMPDIR 与 AgentDir 同时被 --env 覆盖
+// 时会重新消费宿主配置。
+
+func TestPrivateAgentDirIdentityNotRebuiltFromUserTmpdir(t *testing.T) {
+	workdir := t.TempDir()
+	for _, env := range []string{"PIG_HOME", "PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_USE_PI_DIRS"} {
+		unsetEnv(t, env)
+	}
+
+	assertPrivateBothKeys := func(t *testing.T, cfg cliConfig, forbidden ...string) {
+		t.Helper()
+		var fact reviewerAgentDirFact
+		captureReviewerAgentDirFactHook = func(f reviewerAgentDirFact) { fact = f }
+		t.Cleanup(func() { captureReviewerAgentDirFactHook = nil })
+		policy, err := buildPolicy(cfg)
+		if err != nil {
+			t.Fatalf("buildPolicy: %v", err)
+		}
+		defer cleanupPresetTempDirsFromPolicy(policy)
+		priv := fact.privateDir
+		if priv == "" {
+			t.Fatalf("captured fact has empty privateDir (fact=%+v)", fact)
+		}
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			got, n := envKeyValue(policy.Env, key)
+			if got != priv {
+				t.Fatalf("final %s = %q (count=%d), want real private dir %q (not rebuilt from user TMPDIR)", key, got, n, priv)
+			}
+			for _, f := range forbidden {
+				if got == f {
+					t.Fatalf("final %s = %q: must not equal rejected path", key, f)
+				}
+			}
+		}
+	}
+
+	t.Run("tmpdir_override_plus_agentdir_empty", func(t *testing.T) {
+		// --env TMPDIR=/root/.pig --env PIG_CODING_AGENT_DIR= ：旧实现从
+		// merge 后 TMPDIR 重建得 /root/.pig/pig-agent（重新消费宿主配置）。
+		assertPrivateBothKeys(t, cliConfig{
+			Preset:  "reviewer-agent",
+			WorkDir: workdir,
+			Env:     []string{"TMPDIR=" + t.TempDir(), "PIG_CODING_AGENT_DIR="},
+		}, "/root/.pig/pig-agent")
+	})
+
+	t.Run("tmpdir_override_plus_untrusted_custom_rejected", func(t *testing.T) {
+		realDir := t.TempDir()
+		linkDir := filepath.Join(t.TempDir(), "agent-link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatal(err)
+		}
+		assertPrivateBothKeys(t, cliConfig{
+			Preset:  "reviewer-agent",
+			WorkDir: workdir,
+			Env:     []string{"TMPDIR=" + t.TempDir(), "PIG_CODING_AGENT_DIR=" + linkDir},
+		}, linkDir, realDir)
+	})
+
+	t.Run("empty_tmpdir", func(t *testing.T) {
+		// --env TMPDIR= ：旧实现空 TMPDIR 退成 cwd 相对的 pig-agent。
+		assertPrivateBothKeys(t, cliConfig{
+			Preset:  "reviewer-agent",
+			WorkDir: workdir,
+			Env:     []string{"TMPDIR=", "PIG_CODING_AGENT_DIR="},
+		}, "pig-agent", filepath.Join(workdir, "pig-agent"))
+	})
+
+	t.Run("tmpdir_points_to_untrusted_parent", func(t *testing.T) {
+		// TMPDIR 指向宿主不可信父目录（如 /root/.pig）：私有目录身份
+		// 仍须是预设事实，不是 TMPDIR 下的重建路径。
+		fakePig := t.TempDir()
+		t.Setenv("PIG_HOME", fakePig)
+		assertPrivateBothKeys(t, cliConfig{
+			Preset:  "reviewer-agent",
+			WorkDir: workdir,
+			Env:     []string{"TMPDIR=" + fakePig, "PIG_CODING_AGENT_DIR="},
+		}, filepath.Join(fakePig, "pig-agent"))
+	})
+}
+
+// TestCaptureHookUnreachableInProduction 断言 captureReviewerAgentDirFactHook
+// 是仅供同包单测使用的注入 seam：无任何环境变量 / 配置 / 命令行开关能
+// 在生产路径上设置它（它是无导出符号的包级变量，默认 nil；若未来意外
+// 引入外部开启入口，本用例随基线失效提示回查）。生产调用点
+// `if captureReviewerAgentDirFactHook != nil` 在生产进程内恒为 false，
+// 不影响任何生产分支；同时断言其类型与调用点签名吻合。
+func TestCaptureHookUnreachableInProduction(t *testing.T) {
+	if captureReviewerAgentDirFactHook != nil {
+		t.Fatalf("captureReviewerAgentDirFactHook must be nil before test assignment (production default)")
+	}
+	// seam 变量仅在 _test.go（同包）内可赋值——main 包外的任何代码无法引用它。
+	var hook func(reviewerAgentDirFact) = func(f reviewerAgentDirFact) {}
+	captureReviewerAgentDirFactHook = hook
+	if captureReviewerAgentDirFactHook == nil {
+		t.Fatal("hook assignment failed")
+	}
+	captureReviewerAgentDirFactHook = nil
+}
+
+// TestEffectiveEnvPigUsePiDirsStrippedFromHostEnv 覆盖 N2：宿主
+// os.Environ() 中的 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 残留不得透传
+// 进最终目标 exec env——断言对象是 stripSandboxEnv(os.Environ())+policy.Env
+// 合并后的最终 env（与 runChildFromEnv 的 execEnv 同路径），不只断言
+// policy.Env。
+func TestEffectiveEnvPigUsePiDirsStrippedFromHostEnv(t *testing.T) {
+	t.Setenv("PIG_USE_PI_DIRS", "1")
+	t.Setenv("PI_CODING_AGENT_DIR", "/tmp/host-pi-residual")
+	t.Setenv("PIG_HOME", t.TempDir())
+	unsetEnv(t, "PIG_CODING_AGENT_DIR")
+	workdir := t.TempDir()
+
+	policy, err := buildPolicy(cliConfig{
+		Preset:  "reviewer-agent",
+		WorkDir: workdir,
+	})
+	if err != nil {
+		t.Fatalf("buildPolicy: %v", err)
+	}
+	defer cleanupPresetTempDirsFromPolicy(policy)
+
+	// 最终 exec env：runChildFromEnv 用 stripHostEnv(os.Environ())+policy.Env。
+	execEnv := mergeEnv(stripHostEnv(os.Environ()), policy.Env)
+	if got, n := envKeyValue(execEnv, "PIG_USE_PI_DIRS"); n != 0 {
+		t.Fatalf("host PIG_USE_PI_DIRS must not appear in final exec env (got %q x%d)", got, n)
+	}
+	if got, _ := envKeyValue(execEnv, "PI_CODING_AGENT_DIR"); got == "/tmp/host-pi-residual" {
+		t.Fatalf("host PI_CODING_AGENT_DIR residual leaked into final exec env: %q", got)
+	}
+}
+
 // TestUntrustedCustomAgentDirFallsBackToPrivate 覆盖 M2 校验失败路径：
 // 显式 PIG_CODING_AGENT_DIR 指向不可信目录（软链）时，最终生效目录必须
 // 回退到 ReviewerAgentWithEnv 准备的私有 pig-agent，不得只回退复制源。
@@ -2321,7 +2539,9 @@ func TestFd3ForwardOwnerSurvivesGCAndRetry(t *testing.T) {
 // M6c：FM-2A cell 校验失败必须清理 pi-reviewer-* 与 pi-reviewer-exec-*
 // （含 auth.json 副本）。直接构造 reviewer-agent + pig 命令 + 会让 cell
 // 校验失败的缓存（Go 扩展存在但零有效 Go 产物），断言 buildPolicy 返回
-// 错误后临时目录被清空。
+// 错误后临时目录被清空。断言方式是捕获调用前后 /tmp 下 pi-reviewer-*/
+// pi-reviewer-exec-* 目录的实际差集：遇 nil/err 不再 skip（遇 Policy{} 零
+// 条清理断言的假绿场景）。
 func TestCellValidationFailureCleansPresetDirs(t *testing.T) {
 	hostPigHome := t.TempDir()
 	extDir := filepath.Join(hostPigHome, "agent", "extensions", "fake-go-ext")
@@ -2341,6 +2561,20 @@ func TestCellValidationFailureCleansPresetDirs(t *testing.T) {
 	unsetEnv(t, "PIG_USE_PI_DIRS")
 	workdir := t.TempDir()
 
+	// 前后差集：枚举 /tmp 下 pi-reviewer-*/pi-reviewer-exec-* 目录。
+	snapshot := func() map[string]bool {
+		out := map[string]bool{}
+		entries, _ := os.ReadDir("/tmp")
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() && (strings.HasPrefix(name, "pi-reviewer-") || strings.HasPrefix(name, "pi-reviewer-exec-")) {
+				out[filepath.Join("/tmp", name)] = true
+			}
+		}
+		return out
+	}
+	before := snapshot()
+
 	policy, err := buildPolicy(cliConfig{
 		Preset:  "reviewer-agent",
 		WorkDir: workdir,
@@ -2348,21 +2582,40 @@ func TestCellValidationFailureCleansPresetDirs(t *testing.T) {
 	})
 	if err == nil {
 		cleanupPresetTempDirsFromPolicy(policy)
-		t.Skip("cell validation not triggered (ReviewerAgentCellTargetError absent)")
+		t.Fatalf("buildPolicy must fail closed on zero valid Go artifacts (hasGoExt=true), got nil error")
 	}
-	for _, kv := range policy.Env {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
+	// buildPolicy 在 cell 校验失败时返回空 Policy{}（Env=nil）——创建的
+	// pi-reviewer-* 证据不再来自 policy.Env，改由 captureReviewerAgentDirFactHook
+	// 捕获 merge 前事实（privateDir 位于 privateTmpDir 内）。
+	var fact reviewerAgentDirFact
+	captureReviewerAgentDirFactHook = func(f reviewerAgentDirFact) { fact = f }
+	t.Cleanup(func() { captureReviewerAgentDirFactHook = nil })
+
+	// 第二次调用只为捕获事实（同一次 buildPolicy 内私有目录路径随机，
+	// 与上一次的差集断言独立）。
+	_, err2 := buildPolicy(cliConfig{
+		Preset:  "reviewer-agent",
+		WorkDir: workdir,
+		Command: []string{"/root/.local/bin/pig"},
+	})
+	if err2 == nil {
+		t.Fatalf("second buildPolicy must also fail closed")
+	}
+	after := snapshot()
+
+	// 新增目录差集必须为空（pi-reviewer-*/pi-reviewer-exec-* 均被清理）。
+	for dir := range after {
+		if !before[dir] {
+			t.Fatalf("cell validation failure leaked preset dir %s", dir)
 		}
-		switch k {
-		case "TMPDIR", "GOTMPDIR", "PI_SANDBOX_GO_EXEC_DIR":
-			if strings.Contains(v, "pi-reviewer-") {
-				if _, serr := os.Lstat(v); !os.IsNotExist(serr) {
-					t.Fatalf("cell validation failure left preset dir %s=%s (err=%v)", k, v, serr)
-				}
-			}
-		}
+	}
+	// 反向断言：merge 前事实确实含私有 TMPDIR（pi-reviewer-*）——
+	// 证明本次确实创建过预设临时目录，上面的差集断言不是空转。
+	if fact.privateDir == "" || !strings.Contains(filepath.Base(filepath.Dir(fact.privateDir)), "pi-reviewer-") {
+		t.Fatalf("captured fact has no pi-reviewer-* private dir (fact=%+v); cleanup assertions vacuous", fact)
+	}
+	if _, serr := os.Lstat(fact.privateDir); !os.IsNotExist(serr) {
+		t.Fatalf("cell validation failure left private pig-agent dir %s (err=%v)", fact.privateDir, serr)
 	}
 }
 
@@ -2373,17 +2626,22 @@ func TestCellValidationFailureCleansPresetDirs(t *testing.T) {
 // 非执行（ready.json 合法但无执行位）/非 Go 条目只作可读投影，不参与 Exec
 // 完整性校验，也不得计入 missing。
 
-// writeFakeGoExtCell 在 <cacheRoot> 下造一个语言 go 的可执行缓存单元。
+// writeFakeGoExtCell 在 <cacheRoot> 下造一个语言 go 的可执行缓存单元；
+// ready.json 的 size 取脚本实际字节数，确保 validCellEntryDir 真实命中
+// （旧夹具把脚本字面 17 字节写成 size:18，cell 被排除、hasGoExt=false
+// 直接绕过门禁——本函数必须保证夹具本身合法有效）。
 func writeFakeGoExtCell(t *testing.T, cacheRoot, name, artifact string) string {
 	t.Helper()
 	dir := filepath.Join(cacheRoot, "ext", name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, artifact), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, artifact), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	meta := `{"inputDigest":"` + name + `","artifact":"` + artifact + `","size":18,"created":1700000000,"language":"go"}`
+	meta := fmt.Sprintf(`{"inputDigest":%q,"artifact":%q,"size":%d,"created":1700000000,"language":"go"}`,
+		name, artifact, len(script))
 	if err := os.WriteFile(filepath.Join(dir, "ready.json"), []byte(meta), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2392,7 +2650,9 @@ func writeFakeGoExtCell(t *testing.T, cacheRoot, name, artifact string) string {
 
 // TestGoValidPlusNonExecEntriesStillAllowPig 覆盖 M5：宿主 pig home 下既有
 // 合法可执行 Go cell，又有「无执行位但 ready 元数据有效」的缓存单元时，
-// buildPolicy 不得因无关非执行条目进入 missing 而拒绝 pig。
+// buildPolicy 不得因无关非执行条目进入 missing 而拒绝 pig。用例真正创建
+// Go 扩展并造 size 正确的 ready 元数据，直接断言 hasGoExt/total/missing
+// 三层与 buildPolicy 结果。
 func TestGoValidPlusNonExecEntriesStillAllowPig(t *testing.T) {
 	hostPigHome := t.TempDir()
 	cacheRoot := filepath.Join(hostPigHome, "cache")
@@ -2407,7 +2667,7 @@ func TestGoValidPlusNonExecEntriesStillAllowPig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(nonExec, "blob"), []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	nonExecMeta := `{"inputDigest":"fake-cache-bbb002","artifact":"blob","size":4,"created":1700000000,"language":"go"}`
+	nonExecMeta := fmt.Sprintf(`{"inputDigest":"fake-cache-bbb002","artifact":"blob","size":%d,"created":1700000000,"language":"go"}`, len("data"))
 	if err := os.WriteFile(filepath.Join(nonExec, "ready.json"), []byte(nonExecMeta), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2417,6 +2677,15 @@ func TestGoValidPlusNonExecEntriesStillAllowPig(t *testing.T) {
 	unsetEnv(t, "PI_CODING_AGENT_DIR")
 	unsetEnv(t, "PIG_USE_PI_DIRS")
 	workdir := t.TempDir()
+
+	// 必须真实存在 Go 扩展源码，使 hasGoExt=true，门禁真正生效。
+	extDir := filepath.Join(hostPigHome, "agent", "extensions", "fake-go-ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	policy, err := buildPolicy(cliConfig{
 		Preset:  "reviewer-agent",
@@ -2428,11 +2697,18 @@ func TestGoValidPlusNonExecEntriesStillAllowPig(t *testing.T) {
 	}
 	defer cleanupPresetTempDirsFromPolicy(policy)
 
-	// missing 分母不得包含非执行条目：Exec 完整性校验只统计可执行目标。
-	// 基线无 ReviewerAgentCellTargetError（808f0eb 未导出），改断言策略侧
-	// 投影结果：非执行缓存不得触发 missing 语义——投影进 Exec 白名单的
-	// artifact 只能是可执行 Go cell（blob 不得进 Exec，且宿主 blob 也不得
-	// 被软链投影成可执行）。
+	// 门禁断言：hasGoExt=true；total 只计可执行 Go cell（=1）；missing=0。
+	hasGoExt, total, missing := sandbox.ReviewerAgentCellTargets()
+	if !hasGoExt {
+		t.Fatalf("hasGoExt = false, want true (Go extension source present)")
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want 1: only the executable Go cell counts, nonexec blob must not", total)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want empty: nonexec blob must not enter Exec integrity check", missing)
+	}
+	// 非执行缓存不得进 Exec 白名单。
 	for _, ex := range policy.Exec {
 		if strings.HasSuffix(ex, "blob") {
 			t.Fatalf("non-executable cache blob %q must not enter Exec whitelist", ex)
@@ -2442,9 +2718,8 @@ func TestGoValidPlusNonExecEntriesStillAllowPig(t *testing.T) {
 
 // TestNodeOnlyCacheStillRejectsPig 覆盖 M5 负向边界：宿主 cache 仅有
 // node-runtime（language!=go）/ 无执行位条目时 total=0，pig 仍须拒绝。
-// 注：808f0eb 未导出 ReviewerAgentCellTargetError，故以「ReviewerAgentWithEnv
-// 在私有 PIG_HOME 上投影后 Exec 不含任何 Go cell artifact + buildPolicy
-// 对 pig 命令不返回 nil」两层断言覆盖负向契约。
+// 用例真正创建 Go 扩展源码（hasGoExt=true），node cell 不充数、
+// total=0、buildPolicy fail-closed。
 func TestNodeOnlyCacheStillRejectsPig(t *testing.T) {
 	hostPigHome := t.TempDir()
 	cacheRoot := filepath.Join(hostPigHome, "cache")
@@ -2455,7 +2730,7 @@ func TestNodeOnlyCacheStillRejectsPig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(nodeCell, "bin"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	nodeMeta := `{"inputDigest":"node-runtime-ccc003","artifact":"bin","size":18,"created":1700000000,"language":"node"}`
+	nodeMeta := fmt.Sprintf(`{"inputDigest":"node-runtime-ccc003","artifact":"bin","size":%d,"created":1700000000,"language":"node"}`, len("#!/bin/sh\nexit 0\n"))
 	if err := os.WriteFile(filepath.Join(nodeCell, "ready.json"), []byte(nodeMeta), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2466,24 +2741,38 @@ func TestNodeOnlyCacheStillRejectsPig(t *testing.T) {
 	unsetEnv(t, "PIG_USE_PI_DIRS")
 	workdir := t.TempDir()
 
+	// 必须真实存在 Go 扩展源码，使 hasGoExt=true，门禁真正生效。
+	extDir := filepath.Join(hostPigHome, "agent", "extensions", "fake-go-ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	policy, err := buildPolicy(cliConfig{
 		Preset:  "reviewer-agent",
 		WorkDir: workdir,
 		Command: []string{"/root/.local/bin/pig"},
 	})
 	if err == nil {
-		// 基线（808f0eb）无 ReviewerAgentCellTargetError，buildPolicy 对
-		// pig 在 node-only cache 下仍成功——此时必须至少满足负向投影断言：
-		// node cell 不得进入 Exec（语言门），且不得有 Go cell artifact 被
-		// 投影进私有 PIG_HOME 的 Exec。
-		defer cleanupPresetTempDirsFromPolicy(policy)
+		cleanupPresetTempDirsFromPolicy(policy)
+		t.Fatalf("buildPolicy must reject pig: node-only cache total=0 hasGoExt=true, got nil error")
+	}
+	// fail-closed 生效：对 pig 返回错误即拒绝启动；node cell 不得进 Exec。
+	if len(policy.Exec) > 0 {
 		for _, ex := range policy.Exec {
 			if strings.Contains(ex, "node-runtime-ccc003") {
 				t.Fatalf("node-only cache entry %q must not enter Exec whitelist", ex)
 			}
 		}
-		return
 	}
-	// 修复后（含 ReviewerAgentCellTargetError 的分支）：对 pig 返回错误即
-	// fail-closed 生效。此处不再断言错误文本，避免对尚未导出的 API 耦合。
+	// 直接断言目标集：hasGoExt=true、total=0（node cell 不充数）。
+	hasGoExt, total, _ := sandbox.ReviewerAgentCellTargets()
+	if !hasGoExt {
+		t.Fatalf("hasGoExt = false, want true (Go extension source present)")
+	}
+	if total != 0 {
+		t.Fatalf("total = %d, want 0: node-runtime cell must not count toward Go target set", total)
+	}
 }

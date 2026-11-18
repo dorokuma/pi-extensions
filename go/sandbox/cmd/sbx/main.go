@@ -190,11 +190,25 @@ func parseArgs(args []string) (cliConfig, error) {
 // 会话 socket 指针。--env 显式传入这些键同样被剔除（buildPolicy 对
 // cfg.Env 同口径过滤）；预设自身注入的值（如 reviewer-agent 私有
 // XDG_RUNTIME_DIR 指向沙盒内 0700 目录）不属于外部指针，不剔除。
+//
+// PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 不入本集合：仅对宿主
+// os.Environ() 经 sandboxHostStripExtraKeys 追加剔除（--env 显式声明
+// 的合法 PI 自定义入口不能被误伤，N7）。
 var sandboxEnvStripKeys = map[string]bool{
 	"GPG_AGENT_INFO":           true,
 	"SSH_AUTH_SOCK":            true,
 	"DBUS_SESSION_BUS_ADDRESS": true,
 	"XDG_RUNTIME_DIR":          true,
+}
+
+// sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：宿主
+// 残留的 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 属外部指针——pig 包装器
+// 后置 export PIG_USE_PI_DIRS=1 会激活宿主 PI_* 目录，仅删 policy.Env 侧
+// 同名键而保留 os.Environ() 中的宿主值，会让宿主 PIG_USE_PI_DIRS=1 /
+// PI_CODING_AGENT_DIR 直接进入最终目标 env（N2）。
+var sandboxHostStripExtraKeys = map[string]bool{
+	"PIG_USE_PI_DIRS":     true,
+	"PI_CODING_AGENT_DIR": true,
 }
 
 // stripSandboxEnv 剔除 env 列表中的外部指针类变量。
@@ -216,6 +230,25 @@ func stripSandboxEnv(env []string) []string {
 	return out
 }
 
+// stripHostEnv 在 stripSandboxEnv 之上额外剔除宿主残留 AgentDir/PI-dirs
+// 指针（sandboxHostStripExtraKeys）；仅用于最终 exec 环境与受限子进程
+// 环境构造，不作用于 --env 显式声明。
+func stripHostEnv(env []string) []string {
+	out := stripSandboxEnv(env)
+	res := make([]string, 0, len(out))
+	for _, kv := range out {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if sandboxHostStripExtraKeys[k] {
+			continue
+		}
+		res = append(res, kv)
+	}
+	return res
+}
+
 // buildPolicy 根据解析后的命令行配置构造最终的 sandbox.Policy。
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// 先剔除 --env 中的外部指针类变量，防止它们经 policy.Env 写回沙盒。
@@ -224,6 +257,11 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	var pigHome string
 	var claudeConfigDir string
 	var goExecDir string
+	// N1/N7：在 cfgEnv merge 前捕获 ReviewerAgentWithEnv 判定的结构化受信
+	// AgentDir 事实（哪个目录是真正预建的私有目录、哪个是经校验的自定义
+	// 目录、有效目录是谁），merge 后只使用该事实做归一化——绝不从用户可控
+	// TMPDIR 重新 filepath.Join 重建私有目录身份。
+	var agentFact reviewerAgentDirFact
 	if cfg.Preset != "" {
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
@@ -238,6 +276,12 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 				wd = "."
 			}
 			policy = sandbox.ReviewerAgentWithEnv(wd, cfg.Env)
+			// merge 前捕获：预设已经把受信判定结果写进 policy.Env
+			//（effective = 受信自定义或私有；private = 预建 pig-agent 目录）。
+			agentFact = captureReviewerAgentDirFact(policy)
+			if captureReviewerAgentDirFactHook != nil {
+				captureReviewerAgentDirFactHook(agentFact)
+			}
 			// 启动前 fail-closed：本次目标集（宿主已构建的有效 Go 缓存单元）经
 			// ReviewerAgentWithEnv 枚举与投影校验；有 Go 扩展但宿主产物为 0，或
 			// 存在未成功投影/Exec 未命中的目标时，此处返回错误拒绝启动并指名
@@ -277,10 +321,6 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	policy.ReadOnly = append(policy.ReadOnly, cfg.ReadOnly...)
 	policy.ReadWrite = append(policy.ReadWrite, cfg.ReadWrite...)
 	policy.Exec = append(policy.Exec, cfg.Exec...)
-	// 记录 ReviewerAgentWithEnv 对 AgentDir 的判定结果（cfgEnv merge 前）：
-	// 非空 = 显式自定义且可信被拒后回钉的私有目录 / 预注入的私有目录；
-	// 供 merge 后统一归一化区分「受信自定义」与「不可信被拒回钉私有」。
-	policyEnvAgentDirs := envListValue(policy.Env, "PIG_CODING_AGENT_DIR")
 	policy.Env = mergeEnv(policy.Env, cfg.Env)
 	if cfg.Preset == "reviewer-agent" && pigHome != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PIG_HOME=" + pigHome})
@@ -301,8 +341,10 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// 键末项为空）不得把空串写进最终 env（M1）；显式非空自定义分支也须
 	// 清理宿主残留的 PI_CODING_AGENT_DIR / PIG_USE_PI_DIRS（M2），否则 pig
 	// 包装器后置 export PIG_USE_PI_DIRS=1 时会激活宿主 PI 残留。
+	// N1：私有目录身份只使用 merge 前捕获的预设事实 agentFact（绝不从
+	// 用户可控 TMPDIR 重建）；预热、配置复制与最终 exec 使用同一有效目录。
 	if cfg.Preset == "reviewer-agent" {
-		policy.Env = normalizeEffectiveAgentDirs(policy.Env, privateAgentDirFromPolicy(policy), policyEnvAgentDirs)
+		policy.Env = normalizeEffectiveAgentDirs(policy.Env, agentFact)
 	}
 	if cfg.DenyNet {
 		policy.DenyNet = true
@@ -313,48 +355,79 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	return policy, nil
 }
 
-// privateAgentDirFromPolicy 返回 ReviewerAgentWithEnv 在 policy.Env 中预建的
-// 私有 pig-agent 目录（<TMPDIR>/pig-agent）；TMPDIR 缺失时返回空串。
-func privateAgentDirFromPolicy(p sandbox.Policy) string {
-	tmp := envListValue(p.Env, "TMPDIR")
-	if tmp == "" {
-		return ""
+// reviewerAgentDirFact 是 ReviewerAgentWithEnv 在 merge 前写入 policy.Env
+// 的结构化受信 AgentDir 判定结果：哪个目录是真正预建的私有 pig-agent、
+// 哪个是经校验的自定义目录、有效目录最终是谁。该事实在 cfgEnv merge
+// 之前捕获，merge 后只使用它做归一化，绝不从用户可控 TMPDIR 重新推导
+// （N1：TMPDIR 与 AgentDir 同时被 --env 覆盖时，从 TMPDIR filepath.Join
+// 重建出的目录会重新消费宿主配置，如 --env TMPDIR=/root/.pig +
+// --env PIG_CODING_AGENT_DIR= 得 /root/.pig/pig-agent）。
+type reviewerAgentDirFact struct {
+	// privateDir 是 ReviewerAgentWithEnv 实际预建的私有 pig-agent 目录
+	//（<privateTmpDir>/pig-agent，0700 已存在）；非空时即可信私有目录本体。
+	privateDir string
+	// effectiveDir 是 ReviewerAgentWithEnv 最终判定的有效 AgentDir：
+	// 受信自定义（trustedCustom）= 解析后的自定义目录；其余 = privateDir。
+	effectiveDir string
+	// trustedCustom 记录受信自定义是否真实存在（effectiveDir != privateDir）。
+	trustedCustom bool
+}
+
+// captureReviewerAgentDirFactHook 是可注入的 merge 前事实捕获 seam：
+// 单测把它置为记录函数即可在同一 buildPolicy 调用内拿到真实私有目录
+// （privateTmpDir 随机名跨次构造不同，断言必须用本次 buildPolicy 的
+// 那一次），生产路径为 nil 零开销。
+var captureReviewerAgentDirFactHook func(reviewerAgentDirFact)
+
+// captureReviewerAgentDirFact 从 ReviewerAgentWithEnv 产出的 policy.Env
+// 读取 merge 前的事实：privateDir 取预设注入的 PIG_CODING_AGENT_DIR
+// （此时即有效目录；trustedCustom 分支下预设已把受信自定义写入同一键，
+// 私有目录本体可由 privateTmpDir 推导但判定本身已可信），effectiveDir
+// 与 privateDir 的区分仅靠 PIG_CODING_AGENT_DIR 是否等于 <TMPDIR>/pig-agent。
+func captureReviewerAgentDirFact(policy sandbox.Policy) reviewerAgentDirFact {
+	tmp := envListValue(policy.Env, "TMPDIR")
+	pig := envListValue(policy.Env, "PIG_CODING_AGENT_DIR")
+	fact := reviewerAgentDirFact{}
+	if tmp == "" || pig == "" {
+		return fact
 	}
-	return filepath.Join(tmp, "pig-agent")
+	fact.privateDir = filepath.Join(tmp, "pig-agent")
+	if pig != fact.privateDir {
+		fact.trustedCustom = true
+		fact.effectiveDir = pig
+	} else {
+		fact.effectiveDir = fact.privateDir
+	}
+	return fact
 }
 
 // normalizeEffectiveAgentDirs 统一归一化最终 env 中两个 AgentDir 键与
-// PIG_USE_PI_DIRS：
-//   - 显式且经 ReviewerAgentWithEnv 校验为非空的 PIG_CODING_AGENT_DIR
-//     保留为有效目录；PI_CODING_AGENT_DIR 归一到同一目录（宿主残留 PI 键
-//     不得生效），PIG_USE_PI_DIRS 不再注入（sbx 直接给定绝对路径）。
-//   - 其余情形（键缺失 / 显式空串 / 不可信被拒）两个键都回钉私有
-//     pig-agent；PIG_USE_PI_DIRS 不注入。
+// PIG_USE_PI_DIRS；输入只用 merge 前捕获的结构化事实 agentFact：
+//   - agentFact.trustedCustom：经 ReviewerAgentWithEnv 校验的非空自定义
+//     PIG_CODING_AGENT_DIR 保留为有效目录；PI_CODING_AGENT_DIR 归一到同一
+//     目录（宿主残留 PI 键不得生效），PIG_USE_PI_DIRS 不再注入。
+//   - 其余情形（键缺失 / 显式空串 / 不可信被拒）两个键都回钉
+//     agentFact.privateDir（真实预建私有目录，非 TMPDIR 重建值）。
 //
 // cfgEnv 空覆盖语义：显式空串屏蔽宿主同名变量后仍归一化回钉，不得把
-// 空串写进最终 env（M1）。
-func normalizeEffectiveAgentDirs(env []string, privatePigAgentDir, preMergePigDir string) []string {
-	// 「受信自定义」的判定以 ReviewerAgentWithEnv 注入 policy.Env 的值为
-	// 准（preMergePigDir）：cfgEnv merge 会把不可信自定义路径写进最终
-	// env，但 preMergePigDir 已被 ReviewerAgentWithEnv 回钉私有目录——
-	// 不可信路径不得被误认为受信自定义保留（M2）。
-	trustedCustom := preMergePigDir != "" &&
-		preMergePigDir != privatePigAgentDir &&
-		envListValue(env, "PIG_CODING_AGENT_DIR") == preMergePigDir
-	if trustedCustom {
-		// 受信自定义 PIG 目录保留为唯一有效目录：PI_CODING_AGENT_DIR 归一到
-		// 同一值（消除宿主 PI 残留），PIG_USE_PI_DIRS 不注入。
-		eff := envListValue(env, "PIG_CODING_AGENT_DIR")
+// 空串写进最终 env（M1）。有效目录一律来自预设事实，绝不从合并后的
+// TMPDIR 重新 filepath.Join 重建（N1）。
+func normalizeEffectiveAgentDirs(env []string, agentFact reviewerAgentDirFact) []string {
+	// 受信自定义：agentFact.effectiveDir 即 ReviewerAgentWithEnv 校验过的
+	// 自定义目录（trustedCustom=true）；privateDir 仍是真实私有目录本体。
+	if agentFact.trustedCustom && agentFact.effectiveDir != "" {
+		eff := agentFact.effectiveDir
 		env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", eff)
 		env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", eff)
 		env = removeEnvKey(env, "PIG_USE_PI_DIRS")
 		return env
 	}
-	// 非受信自定义（含不可信被拒 / 显式空串 / 键缺失）：两键统一回钉私有
-	// pig-agent；显式空串被归一化覆盖，不再把空串写进最终 env（M1）。
-	// PIG_USE_PI_DIRS 不注入。
-	env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", privatePigAgentDir)
-	env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", privatePigAgentDir)
+	// 非受信自定义（含不可信被拒 / 显式空串 / 键缺失）：两键统一回钉
+	// agentFact.privateDir——真实预建私有目录；显式空串被归一化覆盖，
+	// 不再把空串写进最终 env（M1）。PIG_USE_PI_DIRS 不注入。
+	privateDir := agentFact.privateDir
+	env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", privateDir)
+	env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", privateDir)
 	env = removeEnvKey(env, "PIG_USE_PI_DIRS")
 	return env
 }
@@ -690,7 +763,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd 
 	}
 
 	// 传入子进程的环境同样剔除外部指针类变量（子进程 Apply 前的辅助进程不继承 HC_*）。
-	childEnv := mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+	childEnv := mergeEnv(stripHostEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
 
 	newChildCmd := func() *exec.Cmd {
 		cmd := exec.Command(selfExe)
@@ -721,7 +794,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd 
 			sysProcAttr = nil
 			spec.MountNS = false
 			if specBytes, err = json.Marshal(spec); err == nil {
-				childEnv = mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+				childEnv = mergeEnv(stripHostEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
 				cmd = newChildCmd()
 				err = cmd.Start()
 			}
@@ -810,7 +883,8 @@ func runChildFromEnv() int {
 
 	// mergeEnv 只能覆盖不能删：对宿主继承部分剔除外部指针类变量后再合并，
 	// policy.Env 中预设注入的同名键（如私有 XDG_RUNTIME_DIR）不受影响。
-	execEnv := mergeEnv(stripSandboxEnv(os.Environ()), policy.Env)
+	// 宿主侧额外剔除 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 残留（N2）。
+	execEnv := mergeEnv(stripHostEnv(os.Environ()), policy.Env)
 	// MountNS 路径下本进程是新 PID 命名空间的 PID 1：不得直接 syscall.Exec
 	// 顶替 PID 1（业务进程作为 PID 1 会忽略默认未捕获信号，且无人回收孤儿
 	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生目标子进程。
