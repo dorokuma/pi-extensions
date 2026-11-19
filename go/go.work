@@ -17,6 +17,7 @@ use (
 	./moshi-hooks
 	./no-tables
 	./pi-context-pruning
+	./pi-emphasis
 	./pi-env
 	./pi-my-compact-ui
 	./pi-tinyfish
