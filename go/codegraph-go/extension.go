@@ -80,15 +80,31 @@ func (r *runtimeState) sessionStart(cwd string, notify func(string, string)) {
 		notify("codegraph-go 不可用: "+d.Reason, "warning")
 	}
 }
-func (r *runtimeState) beforeAgentStart(prompt string) any {
+
+// sectionCodeGraphInstructions and sectionCodeGraphTools are the custom
+// system-prompt sections this extension owns; names stay lowercase with
+// underscores so Pi's XML tag constraint accepts them.
+const (
+	sectionCodeGraphInstructions = "codegraph_instructions"
+	sectionCodeGraphTools        = "codegraph_tools"
+)
+
+func (r *runtimeState) beforeAgentStart(sections *sdk.SystemPromptSections) {
+	if sections == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	d := r.decision
 	if d == nil {
-		return nil
+		sections.Delete(sectionCodeGraphTools)
+		sections.Delete(sectionCodeGraphInstructions)
+		return
 	}
 	if !d.OK {
-		return map[string]any{"systemPrompt": prompt + "\n\n## CodeGraph Tools\n\n本会话 CodeGraph 未启用: " + d.Reason + "\n请用普通文件工具，或设置 CODEGRAPH_GO_WORKDIR。"}
+		sections.Set(sectionCodeGraphTools, "## CodeGraph Tools\n\n本会话 CodeGraph 未启用: "+d.Reason+"\n请用普通文件工具，或设置 CODEGRAPH_GO_WORKDIR。")
+		sections.Delete(sectionCodeGraphInstructions)
+		return
 	}
 	projectLine := "当前索引根就是单个项目目录，一般不必再加 path。"
 	if isHomeDir(d.Workdir) {
@@ -99,13 +115,16 @@ func (r *runtimeState) beforeAgentStart(prompt string) any {
 		}
 		projectLine = "家目录模式已开：索引里只有像项目的一级目录" + names + "。用户点名项目时代理自动补 path=，不依赖用户传。"
 	}
+	instructions := ""
 	if r.client != nil {
-		if instructions := r.client.getServerInstructions(); instructions != "" {
-			prompt += "\n\n## CodeGraph server instructions\n\n" + instructions
-		}
+		instructions = r.client.getServerInstructions()
 	}
-	prompt += fmt.Sprintf("\n\n## CodeGraph Tools\n\n索引根: `%s`（%s）\n%s\n单次结果预算约 %d 字 / %d 行（过大才压缩；正常体量不砍）。", d.Workdir, d.Note, projectLine, outputChars(), outputLines())
-	return map[string]any{"systemPrompt": prompt}
+	if instructions != "" {
+		sections.Set(sectionCodeGraphInstructions, "## CodeGraph server instructions\n\n"+instructions)
+	} else {
+		sections.Delete(sectionCodeGraphInstructions)
+	}
+	sections.Set(sectionCodeGraphTools, fmt.Sprintf("## CodeGraph Tools\n\n索引根: `%s`（%s）\n%s\n单次结果预算约 %d 字 / %d 行（过大才压缩；正常体量不砍）。", d.Workdir, d.Note, projectLine, outputChars(), outputLines()))
 }
 func (r *runtimeState) shutdown() {
 	r.mu.Lock()
@@ -210,15 +229,17 @@ func Extension() *sdk.Extension {
 		return nil, nil
 	})
 	e.OnEvent("before_agent_start", func(_ sdk.Context, data map[string]any) (any, error) {
-		p, _ := data["systemPrompt"].(string)
-		if rendered, ok := data["systemPrompt"].(*sdk.SystemPrompt); ok {
-			var err error
-			p, err = rendered.Get()
-			if err != nil {
-				return nil, err
-			}
+		// Sections travel in systemPromptOptions; a handler returning
+		// {"systemPrompt": ...} would make the host force-render the prompt
+		// and drop sections later extensions add, so this handler only edits
+		// the shared sections and returns nil.
+		options, _ := data["systemPromptOptions"].(map[string]any)
+		if options == nil {
+			return nil, nil
 		}
-		return r.beforeAgentStart(p), nil
+		sections, _ := options["sections"].(*sdk.SystemPromptSections)
+		r.beforeAgentStart(sections)
+		return nil, nil
 	})
 	e.OnSessionShutdown(func(_ sdk.Context, _ map[string]any) (any, error) { r.shutdown(); return nil, nil })
 	e.RegisterCommand("codegraph-start", sdk.CommandOptions{Description: "启动 codegraph-go", Handler: func(ctx sdk.Context, _ string) error {

@@ -207,9 +207,32 @@ func TestSDKCancellationAndCommands(t *testing.T) {
 	if promptResponse["error"] != nil {
 		t.Fatalf("before_agent_start failed: %+v", promptResponse)
 	}
-	requireContains(t, promptResponse["result"].(map[string]any)["_pigPromptResult"].(map[string]any)["systemPrompt"].(string), "BASE\n\n## Ctxmode server instructions\n\nstub")
+	promptResult := promptResponse["result"].(map[string]any)
+	if promptResult["_pigPromptResult"] != nil {
+		t.Fatalf("handler must not return a systemPrompt result: %+v", promptResult)
+	}
+	sectionsWire, _ := promptResult["_pigPromptSections"].(map[string]any)
+	requireContains(t, sectionsWire["ctxmode_instructions"].(string), "## Ctxmode server instructions\n\nstub")
 	_, ch = h.request("command", "ctxmode-stop", "")
 	h.await(ch)
+	// With the client stopped the handler clears its section instead of
+	// leaving stale instructions for the next prompt.
+	_, prompt = h.request("event", "before_agent_start", map[string]any{
+		"systemPrompt":        "BASE",
+		"systemPromptOptions": map[string]any{"sections": map[string]any{"ctxmode_instructions": "stale"}},
+	})
+	promptResponse = h.await(prompt)
+	if promptResponse["error"] != nil {
+		t.Fatalf("before_agent_start failed: %+v", promptResponse)
+	}
+	promptResult = promptResponse["result"].(map[string]any)
+	if promptResult["_pigPromptResult"] != nil {
+		t.Fatalf("handler must not return a systemPrompt result: %+v", promptResult)
+	}
+	sectionsWire, _ = promptResult["_pigPromptSections"].(map[string]any)
+	if _, stale := sectionsWire["ctxmode_instructions"]; stale {
+		t.Fatalf("stopped client left stale section: %+v", sectionsWire)
+	}
 	_, call = h.request("tool_call", "ctx_git", map[string]any{"action": "status"})
 	requireContains(t, responseText(h.await(call)), "ctxmode 未运行。用 /ctxmode-start 启动。")
 	h.mu.Lock()

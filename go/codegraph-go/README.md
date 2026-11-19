@@ -43,8 +43,10 @@ PiG 的 **CodeGraph MCP stdio 桥接扩展**，不是索引服务器本身。它
 7. 默认输出预算超限才压缩：行数保头尾，字符按 UTF-16 code unit 计数，不切断代理对。
    再按 TS 顺序清洗 markdown、引用与 rg fallback。`node/read`、`skipCode=false` 或
    `includeCode=true` 保留代码内容与 `file:line:content`，但仍执行行内反引号清理。
-8. `before_agent_start` 保留原 system prompt，追加工作目录、预算和可选 server instructions；
-   未授权则追加不可用说明。SDK 的 `*sdk.SystemPrompt` 通过 `Get()` 读取。
+8. `before_agent_start` 不再返回 `systemPrompt`（那会触发宿主强制渲染并丢弃后续扩展
+   的 section）；改为就地编辑 `systemPromptOptions.sections`：工作目录/预算写入
+   `codegraph_tools`，server instructions 写入 `codegraph_instructions`；未授权写不可用说明、
+   无决议时清理这两个 section。其余 options 字段原样回传。
 9. shutdown、手动 stop 关闭客户端；stop 保留决议，后续调用可以再次惰性启动。
    3 个命令为 `codegraph-start`、`codegraph-stop`、`codegraph-info`，文案按 TS 保留。
 10. stderr 持续 drain；非 DEBUG 保留最近 20 行，异常退出过滤 INFO/DEBUG 写诊断，
