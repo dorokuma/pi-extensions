@@ -163,18 +163,26 @@ func Extension() *sdk.Extension {
 	}
 	e.OnSessionStart(func(ctx sdk.Context, _ map[string]any) (any, error) { start(ctx, false, "warning"); return nil, nil })
 	e.OnEvent("before_agent_start", func(_ sdk.Context, event map[string]any) (any, error) {
+		// Sections travel in systemPromptOptions; returning
+		// {"systemPrompt": ...} would make the host force-render the prompt
+		// and drop sections later extensions add, so this handler only edits
+		// the shared sections and returns nil.
+		options, _ := event["systemPromptOptions"].(map[string]any)
+		if options == nil {
+			return nil, nil
+		}
+		sections, _ := options["sections"].(*sdk.SystemPromptSections)
+		if sections == nil {
+			return nil, nil
+		}
+		instructions := ""
 		if c := state.getClient(); c != nil {
-			if instructions := c.GetServerInstructions(); instructions != "" {
-				prompt, _ := event["systemPrompt"].(string)
-				if p, ok := event["systemPrompt"].(*sdk.SystemPrompt); ok {
-					var err error
-					prompt, err = p.Get()
-					if err != nil {
-						return nil, err
-					}
-				}
-				return map[string]any{"systemPrompt": prompt + "\n\n## Ctxmode server instructions\n\n" + instructions}, nil
-			}
+			instructions = c.GetServerInstructions()
+		}
+		if instructions != "" {
+			sections.Set("ctxmode_instructions", "## Ctxmode server instructions\n\n"+instructions)
+		} else {
+			sections.Delete("ctxmode_instructions")
 		}
 		return nil, nil
 	})

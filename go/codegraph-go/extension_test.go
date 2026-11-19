@@ -14,11 +14,24 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 func notifyRecorder() (func(string, string), *[]string) {
 	out := []string{}
 	return func(m, k string) { out = append(out, k+":"+m) }, &out
+}
+func sectionValue(sections *sdk.SystemPromptSections, name string) string {
+	if sections == nil {
+		return ""
+	}
+	for _, s := range *sections {
+		if s.Name == name {
+			return s.Value
+		}
+	}
+	return ""
 }
 func TestRuntimeLifecycleAndCommands(t *testing.T) {
 	h := isolated(t)
@@ -33,9 +46,20 @@ func TestRuntimeLifecycleAndCommands(t *testing.T) {
 		return c, nil
 	}
 	notify, messages := notifyRecorder()
-	if r.beforeAgentStart("base") != nil {
-		t.Fatal("nil decision")
+	sections := &sdk.SystemPromptSections{}
+	r.beforeAgentStart(sections)
+	if len(*sections) != 0 {
+		t.Fatal("nil decision wrote sections", *sections)
 	}
+	r.beforeAgentStart(nil)
+	sections.Set("stale_other", "keep")
+	sections.Set("codegraph_tools", "stale")
+	sections.Set("codegraph_instructions", "stale")
+	r.beforeAgentStart(sections)
+	if len(*sections) != 1 || sectionValue(sections, "stale_other") != "keep" || sectionValue(sections, "codegraph_tools") != "" || sectionValue(sections, "codegraph_instructions") != "" {
+		t.Fatal("nil decision must only clean its own sections", *sections)
+	}
+	*sections = sdk.SystemPromptSections{}
 	if c, msg := r.getClient(); c != nil || !strings.Contains(msg, "尚无会话决策") {
 		t.Fatal(msg)
 	}
@@ -51,15 +75,17 @@ func TestRuntimeLifecycleAndCommands(t *testing.T) {
 	if spawns != 0 || registered != 1 || !strings.HasPrefix((*messages)[2], "info:codegraph-go 可用（按需）：") {
 		t.Fatal(*messages)
 	}
-	prompt := r.beforeAgentStart("base").(map[string]any)["systemPrompt"].(string)
-	if !strings.Contains(prompt, "家目录模式已开") || strings.Contains(prompt, "server instructions") {
-		t.Fatal(prompt)
+	r.beforeAgentStart(sections)
+	prompt := sectionValue(sections, "codegraph_tools")
+	if !strings.Contains(prompt, "家目录模式已开") || sectionValue(sections, "codegraph_instructions") != "" {
+		t.Fatal(prompt, *sections)
 	}
 	c, msg := r.getClient()
 	if c == nil || msg != "" || spawns != 1 {
 		t.Fatal(msg)
 	}
-	if got := r.beforeAgentStart("base").(map[string]any)["systemPrompt"].(string); !strings.Contains(got, "## CodeGraph server instructions\n\ninstructions") {
+	r.beforeAgentStart(sections)
+	if got := sectionValue(sections, "codegraph_instructions"); !strings.Contains(got, "## CodeGraph server instructions\n\ninstructions") {
 		t.Fatal(got)
 	}
 	r.commandStart(h, notify)
@@ -84,7 +110,8 @@ func TestRuntimeLifecycleAndCommands(t *testing.T) {
 	if r.client != nil || registered != 1 || r.decision.Workdir != p {
 		t.Fatal("new workdir")
 	}
-	prompt = r.beforeAgentStart("base").(map[string]any)["systemPrompt"].(string)
+	r.beforeAgentStart(sections)
+	prompt = sectionValue(sections, "codegraph_tools")
 	if !strings.Contains(prompt, "当前索引根就是单个项目目录") {
 		t.Fatal(prompt)
 	}
@@ -101,7 +128,8 @@ func TestRuntimeLifecycleAndCommands(t *testing.T) {
 	if r.decision.OK || !strings.HasPrefix((*messages)[len(*messages)-1], "warning:codegraph-go 不可用:") {
 		t.Fatal(*messages)
 	}
-	prompt = r.beforeAgentStart("base").(map[string]any)["systemPrompt"].(string)
+	r.beforeAgentStart(sections)
+	prompt = sectionValue(sections, "codegraph_tools")
 	if !strings.Contains(prompt, "本会话 CodeGraph 未启用:") {
 		t.Fatal(prompt)
 	}
@@ -332,7 +360,13 @@ func TestSDKLifecycleRegistration(t *testing.T) {
 	}
 	request("1", map[string]any{"method": "event", "event": "session_start", "handler_id": 1, "args": map[string]any{}})
 	resp := request("2", map[string]any{"method": "event", "event": "before_agent_start", "handler_id": 2, "args": map[string]any{"systemPrompt": "base", "systemPromptOptions": map[string]any{"sections": map[string]any{}}}})
-	if prompt := resp["result"].(map[string]any)["_pigPromptResult"].(map[string]any)["systemPrompt"].(string); !strings.HasPrefix(prompt, "base\n\n") || !strings.Contains(prompt, "索引根:") {
+	result := resp["result"].(map[string]any)
+	if result["_pigPromptResult"] != nil {
+		t.Fatal("handler must not return a systemPrompt result", resp)
+	}
+	sectionsWire, _ := result["_pigPromptSections"].(map[string]any)
+	tools, _ := sectionsWire["codegraph_tools"].(string)
+	if !strings.Contains(tools, "索引根:") {
 		t.Fatal(resp)
 	}
 	request("3", map[string]any{"method": "command", "tool": "codegraph-info", "args": ""})

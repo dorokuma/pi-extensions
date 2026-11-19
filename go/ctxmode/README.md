@@ -58,7 +58,9 @@ exposure 注册：始终作为模型顶层直连工具暴露，不注入 codemod
   取消错误，不阻塞两段 `CTXMODE_START_TIMEOUT_MS`。
 - dispose 关闭 stdio，SIGTERM 等待窗口后才升级 SIGKILL。Go 版等待子进程被回收，
   不留下 zombie；旧 readers/waiter 不能修改替换连接的缓冲或 pending。
-- before_agent_start 只追加 `## Ctxmode server instructions`，不拦截用户消息。
+- before_agent_start 以 `ctxmode_instructions` section 写入 `## Ctxmode server instructions`
+  （就地编辑 `systemPromptOptions.sections`，不返回 `systemPrompt`），客户端停止时清理该
+  section；不拦截用户消息。
 
 ## 环境变量
 
@@ -91,8 +93,10 @@ exposure 注册：始终作为模型顶层直连工具暴露，不注入 codemod
    cancellation 使用 SDK `Context.Done/Err` 的 context adapter。工具返回原始
    `{content:[{type:"text",text}], details:{}}` 形状，不依赖 SDK 的字符串 Content 捷径。
    写入路径单独用一把 `writeMu` 串行化、不持状态锁，故被塞死的 stdin 不会拖住取消。
-3. SDK 在 before_agent_start 中将 `systemPrompt` 转为 `*sdk.SystemPrompt`，因此用
-   `Get()` 读取；不是直接断言为 string。台架提供真实的 `systemPromptOptions`。
+3. before_agent_start 不再读取/返回 `systemPrompt`（返回值会让宿主强制渲染并丢弃
+   后续扩展注入的 section）；handler 只就地编辑 `systemPromptOptions` 里的
+   `*sdk.SystemPromptSections`（Set/Delete `ctxmode_instructions`）并返回 nil。台架提供真实的
+   `systemPromptOptions`。
 4. `ResolveRoleEnv` 的提取与不覆盖行为按原版测试验证。但 PiG 的 factory 可能在
    独立 runner 中运行，runner 的 `os.Args` 不一定包含宿主 `--name`；生产部署若依赖角色
    自动推导，应由调用方显式传递 `CTXMODE_ROLE` / `CTXMODE_READONLY`。本任务未增加
