@@ -134,10 +134,16 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
 extensions/<name>/src/<file>.ts     # 6 个内生扩展源码（唯一权威副本）
 extensions/<name>/README.md          # 各扩展：权威源/目标/来源/出处/一致性记录
 federated/registry.json              # 10 扩展的类别与绝对权威路径（install.sh 数据源）
+go/sandbox/                          # Landlock 沙盒库 + sbx CLI（go.work 聚合；见 go/sandbox/README.md）
 install.sh                           # 统一安装/巡检入口
 .agents/notes/                       # 重大变更与踩坑笔记
 .agents/history/no-tables/           # no-tables 两份历史备份的只读副本（三段式还原输入源）
 ```
+
+> `go/sandbox` 是**防误操作护栏（Guardrail）而非强对抗隔离沙箱**：`Policy.Exec`/
+> 禁名/`ld-linux` 拦截属护栏级限制，`/` 整树只读可读面、`DenyNet:false` 网络面
+> 与 `memfd_create`/`execveat` 匿名 `PROT_EXEC` 旁路为如实披露的已知边界；详见
+> `go/sandbox/README.md` 的「威胁模型」专节。
 
 ## 类型检查
 

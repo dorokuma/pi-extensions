@@ -1954,9 +1954,8 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\necho untrusted-fake-go\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile fake go: %v", err)
 	}
-	// 同一污染现场再叠加 PI_SANDBOX_REAL_GO 污染（resolveRealGoBinary 的
-	// Env 覆盖优先于 PATH）：伪造 go 不得成为预热/策略共用的受信实体。
-	t.Setenv("PI_SANDBOX_REAL_GO", fakeGo)
+	// 同一污染现场叠加 PATH 前置的「假 go」：resolveSandboxRealGoBinary 必须
+	// 拒绝把它（或其所在不可信父目录）前置进预热 PATH。
 	t.Setenv("PATH", untrustedDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// GOROOT 别名反例（先建壳）：伪造 GOROOT 的 bin/go 是指向受信 go 的软链，
@@ -1983,8 +1982,8 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 		t.Fatal("cold start: fake pig was not invoked")
 	}
 
-	// 受信解析：resolveSandboxRealGoBinary 跳过不可信 PATH 前置与
-	// PI_SANDBOX_REAL_GO 污染的假 go，命中固定可信工具链前缀内的真实 go。
+	// 受信解析：resolveSandboxRealGoBinary 跳过不可信 PATH 前置的假 go，
+	// 命中固定可信工具链前缀内的真实 go。
 	wantRealGo := resolveSandboxRealGoBinary("")
 	if wantRealGo == "" {
 		t.Skip("no trusted real go resolvable on host; cannot assert toolchain alignment")
@@ -2022,16 +2021,29 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 
 	// GOROOT 别名反例落成：<fakeGOROOT>/bin/go 软链指向受信 go（旧实现会
 	// 误判整根可信），pkg/tool 为伪造目录。同一污染现场调用
-	// ReadOnlyReviewer：policy 注入的 PI_SANDBOX_REAL_GO 必须与预热同一
-	// 受信实体，且 Policy.Exec 绝不含伪造 GOROOT/pkg/tool 与不可信 go。
+	// ReadOnlyReviewer：policy 不再注入 PI_SANDBOX_REAL_GO（阶段 3 拆除后
+	// 该键已废除）；<goExecDir>/bin/go 直链的真实 go 必须与预热同一受信
+	// 实体，且 Policy.Exec 绝不含伪造 GOROOT/pkg/tool 与不可信 go。
 	if err := os.Symlink(wantRealGo, filepath.Join(fakeGOROOT, "bin", "go")); err != nil {
 		t.Fatalf("symlink fake GOROOT/bin/go -> trusted go: %v", err)
 	}
 	t.Setenv("GOROOT", fakeGOROOT)
 	policy := ReadOnlyReviewer(t.TempDir())
 	t.Cleanup(func() { removePresetTempDirs(t, policy) })
-	if got := lookupEnvValue(policy.Env, "PI_SANDBOX_REAL_GO"); got != wantRealGo {
-		t.Fatalf("policy PI_SANDBOX_REAL_GO = %q, want same trusted entity as warm resolver %q", got, wantRealGo)
+	if got := lookupEnvValue(policy.Env, "PI_SANDBOX_REAL_GO"); got != "" {
+		t.Fatalf("policy PI_SANDBOX_REAL_GO must be empty after broker removal, got %q", got)
+	}
+	goExecDir := lookupEnvValue(policy.Env, "PI_SANDBOX_GO_EXEC_DIR")
+	if goExecDir == "" {
+		t.Fatal("policy must inject PI_SANDBOX_GO_EXEC_DIR")
+	}
+	linkGo := filepath.Join(goExecDir, "bin", "go")
+	resolvedLink, err := filepath.EvalSymlinks(linkGo)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", linkGo, err)
+	}
+	if filepath.Clean(resolvedLink) != filepath.Clean(wantRealGo) {
+		t.Fatalf("<goExecDir>/bin/go resolves to %q, want same trusted entity as warm resolver %q", resolvedLink, wantRealGo)
 	}
 	execSet := make(map[string]struct{}, len(policy.Exec))
 	for _, ex := range policy.Exec {

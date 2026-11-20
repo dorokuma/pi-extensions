@@ -70,13 +70,13 @@ import (
 //     而在独立 PID ns 内宿主 PID 本就 ESRCH 不可达。
 //
 // PID 1 由 sbx 自身担任轻量 init：runAsSandboxInit 派生目标命令（其实际
-// PID 不固定——sandbox.Apply 会先派生 helper/broker 辅助进程），回收孤儿
+// PID 不固定——sandbox.Apply 会先派生 helper 辅助进程），回收孤儿
 // 僵尸并向目标命令转发信号（业务进程若为 PID 1 会忽略默认未捕获信号且
 // 无人收尸）。
 //
 // 已知边界（按设计保持可达）：/root/.herdsman/herdsman.sock（herdsman 扩展
 // 必需）、/root/.config/herdr/herdr.sock（老 herdr agent 状态上报）、
-// goExecDir 内 broker.sock 与 report.sock。
+// goExecDir 内 report.sock。
 
 const (
 	runDir           = "/run"
@@ -462,7 +462,7 @@ func allThreadsCapset(hdr *unix.CapUserHeader, data *unix.CapUserData) error {
 // CAP_PERFMON/CAP_NET_ADMIN/CAP_SYS_TIME/CAP_SYS_RAWIO/CAP_SYS_PTRACE/
 // CAP_SYS_CHROOT/CAP_DAC_READ_SEARCH/CAP_LINUX_IMMUTABLE 等高权能力，
 // capability 门控的宿主全局副作用（reboot/载模块/改时钟/改主机名等）
-// 在能力校验层整体失效；helper/broker 与目标命令等全部子孙经 fork/exec
+// 在能力校验层整体失效；helper 与目标命令等全部子孙经 fork/exec
 // 继承同一已裁剪能力集。
 func dropSandboxCapabilities() error {
 	lastCap := sandboxCapLastCap()

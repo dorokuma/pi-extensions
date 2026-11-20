@@ -1050,7 +1050,7 @@ func runPigWarmSubprocess(sigCtx context.Context, pigBin, pigHome, srcAgentDir s
 	}
 	// Go 工具链对齐：goPackedCellHash 把 toolchain 的 commandVersion/goroot/
 	// compiler 折进 cell 摘要，预热 cell 与沙盒内 pig 实际构建的 cell 必须用
-	// 同一个 go 才能命中同一 <digest>/runner。沙盒内 go 经 goExecDir 包装器
+	// 同一个 go 才能命中同一 <digest>/runner。沙盒内 go 经 goExecDir 直链
 	// 派发 resolveRealGoBinary（宿主 PATH 顺序）选出的真实 go；预热子进程若
 	// 用 controlledWarmPath() 的固定目录顺序解析出不同 go（如 /usr/local/go
 	// 优先而宿主 PATH 先命中 /usr/bin），cell 摘要必然错配、沙盒内被迫在
@@ -1059,7 +1059,7 @@ func runPigWarmSubprocess(sigCtx context.Context, pigBin, pigHome, srcAgentDir s
 	//
 	// 所选真实 go 必须经 resolveSandboxRealGoBinary 受信解析（真实路径位于
 	// 固定可信工具链前缀内）——绝不把 resolveRealGoBinary 直接按宿主 PATH /
-	// PI_SANDBOX_REAL_GO 选中的任意父目录前置进预热 PATH：调用方可控目录内
+	// 调用方 PATH 选中的任意父目录前置进预热 PATH：调用方可控目录内
 	// 的「假 go」会在 Landlock 生效前以宿主权限被预热子进程执行
 	//（controlledWarmPath 刻意不读调用方 PATH 的既有防线由此被打穿）。
 	if realGo := resolveSandboxRealGoBinary(""); realGo != "" {

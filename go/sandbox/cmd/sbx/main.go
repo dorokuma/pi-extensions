@@ -82,7 +82,7 @@ type childExecSpec struct {
 	MountNS bool `json:"mount_ns"`
 	// FD3Forward 标记 agent 预设下 fd3（claude-pty debugW 写端）须经
 	// ExtraFiles 显式单路转发给最终目标进程：内层子进程在 Apply（派生
-	// helper/broker）前先对 fd3 置 CLOEXEC，再由 runAsSandboxInit 经
+	// helper）前先对 fd3 置 CLOEXEC，再由 runAsSandboxInit 经
 	// ExtraFiles 传给目标，杜绝辅助进程/常驻 daemon 继承（oracle FM-3）。
 	FD3Forward bool `json:"fd3_forward"`
 }
@@ -189,7 +189,14 @@ func parseArgs(args []string) (cliConfig, error) {
 // （HC_TERMINAL_SOCKET/HC_SCOPE/HC_SOCKET/HC_SESSION 等），以及凭据与
 // 会话 socket 指针。--env 显式传入这些键同样被剔除（buildPolicy 对
 // cfg.Env 同口径过滤）；预设自身注入的值（如 reviewer-agent 私有
-// XDG_RUNTIME_DIR 指向沙盒内 0700 目录）不属于外部指针，不剔除。
+// XDG_RUNTIME_DIR 指向沙盒内 0700 目录，以及 ReadOnlyReviewer 经
+// Policy.Env 回钉的受信 GOROOT 根）不属于外部指针——剥离只作用于
+// cfg.Env 与宿主继承，不动 Policy.Env 注入，故受信注入不受影响。
+//
+// GOROOT 全剥离（方案 B）：宿主 os.Environ() 携带的 toolchain module
+// 缓存 GOROOT 与调用方 --env GOROOT=<伪根> 一律剔除——否则其经
+// mergeEnv 覆盖 ReadOnlyReviewer 注入的受信根，把沙盒内 go 的
+// <GOROOT>/pkg/tool 指到不可信根。
 //
 // PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 不入本集合：仅对宿主
 // os.Environ() 经 sandboxHostStripExtraKeys 追加剔除（--env 显式声明
@@ -199,9 +206,9 @@ var sandboxEnvStripKeys = map[string]bool{
 	"SSH_AUTH_SOCK":              true,
 	"DBUS_SESSION_BUS_ADDRESS":   true,
 	"XDG_RUNTIME_DIR":            true,
+	"GOROOT":                     true,
 	"PI_SANDBOX_INTERNAL_MODE":   true,
 	"PI_SANDBOX_HELPER_CFG":      true,
-	"PI_SANDBOX_BROKER_CFG":      true,
 	"PI_SANDBOX_PRESET_TMP_DIRS": true,
 }
 
@@ -329,7 +336,7 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// ~/.claude 或与 ReadWrite 策略脱配。
 			claudeConfigDir = envListValue(policy.Env, "CLAUDE_CONFIG_DIR")
 			// PI_SANDBOX_GO_EXEC_DIR 同理：ReviewerAgentWithEnv 把受控执行目录
-			//（/tmp/pi-reviewer-exec-*，go 包装器/broker.sock/report.sock 所在）
+			//（/tmp/pi-reviewer-exec-*，bin/go 直链/report.sock 所在）
 			// 注入 Policy.Env；记下来供 mergeEnv 之后回钉，防 --env
 			// PI_SANDBOX_GO_EXEC_DIR=<其他路径> 把回报中继监听路径与 go
 			// 包装器目录劫持到调用方指定的任意目录。
@@ -354,7 +361,7 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	}
 	// reviewer 与 reviewer-agent 预设统一回钉 PI_SANDBOX_GO_EXEC_DIR：把最终
 	// env 中该键强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME
-	// 同口径），防 --env 劫持回报中继监听路径或 go 包装器/broker 目录。
+	// 同口径），防 --env 劫持回报中继监听路径或 go 直链目录。
 	if (cfg.Preset == "reviewer" || cfg.Preset == "read-only-reviewer" || cfg.Preset == "reviewer-agent") && goExecDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PI_SANDBOX_GO_EXEC_DIR=" + goExecDir})
 	}
@@ -782,7 +789,7 @@ var childSysProcAttrForRun = childSysProcAttr
 // （继承 /dev/mqueue 挂载未覆盖）；
 // 子进程即新 PID ns
 // 的 PID 1，完成隔离后担任轻量 init 派生目标命令（记录目标子进程 PID——
-// sandbox.Apply 会先派生 helper/broker，业务进程 PID 不固定为 2；socket
+// sandbox.Apply 会先派生 helper 辅助进程，业务进程 PID 不固定为 2；socket
 // 白名单视图见 mountns_linux.go）；
 // --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
 // <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
@@ -894,7 +901,7 @@ func runChildFromEnv() int {
 	// -race/cgo 下 syscall.AllThreadsSyscall 返回 ENOTSUP 时，降权、封锁与
 	// Apply 会回退到「当前线程」口径，必须保证 isolateRuntimeSockets
 	//（drop-capabilities/seal-mount-namespace）→ sandbox.Apply（派生 helper
-	// 及后续 go test 子进程）→ runAsSandboxInit（派生目标子进程）全程跑在
+	// 及后续子进程）→ runAsSandboxInit（派生目标子进程）全程跑在
 	// 同一个已降权/已封锁的 OS 线程上，子孙经 fork/exec 继承同一能力集。
 	runtime.LockOSThread()
 
@@ -934,7 +941,7 @@ func runChildFromEnv() int {
 		}
 	}
 	// agent 预设：fd3 经外层 ExtraFiles 传入后为非 CLOEXEC，必须在
-	// sandbox.Apply 派生 helper/broker 前置 CLOEXEC，杜绝辅助进程继承
+	// sandbox.Apply 派生 helper 前置 CLOEXEC，杜绝辅助进程继承
 	// debugW 写端；目标进程由 runAsSandboxInit 经 ExtraFiles 显式接收。
 	if spec.FD3Forward && fd3Open() {
 		unix.CloseOnExec(3)
@@ -970,7 +977,7 @@ func runChildFromEnv() int {
 
 // runAsSandboxInit 在新 PID 命名空间内以 PID 1 运行轻量 init：派生目标
 // 命令并记录其子进程 PID（不固定为 2——sandbox.Apply 会先派生
-// helper/broker 辅助进程），转发信号并回收孤儿僵尸进程。PID 1 有特殊
+// helper 辅助进程），转发信号并回收孤儿僵尸进程。PID 1 有特殊
 // 语义——默认未捕获的信号对它不生效（kill 不掉），且其退出的子孙会被
 // 内核转给它收尸；让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉
 // 并残留僵尸。
@@ -1003,7 +1010,7 @@ func runAsSandboxInit(bin string, argv []string, env []string, fd3Fwd bool) int 
 		Stderr: os.Stderr,
 	}
 	// agent 预设：fd3 经 ExtraFiles 显式单路转发给目标进程（已在 Apply 前
-	// 置 CLOEXEC 阻断 helper/broker 继承；此处显式放行最终目标）。
+	// 置 CLOEXEC 阻断 helper 继承；此处显式放行最终目标）。
 	forwardFD3ToChild(cmd, fd3Fwd)
 	if err := cmd.Start(); err != nil {
 		// Start 失败退 126 前对称释放 fd3 owner（与 runSandboxedChild

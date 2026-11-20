@@ -2,6 +2,17 @@
 
 `go/sandbox` 提供零 `cgo`、仅依赖 `golang.org/x/sys/unix` 的 Linux Landlock 文件系统与网络沙盒封装，以及命令行工具 `cmd/sbx`，用于约束子代理（如只读代码审查员 `ReadOnlyReviewer`）的文件读写与程序执行边界。
 
+## 威胁模型：防误操作护栏（Guardrail）而非强对抗隔离沙箱
+
+本模块的定位必须被正确理解：**内核强制隔离主体**（Landlock 文件系统白名单、独立命名空间、capabilities 裁剪、mount-seal seccomp 锁）构成真实边界；而 **`Policy.Exec` 白名单、`ForbiddenExecNames` 名单与 `ld-linux` 拦截属护栏级限制**——它们拦截的是「误敲命令」「常规路径执行禁用二进制」这类非对抗操作，**不承诺抵抗已注入沙盒的任意原生代码**。具体边界如实披露：
+
+- **`memfd_create` + `execveat` / 匿名 `PROT_EXEC` 旁路**：seccomp `PROT_EXEC` 守卫只拦截带 `PROT_EXEC` 标志的 `mmap`/`mprotect` 且以 `/proc/<pid>/fd`/`exe` 判定文件来源；经 `memfd_create` 创建的匿名内存 fd 无文件路径可判定，写入任意代码后 `execveat(AT_EMPTY_PATH)` 或匿名 `mprotect(PROT_EXEC)` 属内核接口级旁路，本沙盒不封堵——护栏级定位下不要求，强对抗场景需独立的内核级隔离方案。
+- **`/` 整树只读可读面**：`ReadOnlyReviewer` 授予 `/` 只读权限，沙盒内进程可读取宿主几乎全部文件内容（含 `/root` 下凭据、密钥、配置）；只读面按设计保留，不属越权。
+- **`DenyNet:false` 网络面**：默认预设不限制 TCP bind/connect，沙盒内进程可自由出网（LLM 走本机 Magpie、MCP、ssh 等均需）；需断网时显式 `DenyNet:true` 或 `sbx --deny-net`。
+- **护栏级 `Policy.Exec`/`ForbiddenExecNames`/`ld-linux`**：Exec 白名单按路径放行 `execve`，禁名按 basename 匹配；二者拦截直接 `exec` 与经 `ld-linux` 间接加载的常规形态，但对已能在沙盒内运行原生代码的对手不构成边界（见上 memfd 旁路）。
+
+简言之：把本模块当作**「防止 LLM/子代理误操作破坏宿主」的护栏**而非「隔离不可信代码」的强沙箱；需要运行动态测试代码时应交独立的隔离验证环境（容器/VM），而非依赖本沙盒承载 `go test` 产物执行。
+
 ## 环境要求
 
 - **操作系统**：启用了 Landlock LSM 的 Linux 内核（`Linux >= 5.13`，自适应支持 ABI v1 至 v5+）。
@@ -25,7 +36,7 @@
   - 根文件系统 `/` 只读；
   - 仅允许会话级私有临时目录 `/tmp/pi-reviewer-*`（含 `TMPDIR`、`GOTMPDIR`、`GOCACHE`）可写；`<workdir>` 与其 `reports/` 子目录**不再**获得写授权，绝不在目标 Git 工作树内凭空创建 `reports/`（行为变更：`reviewer`/`reviewer-agent` 预设均生效）。**注意**：纯 `ReadOnlyReviewer`/`--preset reviewer` 的 `ReadWrite` 只有该私有 `TMPDIR`——`/tmp/herdr-role-reports` 共享报告根与 `/tmp/herdr-role-sessions` 共享会话根**仅**在 `ReviewerAgentWithEnv`（`--preset reviewer-agent`）的白名单内，纯 reviewer 写报告只能用自身私有 `TMPDIR`（如 `<TMPDIR>/reports`），并未获共享根写权；
   - **严格执行 `W^X`（可写与可执行完全分离）**：所有 `ReadWrite` 目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`）均**不**授予 `LANDLOCK_ACCESS_FS_EXECUTE` 权限；
-  - 建立独立的只读可执行目录 `/tmp/pi-reviewer-exec-*`，通过受控的 `go` 包装器与前置构建代理支持 `go build`、`go vet`、`go test`；
+  - 建立独立的只读可执行目录 `/tmp/pi-reviewer-exec-*`，其中 `bin/go` 直接软链受信真实 `go`——`go list`/`go build`/`go vet` 等只读编译子命令原样可用；`go test`/`go run` 需在沙盒内执行动态产物，按其落点目录的 `W^X`（可写不执、可执不写）**自然拒绝**（`EACCES`），不再经构建代理/测试降权运行（该链路已随阶段 3 拆除）；
   - 严格限制可执行二进制白名单，显式拦截嵌套代理与调度器（`pig`、`pi`、`agy`、`grok`、`dispatch-agent`、`herdr`，含 ELF 本体名 `dispatch-agent-go`、`herdr-core`、`herdr-mobile-bridge`，并闭合「禁名+`-`/`.`」前缀派生形态如 `dispatch-agent-go.bak-*`）以及直接调用 ELF 动态链接器（`ld-linux*.so*`）。
 - `sandbox.ReviewerAgent(workdir string) Policy`：在 `ReadOnlyReviewer` 之上允许**顶层**启动 `agy`/`pig`/`pi`/`claude`（`EntryAgents`；软链解析目标须过身份校验——basename 命中白名单名 `agy`/`pig`/`pi`/`claude`/`agentapi`/`webm_encoder`，或含 `/<查找名>/` 路径段且位于已知安装根前缀之下；basename 命中禁名及其 `-`/`.` 前缀派生名（如 `dispatch-agent-go.bak-*`）一律拒，整个候选（含软链 norm）不收录并打 `WARN` 跳过，防 PATH 前置毒软链混入），并对 pig 与 agy MCP 生态做四层私有隔离：
   - **ctxmode/MCP 数据隔离**：点名放行 `ctxmode`/`codegraph-go`/`jev-mcp`/`jev-mcp-go`/`agy-recall`（含软链目标）；未显式指定 `CTXMODE_DB` 时注入 `<privateTmpDir>/ctxmode/context_mode.db`（0700）；宿主兜底仅精确放行 `~/.local/share/ctxmode` 与 `agy-recall` state，绝不放宽到 `~/.local/share` 或 `gemini-web`。
@@ -35,7 +46,7 @@
   - **启动前 fail-closed**：`ReviewerAgentWithEnv` 枚举扩展集（`sourceAgentGoExtensionDirs`，与预热指纹同口径）与宿主有效产物集（`cellCacheEntryDirs`+`validCellEntryDir`），逐项把宿主产物投影进私有 cache 并校验每个 artifact 经软链解析后的宿主真实路径已入 `Policy.Exec`；`buildPolicy` 在启动前经 `ReviewerAgentCellTargetError` 读取校验结果——有 Go 扩展但宿主有效产物为 0（预热失败）或存在未成功投影/Exec 未命中的目标时返回错误拒绝启动并指名缺失项，绝不进入「沙盒内 build 成功但 exec 失败」的不完全兼容态。Exec 完整性 missing 仅对预注册的可执行目标集合（language=`go` 且带执行位的 cells/go、ext 条目）计算；非执行/非 Go 缓存条目仅作可读投影不参与 missing，node-only 或无执行位条目场景下 `total=0` 仍拒绝 pig。
   - **XDG_RUNTIME_DIR 私有隔离**：宿主 `/run/user/0`（systemd user bus、keyring 等敏感套接字）绝不进 `ReadWrite`；在 `<privateTmpDir>` 下预建 0700 短名 `rt` 并覆写注入 `XDG_RUNTIME_DIR=<privateTmpDir>/rt`。
   - **claude 私有配置目录**：CC 会话必写配置目录；注入 `CLAUDE_CONFIG_DIR=<privateTmpDir>/claude`（0700，每会话私有目录，加入 `ReadWrite`）后 CC 配置根整体切到私有目录，写面随之收敛；目录随 `privateTmpDir` 清理——CC 会话状态本就不需跨会话持久，固定共享目录会让沙盒内 claude 写的 settings/hooks/mcpServers 被下一次会话原样继承（跨会话投毒通道），与 pig-agent/ctxmode/XDG_RUNTIME_DIR 全落 `privateTmpDir` 的每会话隔离口径一致。**唯一跨会话例外**：私有配置目录下预置 `projects` → `<herdrRoleSessionsRoot>/claude-projects`（0700，共享写根已在 ReadWrite 白名单内）符号链接，`projects/` 下的会话转录（`<project-slug>/<uuid>.jsonl`）按既定口径跨会话汇聚共享；根级 `.claude.json`/`settings.json` 仍每会话私有。宿主 `~/.claude` 与 `~/.claude.json` 仅随通用只读根顺带可读、CC 不消费其配置（宿主配置内容属不可信面，不放给沙盒内写）。
-  - **Go 扩展按需宿主预热**：`sbx` 在 `buildPolicy` 之前调用 `MaybeWarmGoExtensionCells`——当 preset 为 `reviewer-agent`、目标命令经固定可信目录（`<trustedHome>/.local/bin`、`<trustedHome>/.pig/bin`、`/root/.local/bin`、`/root/.pig/bin`、`standardBinDirs`；真实文件必须落在可信前缀内、普通文件、`perm & 0o022 == 0`、属主 root 或当前 euid，绝不读调用方 `PATH`）解析为 `pig`、且 `<PIG_HOME>/agent/extensions` 下存在 Go 扩展时，在 `<PIG_HOME>/cache/.locks/sbx-warm.lock` 排他锁内以最小干净环境（私有 cwd、私有 `pig-agent` AgentDir、受控 `PATH`）执行 `pig --help` 完成 cell 编译。预热子进程前置进 PATH 的真实 go 经 `resolveSandboxRealGoBinary` 受信解析（`EvalSymlinks` 后必须落在固定可信工具链前缀内）：宿主 `PATH`/`PI_SANDBOX_REAL_GO` 命中不可信目录（如工作树内「假 go」）时**拒绝前置该父目录**，回退固定可信工具链目录顺序取首个可信 go——绝不把调用方可控目录在 Landlock 生效前以宿主权限前置进预热 PATH。指纹（pig + `bin/pi`/`official/pig` 真实 ELF + 扩展/SDK 源清单）与 `cache/.locks/sbx-warm.sha256` 墓碑一致且存在有效产物（`cache/cells/go` 合包或 `cache/ext` 单扩展）时零子进程短路；子进程 stderr 命中 `Failed to load extension` / `extension build failed` 即使退 0 也拒绝写墓碑；预热前后指纹漂移有界重试 2 轮；预热期信号中断按进程组 SIGKILL 回收、`/tmp/sbx-warm-*` 零残留并以 `128+信号` 直接退出。
+  - **Go 扩展按需宿主预热**：`sbx` 在 `buildPolicy` 之前调用 `MaybeWarmGoExtensionCells`——当 preset 为 `reviewer-agent`、目标命令经固定可信目录（`<trustedHome>/.local/bin`、`<trustedHome>/.pig/bin`、`/root/.local/bin`、`/root/.pig/bin`、`standardBinDirs`；真实文件必须落在可信前缀内、普通文件、`perm & 0o022 == 0`、属主 root 或当前 euid，绝不读调用方 `PATH`）解析为 `pig`、且 `<PIG_HOME>/agent/extensions` 下存在 Go 扩展时，在 `<PIG_HOME>/cache/.locks/sbx-warm.lock` 排他锁内以最小干净环境（私有 cwd、私有 `pig-agent` AgentDir、受控 `PATH`）执行 `pig --help` 完成 cell 编译。预热子进程前置进 PATH 的真实 go 经 `resolveSandboxRealGoBinary` 受信解析（`EvalSymlinks` 后必须落在固定可信工具链前缀内）：宿主 `PATH` 命中不可信目录（如工作树内「假 go」）时**拒绝前置该父目录**，回退固定可信工具链目录顺序取首个可信 go——绝不把调用方可控目录在 Landlock 生效前以宿主权限前置进预热 PATH。指纹（pig + `bin/pi`/`official/pig` 真实 ELF + 扩展/SDK 源清单）与 `cache/.locks/sbx-warm.sha256` 墓碑一致且存在有效产物（`cache/cells/go` 合包或 `cache/ext` 单扩展）时零子进程短路；子进程 stderr 命中 `Failed to load extension` / `extension build failed` 即使退 0 也拒绝写墓碑；预热前后指纹漂移有界重试 2 轮；预热期信号中断按进程组 SIGKILL 回收、`/tmp/sbx-warm-*` 零残留并以 `128+信号` 直接退出。
 
 ### `sbx --preset` 失败清理
 
@@ -89,12 +100,12 @@ PID 1 启动），在 `sandbox.Apply` 之前完成全部隔离步骤：
 4. **`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖**（tmux send-keys 注入面）；
 5. **整个 `/run` 被 tmpfs 覆盖**，仅按原相对路径回绑白名单项：`/run/user/0/moshi-hook.sock`（agy 钩子遥测，socket 回绑保持可写，`connect()` 要求挂载点可写）与 `/run` 下的 `/etc/resolv.conf` 解析目标（普通文件，补只读 remount 保 DNS stub）；覆盖层最终整体 remount 为只读；
 6. **继承 cwd 重绑**（`rebind-cwd`）：覆盖挂载只改变其后的绝对路径解析，内核已持有的 `fs->pwd` 仍引用覆盖前的底层目录项；隔离流程 `os.Chdir` 回原 cwd 并 `os.Getwd()` 复核，强制内核从新挂载命名空间根重解析 cwd。原 cwd 在新视图不存在（如位于被覆盖且未回绑的 `/run/user/0/herdr-core`）时返回 `ENOENT`，默认 fail-closed 拒绝启动；不会擅自切往 `--workdir`，正常目录的继承 cwd 契约不变；
-7. **Linux capabilities 根治裁剪**（`drop-capabilities`）：先循环 `PR_CAPBSET_DROP` 收缩 bounding set（`CAP_SETPCAP` 留到最后一步——内核要求调用时仍持该能力），再 `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，最后 `capset` 把 `Effective`/`Permitted` 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`：前者供 uid=0 清理只读权限临时目录且受 Landlock 约束，后者供独立 PID ns 内信号转发），`Inheritable` 置 0。`CAP_SYS_ADMIN`/`CAP_SYS_BOOT`/`CAP_SYS_MODULE`/`CAP_BPF`/`CAP_PERFMON`/`CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_RAWIO`/`CAP_SYS_PTRACE`/`CAP_SYS_CHROOT`/`CAP_DAC_READ_SEARCH`/`CAP_LINUX_IMMUTABLE` 等其余能力一律剥离，helper/broker 与目标命令等全部子孙经 fork/exec 继承同一已裁剪能力集；
+7. **Linux capabilities 根治裁剪**（`drop-capabilities`）：先循环 `PR_CAPBSET_DROP` 收缩 bounding set（`CAP_SETPCAP` 留到最后一步——内核要求调用时仍持该能力），再 `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，最后 `capset` 把 `Effective`/`Permitted` 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`：前者供 uid=0 清理只读权限临时目录且受 Landlock 约束，后者供独立 PID ns 内信号转发），`Inheritable` 置 0。`CAP_SYS_ADMIN`/`CAP_SYS_BOOT`/`CAP_SYS_MODULE`/`CAP_BPF`/`CAP_PERFMON`/`CAP_NET_ADMIN`/`CAP_SYS_TIME`/`CAP_SYS_RAWIO`/`CAP_SYS_PTRACE`/`CAP_SYS_CHROOT`/`CAP_DAC_READ_SEARCH`/`CAP_LINUX_IMMUTABLE` 等其余能力一律剥离，helper 与目标命令等全部子孙经 fork/exec 继承同一已裁剪能力集；
 8. **mount-seal seccomp-BPF 锁**（`PR_SET_NO_NEW_PRIVS` + `SECCOMP_FILTER_FLAG_TSYNC` 同步全部线程）：12 个挂载族（`mount`/`umount2`/`setns`/`unshare`/`pivot_root`/`open_tree`/`move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/`mount_setattr`）+ 6 个越狱/进程控制族（`chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/`pidfd_getfd`/`kcmp`）+ 27 个 capability 门控的宿主全局副作用/句柄/密钥环族（`reboot`/`kexec_load`/`kexec_file_load`/`init_module`/`finit_module`/`delete_module`/`bpf`/`perf_event_open`/`fanotify_init`/`syslog`/`sethostname`/`setdomainname`/`settimeofday`/`clock_settime`/`adjtimex`/`clock_adjtime`/`swapon`/`swapoff`/`quotactl`/`quotactl_fd`/`acct`/`open_by_handle_at`/`name_to_handle_at`/`add_key`/`request_key`/`keyctl`/`pidfd_send_signal`；amd64 另有 `ioperm`/`iopl`）共 45 个（amd64 47 个）系统调用一律 `EPERM`；amd64 下另以 `JGE __X32_SYSCALL_BIT` 封堵 x32 ABI 位绕过；`pidfd_open` 有意放行（Go 标准库管理沙盒内子进程需要，宿主 PID 在新 PID ns 内本就 `ESRCH` 不可达）。异构 ABI `KILL_PROCESS`；仅 `linux/amd64` 与 `linux/arm64` 安装，其它架构跳过。
 
-隔离完成后 `sbx` 本体不直接 `exec` 业务命令，而是担任**轻量 PID 1 init**：派生目标命令并向它转发信号（其实际 PID 不固定为 2——`sandbox.Apply` 会先派生 helper/broker 辅助进程；信号经 `kill(目标子进程 PID, sig)` 送达）、以 `Wait4(-1, WNOHANG)` 循环回收孤儿僵尸进程（业务进程若为 PID 1 会忽略默认未捕获信号且无人收尸）；目标子进程退出即返回其退出码/`128+信号`，PID 1 退出后内核自动清理命名空间内残余进程。**信号转发分两层口径**：CLI 外层 `sbx` 父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 共 4 种；容器内 PID-1 init 监听 `SIGCHLD`/`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH` 共 8 种——其中 `SIGCHLD` 仅用于唤醒 `Wait4` 收尸不转发，其余 7 种转发给目标子进程。
+隔离完成后 `sbx` 本体不直接 `exec` 业务命令，而是担任**轻量 PID 1 init**：派生目标命令并向它转发信号（其实际 PID 不固定为 2——`sandbox.Apply` 会先派生 helper 辅助进程；信号经 `kill(目标子进程 PID, sig)` 送达）、以 `Wait4(-1, WNOHANG)` 循环回收孤儿僵尸进程（业务进程若为 PID 1 会忽略默认未捕获信号且无人收尸）；目标子进程退出即返回其退出码/`128+信号`，PID 1 退出后内核自动清理命名空间内残余进程。**信号转发分两层口径**：CLI 外层 `sbx` 父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 共 4 种；容器内 PID-1 init 监听 `SIGCHLD`/`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH` 共 8 种——其中 `SIGCHLD` 仅用于唤醒 `Wait4` 收尸不转发，其余 7 种转发给目标子进程。
 
-同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。**退出码口径**：父进程派生子进程失败（`unshare` 不被支持/权限不足等）严格模式退 `126`，`--best-effort` 下告警回退不 unshare（跳过全部覆盖与挂载锁，绝不动宿主命名空间）；子进程内任一挂载/封锁步骤失败默认退 `1` 拒绝启动，`--best-effort` 下仅告警继续。已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `broker.sock`/`report.sock`。
+同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。**退出码口径**：父进程派生子进程失败（`unshare` 不被支持/权限不足等）严格模式退 `126`，`--best-effort` 下告警回退不 unshare（跳过全部覆盖与挂载锁，绝不动宿主命名空间）；子进程内任一挂载/封锁步骤失败默认退 `1` 拒绝启动，`--best-effort` 下仅告警继续。已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `report.sock`。
 
 ## 受控发布 `scripts/deploy.sh`
 
@@ -117,18 +128,15 @@ bash go/sandbox/scripts/deploy.sh
 
 ## 安全机制与本轮封堵的绕过路径
 
-### 1. 可写临时目录与可执行目录分离（`W^X`）+ 受控 `go` 工具链代理
+### 1. 可写临时目录与可执行目录分离（`W^X`）+ 真实 `go` 工具链直链
 
 在早期版本中，为了让 `go test` 编译并执行生成的 `*.test` 二进制，私有临时目录 `/tmp/pi-reviewer-*`（`TMPDIR`、`GOTMPDIR`、`GOCACHE`）同时拥有读写和执行权限。审查员子代理可以把任意可读的 ELF（如 `/root/.local/bin/agy`、`/root/.local/bin/pi`、`dispatch-agent`）拷贝进该目录后再执行，从而绕过执行白名单。
 
-本轮通过 **`W^X` 目录分离 + 受控 `go` 包装器代理** 彻底堵上该口子：
+本轮通过 **`W^X` 目录分离 + `<goExecDir>/bin/go` 直链受信真实 `go`** 堵上该口子：
 
-1. **所有可写目录一律不可执行**：`ReadOnlyReviewer` 下，`Policy.ReadWrite` 中的 `/tmp/pi-reviewer-*`（含 `TMPDIR`、`GOTMPDIR`、`GOCACHE`）均不包含在 `Policy.Exec` 中（`<workdir>/reports` 不再获写授权）。审查员把 `agy` 或任意 ELF 拷入这些目录后直接执行时，内核 Landlock 直接返回 `EACCES` 拒绝执行。
-2. **可执行构建目录对审查员只读**：单独创建 `/tmp/pi-reviewer-exec-*`（`goExecDir`），在审查员进程的 Landlock 规则集中仅授予 `ReadOnly + Exec` 权限，审查员无法向其中写入、拷贝或重命名任何文件。**`Policy.Exec` 仅放行 `<goExecDir>/bin`（MF-1）**：`work/`/`cache/` 是 helper 的写域但不对审查员可执行——沙盒内经 broker 写穿到 `work/` 的任意 ELF（含 `objcopy` 拷入的禁用二进制）对审查员进程不可执行，Landlock `EXECUTE` 被拒。`pi-test-runner` 位于 `bin/` 内（审查员可执行），它在叠加审查员规则集前经 broker 注入的 `PI_SANDBOX_GO_TEST_WORK` 把 `work/` 追加进自身 `cfg.Exec`，再 `execve` `.test` 产物——`.test` 授权只存在于 runner 进程本身，不进审查员全局 `Policy.Exec`。
-3. **前置受控构建辅助进程与 `pi-test-runner` 降权运行**：
-   - 在 `sandbox.Apply` 对审查员主进程调用 `landlock_restrict_self` 之前，先派生一个同样受 Landlock 约束的内部辅助进程（该辅助进程仅比审查员多出对 `<goExecDir>/work` 与 `<goExecDir>/cache` 的写权限）。
-   - `Policy.Env` 将 `<goExecDir>/bin` 置于 `PATH` 首位，其中的 `go` 包装器会对子命令和参数做严格白名单校验（允许 `build`、`vet`、`test`、`list`、`env`、`version`、`mod`、`doc`、`fmt`，拒绝 `run`、`generate`、`tool`、`install` 以及 `-exec`、`-toolexec`、`-overlay`、`-ldflags`/`-gcflags`/`-asmflags`/`-gccgoflags`、`go test -c`、指向 `goExecDir` 的 `-o` 参数——`EvalSymlinks` 解析首个已存在祖先软链后判定，覆盖 `$TMPDIR/sym -> goExecDir/work` 形态——或 `cwd` 落在 `goExecDir` 内的缺省 `-o` 构建），再通过 Unix 域套接字请求辅助进程调用真实的 `go` 二进制。
-   - 执行 `go test` 时，辅助进程自动注入 `-exec=<goExecDir>/bin/pi-test-runner`。`pi-test-runner` 在校验目标路径必须位于 `<goExecDir>/work/` 且以 `.test` 结尾后，**先在自身进程上叠加审查员的 Landlock 规则集（收回对 `<goExecDir>/work` 与 `<goExecDir>/cache` 的写权限）**，再 `execve` 运行编译出的测试二进制。这样既保证了 `go build`、`go vet`、`go test` 正常工作，又确保测试代码本身同样处于严格的只读审查沙盒内。
+1. **所有可写目录一律不可执行**：`ReadOnlyReviewer` 下，`Policy.ReadWrite` 中的 `/tmp/pi-reviewer-*`（含 `TMPDIR`、`GOTMPDIR`、`GOCACHE`）均不包含在 `Policy.Exec` 中（`<workdir>/reports` 不再获写授权）。审查员把 `agy` 或任意 ELF 拷入这些目录后直接执行时，内核 Landlock 直接返回 `EACCES` 拒绝执行；`go build`/`go test` 产物落到可写域同样不可执行——`go test`/`go run` 因此在沙盒内被 `W^X` 自然拒绝（`EACCES`），不再有 runner 降权放行产物。
+2. **可执行目录对审查员只读**：单独创建 `/tmp/pi-reviewer-exec-*`（`goExecDir`），在审查员进程的 Landlock 规则集中仅授予 `ReadOnly + Exec` 权限（`Policy.Exec` 仅放行 `<goExecDir>/bin`，不放行整目录），审查员无法向其中写入、拷贝或重命名任何文件。
+3. **`bin/go` 直链受信真实 `go`**：`<goExecDir>/bin/go` 是指向 `resolveSandboxRealGoBinary` 受信解析出的真实 `go` 的软链（真实 `go` 本体与其 `<goroot>/pkg/tool` 工具目录同步收录 `Policy.Exec`）；`Policy.Env` 将 `GOROOT` 回钉该受信根（杜绝宿主 `GOROOT`/toolchain module 缓存指向不可信根的污染）。沙盒内 `go list`/`go build`/`go vet` 等只读编译子命令由真实 `go` 原样执行；`go test -c -o <可写路径>` 编译成功（退 0），随后**执行**产物才按其落点 `W^X` 拒绝（`EACCES`）；`go test`（非 `-c`）/`go run` 内部 fork/exec 动态产物同样被 `W^X` 自然拒绝。`report.sock` 中继（`hc` 受限客户端）不变。
 
 ### 2. 拦截通过 `ld-linux` 直接加载非白名单 ELF
 
@@ -152,9 +160,9 @@ bash go/sandbox/scripts/deploy.sh
 
 ## 残余风险与已知边界
 
-1. **只读路径上已有的 `.so` 仍可经 `LD_PRELOAD` 注入**：当前 `seccomp` `PROT_EXEC` 守卫拦截的是「直接将 `ld-linux` 作为主程序启动」、「映射 `ForbiddenExecNames` 二进制」以及「从不可执行的 `ReadWrite` 目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`）映射文件」。由于正常动态链接加载系统共享库同样通过 `mmap(..., PROT_EXEC, ...)` 完成，对于根文件系统 `/` 等只读路径上**原本已存在**的 `.so` 文件，若子代理对直接启动的动态链接程序设置 `LD_PRELOAD` 指向这些只读路径上已有的 `.so`（注：受控 `go` 构建代理内部已主动剥离 `LD_PRELOAD`、`LD_AUDIT` 与 `LD_LIBRARY_PATH`），当前沙盒不会拦截该只读 `.so` 的映射。
+1. **只读路径上已有的 `.so` 仍可经 `LD_PRELOAD` 注入**：当前 `seccomp` `PROT_EXEC` 守卫拦截的是「直接将 `ld-linux` 作为主程序启动」、「映射 `ForbiddenExecNames` 二进制」以及「从不可执行的 `ReadWrite` 目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`）映射文件」。由于正常动态链接加载系统共享库同样通过 `mmap(..., PROT_EXEC, ...)` 完成，对于根文件系统 `/` 等只读路径上**原本已存在**的 `.so` 文件，若子代理对直接启动的动态链接程序设置 `LD_PRELOAD` 指向这些只读路径上已有的 `.so`，当前沙盒不会拦截该只读 `.so` 的映射。
 2. **白名单内的脚本解释器（`bash` / `sh` / `awk` / `sed`）**：`ReadOnlyReviewer` 白名单中包含 `bash`、`sh` 等工具，审查员仍可执行仓库或临时目录中的 Shell 脚本逻辑；但脚本中派生的任何外部二进制仍受 Landlock `Exec` 白名单与 `seccomp` `PROT_EXEC` 守卫双重约束，无法借此拉起 `agy`、`pi`、`pig`、`grok`、`dispatch-agent` 或其他非白名单 ELF。
-3. **被审查仓库自身的测试代码与构建期代码**：运行 `go test` 时，被审查仓库中的 `*_test.go` 代码会在沙盒内执行。由于 `pi-test-runner` 在启动测试二进制前已叠加了审查员的 Landlock 规则集且继承了 `seccomp` `PROT_EXEC` 守卫，测试代码同样无法篡改仓库源码、无法向可执行目录写入文件、也无法执行禁用二进制。
+3. **被审查仓库自身的测试代码与构建期代码**：`go test`/`go run` 需在沙盒内执行动态编译产物，阶段 3 起按其落点 `W^X` 一律拒绝执行——被审查仓库的 `*_test.go` 不再在沙盒内运行（护栏定位下由设计排除）；需运行测试的验证环节应交独立隔离环境。`go vet`/`go build` 等只读编译子命令仍原样可用，其间 `go` 工具链内部编译器调用在沙盒内执行，受同一 Landlock 规则集与 `seccomp` `PROT_EXEC` 守卫约束，无法篡改仓库源码或执行禁用二进制。
 4. **`/proc/<pid>/fd/<fd>` 路径检查的极窄 TOCTOU 窗口**：`seccomp_unotify` 通过读取 `/proc/<pid>/fd/<fd>` 校验被映射文件的路径。由于审查员对所有可执行目录均无写权限，且所有可写目录（`TMPDIR`、`GOTMPDIR`、`GOCACHE`）均被整体禁止 `PROT_EXEC` 映射，审查员无法在可执行目录内通过硬链接或重命名制造竞争条件。
 5. **默认未开启网络隔离**：`ReadOnlyReviewer` 默认 `DenyNet: false`；若需彻底阻断 TCP 网络连接，可将 `Policy.DenyNet` 设为 `true`（要求内核 Landlock ABI >= 4）或配合 `sbx --deny-net` 使用。
 6. **`usage.json` 预刷新的时间窗口**：宿主态预刷新把 `lastUsed` 写入缓存单元；沙盒内 pig `TouchUsage` 的 `<1h` 只读短路只在「会话剩余时长 <55m」内稳定命中。`>55m` 的超长会话里 pig 可能重新尝试写 `usage.json` 临时文件并被 Landlock 拒绝——这属于 PiG 侧只读容错范围，不视为沙盒漏洞，但调用方应知晓长会话下 pig 可能报只读写入失败。
@@ -171,5 +179,5 @@ bash go/sandbox/scripts/deploy.sh
     - **`--best-effort` 完全降级残余（O5′）**：派生时完全放弃命名空间（`MountNS=false`，unshare 失败回退）的降级路径下，除 `/proc/<hostPid>/root` 魔链外还存在更宽的残余面——未执行 `isolateRuntimeSockets` 意味着 capabilities 未裁剪至 `0x22`（宿主 root 仍持完整能力）、继承 `cwd` 未从新挂载视图重绑、mount-seal 锁未安装（走原 `syscall.Exec` 而非 init 路径），与挂载步骤失败的「降权+装锁」部分降级属不同口径；
     - **无特权只读宿主信息面（O3′）**：`AF_NETLINK`（如 `NETLINK_KOBJECT_UEVENT`/`NETLINK_ROUTE` 只读 dump）与 `/proc/sys`、`/sys` 的只读宿主信息在沙盒内仍可读——无特权只读面按设计保留，不属越权通道；
     - **继承的宿主 `/dev/mqueue` 挂载视图未覆盖**：`CLONE_NEWIPC` 隔离了按命名空间解析的 `mq_open`/`mq_unlink` 系统调用（按名打开宿主队列返回 `ENOENT`），但未额外重挂或 tmpfs 覆盖宿主继承的 `/dev/mqueue` 挂载（绑定于宿主 `init_ipc_ns`）；Landlock / 只读规则阻断了 `O_RDWR` 打开与新建写入（`EACCES`），但若宿主 `/dev/mqueue` 预存可读队列节点，沙盒内经路径 `O_RDONLY` 打开 fd 后仍可调用 `mq_timedreceive` 接收并取走宿主队列消息（当前主机常态无宿主 POSIX 队列）。
-    - 按设计保持可达：`/root/.herdsman/herdsman.sock`、`/root/.config/herdr/herdr.sock`、goExecDir 内 `broker.sock`/`report.sock`。
+    - 按设计保持可达：`/root/.herdsman/herdsman.sock`、`/root/.config/herdr/herdr.sock`、goExecDir 内 `report.sock`。
 13. **回报中继只限文本回父终端**：沙盒内 `hc` 客户端只接受 `hc send <父地址> <text>`；向非父地址、`hc run/exec/file/keys` 等其它形态一律拒绝。中继以沙盒外 root 执行真实 `hc send`，其信任面仅限于「校验后的文本 + 固定 argv」。

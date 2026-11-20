@@ -106,32 +106,22 @@ func TestAddPathRuleTransientENOENT(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 限制施加失败的 fail-closed 回归（自 landlock_failclosed_test.go 无损迁入）。
 //
-// 覆盖两处历史 fail-open 缺陷：
-//  1. helper（PI_SANDBOX_INTERNAL_MODE=helper 分支）：配置缺失、配置
-//     损坏或必需路径不存在时，旧实现在 Landlock 施加失败后仍向控制
-//     通道写 ACK "1" 并继续服务；现必须退出且绝不写 ACK。
-//     判定：子进程退出后读控制通道——收到任何字节即 helper accepted。
-//  2. pi-test-runner（argv[0] 基名为 pi-test-runner）：配置缺失/损坏/
-//     必需路径不存在时，旧实现跳过限制直接 syscall.Exec 目标二进制；
-//     现必须非零退出且绝不执行目标。
-//     判定：目标二进制写出 marker 文件即 runner executed。
+// 覆盖历史 fail-open 缺陷：helper（PI_SANDBOX_INTERNAL_MODE=helper 分支）
+// 在配置缺失、配置损坏或必需路径不存在时，旧实现在 Landlock 施加失败后
+// 仍向控制通道写 ACK "1" 并继续服务；现必须退出且绝不写 ACK。
+// 判定：子进程退出后读控制通道——收到任何字节即 helper accepted。
 //
 // 反例日志特征（供独立 verifier 固定断言）：
-//   'helper accepted restriction failure' 或 'runner executed without restrictions'
+//   'helper accepted restriction failure'
 //
-// 本文件只引用 45070b3 基线已有符号（helperConfig/env*Key/init 分发/
-// runTestRunnerClient/sendNotifyFDToHelper/installSeccompExecGuard/Apply），
-// 拷入未修改基线即可编译执行并呈现语义红。同步手段为子进程 exit + 读
-// EOF 与 cmd.Wait 单一所有者（结果经 channel 同步），无 sleep 顺序证明。
-
-// failClosedTargetSuffix 是 init 内部派发的 synthetic 目标标记：
-// argv[0] 基名带此后缀的进程在 SBX_FAILCLOSED_MARKER 指定路径写
-// marker 后退出 0（模拟被 runner 裸 exec 成功的目标测试二进制）。
-const failClosedTargetSuffix = ".sbx-failclosed.test"
+// 本文件只引用基线已有符号（helperConfig/env*Key/init 分发/
+// sendNotifyFDToHelper/installSeccompExecGuard/Apply），同步手段为子进程
+// exit + 读 EOF 与 cmd.Wait 单一所有者（结果经 channel 同步），无 sleep
+// 顺序证明。pi-test-runner 分发链路已随阶段 3 拆除，相关用例一并移除。
 
 // failClosedSyntheticModeEnv 是本测试文件专属 synthetic 子进程分发键。
 // 不走 envInternalModeKey：该键会触发真实 runHelperProcess（真实施加
-// Landlock/seccomp、依赖 broker cfg），与「只回 ACK 不施加限制」的
+// Landlock/seccomp、依赖 helper cfg），与「只回 ACK 不施加限制」的
 // synthetic helper 语义相反；也不走 argv0 分发（不占用业务名）。
 //   - "helper-ack-only"：写就绪 ACK，读一次通知消息（SCM_RIGHTS fd），
 //     默认不回 ACK 直接退出（父侧读 EOF）；消息首字节 'B' 时先回
@@ -146,26 +136,12 @@ const failClosedSyntheticModeEnv = "SBX_FAILCLOSED_SYNTHETIC_MODE"
 // 非法字节时返回 nil，不产生此文本——断言它即语义红。
 const postInstallFilterMarker = "seccomp PROT_EXEC filter already installed"
 
-// init 先于 main() 执行，在测试二进制内完成 pi-test-runner、目标进程与
-// synthetic 子进程的 argv0/env 分发——sandbox_test.go 的 TestMain 已存在，
-// 不能重复定义，且该 TestMain 只做 env 分发、不会先消费本文件分支。
-// 生产 init()（landlock_linux.go，文件序在前）已先检查
-// envInternalModeKey/argv0，真实 helper/runner 分发不受影响。
+// init 先于 main() 执行，在测试二进制内完成 synthetic 子进程的 env
+// 分发——sandbox_test.go 的 TestMain 已存在，不能重复定义，且该
+// TestMain 只做 env 分发、不会先消费本文件分支。生产 init()
+// （landlock_linux.go，文件序在前）已先检查 envInternalModeKey/argv0，
+// 真实 helper 分发不受影响。
 func init() {
-	// pi-test-runner 分发与包 init() 相同条件：envGoExecDirKey + argv0 基名。
-	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "pi-test-runner" &&
-		os.Getenv(envGoExecDirKey) != "" {
-		os.Exit(runTestRunnerClient(os.Getenv(envGoExecDirKey)))
-	}
-	if len(os.Args) > 0 && strings.HasSuffix(filepath.Base(os.Args[0]), failClosedTargetSuffix) {
-		if marker := os.Getenv("SBX_FAILCLOSED_MARKER"); marker != "" {
-			if err := os.WriteFile(marker, []byte("executed"), 0o600); err != nil {
-				fmt.Fprintf(os.Stderr, "write marker: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		os.Exit(0)
-	}
 	switch os.Getenv(failClosedSyntheticModeEnv) {
 	case "helper-ack-only", "helper-ack-bad-byte":
 		syntheticHelperAckOnly()
@@ -224,7 +200,7 @@ func spawnAckOnlyHelper(t *testing.T, mode, cfgJSON string) (ctrlFD, lifeWFD int
 	case "helper":
 		env = append(env, envInternalModeKey+"=helper")
 		if cfgJSON != "" {
-			env = append(env, envBrokerCfgKey+"="+cfgJSON)
+			env = append(env, envHelperCfgKey+"="+cfgJSON)
 		}
 	case "synthetic":
 		env = append(env, failClosedSyntheticModeEnv+"=helper-ack-only")
@@ -354,220 +330,17 @@ func TestHelperRejectsRestrictionFailure(t *testing.T) {
 		if n, rerr := unix.Read(ctrlFD, buf[:]); n > 0 {
 			t.Fatalf("helper without config wrote ack n=%d data=%q (read err=%v)", n, buf[:n], rerr)
 		}
-		if !strings.Contains(stderr.String(), envBrokerCfgKey) {
-			t.Fatalf("helper stderr = %q, want %s diagnostic", stderr.String(), envBrokerCfgKey)
+		if !strings.Contains(stderr.String(), envHelperCfgKey) {
+			t.Fatalf("helper stderr = %q, want %s diagnostic", stderr.String(), envHelperCfgKey)
 		}
 	})
-}
-
-// runTestRunnerCase 派生 pi-test-runner 软链执行 target，返回退出码、
-// 合并输出与 marker 是否存在。child env 在受控小集合上定向构造：
-// 只传 PATH/HOME 与显式业务键，剔除宿主侧可能继承的 cfg/internal
-// 分发键（envBrokerCfgKey/envInternalModeKey 绝不从 os.Environ() 透传），
-// 避免 missing-cfg 伪缺；不输出完整 env。
-func runTestRunnerCase(t *testing.T, runnerLink, target, goExecDir, marker, cfgJSON string) (rc int, output string, markerPresent bool) {
-	t.Helper()
-
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		envGoExecDirKey + "=" + goExecDir,
-		"SBX_FAILCLOSED_MARKER=" + marker,
-	}
-	if cfgJSON != "" {
-		env = append(env, envBrokerCfgKey+"="+cfgJSON)
-	}
-
-	cmd := exec.Command(runnerLink, target)
-	cmd.Env = env
-	out, runErr := cmd.CombinedOutput()
-
-	exitCode := 0
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			t.Fatalf("runner launch error (not an exit status): %v\noutput: %s", runErr, out)
-		}
-	}
-	_, statErr := os.Stat(marker)
-	return exitCode, string(out), statErr == nil
 }
 
 // ---------------------------------------------------------------------------
-// MF-1 回归：受控 go 构建代理 validateGoWrapperArgs 的参数/路径收口。
-// 纯函数断言，不依赖真实 go 工具链——直接驱动生产校验函数覆盖：
-//   - -o 经 $TMPDIR 软链指向 <goExecDir>/work 时必须拒（首个存在祖先软链解析）；
-//   - 缺省 -o + cwd=<goExecDir>/work（含软链别名）时必须拒；
-//   - -ldflags/-gcflags/-asmflags/-gccgoflags 外挂标志必须拒；
-//   - 合法 build/vet/test 参数仍放行（防全拒假绿）。
-func TestValidateGoWrapperArgsWriteThrough(t *testing.T) {
-	goExecDir := t.TempDir()
-	workDir := filepath.Join(goExecDir, "work")
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		t.Fatalf("mkdir work: %v", err)
-	}
-	outside := t.TempDir()
-
-	// 软链：$outside/sym -> <goExecDir>/work，-o <sym>/pwn 必须被拒。
-	sym := filepath.Join(outside, "sym")
-	if err := os.Symlink(workDir, sym); err != nil {
-		t.Fatalf("symlink sym->work: %v", err)
-	}
-
-	reject := func(name string, args []string, cwd string) {
-		t.Helper()
-		if _, err := validateGoWrapperArgs(args, cwd, goExecDir); err == nil {
-			t.Fatalf("%s: validateGoWrapperArgs(%v, cwd=%q) must be rejected, got nil", name, args, cwd)
-		}
-	}
-	accept := func(name string, args []string, cwd string) {
-		t.Helper()
-		if _, err := validateGoWrapperArgs(args, cwd, goExecDir); err != nil {
-			t.Fatalf("%s: validateGoWrapperArgs(%v, cwd=%q) = %v, want nil", name, args, cwd, err)
-		}
-	}
-
-	// 路径 A：软链 -o 写穿
-	reject("symlink -o", []string{"build", "-o", filepath.Join(sym, "pwn"), "./x"}, outside)
-	reject("symlink -o joined flag", []string{"build", "-o" + filepath.Join(sym, "pwn"), "./x"}, outside)
-	// 直接 -o 到 goExecDir 内部（含嵌套 work/）
-	reject("direct -o into goExecDir", []string{"build", "-o", filepath.Join(goExecDir, "work", "pwn"), "./x"}, outside)
-	reject("direct -o into goExecDir root", []string{"build", "-o", filepath.Join(goExecDir, "pwn"), "./x"}, outside)
-
-	// 路径 B：缺省 -o + cwd 落在 goExecDir（含 work/ 与软链别名）
-	reject("no -o cwd=goExecDir/work", []string{"build", "./x"}, workDir)
-	reject("no -o cwd=goExecDir", []string{"build", "./x"}, goExecDir)
-	// cwd 经软链指向 work/（sym 本身是 work 的软链）
-	reject("no -o cwd=symlink to work", []string{"build", "./x"}, sym)
-
-	// 路径 C：链接器/编译器外挂标志
-	for _, flagArgs := range [][]string{
-		{"build", "-ldflags=-linkmode=external -extld=/bin/sh", "./x"},
-		{"build", "-ldflags", "-s -w", "./x"},
-		{"build", "-gcflags=-N", "./x"},
-		{"build", "-asmflags=-trimpath", "./x"},
-		{"build", "-gccgoflags=-foo", "./x"},
-		{"test", "-ldflags=all=-linkmode=external", "./..."},
-	} {
-		reject("external flag "+flagArgs[1], flagArgs, outside)
-	}
-
-	// 合法流程放行（cwd 在 goExecDir 之外、无外挂标志、无软链 -o）
-	accept("plain build", []string{"build", "./x"}, outside)
-	accept("plain vet", []string{"vet", "./x"}, outside)
-	accept("plain test", []string{"test", "./x"}, outside)
-	accept("explicit -o to outside", []string{"build", "-o", filepath.Join(outside, "bin"), "./x"}, outside)
-	// -o 目标不存在（新文件）但父目录在 goExecDir 外：允许（写面归审查员
-	// 私有 TMPDIR 域，与 W^X 无关）。
-	accept("explicit -o new file outside", []string{"build", "-o", filepath.Join(outside, "new-sub", "bin"), "./x"}, outside)
-}
-
-// TestValidateGoWrapperArgsClientCwd 断言：runGoWrapperClient 现在必须以真实
-// cwd 而非空串调 validateGoWrapperArgs——空串会让缺省 -o 的 cwd 校验完全失效。
-// 经客户端路径预校验（客户端 cwd=<goExecDir>/work 时即使未走 broker 也必须拒）。
-func TestValidateGoWrapperArgsClientCwd(t *testing.T) {
-	goExecDir := t.TempDir()
-	workDir := filepath.Join(goExecDir, "work")
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		t.Fatalf("mkdir work: %v", err)
-	}
-	// 模拟客户端在 <goExecDir>/work 内发起 build：客户端侧（cwd 非空）与
-	// broker 侧（req.Dir 非空）都应拒绝——cwd 为空串的旧实现客户端会漏过。
-	if _, err := validateGoWrapperArgs([]string{"build", "./x"}, workDir, goExecDir); err == nil {
-		t.Fatal("client-side validation with real cwd inside goExecDir/work must reject")
-	}
-	// cwd 空串时缺省 -o 校验被跳过（仅防 runGoWrapperClient 回退传空串的
-	// 静默退化回归——本断言锁定"空 cwd 放行、真实 cwd 拒绝"的差异）。
-	if _, err := validateGoWrapperArgs([]string{"build", "./x"}, "", goExecDir); err != nil {
-		t.Fatalf("empty cwd must skip cwd check (fail-open only via client regression), got %v", err)
-	}
-}
-
-// TestTestRunnerRejectsInvalidRestriction 断言：pi-test-runner 在配置
-// 缺失、JSON 损坏、必需路径不存在时非零退出且不执行目标；有效配置
-// 正向对照必须 rc=0 + marker 落盘（防全拒假绿）。
-// 旧实现（45070b3）：坏配置下仍 syscall.Exec 目标，marker 出现即
-// 反例。先查 marker 再查 rc——每个负向用例在基线都命中
-// 'runner executed without restrictions'。
-func TestTestRunnerRejectsInvalidRestriction(t *testing.T) {
-	if _, ok := supported(); !ok {
-		t.Skip("kernel lacks landlock")
-	}
-
-	exe := failClosedTestBinary(t)
-	goExecDir := t.TempDir()
-	workDir := filepath.Join(goExecDir, "work")
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		t.Fatalf("mkdir work: %v", err)
-	}
-	target := filepath.Join(workDir, "synthetic"+failClosedTargetSuffix)
-	if err := os.Symlink(exe, target); err != nil {
-		t.Fatalf("symlink target: %v", err)
-	}
-	runnerLink := filepath.Join(t.TempDir(), "pi-test-runner")
-	if err := os.Symlink(exe, runnerLink); err != nil {
-		t.Fatalf("symlink runner: %v", err)
-	}
-
-	badPathCfg, err := json.Marshal(helperConfig{
-		ReadOnly: []string{filepath.Join(t.TempDir(), "missing-required")},
-	})
-	if err != nil {
-		t.Fatalf("marshal bad-path cfg: %v", err)
-	}
-
-	rejectCase := func(name, cfgJSON, wantDiag string) {
-		t.Run(name, func(t *testing.T) {
-			markerDir := t.TempDir()
-			marker := filepath.Join(markerDir, "marker")
-			rc, out, markerPresent := runTestRunnerCase(t, runnerLink, target, goExecDir, marker, cfgJSON)
-			// marker 先判：runner 裸 exec 成功即反例，先于 rc 断言以
-			// 保证基线每 negative 命中注册反例文本。
-			if markerPresent {
-				t.Fatalf("runner executed without restrictions (marker present)")
-			}
-			if rc == 0 {
-				t.Fatalf("runner executed without restrictions: exited 0, want non-zero rejection\noutput: %s", out)
-			}
-			if !strings.Contains(out, wantDiag) {
-				t.Fatalf("runner %s diagnostic = %q, want %q", name, out, wantDiag)
-			}
-		})
-	}
-
-	rejectCase("missing-cfg", "", "missing "+envBrokerCfgKey)
-	rejectCase("invalid-json", "{not-json", "invalid "+envBrokerCfgKey)
-	rejectCase("missing-required-path", string(badPathCfg), "create landlock")
-
-	// 正向对照：有效配置必须 rc=0 且 marker 真实落盘（marker 内容
-	// 检查先于存在性判断，WriteFile 失败不得吞成成功）。markerDir
-	// 须并入 cfg.ReadWrite 供 runner 叠加后的 Landlock 放行。
-	t.Run("valid-cfg-control", func(t *testing.T) {
-		markerDir := t.TempDir()
-		marker := filepath.Join(markerDir, "marker")
-		validCfg, err := json.Marshal(helperConfig{
-			ReadOnly:  []string{"/"},
-			ReadWrite: []string{workDir, markerDir},
-			Exec:      []string{exe, filepath.Dir(exe)},
-		})
-		if err != nil {
-			t.Fatalf("marshal valid cfg: %v", err)
-		}
-		rc, out, markerPresent := runTestRunnerCase(t, runnerLink, target, goExecDir, marker, string(validCfg))
-		if !markerPresent {
-			t.Fatalf("marker missing after valid cfg exec (rc=%d)\noutput: %s", rc, out)
-		}
-		if rc != 0 {
-			t.Fatalf("runner rc=%d on valid cfg, want 0\noutput: %s", rc, out)
-		}
-		content, err := os.ReadFile(marker)
-		if err != nil || string(content) != "executed" {
-			t.Fatalf("marker content=%q err=%v, want 'executed'", content, err)
-		}
-	})
-}
+// 阶段 3：broker/pi-test-runner 链路已拆除，以下历史用例随之移除：
+// runTestRunnerCase、TestValidateGoWrapperArgsWriteThrough、
+// TestValidateGoWrapperArgsClientCwd、TestTestRunnerRejectsInvalidRestriction。
+// 保留下方 helper 握手/EINTR/post-install 回归（与 broker 无关）。
 
 // ---------------------------------------------------------------------------
 // 父侧握手真实覆盖（生产 sendNotifyFDToHelper / 生产 ExtraFiles 布局）。
@@ -986,7 +759,7 @@ func syntheticApplyBestEffortPostinstall() {
 	// EOF → errSeccompFilterInstalled）。这仍是真实握手协议 + 真实
 	// installSeccompExecGuard 装 filter + 真实生产 sendNotifyFDToHelper 路径，
 	// 仅 helper 的 notify 应答被确定性控制。
-	startHelperForSetup = func(p Policy, goExecDir, realGoBin string) (int, int, error) {
+	startHelperForSetup = func(p Policy) (int, int, error) {
 		ctrlFD, lifeWFD, waitCh := spawnSyntheticHelperChild()
 		_ = waitCh // 存活至 Apply 失败路径关闭 lifeWFD 触发 helper 退出
 		var ack [1]byte

@@ -49,14 +49,10 @@ const (
 	// 父目录）。该键是内部实现细节，不进入受限子进程最终 env，不属
 	// 调用方可控输入。
 	envPresetTempDirsKey = "PI_SANDBOX_PRESET_TMP_DIRS"
-	// envGoTestWorkDirKey 仅在 broker 启动 go test 时由 helper 注入，让
-	// pi-test-runner 能把 <goExecDir>/work（.test 产物所在，helper 可写域）
-	// 经 cfg.Exec 单独放行执行；审查员进程侧绝不持有该键——Policy.Exec
-	// 只放行 <goExecDir>/bin（MF-1）。
-	envGoTestWorkDirKey = "PI_SANDBOX_GO_TEST_WORK"
-	envRealGoBinKey     = "PI_SANDBOX_REAL_GO"
-	envInternalModeKey  = "PI_SANDBOX_INTERNAL_MODE"
-	envBrokerCfgKey     = "PI_SANDBOX_BROKER_CFG"
+	envInternalModeKey   = "PI_SANDBOX_INTERNAL_MODE"
+	// envHelperCfgKey 承载父进程传给 helper 的序列化 helperConfig
+	//（原 PI_SANDBOX_BROKER_CFG 随构建代理链路拆除同步改名）。
+	envHelperCfgKey = "PI_SANDBOX_HELPER_CFG"
 )
 
 // ForbiddenExecNames 定义严禁在只读审查子代理中执行的嵌套代理与调度器二进制名称。
@@ -245,7 +241,7 @@ func BuildExecWhitelist(toolNames []string) []string {
 		}
 
 		// 针对 git、go、gcc，额外放行其内部子命令目录（如 git-core、go/pkg/tool、gcc libexec），
-		// 确保 git status / git diff / go build / go vet / go test 等子进程调用正常运转。
+		// 确保 git status / git diff / go build / go vet 等只读子进程调用正常运转。
 		switch name {
 		case "git":
 			for _, gitCore := range []string{"/usr/lib/git-core", "/usr/libexec/git-core"} {
@@ -273,7 +269,7 @@ func resolveGoToolchainPaths() []string {
 	var paths []string
 	var goRoots []string
 
-	// 受信真实 go 根：与预热/策略/broker 共用 resolveSandboxRealGoBinary
+	// 受信真实 go 根：与预热/策略共用 resolveSandboxRealGoBinary
 	// 的同一实体——其真实根 <goroot> 下的 bin/go 与 pkg/tool 才可放行，
 	// 绝不因宿主 GOROOT/bin/go 软链指向受信 go 就放行原任意 GOROOT/pkg/tool
 	//（别名反例：伪造 GOROOT 的 bin/go 软链→受信 go，pkg/tool 仍是伪造内容）。
@@ -418,12 +414,6 @@ func resolveRealGoBinary(skipDir string) string {
 		return norm == cleanSkip || strings.HasPrefix(norm, cleanSkip+string(filepath.Separator))
 	}
 
-	if envReal := strings.TrimSpace(os.Getenv(envRealGoBinKey)); envReal != "" && !isSkipped(envReal) {
-		if st, err := os.Stat(envReal); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
-			return envReal
-		}
-	}
-
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
 		if dir == "" || isSkipped(dir) {
 			continue
@@ -454,29 +444,28 @@ func resolveRealGoBinary(skipDir string) string {
 
 // resolveSandboxRealGoBinary 是 reviewer-agent 预热（含后续任何把所选真实
 // go 目录前置进受控 PATH 的用途）共用的可信 go 解析：绝不把由调用方可控
-// 输入（宿主 PATH 前置目录、PI_SANDBOX_REAL_GO）解析出的二进制直接以宿主
+// 输入（宿主 PATH 前置目录）解析出的二进制直接以宿主
 // 权限喂给预热子进程——工作树/任意目录内放个「假 go」+ 宿主 PATH 前置，旧
 // 实现在 Landlock 生效前就已在宿主权限下把它前置进预热 PATH 被执行
 // （controlledWarmPath 刻意不读调用方 PATH 的既有防线由此被打穿）。
 //
 // 可信判定分两步：先经 resolveRealGoBinary(skipDir) 做常规「非目录且有执行位」
-// 解析（Env 覆盖 → 调用方 PATH → 固定目录回退）得到沙盒侧将选中的同一个
+// 解析（调用方 PATH → 固定目录回退）得到沙盒侧将选中的同一个
 // go（cell 摘要对齐的来源），再对其做受信校验——EvalSymlinks 后的真实
 // 路径必须位于固定可信工具链前缀（trustedGoToolchainPrefixes）之下。命中
 // 不可信前缀时**不再继续探测下一候选**，直接回退固定可信目录顺序解析：
 // 预热子进程 PATH 本就以 /usr/local/go/bin 等固定目录起头，回退到固定目录
 // 首个可信 go 仍与沙盒侧同口径对齐（两侧均落同一真实工具链根），而「跳过
-// PATH 命中改用 PATH 内下一目录」反而会让预热与沙盒内包装器（resolveRealGoBinary
+// PATH 命中改用 PATH 内下一目录」反而会让预热与沙盒内 go（resolveRealGoBinary
 // 仍按宿主 PATH 命中同一不可信目录）解析出不同 go——cell 摘要错配。于是
 // 折中：PATH 命中不可信时放弃 PATH 对齐、回退固定可信目录首个 go（该目录
 // 同样在沙盒 resolveRealGoBinary 的固定目录回退列表内，兜底一致），同时
 // 杜绝不可信父目录被前置进预热 PATH。
 //
-// skipDir 与 resolveRealGoBinary 同语义（沙盒内 go 包装器跳过 goExecBinDir
-// 自身）。
+// skipDir 与 resolveRealGoBinary 同语义（调用方传入需跳过的目录前缀）。
 func resolveSandboxRealGoBinary(skipDir string) string {
-	// 第一步：与沙盒同口径 resolveRealGoBinary 解析（PI_SANDBOX_REAL_GO →
-	// 调用方 PATH → 固定目录回退），得到沙盒侧将选中的同一个 go。
+	// 第一步：与沙盒同口径 resolveRealGoBinary 解析（调用方 PATH →
+	// 固定目录回退），得到沙盒侧将选中的同一个 go。
 	if realGo := resolveRealGoBinary(skipDir); realGo != "" {
 		if trusted, ok := trustedRealGoCandidate(realGo); ok {
 			return trusted
@@ -485,7 +474,7 @@ func resolveSandboxRealGoBinary(skipDir string) string {
 		// 不把不可信父目录前置进预热 PATH。
 	}
 	// 回退：固定可信工具链目录顺序，与 controlledWarmPath 前缀一致。
-	// 同步应用 skipDir（沙盒内 go 包装器须跳过 goExecBinDir 自身）。
+	// 同步应用 skipDir（供调用方跳过不应命中的目录前缀自身）。
 	cleanSkip := ""
 	if skipDir != "" {
 		if norm, err := NormalizePath(skipDir); err == nil {
@@ -566,7 +555,7 @@ func trustedRealGoCandidateWithPrefixes(candidate string, prefixes []string) (st
 		return "", false
 	}
 	// 基名校验：解析后真实文件名必须是 go 本体（go 或 go<版本>/go-* 形态），
-	// 杜绝借 PI_SANDBOX_REAL_GO=<受信根>/<其它二进制> 混入非 go 可执行文件。
+	// 杜绝借受信根下的其它二进制伪装混入非 go 可执行文件。
 	base := filepath.Base(filepath.Clean(resolved))
 	if base != "go" && !strings.HasPrefix(base, "go-") && !strings.HasPrefix(base, "go1.") {
 		return "", false
@@ -610,8 +599,9 @@ func trustedRealGoCandidateWithPrefixes(candidate string, prefixes []string) (st
 //     <workdir> 下创建 reports/ 子目录污染目标 Git 工作树（oracle SF-2）；
 //   - 严格实施 W^X：所有可写目录（TMPDIR、GOTMPDIR、GOCACHE）均不授予执行权限，
 //     彻底封堵将可读 ELF（如 agy、pi、dispatch-agent）拷贝至可写临时目录后再执行的绕过路径；
-//   - 建立独立的只读可执行目录 (/tmp/pi-reviewer-exec-*) 并注入受控的 go 包装器，
-//     使 go build / go vet / go test 在受控的构建域中生成和运行测试二进制，且测试二进制运行前自动降权回只读审查域。
+//   - 建立独立的只读可执行目录 (/tmp/pi-reviewer-exec-*)，其中 bin/go 直接
+//     软链受信真实 go——go build/vet/list 等只读编译子命令原样可用；
+//     go test/go run 的动态产物按 W^X（可写不执）自然拒绝执行。
 func ReadOnlyReviewer(workdir string) Policy {
 	if strings.TrimSpace(workdir) == "" {
 		workdir = "."
@@ -646,38 +636,35 @@ func ReadOnlyReviewer(workdir string) Policy {
 		}
 	}
 	goExecBinDir := filepath.Join(goExecDir, "bin")
-	goExecWorkDir := filepath.Join(goExecDir, "work")
-	goExecCacheDir := filepath.Join(goExecDir, "cache")
 	_ = os.MkdirAll(goExecBinDir, 0o755)
-	_ = os.MkdirAll(goExecWorkDir, 0o700)
-	_ = os.MkdirAll(goExecCacheDir, 0o700)
 
-	// 与预热 resolveSandboxRealGoBinary 共用同一次受信解析：策略注入的
-	// PI_SANDBOX_REAL_GO 与预热前置进 PATH 的真实 go 必须是同一实体
-	//（杜绝 PATH/PI_SANDBOX_REAL_GO 污染导致的 cell toolchain 摘要错配）。
+	// 与预热 resolveSandboxRealGoBinary 共用同一次受信解析：
+	// <goExecDir>/bin/go 直接软链受信真实 go（不再经 broker 代理），
+	// 与预热前置进 PATH 的真实 go 必须是同一实体（杜绝 PATH 污染导致的
+	// cell toolchain 摘要错配）。
 	realGoBin := resolveSandboxRealGoBinary(goExecBinDir)
 
 	execList := BuildExecWhitelist(DefaultReviewerTools)
-	// MF-1：审查员 Policy.Exec 只放行 <goExecDir>/bin（go 包装器、
-	// pi-test-runner、hc 受限客户端），绝不放行整个 goExecDir——其下
-	// work/ 是 broker 可写域，整目录放行等于授予沙盒内进程执行任何被
-	// 写入 work/ 的 ELF 的权利（含 objcopy 拷入的 ForbiddenExecNames）。
-	// .test 产物不走审查员侧 Exec：pi-test-runner 自身位于 bin/ 内可执行，
-	// 它先叠加审查员规则集再 exec <goExecDir>/work 下 .test 目标，目标
-	// 授权来自 helper 侧 helperPolicy 的 Exec 放行（helper Exec 经
-	// startHelperProcess 继承 cfg.Exec，对应规则授予路径级执行权）；
-	// 审查员进程自己 exec work/*.test 不再被 Landlock 放行——W^X 收口。
+	// 审查员 Policy.Exec 只放行 <goExecDir>/bin（真实 go 直链与 hc 受限
+	// 客户端所在），绝不放行整个 goExecDir——不授予沙盒内进程在
+	// goExecDir 其它子目录执行任何 ELF 的权利。go test/go run 产物按
+	// W^X 语义（可写目录一律不执）自然拒绝，不再走构建代理/runner。
 	execList = append(execList, goExecBinDir)
 
-	if selfExe, err := os.Executable(); err == nil && selfExe != "" {
-		if resolvedExe, err := filepath.EvalSymlinks(selfExe); err == nil && resolvedExe != "" {
-			selfExe = resolvedExe
-		}
-		if normExe, err := NormalizePath(selfExe); err == nil && !IsForbiddenExec(normExe) && !IsELFInterpreter(normExe) {
-			execList = append(execList, normExe)
-			_ = os.Symlink(normExe, filepath.Join(goExecBinDir, "go"))
-			_ = os.Symlink(normExe, filepath.Join(goExecBinDir, "pi-test-runner"))
-		}
+	// <goExecDir>/bin/go -> 受信真实 go 直链（受信实体同时并进 Exec）。
+	if realGoBin != "" {
+		execList = append(execList, realGoBin)
+		_ = os.Symlink(realGoBin, filepath.Join(goExecBinDir, "go"))
+	}
+	// GOROOT 回钉受信真实 go 根：宿主环境可能携带指向 toolchain module
+	// 缓存（/root/go/pkg/mod/golang.org/toolchain@*，不在受信前缀）或伪造
+	// GOROOT 的残留，直链真实 go 继承后会把工具链解析到不可信根下——
+	// 其 pkg/tool 产物既未收录 Policy.Exec 又是污染源。显式覆写为受信根
+	//（真实 go 的祖父目录），保证沙盒内 go 命中的 pkg/tool 与
+	// resolveGoToolchainPaths 收录的受信 pkg/tool 同一实体。
+	var goRootEnv string
+	if realGoBin != "" {
+		goRootEnv = filepath.Dir(filepath.Dir(realGoBin))
 	}
 
 	curPath := os.Getenv("PATH")
@@ -692,6 +679,9 @@ func ReadOnlyReviewer(workdir string) Policy {
 		"GOCACHE=" + goCacheDir,
 		"PATH=" + newPath,
 		envGoExecDirKey + "=" + goExecDir,
+	}
+	if goRootEnv != "" {
+		envList = append(envList, "GOROOT="+goRootEnv)
 	}
 	// 创建清单登记（见 envPresetTempDirsKey）：本次预设实际创建的
 	// privateTmpDir/goExecDir 绝对路径，是清理动作唯一可信的身份来源。
@@ -713,10 +703,6 @@ func ReadOnlyReviewer(workdir string) Policy {
 			envList = append(envList, envPresetTempDirsKey+"="+string(raw))
 		}
 	}
-	if realGoBin != "" {
-		envList = append(envList, envRealGoBinKey+"="+realGoBin)
-	}
-
 	return Policy{
 		ReadOnly:  []string{"/"},
 		ReadWrite: []string{privateTmpDir},
@@ -1443,13 +1429,16 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// 只读角色回报通道：在 goExecDir/bin 下建指向 sbx 本体的 hc 软链，
 	// 经 landlock_linux.go init 分发进入受限客户端（仅接受 hc send <addr> <text>，
 	// 提交给沙盒外 report.sock 中继）。仅本预设；ReadOnlyReviewer 与 --preset reviewer
-	// 不建此链接。真 /root/.local/bin/hc 不进任何 Exec 白名单。
+	// 不建此链接。真 /root/.local/bin/hc 不进任何 Exec 白名单。sbx 本体
+	// 路径（normExe）须并入 Policy.Exec——hc 软链的 exec 经内核解引用
+	// 最终落到本体路径判定。
 	if goExecDir := lookupEnvValue(p.Env, envGoExecDirKey); goExecDir != "" {
 		if selfExe, err := os.Executable(); err == nil && selfExe != "" {
 			if resolvedExe, err := filepath.EvalSymlinks(selfExe); err == nil && resolvedExe != "" {
 				selfExe = resolvedExe
 			}
 			if normExe, err := NormalizePath(selfExe); err == nil && !IsForbiddenExec(normExe) && !IsELFInterpreter(normExe) {
+				p.Exec = append(p.Exec, normExe)
 				_ = os.Symlink(normExe, filepath.Join(goExecDir, "bin", "hc"))
 			}
 		}

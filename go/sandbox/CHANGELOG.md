@@ -12,17 +12,29 @@
   `/tmp/herdr-role-reports`（仅 `ReviewerAgentWithEnv`/`--preset reviewer-agent`
   白名单）或各角色私有 `TMPDIR`。依赖 `<workdir>/reports` 旧写面的调用方须改经
   `DISPATCH_REPORT_PATH`/`--report-to` 或角色私有 `TMPDIR` 落盘（oracle SF-2）。
-- **`ReadOnlyReviewer` `Policy.Exec` 由整个 `<goExecDir>` 收缩为
-  `<goExecDir>/bin`（oracle9 MF-1）**：原整目录放行等于授予审查员执行
-  `<goExecDir>/work/` 下任何 ELF 的权利（含经 broker/objcopy 写穿进去的
-  `ForbiddenExecNames`/非白名单二进制）；收缩后审查员仅可执行
-  `bin/go`、`bin/pi-test-runner`、`bin/hc` 受限客户端。`.test` 产物
-  （`<goExecDir>/work/run-*/.../*.test`）不再对审查员主进程可执行：
-  `pi-test-runner` 位于 `bin/` 内，启动前先叠加审查员规则集再 exec 目标——
-  helper 进程（broker/`go test` 拉起方）在自身 Landlock 域内保留
-  `<goExecDir>/work` 执行授权，`pi-test-runner` 经 broker 注入的
-  `PI_SANDBOX_GO_TEST_WORK` 获得该产物根放行（仅本进程、非审查员全局）。
-  调用方若在沙盒内直接 `exec` `<goExecDir>/work/*` 将收到 `EACCES`。
+- **阶段 3：拆除 `go` 受控构建代理（broker）与 `pi-test-runner` 整条链路**：
+  `<goExecDir>` 不再创建 `work/`/`cache/` 子目录，不再监听 `broker.sock`；
+  `Policy.Exec` 收缩为 `<goExecDir>/bin`（`bin/go` 直链 + `bin/hc` 受限
+  客户端）且**不再放行整目录**——审查员在 `<goExecDir>` 下无任何
+  写/执权限。`<goExecDir>/bin/go` 改为直接软链 `resolveSandboxRealGoBinary`
+  受信解析出的**真实 `go`**（其本体与 `<goroot>/pkg/tool` 工具目录
+  同步收录 `Policy.Exec`），`Policy.Env` 把 `GOROOT` 回钉该受信根并
+  移除 `PI_SANDBOX_REAL_GO`/`PI_SANDBOX_GO_TEST_WORK` 注入（env 键随
+  链路删除）。沙盒内 `go list`/`go build`/`go vet` 等只读编译子命令
+  由真实 `go` 原样执行，不再经包装器参数白名单校验；**`go test -c
+  -o <可写路径>` 仅编译产物成功（退 0），随后**执行**产物才按落点
+  `W^X`（可写目录一律不授予执行授权）拒绝（`EACCES`）；`go test`
+  （非 `-c`）/`go run` 内部 fork/exec 动态产物被同一 `W^X` 自然拒绝
+  （`EACCES`）**——被审查仓库的 `*_test.go` 不再于沙盒内运行，动态
+  测试应交独立隔离验证环境。
+  helper 进程（seccomp notify 监听）与审查员**同权**（不再追加
+  `<goExecDir>/work`/`cache` 写执域），`helperConfig` 删除
+  `GoExecDir`/`RealGoBin`/`HasBroker` 字段，内部配置键
+  `PI_SANDBOX_BROKER_CFG` 改名 `PI_SANDBOX_HELPER_CFG`。
+  被删符号：`goBrokerRequest`/`serveGoBroker`/`handleGoBrokerConn`/
+  `writeBrokerExitCode`/`resolvePathThroughAncestorSymlinks`/
+  `validateGoWrapperArgs`/`injectGoTestExecFlag`/`sanitizeGoBrokerEnv`/
+  `runGoWrapperClient`/`runTestRunnerClient`。
 - **阶段 2 安全收口（W10 非 broker 收紧项，4 处缺陷修补）**：
   - `validateTrustedPigDir` 末级本体严格化：`Perm()&0o022 != 0` 无条件拒
     （含 `01777` sticky——`/tmp`/`var/tmp` 不得再被当作可信 `PIG_HOME`/
@@ -43,7 +55,8 @@
     与 `pigAgentConfigFiles` 白名单配置文件均由 `os.Stat` 改 `os.Lstat`，
     软链本体一律不作来源（私有 `pig-agent` 不再被越界拷入外部目标）。
   - `sandboxEnvStripKeys` 补剔 `PI_SANDBOX_INTERNAL_MODE`/
-    `PI_SANDBOX_HELPER_CFG`/`PI_SANDBOX_BROKER_CFG` 三枚内部指针键；
+    `PI_SANDBOX_HELPER_CFG`（阶段 3 随 broker 拆除由 `PI_SANDBOX_BROKER_CFG`
+    改名而来，剥离键名以最终生效者为准）两枚内部指针键；
     `buildPolicy` 对 `reviewer` 与 `reviewer-agent` 两个预设统一捕获并
     回钉 `PI_SANDBOX_GO_EXEC_DIR`；`cleanupPresetTempDirsFromPolicy`
     的清理身份改为「预设创建时经 `PI_SANDBOX_PRESET_TMP_DIRS` 登记的
@@ -57,15 +70,13 @@
     外部调用方手工构造 policy）才回退旧的 env 字段推断
     （TMPDIR/GOTMPDIR/PI_SANDBOX_GO_EXEC_DIR）+ ReadWrite 前缀命中，
     `Policy.Exec` 一律不参与清理推断。
-  - **行为变化预告（分阶段归属，阶段 3 拆除 broker 前同步）**：
-    `Policy.Exec` 收缩为 `<goExecDir>/bin` 是**本阶段（阶段 2）已生效**
-    的收紧——自此沙盒内 `go test`/`go run` 的 `.test`/构建产物不再对
-    审查员主进程直接可执行（直接 `exec` `<goExecDir>/work/*` 或在
-    `GOTMPDIR` 下执行产物收到 `EACCES`）；「产物执行改经
-    `pi-test-runner`（位于 `bin/` 内）在自身 Landlock 域内经
-    `PI_SANDBOX_GO_TEST_WORK` 追加放行后完成」是**阶段 3 才完整落地**
-    的收口——阶段 2 仍保留 broker/helper 旧路径，仅其 `Exec` 授权范围
-    已随 `<goExecDir>/bin` 收缩同步收紧。
+  - **行为变化（阶段 3 已落地）**：`Policy.Exec` 收缩为 `<goExecDir>/bin`
+    在阶段 2 已生效；阶段 3 进一步拆除 broker/`pi-test-runner` 后，
+    `go test -c -o <可写路径>` 仅完成编译（退 0），随后执行产物按落点
+    `W^X` 自然拒绝（`EACCES`）；`go test`（非 `-c`）/`go run` 内部
+    fork/exec 动态产物同样被 `W^X` 拒绝，不再存在任何 runner 降权
+    放行路径；`go build`/`go vet`/`go list` 等只读编译子命令经
+    `bin/go` 真实直链原样可用。
 
 ### Added
 
@@ -73,7 +84,7 @@
   `runMain` 入口对 agent 预设继承的 fd3 置 `FD_CLOEXEC`（`sealInheritedFD3`），
   杜绝其泄漏进 `MaybeWarmGoExtensionCells` 预热子进程、`codegraph-go
   -warm-daemon` 常驻 daemon、`reportRelay` 的 `hc send` 及 `sandbox.Apply`
-  派生的 helper/broker（无 CLOEXEC 的 debugW 写端被常驻 daemon 继承会永久
+  派生的 helper 辅助进程（无 CLOEXEC 的 debugW 写端被常驻 daemon 继承会永久
   劫持 `claude-pty` `drainDebug` 的 EOF）。`newChildCmd` 与 `runAsSandboxInit`
   经 `ExtraFiles` 显式单路转发给最终目标进程，父进程 `Start()` 后立即关闭
   自身 fd3 副本；无 mountns 的 `syscall.Exec` 分支在 `Exec` 前恢复
@@ -84,10 +95,9 @@
   PROT_EXEC 过滤器装入后的下游失败——post-install 失败不可撤销，
   BestEffort 也不得降级（否则 PROT_EXEC 映射永久阻塞在无人服务的 notify
   应答上）。helper 就绪握手 ACK 需 `n==1 && byte=='1'`，读错/EOF/非法字节
-  均视为拒绝启动并 kill+wait 回收；broker 监听器未建立、`createAndPopulate
-  Ruleset`/`enforceRuleset`/`installSeccompExecGuard` 失败均 fail-closed
-  退出（`helperFailf`），绝不以未受限状态 ACK 继续服务；`runTestRunnerClient`
-  配置缺失/损坏/必需路径不存在即返回 126 拒绝执行目标，绝不裸 exec。
+  均视为拒绝启动并 kill+wait 回收；`createAndPopulateRuleset`/
+  `enforceRuleset`/`installSeccompExecGuard` 失败均 fail-closed
+  退出（`helperFailf`），绝不以未受限状态 ACK 继续服务。
   `helperConfig` 新增 `BestEffort` 透传父策略降级口径（缺省 false 会让
   helper 对 BestEffort 策略内容许的瞬态缺失路径 fail-closed，语义不一致）；
   `helperPolicy`/`reviewerPolicy` 均携带。握手链 `unix.Read`/`Sendmsg`/
@@ -124,17 +134,6 @@
   宿主进程的控制面因宿主 PID 不可达而天然失效。此前共享宿主 PID ns
   时 `/proc/1/root/run/docker.sock` 一行即可绕过全部挂载覆盖，等价
   沙盒外任意命令执行。
-- **受控 `go` 构建代理参数/路径收口（oracle9 MF-1）**：`validateGoWrapperArgs`
-  （客户端与 broker 双端）`-o` 校验改为解析首个已存在祖先目录的
-  `EvalSymlinks` 真实路径后再判是否落入 `<goExecDir>`——沙盒内
-  `ln -s $PI_SANDBOX_GO_EXEC_DIR/work $TMPDIR/sym` + `go build -o $TMPDIR/sym/pwn`
-  的祖先软链写穿被拒；缺省 `-o` 且 `cwd`（`req.Dir`）解析后位于
-  `<goExecDir>`（含 work/）的构建被拒；`runGoWrapperClient` 客户端预校验
-  改为传真实 `cwd` 而非空串（空串会让 cwd 校验静默失效）；
-  `-ldflags`/`-gcflags`/`-asmflags`/`-gccgoflags` 纳入禁用标志（可在 broker
-  Landlock 域内拉起外部链接器/编译外挂，经 `-extld` 脚本借白名单 `objcopy`
-  拷入禁用二进制）。新增 `resolvePathThroughAncestorSymlinks`：末级不存在时
-  逐级向上找首个已存在祖先，经 `EvalSymlinks` 解析真实目标后拼回剩余段。
 - **`validateTrustedPigDir` 祖先链逐级校验 + `appendCellCachePolicy` 仅入
   解析后真实 `artifactPath`（oracle9 SF-1）**：PIG_HOME/AgentDir 的末级
   `Lstat` 自动跟随中间软链，仅查末级会让 `pig-link/host` 或 `world-0777/host`
@@ -148,8 +147,8 @@
 - **轻量 PID 1 init**：`MountNS` 路径下 `sbx` 不再以 `syscall.Exec` 顶替
   PID 1（PID 1 忽略默认未捕获信号且无人回收孤儿僵尸），改由
   `runAsSandboxInit` 担任 init：派生目标命令（记录其实际 PID 并向它转发
-  信号——`sandbox.Apply` 会先派生 helper/broker 辅助进程，业务进程 PID
-  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`，
+  信号——`sandbox.Apply` 会先派生 helper 辅助进程，业务进程 PID
+  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`,
   容器内 init 另监听 `SIGUSR1`/`SIGUSR2`/`SIGWINCH`/`SIGCHLD`；每轮先
   `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），目标子进程退出
   即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
@@ -174,7 +173,7 @@
   set（`CAP_SETPCAP` 留到循环最后一步——内核要求调用时仍持该能力），
   `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，`capset` 把
   Effective/Permitted 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`）
-  Inheritable 置 0；helper/broker、目标命令与 `go test` 子孙经
+  Inheritable 置 0；helper、目标命令与其子孙经
   fork/exec 继承同一已裁剪能力集，`reboot`/载模块/改时钟/`bpf` 等
   capability 门控宿主副作用在能力校验层整体失效。优先
   `syscall.AllThreadsSyscall` 全线程生效，`-race`/cgo 下 `ENOTSUP`
@@ -322,7 +321,7 @@
   软链投影进私有 cache 即记入 missing fail-closed。
 - **预热子进程前置 go 目录可被调用方 PATH 投毒（N5）**：
   `runPigWarmSubprocess` 为对齐 cell 摘要把 `resolveRealGoBinary` 按宿主
-  `PATH`/`PI_SANDBOX_REAL_GO` 选中的目录前置进预热 `PATH`——该解析不校验
+  `PATH` 选中的目录前置进预热 `PATH`——该解析不校验
   可信前缀，工作树/任意目录内放「假 go」并前置宿主 `PATH` 即让该不可信
   父目录被前置，预热子进程在 Landlock 生效前以宿主权限执行它
   （`controlledWarmPath` 刻意不读调用方 `PATH` 的既有防线被打穿）。修复：
@@ -357,8 +356,9 @@
   并将其放入 `ReadWrite[0]`——目标 Git 工作树未忽略 `reports/` 时每次
   启动 sbx 都弄脏 `git status`，且使只读角色在源仓内拥有可写子目录。
   报告根已统一收敛 `/tmp/herdr-role-reports`，故移除该创建与写权限；
-  `runTestRunnerClient` 取私有 `TMPDIR` 不再硬编码 `reviewerRW[1]`（
-  ReadWrite 列表移除 reports 后按位置取会错位），改从 env `TMPDIR` 判定。
+  原 `runTestRunnerClient`（阶段 3 已随 `pi-test-runner` 一并删除）曾
+  将私有 `TMPDIR` 判定从硬编码 `reviewerRW[1]` 改为读 env `TMPDIR`
+  （ReadWrite 列表移除 reports 后按位置取会错位）。
 - **arm64 测试夹具（`fix-sbx-portable-baseline` 移植 + TMPDIR 隔离）**：
   `sandbox_test.go` 系统只读目录枚举改为必需目录存在性校验 + 可选库目录
   （`/lib64`/`/usr/lib64`，x86-64 专属）按实际存在追加——arm64 rootfs 无
@@ -397,8 +397,7 @@
   `appendAgyStateReadWrite` 枚举出的根级文件同步登记（授权仍完全由
   `ReadWrite` 决定，`OptionalReadWrite` 仅标记「缺失可容忍」）；该字段
   随 `childExecSpec.orw` 与 `helperConfig.orw` 跨
-  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 与 broker/helper/`pi-test-runner`
-  全链路 100% 透传。`buildPathRuleEntries` 将 OptionalReadWrite 归一化为
+  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 与 helper 配置链路 100% 透传。`buildPathRuleEntries` 将 OptionalReadWrite 归一化为
   集合打标 `transient`，`addPathRule` 仅对 `transient` 条目容忍
   `ENOENT`（含悬空软链）安全跳过；未登记的普通 `ReadWrite` 缺失路径
   （显式 `--rw`、`<workdir>/reports`、私有 `TMPDIR`、agyStateDataSubdirs
@@ -409,7 +408,7 @@
   的是后者，已更正为两类失败路径区分。
 - **init 文档口径修正**：README/CHANGELOG 中「派生目标命令为 PID 2」
   更正为「记录的目标子进程 PID」——`sandbox.Apply` 先派生
-  helper/broker，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
+  helper 辅助进程，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
   父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 4 种信号，
   与容器内 PID-1 init 监听的 8 种信号（`SIGCHLD` 仅用于唤醒 `Wait4`
   收尸不转发，其余 7 种转发给目标子进程），不再混述为同一端到端
@@ -472,6 +471,35 @@
   注入 `hostHome`（与生产 `resolveEntryAgentPaths(trustedHomeDir())`
   同一代码路径，生产 HOME 信任边界不变），消除干净容器/CI 未安装
   `claude` 或 `agy` 时的静默 `t.Skip`。
+- **`ReadOnlyReviewer` 把 `GOROOT` 回钉受信真实 `go` 根**：阶段 3 直链
+  真实 `go` 后，宿主环境携带的 `GOROOT`（如 `go test` 父进程传给测试
+  二进制的 toolchain module 缓存路径 `/root/go/pkg/mod/golang.org/
+  toolchain@*`，或调用方伪造根）会被沙盒内 `go` 继承——其 `pkg/tool`
+  既不在受信前缀（编译产物 `EACCES`）又是污染源。`Policy.Env` 显式
+  注入 `GOROOT=<受信真实 go 根>`，保证沙盒内 `go` 命中的 `pkg/tool`
+  与 `resolveGoToolchainPaths` 收录的受信 `pkg/tool` 同一实体。
+  同批把 `GOROOT` 加入 `sandboxEnvStripKeys` 全剥离（方案 B）：
+  `--env GOROOT=<伪根>` 与宿主 `os.Environ()` 携带的 GOROOT 一律剔除
+  （剥离只作用于 `cfg.Env` 与宿主继承，不动 `Policy.Env` 注入），
+  杜绝外部 GOROOT 经 `mergeEnv` 覆盖受信回钉、把沙盒内 `go` 的
+  `pkg/tool` 指到不可信根。
+
+### Known Risks
+
+- **`memfd_create`/`execveat` 与匿名 `PROT_EXEC` 旁路（Q1 决策：不改
+  seccomp 黑名单，仅文档披露）**：seccomp `PROT_EXEC` 守卫只拦截带
+  `PROT_EXEC` 标志的 `mmap`/`mprotect` 且以 `/proc/<pid>/fd`/`exe` 判定
+  文件来源；`memfd_create` 创建的匿名内存 fd 无文件路径可判定，写入
+  任意代码后经 `execveat(AT_EMPTY_PATH)` 或匿名 `mprotect(PROT_EXEC)`
+  属内核接口级旁路，本沙盒不封堵。护栏级定位（防误操作）下接受该
+  边界；强对抗隔离需求应使用独立的内核级方案（容器/VM）。
+- **沙盒内 `go test`/`go run` 产物按 `W^X` 一律拒执行**：阶段 3 起
+  不再有任何 runner 放行路径，被审查仓库的 `*_test.go` 不在沙盒内
+  运行——属设计内行为变更（护栏定位），非回归；需要运行测试的环节
+  应交独立隔离验证环境。
+- **`/` 整树只读可读面与 `DenyNet:false` 网络面保持原状**：护栏定位
+  下按设计保留，本批不改动；文档（模块 README「威胁模型」节）已
+  如实披露两边界含义。
 
 ## [0.4.0] - 2026-11-07
 

@@ -797,6 +797,9 @@ func subprocReviewerPreset() {
 	os.Exit(0)
 }
 
+// TestLandlockReviewerGoToolchain 验证 ReadOnlyReviewer 预设下真实 go
+// 工具链直链后的可用性：go list/build/vet 等只读编译子命令原样工作，
+// 动态产物按其落点 W^X 语义拒绝执行（go test/go run 自然 EACCES）。
 func TestLandlockReviewerGoToolchain(t *testing.T) {
 	requireLandlock(t)
 
@@ -878,25 +881,35 @@ func subprocReviewerGoToolchain() {
 		os.Exit(1)
 	}
 
-	// 1. go build ./... 必须正常通过
-	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "go build ./... failed: %v\noutput:\n%s\n", err, string(out))
+	// 阶段 3：broker 拆除后 <goExecDir>/bin/go 是真实 go 直链——只读编译
+	// 子命令原样执行，动态产物按其落点目录的 W^X（可写不执）自然拒绝。
+	goExecDir := os.Getenv("PI_SANDBOX_GO_EXEC_DIR")
+
+	// 1. go list ./... 必须正常通过（只读编译域）
+	if out, err := exec.Command("go", "list", "./...").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go list ./... failed: %v\noutput:\n%s\n", err, string(out))
 		os.Exit(1)
 	}
 
-	// 2. go vet ./... 必须正常通过
+	// 2. go build -o <TMPDIR> 必须正常通过（产物落私有可写域；缺省 -o
+	//    会把 demo 二进制写进 cwd 即 workDir，而 workDir 对审查员只读——
+	//    直链真实 go 后该写被 Landlock 正确拒绝，故用显式 -o 到可写域）。
+	demoOut := filepath.Join(os.Getenv("TMPDIR"), "demo-out")
+	if out, err := exec.Command("go", "build", "-o", demoOut, "./cmd/demo").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go build -o %s ./cmd/demo failed: %v\noutput:\n%s\n", demoOut, err, string(out))
+		os.Exit(1)
+	}
+
+	// 3. go vet ./... 必须正常通过
 	if out, err := exec.Command("go", "vet", "./...").CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "go vet ./... failed: %v\noutput:\n%s\n", err, string(out))
 		os.Exit(1)
 	}
 
-	// 3. go test ./... 必须正常编译并执行测试二进制通过
-	if out, err := exec.Command("go", "test", "-v", "./...").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "go test -v ./... failed: %v\noutput:\n%s\n", err, string(out))
-		os.Exit(1)
-	}
-
-	// 4. 若用 go build -o 将二进制输出到可写的 TMPDIR，编译本身允许，但执行该产物必须被拒绝
+	// 4. go build -o 到可写 TMPDIR 允许（写面归私有 TMPDIR），但执行产物
+	//    必须被 W^X 拒绝（可写目录无执行授权 → EACCES）。Go 侧 exec 失败
+	//    返回 *os.PathError（execve EACCES），断言 errors.Is(err, EACCES)
+	//    或错误文本含 permission denied——不得把任何非 nil 错误当拒绝。
 	builtInTmp := filepath.Join(os.Getenv("TMPDIR"), "demo-bin")
 	if out, err := exec.Command("go", "build", "-o", builtInTmp, "./cmd/demo").CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "go build -o %s ./cmd/demo failed: %v\noutput:\n%s\n", builtInTmp, err, string(out))
@@ -905,73 +918,76 @@ func subprocReviewerGoToolchain() {
 	if err := exec.Command(builtInTmp).Run(); err == nil {
 		fmt.Fprintf(os.Stderr, "SECURITY BREACH: executing go build output %s inside TMPDIR succeeded!\n", builtInTmp)
 		os.Exit(1)
+	} else if !errors.Is(err, unix.EACCES) && !strings.Contains(err.Error(), "permission denied") {
+		fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: exec %s rejected with unexpected error (want EACCES): %v\n", builtInTmp, err)
+		os.Exit(1)
 	}
 
-	// 5. 试图通过 go run、go test -exec、go test -toolexec、go test -c 绕过受控执行的行为必须被拒绝
-	for _, forbiddenArgs := range [][]string{
+	// 5. go test -c -o <TMPDIR> 编译本身允许，执行 .test 产物同样被 W^X
+	//    拒绝（不再经 pi-test-runner 降权执行）；同锁 EACCES 原因。
+	testBin := filepath.Join(os.Getenv("TMPDIR"), "demo.test")
+	if out, err := exec.Command("go", "test", "-c", "-o", testBin, ".").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go test -c -o %s . failed: %v\noutput:\n%s\n", testBin, err, string(out))
+		os.Exit(1)
+	}
+	if err := exec.Command(testBin).Run(); err == nil {
+		fmt.Fprintf(os.Stderr, "SECURITY BREACH: executing go test binary %s succeeded!\n", testBin)
+		os.Exit(1)
+	} else if !errors.Is(err, unix.EACCES) && !strings.Contains(err.Error(), "permission denied") {
+		fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: exec %s rejected with unexpected error (want EACCES): %v\n", testBin, err)
+		os.Exit(1)
+	}
+
+	// 6. go test / go run 需在沙盒内执行动态产物，按 W^X 自然拒——锁
+	//    *exec.ExitError 非零退出 + 输出含 "fork/exec <GOTMPDIR 产物>:
+	//    permission denied"：go 命令自身编译/启动失败同样非零退出，绝不能
+	//    把 exit 127/编译错误报为 W^X 拒绝；仅锁 "permission denied" 子串
+	//    会把非执行期 EACCES（如 chmod 000 测试源文件的 open EACCES）假绿，
+	//    故 fork/exec 前缀与 permission denied 后缀必须同时命中（verifier
+	//    实测真实形态：fork/exec <tmp>/... reviewcheck.test: permission
+	//    denied，退出码 1；产物目录名 go-tmp/go-build<random> 不固定）。
+	for _, runArgs := range [][]string{
+		{"test", "./..."},
 		{"run", "./cmd/demo"},
-		{"test", "-exec=/bin/sh", "./..."},
-		{"test", "-toolexec=/bin/sh", "./..."},
-		{"test", "-c", "./..."},
 	} {
-		if out, err := exec.Command("go", forbiddenArgs...).CombinedOutput(); err == nil {
-			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded:\n%s\n", forbiddenArgs, string(out))
+		out, err := exec.Command("go", runArgs...).CombinedOutput()
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded in sandbox:\n%s\n", runArgs, string(out))
+			os.Exit(1)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+			fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: go %v failed without a non-zero ExitError (compile/startup error?): %v\noutput:\n%s\n", runArgs, err, string(out))
+			os.Exit(1)
+		}
+		if !strings.Contains(string(out), "fork/exec") || !strings.Contains(string(out), "permission denied") {
+			fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: go %v exit=%d but output lacks 'fork/exec ... permission denied' (want exec-time EACCES, not open/compile EACCES):\n%s\n", runArgs, exitErr.ExitCode(), string(out))
 			os.Exit(1)
 		}
 	}
 
-	// 6. MF-1：沙盒内借 broker 写权限向 <goExecDir>/work 写入可执行文件的三路
-	//    攻击必须全部被封死，且即便有产物落入 work/ 也不得被审查员进程执行
-	//   （Policy.Exec 已收缩到 <goExecDir>/bin）。
-	goExecDir := os.Getenv("PI_SANDBOX_GO_EXEC_DIR")
+	// 7. <goExecDir>/bin 与 <goExecDir> 对审查员只读不执写：写入必须被拒；
+	//    broker.sock / work/ / cache/ / bin/pi-test-runner 已随 broker 拆除消失。
 	if goExecDir != "" {
-		tmpDir := os.Getenv("TMPDIR")
-		// 路径 A：$TMPDIR 软链 -o 指向 <goExecDir>/work —— 包装器/broker 必须
-		// 解析首个存在祖先软链后拒绝，绝不在 work/ 下落产物。
-		symLink := filepath.Join(tmpDir, "sym-work")
-		if err := os.Symlink(filepath.Join(goExecDir, "work"), symLink); err == nil {
-			if out, err := exec.Command("go", "build", "-o", filepath.Join(symLink, "pwn1"), "./cmd/demo").CombinedOutput(); err == nil {
-				fmt.Fprintf(os.Stderr, "SECURITY BREACH: go build -o via symlink %s succeeded (wrote into goExecDir/work)\noutput:%s\n", symLink, string(out))
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "note: symlink %s failed: %v\n", symLink, err)
-		}
-		// 路径 B：缺省 -o + cwd=<goExecDir>/work —— broker 必须拒绝 cwd 落在
-		// 受保护可写执行目录内的构建。
-		if out, err := exec.Command("go", "build", "./cmd/demo").CombinedOutput(); err == nil {
-			// cwd 合法（workDir）时 build 成功属于正常流程，不在此断言。
-			_ = out
-		}
-		cwdCmd := exec.Command("go", "build", workDir)
-		cwdCmd.Dir = filepath.Join(goExecDir, "work")
-		if out, err := cwdCmd.CombinedOutput(); err == nil {
-			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go build with cwd=%s succeeded (default -o wrote into goExecDir/work)\noutput:%s\n", cwdCmd.Dir, string(out))
+		if f, err := os.Create(filepath.Join(goExecDir, "bin", "pwn")); err == nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: write into <goExecDir>/bin succeeded\n")
 			os.Exit(1)
 		}
-		// 路径 C：-ldflags/-gcflags 外部链接器外挂标志必须被拒。
-		for _, flagArgs := range [][]string{
-			{"build", "-ldflags=-linkmode=external -extld=/bin/sh", "-o", filepath.Join(tmpDir, "dummy1"), "./cmd/demo"},
-			{"build", "-gcflags=-N", "./cmd/demo"},
-			{"test", "-ldflags=all=-linkmode=external", "./..."},
-		} {
-			if out, err := exec.Command("go", flagArgs...).CombinedOutput(); err == nil {
-				fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded\noutput:%s\n", flagArgs, string(out))
+		if f, err := os.Create(filepath.Join(goExecDir, "pwn")); err == nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: write into <goExecDir> succeeded\n")
+			os.Exit(1)
+		}
+		for _, gone := range []string{"work", "cache", "broker.sock"} {
+			if _, err := os.Lstat(filepath.Join(goExecDir, gone)); !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "SECURITY BREACH: <goExecDir>/%s still exists after broker removal (err=%v)\n", gone, err)
 				os.Exit(1)
 			}
 		}
-		// 终态：<goExecDir>/work 下不得有可被执行的攻击产物——Policy.Exec
-		// 收缩到 bin/ 后，work/ 内任何文件对审查员均无执行授权。
-		if entries, err := os.ReadDir(filepath.Join(goExecDir, "work")); err == nil {
-			for _, ent := range entries {
-				p := filepath.Join(goExecDir, "work", ent.Name())
-				if st, statErr := os.Stat(p); statErr == nil && !st.IsDir() {
-					if execErr := exec.Command(p).Run(); execErr == nil {
-						fmt.Fprintf(os.Stderr, "SECURITY BREACH: %s under goExecDir/work executed!\n", p)
-						os.Exit(1)
-					}
-				}
-			}
+		if _, err := os.Lstat(filepath.Join(goExecDir, "bin", "pi-test-runner")); !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: <goExecDir>/bin/pi-test-runner still exists (err=%v)\n", err)
+			os.Exit(1)
 		}
 	}
 

@@ -1643,9 +1643,10 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 	}
 
 	probeBin, _ := os.Executable()
-	// 沙盒内经 broker 的 go test 子进程 capabilities 证据：在 workdir 下
-	// 预置最小模块（go test 二进制经 pi-test-runner 降权后读取自身
-	// /proc/self/status 打印 CapEff）。
+	// 阶段 3：broker/pi-test-runner 拆除后，沙盒内 go list/build/vet 原样
+	// 可用（受信 GOROOT 回钉 + pkg/tool 已收录 Exec）；go test 需在沙盒
+	// 内执行动态产物，按 W^X 自然拒（EACCES）。保留一个含真实 _test.go
+	// 的最小模块以驱动 go test 产物执行路径。
 	capTestDir := filepath.Join(workdir, "captest")
 	if err := os.MkdirAll(capTestDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll captest: %v", err)
@@ -1654,32 +1655,11 @@ func TestSbxReportRelayIntegration(t *testing.T) {
 		[]byte("module example.com/captest\n\ngo 1.22\n"), 0o644); err != nil {
 		t.Fatalf("write captest go.mod: %v", err)
 	}
-	capTestSrc := `package captest
-
-import (
-	"os"
-	"strings"
-	"testing"
-)
-
-func TestCaps(t *testing.T) {
-	b, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		t.Fatalf("read status: %v", err)
+	if err := os.WriteFile(filepath.Join(capTestDir, "cap.go"), []byte("package captest\n\nfunc One() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatalf("write cap.go: %v", err)
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "CapEff:\t"); ok {
-			t.Logf("gotest_capeff=%s", v)
-			if v != "0000000000000022" {
-				t.Fatalf("CapEff = %s, want 0000000000000022", v)
-			}
-			return
-		}
-	}
-	t.Fatal("CapEff line not found in /proc/self/status")
-}
-`
-	if err := os.WriteFile(filepath.Join(capTestDir, "cap_test.go"), []byte(capTestSrc), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(capTestDir, "cap_test.go"),
+		[]byte("package captest\n\nimport \"testing\"\n\nfunc TestOne(t *testing.T) { if One() != 1 { t.Fatal(\"bad\") } }\n"), 0o644); err != nil {
 		t.Fatalf("write cap_test.go: %v", err)
 	}
 	// 宿主 /run 全权 socket 路径集同时用于两类断言：沙盒内直连路径 ENOENT
@@ -1750,11 +1730,28 @@ else
 fi
 z=0; for s in /proc/[0-9]*/status; do grep -q 'State:.*Z' "$s" && z=$((z+1)); done
 printf 'zombie_count=%s\n' "$z"
-# 经 helper broker 的 go test 子孙同样须满足 CapEff=0x22（能力裁剪经
-# fork/exec 继承）。
-cd "$CAPTEST_DIR" && go test -v -count=1 . > "$TMPDIR/captest.out" 2>&1
+# 阶段 3：broker 拆除后 go list/go build/go vet 只读编译子命令原样可用
+#（rc=0，go vet 经受信 GOROOT/pkg/tool 执行，不触可写域产物）；go test
+# 需执行动态产物，按 W^X 自然拒。broker.sock/work/bin/pi-test-runner 已不存在。
+cd "$CAPTEST_DIR" && go list . > "$TMPDIR/caplist.out" 2>&1
+printf 'golist_rc=%d\n' "$?"
+cd "$CAPTEST_DIR" && go build -o "$TMPDIR/capbin" . > "$TMPDIR/capbuild.out" 2>&1
+printf 'gobuild_rc=%d\n' "$?"
+cd "$CAPTEST_DIR" && go vet . > "$TMPDIR/capvet.out" 2>&1
+printf 'govet_rc=%d\n' "$?"
+cd "$CAPTEST_DIR" && go test -count=1 . > "$TMPDIR/captest.out" 2>&1
 printf 'gotest_rc=%d\n' "$?"
-grep gotest_capeff "$TMPDIR/captest.out" || true
+# W^X 拒绝锁执行期 EACCES：同一行须同时含 fork/exec 前缀与 permission
+# denied 后缀（go test 产物路径 go-tmp/go-build<random> 不固定，用
+# 前缀+后缀匹配）；仅 permission denied 会把 chmod 000 源文件的 open
+# EACCES 等非执行期拒绝假绿。
+grep -Eiq 'fork/exec.*permission denied' "$TMPDIR/captest.out" && echo gotest_eacces=1 || echo gotest_eacces=0
+[ -e "$PI_SANDBOX_GO_EXEC_DIR/broker.sock" ] || [ -L "$PI_SANDBOX_GO_EXEC_DIR/broker.sock" ] && echo broker_sock=present || echo broker_sock=absent
+[ -e "$PI_SANDBOX_GO_EXEC_DIR/work" ] || [ -L "$PI_SANDBOX_GO_EXEC_DIR/work" ] && echo goexec_work=present || echo goexec_work=absent
+[ -e "$PI_SANDBOX_GO_EXEC_DIR/bin/pi-test-runner" ] || [ -L "$PI_SANDBOX_GO_EXEC_DIR/bin/pi-test-runner" ] && echo test_runner=present || echo test_runner=absent
+# R2：--env GOROOT=/tmp/evil 与宿主 GOROOT 一律剥离；沙盒内只能看到
+# 预设注入的受信根或空值，绝不能是 /tmp/evil。
+echo "goroot_env=${GOROOT:-<unset>}"
 `
 	script += strings.Join(runSockScriptLines, "\n") + "\n"
 	// CLONE_NEWIPC 实证对照基线：探针前宿主 SysV shm 段集合（探针后
@@ -1772,6 +1769,7 @@ grep gotest_capeff "$TMPDIR/captest.out" || true
 		"--env", "HOST_PARENT_PID=" + strconv.Itoa(os.Getpid()),
 		"--env", "PROC1_ROOT_PROBE_PATHS=" + strings.Join(proc1ProbePaths, " "),
 		"--env", "PI_SANDBOX_GO_EXEC_DIR=/tmp/hijack", // 必须被回钉回 pi-reviewer-exec-*
+		"--env", "GOROOT=/tmp/evil", // 必须被 sandboxEnvStripKeys 剥离（R2）
 		"--exec", filepath.Dir(probeBin),
 		"--", "/bin/sh", "-c", script,
 	})
@@ -1837,16 +1835,41 @@ grep gotest_capeff "$TMPDIR/captest.out" || true
 	}
 
 	// capabilities 根治裁剪：沙盒内 CapEff/CapPrm/CapBnd 精确为
-	// 0x22（CAP_DAC_OVERRIDE|CAP_KILL），CapInh/CapAmb 全零；经 helper
-	// broker 的 go test 子孙同样满足 CapEff=0x22（fork/exec 继承裁剪后
-	// 能力集）。
+	// 0x22（CAP_DAC_OVERRIDE|CAP_KILL），CapInh/CapAmb 全零（fork/exec
+	// 继承裁剪后能力集，helper 同域）。
 	assertOut("capinh", "0000000000000000")
 	assertOut("capprm", "0000000000000022")
 	assertOut("capeff", "0000000000000022")
 	assertOut("capbnd", "0000000000000022")
 	assertOut("capamb", "0000000000000000")
-	assertOut("gotest_rc", "0")
-	assertOut("gotest_capeff", "0000000000000022")
+	// 阶段 3：broker 拆除后 go list/build/vet 原样通过（rc=0）；go test
+	// 需执行 .test 动态产物，按 W^X 自然拒（rc=1 且含 fork/exec ...
+	// permission denied）；broker.sock/work/bin/pi-test-runner 对象不存在
+	//（[ -e ]||[ -L ] 锁不存在语义，普通文件/悬链不得误报 absent）。
+	assertOut("golist_rc", "0")
+	assertOut("gobuild_rc", "0")
+	assertOut("govet_rc", "0")
+	// gotest_rc 按完整输出行精确比较：assertOut 是子串匹配，gotest_rc=1
+	// 会把 126/127（如沙盒拒绝 exec go 本身）误判为 rc=1 假绿。
+	gotestRcExact := false
+	for _, line := range strings.Split(out, "\n") {
+		if line == "gotest_rc=1" {
+			gotestRcExact = true
+			break
+		}
+	}
+	if !gotestRcExact {
+		t.Fatalf("missing exact line gotest_rc=1 (assertOut substring would let 126/127 pass); output:\n%s", out)
+	}
+	assertOut("gotest_eacces", "1")
+	assertOut("broker_sock", "absent")
+	assertOut("goexec_work", "absent")
+	assertOut("test_runner", "absent")
+	// R2：--env GOROOT=/tmp/evil 必须被 sandboxEnvStripKeys 剥离；沙盒内
+	// 只能看到预设注入的受信根或 <unset>，绝不能是 /tmp/evil。
+	if strings.Contains(out, "goroot_env=/tmp/evil") {
+		t.Fatalf("GOROOT=/tmp/evil leaked into sandbox env (want stripped); output:\n%s", out)
+	}
 
 	// PID-1 孤儿收尸：孤儿先被 PID 1 接管（orphan_adopted），放行退出后
 	// /proc/<pid> 彻底消失（orphan_reaped——PID 1 经 Wait4 收割），全量
@@ -1856,7 +1879,7 @@ grep gotest_capeff "$TMPDIR/captest.out" || true
 	assertOut("zombie_count", "0")
 
 	// 独立 PID 命名空间：PID 1 必须是 sbx init 本体（测试二进制自身；
-	// Apply 的 helper/broker 会合法占用 2..N，故不钉死受测命令为 PID 2，
+	// Apply 的 helper 会合法占用 2..N，故不钉死受测命令为 PID 2，
 	// 改以「PID 1 身份 + 小号 PID + 宿主 PID ENOENT」三重证据锁定新 ns）。
 	wantInitComm := filepath.Base(probeBin)
 	if len(wantInitComm) > 15 { // comm 上限 TASK_COMM_LEN-1=15
@@ -2153,7 +2176,7 @@ func TestChildSpecOptionalReadWriteEndToEnd(t *testing.T) {
 //   1. fd3 显式经 ExtraFiles 单路转发到最终目标进程（read reviewer-agent
 //      目标能读到 fd3 内容）——证明转发链 newChildCmd→runAsSandboxInit
 //      生效；
-//   2. fd3 不泄漏给 helper/broker/预热子进程等中间进程（在 sbx 入口已
+//   2. fd3 不泄漏给 helper/预热子进程等中间进程（在 sbx 入口已
 //      置 CLOEXEC）——用「目标进程检测自身 fd3 是否打开」作判据：
 //      agent preset 下目标应能打开 /dev/fd/3 或读到 fd3；非 agent preset
 //      或未传入 fd3 时目标侧 fd3 应不存在。
@@ -2222,7 +2245,7 @@ fi`
 
 	t.Run("fd3_write_end_fully_released_on_sbx_exit", func(t *testing.T) {
 		// 无泄漏判据（claude-pty drainDebug 语义）：传入 debugW 写端给
-		// sbx，测试侧持有读端。sbx 及其全部子进程（helper/broker/init/
+		// sbx，测试侧持有读端。sbx 及其全部子进程（helper/init/
 		// 目标）退出后，若任一中间进程残留持有 fd3 写端，读端 Read 永远
 		// 收不到 EOF（oracle FM-3 的 daemon 劫持缺陷）。收口正确时 sbx
 		// 退出即全部写端关闭，读端立即 EOF。
@@ -2241,7 +2264,7 @@ fi`
 			t.Fatalf("reviewer-agent exit = %d; output:\n%s", code, out)
 		}
 		// sbx 进程已退出：读端设超时读，须在限时内收到 EOF（证明写端
-		// 无残留持有者——helper/broker/daemon 均未继承 fd3）。
+		// 无残留持有者——helper/daemon 均未继承 fd3）。
 		_ = r.SetReadDeadline(time.Now().Add(3 * time.Second))
 		buf := make([]byte, 8)
 		n, rerr := r.Read(buf)
@@ -2429,7 +2452,7 @@ require github.com/MichaelKinsy/PiG/extensions/sdk v0.0.0
 		t.Logf("prewarm-spawned daemon alive: pid=%d token=%s", daemonPid, daemonToken)
 
 		// daemon 存活期间，父侧 debug 读端立即 io.EOF：sbx 及其全部中间
-		// 进程（helper/broker/init）与预热派生的 daemon 均未残留持有 fd3
+		// 进程（helper/init）与预热派生的 daemon 均未残留持有 fd3
 		// 写端——fd3 CLOEXEC 收口与 ExtraFiles 单路转发真实生效。
 		_ = r.SetReadDeadline(time.Now().Add(3 * time.Second))
 		buf := make([]byte, 8)
