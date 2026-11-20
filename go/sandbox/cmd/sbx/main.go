@@ -195,13 +195,14 @@ func parseArgs(args []string) (cliConfig, error) {
 // os.Environ() 经 sandboxHostStripExtraKeys 追加剔除（--env 显式声明
 // 的合法 PI 自定义入口不能被误伤，N7）。
 var sandboxEnvStripKeys = map[string]bool{
-	"GPG_AGENT_INFO":           true,
-	"SSH_AUTH_SOCK":            true,
-	"DBUS_SESSION_BUS_ADDRESS": true,
-	"XDG_RUNTIME_DIR":          true,
-	"PI_SANDBOX_INTERNAL_MODE": true,
-	"PI_SANDBOX_HELPER_CFG":    true,
-	"PI_SANDBOX_BROKER_CFG":    true,
+	"GPG_AGENT_INFO":             true,
+	"SSH_AUTH_SOCK":              true,
+	"DBUS_SESSION_BUS_ADDRESS":   true,
+	"XDG_RUNTIME_DIR":            true,
+	"PI_SANDBOX_INTERNAL_MODE":   true,
+	"PI_SANDBOX_HELPER_CFG":      true,
+	"PI_SANDBOX_BROKER_CFG":      true,
+	"PI_SANDBOX_PRESET_TMP_DIRS": true,
 }
 
 // sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：宿主
@@ -252,11 +253,21 @@ func stripHostEnv(env []string) []string {
 	return res
 }
 
+// lastPresetTempDirs 记录最近一次 buildPolicy 产出的策略在预设构造阶段
+// 实际创建的私有临时目录清单（由预设经 PI_SANDBOX_PRESET_TMP_DIRS 内部
+// env 键携带，buildPolicy 返回前捕获并从 Policy.Env 剔除）。
+// cleanupPresetTempDirsFromPolicy 只删除该清单中登记的目录——清理身份
+// 必须来自创建时登记，绝不从 Policy.Exec/Env 用父目录前缀反推，否则
+// 调用方经 --exec /tmp/pi-reviewer-exec-manual/bin 传入的「形似预设」
+// 路径会让其整个父目录被递归误删。
+var lastPresetTempDirs []string
+
 // buildPolicy 根据解析后的命令行配置构造最终的 sandbox.Policy。
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// 先剔除 --env 中的外部指针类变量，防止它们经 policy.Env 写回沙盒。
 	cfg.Env = stripSandboxEnv(cfg.Env)
 	var policy sandbox.Policy
+	lastPresetTempDirs = nil
 	var pigHome string
 	var claudeConfigDir string
 	var goExecDir string
@@ -299,6 +310,10 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// 再返回错误，不得在 /tmp 泄漏私有目录（oracle FM-2A）。
 			if sandbox.IsPigEntryCommand(cfg.Command) {
 				if err := sandbox.ReviewerAgentCellTargetError(); err != nil {
+					// 清理只针对登记清单中本预设实际创建的目录：
+					// Policy.Env 仍含预设注入的 PI_SANDBOX_PRESET_TMP_DIRS 登记
+					// 条目，cleanupPresetTempDirsFromPolicy 按清单精确删除，
+					// 绝不凭 Exec/env 前缀推断误删外部目录。
 					cleanupPresetTempDirsFromPolicy(policy)
 					return sandbox.Policy{}, fmt.Errorf("sbx: reviewer-agent pig cell target check failed: %w", err)
 				}
@@ -358,6 +373,11 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	if cfg.BestEffort {
 		policy.BestEffort = true
 	}
+	// 预设创建清单在 cfgEnv merge/回钉全部完成后捕获（此时预设注入的登记
+	// 条目仍原样位于 Policy.Env），随后把该内部键从最终 env 剔除——登记
+	// 只服务宿主侧清理，不得进入受限子进程环境。
+	lastPresetTempDirs = append(lastPresetTempDirs, registeredPresetTempDirs(policy.Env)...)
+	policy.Env = removeEnvKey(policy.Env, "PI_SANDBOX_PRESET_TMP_DIRS")
 	return policy, nil
 }
 
@@ -1061,32 +1081,97 @@ func exitCodeFromWaitErr(err error) int {
 	return 1
 }
 
-// cleanupPresetTempDirsFromPolicy 综合 Policy.Env、Policy.ReadWrite 与 Policy.Exec
-// 清理预设构造阶段创建的私有临时目录（即便用户通过 --env 覆盖了 TMPDIR 也不会漏删）。
+// cleanupPresetTempDirsFromPolicy 清理预设构造阶段创建的私有临时目录
+// （即便用户通过 --env 覆盖了 TMPDIR 也不会漏删）。
+//
+// 身份来源（严格按序，绝不回退到 Policy.Exec 前缀推断）：
+//  1. Policy.Env 中 PI_SANDBOX_PRESET_TMP_DIRS 登记条目（预设返回前
+//     尚未被 buildPolicy 剥离的 policy 直接携带）；
+//  2. buildPolicy 捕获的 lastPresetTempDirs（剔除内部键后的最终 policy）；
+//  3. 两者皆无时（单测/外部调用方手工构造 policy）才回退旧的 env
+//     字段推断（TMPDIR/GOTMPDIR/PI_SANDBOX_GO_EXEC_DIR）+ ReadWrite 前缀
+//     命中——该兜底路径绝不遍历 Policy.Exec：Exec 收缩为 <goExecDir>/bin
+//     后，「条目本体或父目录前缀命中即删」会把调用方经 --exec 传入的
+//     /tmp/pi-reviewer-exec-manual/bin 误判为本预设创建，递归误删其整个
+//     父目录（含无关数据）。登记清单存在时唯一可信，逐项 Lstat + 前缀
+//     二次确认后递归删除（防御性保留 isPresetTempDir 形态校验）。
 func cleanupPresetTempDirsFromPolicy(policy sandbox.Policy) {
+	registered := registeredPresetTempDirs(policy.Env)
+	if len(registered) == 0 {
+		registered = append(registered, lastPresetTempDirs...)
+	}
+	if len(registered) > 0 {
+		seen := make(map[string]struct{}, len(registered))
+		for _, dir := range registered {
+			clean := filepath.Clean(dir)
+			if _, dup := seen[clean]; dup {
+				continue
+			}
+			seen[clean] = struct{}{}
+			// 前缀二次确认：登记清单是唯一身份来源，但仍保留形态校验
+			//（/tmp 或 os.TempDir() 第一层子目录、pi-reviewer- 前缀）
+			// 兜底防御清单被意外污染时删错目录。
+			if isPresetTempDir(clean, "pi-reviewer-") {
+				removePresetTempDir(clean)
+			}
+		}
+		return
+	}
+	// 兜底（无登记清单）：仅从 env 字段与 ReadWrite 前缀命中推断；
+	// Policy.Exec 一律不参与清理推断。
 	cleanupPresetTempDirsFromEnv(policy.Env)
 	for _, rw := range policy.ReadWrite {
 		if isPresetTempDir(rw, "pi-reviewer-") && !isPresetTempDir(rw, "pi-reviewer-exec-") {
 			removePresetTempDir(rw)
 		}
 	}
-	for _, ex := range policy.Exec {
-		// Policy.Exec 已收缩为 <goExecDir>/bin（MF-1）：Exec 条目本体或其
-		// 父目录命中 pi-reviewer-exec-* 前缀都纳入清理。
-		if isPresetTempDir(ex, "pi-reviewer-exec-") {
-			removePresetTempDir(ex)
-			continue
-		}
-		if parent := filepath.Dir(filepath.Clean(ex)); isPresetTempDir(parent, "pi-reviewer-exec-") {
-			removePresetTempDir(parent)
+}
+
+// registeredPresetTempDirs 解析 env 中 PI_SANDBOX_PRESET_TMP_DIRS 登记的
+// 目录清单（JSON 字符串数组），返回规范化后的非空绝对路径。
+// 序列化不使用 os.PathListSeparator：备用根 os.TempDir() 可经 TMPDIR 设为
+// 含 ":" 的目录，冒号分隔会把含冒号路径拆成无效段导致清理清单整体失效。
+// 解码出的真实路径不做 strings.TrimSpace——路径首尾空白是合法字符，
+// TrimSpace 会破坏真实目录名；解码失败/非数组/空数组返回 nil，按「无
+// 清单」交由调用方走既有兜底（含外部塞入旧冒号格式时的安全降级）。
+func registeredPresetTempDirs(env []string) []string {
+	raw := envListValue(env, "PI_SANDBOX_PRESET_TMP_DIRS")
+	if raw == "" {
+		return nil
+	}
+	var dirs []string
+	if err := json.Unmarshal([]byte(raw), &dirs); err != nil || len(dirs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		if d := filepath.Clean(dir); d != "" && d != "." {
+			out = append(out, d)
 		}
 	}
+	return out
 }
 
 // cleanupPresetTempDirsFromEnv 删除预设构造阶段创建的私有临时目录
 // （pi-reviewer-* 与 pi-reviewer-exec-*），同时覆盖 /tmp 与 os.TempDir() 兜底路径。
 // 仅删位于合法临时根下且带固定前缀的第一层子目录，绝不递归删除任意 TMPDIR。
+// env 含 PI_SANDBOX_PRESET_TMP_DIRS 登记清单时以清单为准（与
+// cleanupPresetTempDirsFromPolicy 同口径），否则走字段推断兜底。
 func cleanupPresetTempDirsFromEnv(env []string) {
+	if registered := registeredPresetTempDirs(env); len(registered) > 0 {
+		seen := make(map[string]struct{}, len(registered))
+		for _, dir := range registered {
+			clean := filepath.Clean(dir)
+			if _, dup := seen[clean]; dup {
+				continue
+			}
+			seen[clean] = struct{}{}
+			if isPresetTempDir(clean, "pi-reviewer-") {
+				removePresetTempDir(clean)
+			}
+		}
+		return
+	}
 	m := make(map[string]string, len(env))
 	for _, kv := range env {
 		if k, v, ok := strings.Cut(kv, "="); ok {

@@ -51,6 +51,9 @@ func TestMain(m *testing.M) {
 	case "missing_rw_strict":
 		subprocMissingRWStrict()
 		return
+	case "nonutf8_preset":
+		subprocNonUTF8Preset()
+		return
 	}
 	os.Exit(m.Run())
 }
@@ -2888,4 +2891,51 @@ func subprocMissingRWStrict() {
 	}
 	fmt.Fprintln(os.Stderr, "SECURITY REGRESSION: Apply succeeded for non-optional missing ReadWrite path")
 	os.Exit(2)
+}
+
+// TestReadOnlyReviewerNonUTF8RootSkipsManifest 是 R3 发现 1 的回归：
+// ReadOnlyReviewer 备用分支经 os.TempDir()（TMPDIR 指向含非 UTF-8 字节的根）
+// 产生非 UTF-8 privateTmpDir/goExecDir 时，PI_SANDBOX_PRESET_TMP_DIRS 登记键
+// 必须不出现（encoding/json 会把非法 UTF-8 字节有损替换为 U+FFFD 且不报错，
+// 登记的是错误路径）。子进程在独立 mount ns 里把 /tmp 重挂为只读 tmpfs 强制
+// 走备用分支。去掉 preset.go 的 utf8.ValidString 校验后本用例 FAIL（登记键
+// 出现且还原路径被损），红绿对照已本地验证。
+func TestReadOnlyReviewerNonUTF8RootSkipsManifest(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("requires linux mount namespace (GOOS=%s)", runtime.GOOS)
+	}
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), testSubprocEnv+"=nonutf8_preset")
+	out, err := cmd.CombinedOutput()
+	s := string(out)
+	if err != nil {
+		t.Fatalf("nonutf8_preset subprocess failed: %v\noutput:\n%s", err, s)
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "SKIP=") {
+			t.Skipf("subprocess reported unmet precondition: %s", strings.TrimPrefix(line, "SKIP="))
+		}
+		if strings.HasPrefix(line, "FATAL=") {
+			t.Fatalf("subprocess fixture failure: %s", strings.TrimPrefix(line, "FATAL="))
+		}
+	}
+	// 登记键断言：非 UTF-8 路径下必须不登记（policy.Env 无该键）。
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "ENV=") && strings.HasPrefix(strings.TrimPrefix(line, "ENV="), "PI_SANDBOX_PRESET_TMP_DIRS=") {
+			t.Fatalf("non-UTF-8 preset dirs must NOT register %s:\n%s", "PI_SANDBOX_PRESET_TMP_DIRS", s)
+		}
+	}
+	// 夹具生效断言：两目录确为非 UTF-8（备用分支确走到了非 UTF-8 根）。
+	var sawTmpValid, sawExecValid bool
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "VALID_TMP=false") {
+			sawTmpValid = true
+		}
+		if strings.HasPrefix(line, "VALID_EXEC=false") {
+			sawExecValid = true
+		}
+	}
+	if !sawTmpValid || !sawExecValid {
+		t.Fatalf("fixture must produce non-UTF-8 TMPDIR and PI_SANDBOX_GO_EXEC_DIR, output:\n%s", s)
+	}
 }

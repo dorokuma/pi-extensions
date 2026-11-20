@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -364,6 +365,179 @@ func TestBuildPolicyRepinsClaudeConfigDir(t *testing.T) {
 	}
 }
 
+// mustJSONList 按 PI_SANDBOX_PRESET_TMP_DIRS 的 JSON 数组格式序列化
+// 目录清单（登记改用 JSON 后，测试构造清单字面量与生产序列化同型，
+// 且不受路径含 ":" 影响）。
+func mustJSONList(t *testing.T, dirs ...string) string {
+	t.Helper()
+	raw, err := json.Marshal(dirs)
+	if err != nil {
+		t.Fatalf("marshal dir manifest: %v", err)
+	}
+	return string(raw)
+}
+
+// TestCleanupPresetTempDirsNeverDeletesExecParentDir 是创建清单清理的
+// 负向回归（reviewer 发现 1）：Policy.Exec 含用户手工创建的
+// /tmp/pi-reviewer-exec-manual/bin 时，cleanupPresetTempDirsFromPolicy
+// 绝不做「父目录前缀命中即删」的推断式清理——manual 目录及其内容必须
+// 完整保留。反向断言同一登记清单中的真实创建目录仍被递归删除。
+func TestCleanupPresetTempDirsNeverDeletesExecParentDir(t *testing.T) {
+	// 用户手工创建的「形似预设」exec 目录：basename 命中 pi-reviewer-exec-
+	// 前缀、父级在 /tmp 下，但不属于本预设创建清单。
+	manualDir, err := os.MkdirTemp("/tmp", "pi-reviewer-exec-manual-")
+	if err != nil {
+		t.Fatalf("MkdirTemp manual: %v", err)
+	}
+	manualBin := filepath.Join(manualDir, "bin")
+	if err := os.MkdirAll(manualBin, 0o755); err != nil {
+		t.Fatalf("MkdirAll manual bin: %v", err)
+	}
+	manualMarker := filepath.Join(manualDir, "keep.txt")
+	if err := os.WriteFile(manualMarker, []byte("do-not-delete"), 0o600); err != nil {
+		t.Fatalf("WriteFile manual marker: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(manualDir) }()
+
+	// 本预设真实创建的目录（登记进 PI_SANDBOX_PRESET_TMP_DIRS 清单）。
+	revDir, err := os.MkdirTemp("/tmp", "pi-reviewer-")
+	if err != nil {
+		t.Fatalf("MkdirTemp reviewer: %v", err)
+	}
+	execDir, err := os.MkdirTemp("/tmp", "pi-reviewer-exec-")
+	if err != nil {
+		t.Fatalf("MkdirTemp exec: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(execDir, "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll exec bin: %v", err)
+	}
+
+	policy := sandbox.Policy{
+		Env: []string{
+			"TMPDIR=" + revDir,
+			"PI_SANDBOX_GO_EXEC_DIR=" + execDir,
+			"PI_SANDBOX_PRESET_TMP_DIRS=" + mustJSONList(t, revDir, execDir),
+		},
+		ReadWrite: []string{revDir},
+		// Exec 收缩为 <goExecDir>/bin，并混入调用方手工创建的
+		// manual/bin——登记清单口径下它不属于清理目标。
+		Exec: []string{filepath.Join(execDir, "bin"), manualBin},
+	}
+	cleanupPresetTempDirsFromPolicy(policy)
+
+	if _, err := os.Lstat(revDir); !os.IsNotExist(err) {
+		t.Fatalf("registered dir %q must be removed, stat err = %v", revDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("registered dir %q must be removed, stat err = %v", execDir, err)
+	}
+	// 核心负向断言：manual 目录（含 bin/ 与内容）必须完整保留——
+	// 旧实现父目录前缀推断会递归删除整个 manualDir。
+	if _, err := os.Lstat(manualDir); err != nil {
+		t.Fatalf("manual dir %q must NOT be removed, stat err = %v", manualDir, err)
+	}
+	data, err := os.ReadFile(manualMarker)
+	if err != nil || string(data) != "do-not-delete" {
+		t.Fatalf("manual marker must be intact, data=%q err=%v", data, err)
+	}
+	if info, err := os.Lstat(manualBin); err != nil || !info.IsDir() {
+		t.Fatalf("manual bin dir must be intact, err=%v", err)
+	}
+}
+
+// TestCleanupPresetTempDirsUsesBuildPolicyManifest 断言 buildPolicy 捕获的
+// 登记清单（内部键已从最终 env 剥离）驱动清理：返回的 policy 不再含
+// PI_SANDBOX_PRESET_TMP_DIRS，lastPresetTempDirs 仍精确删除本预设创建
+// 的两目录；--env 传入的手工目录不被误伤。
+//
+// 捕获必要性对照（reviewer R2 F3）：本用例在调用 cleanup 前把最终 env 的
+// TMPDIR/PI_SANDBOX_GO_EXEC_DIR 字段替换为无关真实目录——若 buildPolicy
+// 中 lastPresetTempDirs 捕获被删，清理只能走 env 字段兜底（政策里不再含
+// 登记键），登记目录会残留泄漏，本测试立即 FAIL；同时兜底路径会把替代
+// 目录当作预设目录误删（连同其内容），反向断言「替代目录必须完整保留」
+// 一并锁死该行为。红绿对照已本地验证：删捕获行 → FAIL，还原 → PASS。
+func TestCleanupPresetTempDirsUsesBuildPolicyManifest(t *testing.T) {
+	t.Setenv("PIG_HOME", t.TempDir()) // 隔离宿主 pig home
+	workdir := t.TempDir()
+	manualDir, err := os.MkdirTemp("/tmp", "pi-reviewer-exec-manual-")
+	if err != nil {
+		t.Fatalf("MkdirTemp manual: %v", err)
+	}
+	manualBin := filepath.Join(manualDir, "bin")
+	if err := os.MkdirAll(manualBin, 0o755); err != nil {
+		t.Fatalf("MkdirAll manual bin: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(manualDir) }()
+
+	// env 指针遮蔽夹具：替换 TMPDIR/PI_SANDBOX_GO_EXEC_DIR 用的无关真实目录，
+	// 若捕获被删走兜底，这两个目录会被当作预设目录误删。
+	shadowTmpDir := t.TempDir()
+	shadowTmpMarker := filepath.Join(shadowTmpDir, "keep.txt")
+	if err := os.WriteFile(shadowTmpMarker, []byte("do-not-delete"), 0o600); err != nil {
+		t.Fatalf("WriteFile shadow tmp marker: %v", err)
+	}
+	shadowExecDir := t.TempDir()
+	shadowExecMarker := filepath.Join(shadowExecDir, "keep.txt")
+	if err := os.WriteFile(shadowExecMarker, []byte("do-not-delete"), 0o600); err != nil {
+		t.Fatalf("WriteFile shadow exec marker: %v", err)
+	}
+
+	policy, err := buildPolicy(cliConfig{
+		Preset:  "reviewer",
+		WorkDir: workdir,
+		// --env 传入无关键 + 手工 exec 目录：验证登记清单清理不误伤外部目录。
+		Env:  []string{"SBX_TEST_UNRELATED=1", "GOPROXY=off"},
+		Exec: []string{manualBin},
+	})
+	if err != nil {
+		t.Fatalf("buildPolicy: %v", err)
+	}
+	// 内部登记键不得泄进最终 env。
+	if v := envListValue(policy.Env, "PI_SANDBOX_PRESET_TMP_DIRS"); v != "" {
+		t.Fatalf("PI_SANDBOX_PRESET_TMP_DIRS must be stripped from final env, got %q", v)
+	}
+	if envListValue(policy.Env, "SBX_TEST_UNRELATED") != "1" {
+		t.Fatalf("unrelated --env key must survive merge, env=%v", policy.Env)
+	}
+	tmpdir := envListValue(policy.Env, "TMPDIR")
+	execDir := envListValue(policy.Env, "PI_SANDBOX_GO_EXEC_DIR")
+	if !strings.HasPrefix(filepath.Base(tmpdir), "pi-reviewer-") ||
+		!strings.HasPrefix(filepath.Base(execDir), "pi-reviewer-exec-") {
+		t.Fatalf("unexpected preset dirs: TMPDIR=%q EXEC_DIR=%q", tmpdir, execDir)
+	}
+
+	// 遮蔽 env 字段指针：最终 env 的 TMPDIR/PI_SANDBOX_GO_EXEC_DIR 改为
+	// 无关目录后，旧式 env 字段兜底只能指向 shadow 目录——清理只剩
+	// lastPresetTempDirs 一条可信通路（登记键已被 buildPolicy 剥离）。
+	// ReadWrite 仍保留登记目录 rwDir（兜底 rw 前缀命中同样指向登记目录，
+	// 与捕获指向同一目录集，不构成独立旁路）。
+	policy.Env = mergeEnv(policy.Env, []string{
+		"TMPDIR=" + shadowTmpDir,
+		"PI_SANDBOX_GO_EXEC_DIR=" + shadowExecDir,
+	})
+
+	cleanupPresetTempDirsFromPolicy(policy)
+
+	// 反向断言：shadow 目录必须完整保留——兜底路径若被当作预设目录
+	// 误删，说明清理未经登记清单（删除捕获后的泄漏行为即被本断言锁死）。
+	if data, err := os.ReadFile(shadowTmpMarker); err != nil || string(data) != "do-not-delete" {
+		t.Fatalf("shadow TMPDIR dir must be intact, data=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(shadowExecMarker); err != nil || string(data) != "do-not-delete" {
+		t.Fatalf("shadow exec dir must be intact, data=%q err=%v", data, err)
+	}
+
+	if _, err := os.Lstat(tmpdir); !os.IsNotExist(err) {
+		t.Fatalf("preset TMPDIR %q must be removed via manifest, stat err = %v", tmpdir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("preset exec dir %q must be removed via manifest, stat err = %v", execDir, err)
+	}
+	if _, err := os.Lstat(manualDir); err != nil {
+		t.Fatalf("manual dir %q must NOT be removed, stat err = %v", manualDir, err)
+	}
+}
+
 func TestCleanupPresetTempDirsFallbackPath(t *testing.T) {
 	customTmpParent := t.TempDir()
 	t.Setenv("TMPDIR", customTmpParent)
@@ -396,6 +570,130 @@ func TestCleanupPresetTempDirsFallbackPath(t *testing.T) {
 	}
 	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
 		t.Fatalf("expected %q to be removed, stat err = %v", execDir, err)
+	}
+}
+
+// TestCleanupPresetTempDirsColonRootManifest 是 F1 回归：备用根
+// os.TempDir() 经 TMPDIR 设为含 ":" 的目录时，登记清单（JSON 数组）
+// 必须正确还原两个含冒号路径——不误拆成无效段、不误删、能精确清理。
+// 旧冒号分隔序列化在此场景下被 Split 拆成无效段，isPresetTempDir 校验
+// 全失败、非空清单短路返回不再回退兜底，两个真实目录残留泄漏——本
+// 用例在旧实现下必 FAIL（登记目录残留），新实现下 PASS（红绿对照已
+// 本地验证）。
+func TestCleanupPresetTempDirsColonRootManifest(t *testing.T) {
+	// 备用根夹具：含 ":" 的真实目录作为 os.TempDir()。
+	colonRoot := filepath.Join(t.TempDir(), "a:b")
+	if err := os.MkdirAll(colonRoot, 0o700); err != nil {
+		t.Fatalf("MkdirAll colon root: %v", err)
+	}
+	t.Setenv("TMPDIR", colonRoot)
+
+	// 备用目录：位于含冒号根下、基名带固定前缀（与 preset.go
+	// os.MkdirTemp("")/filepath.Join(os.TempDir(), ...) 备用分支同型）。
+	revDir, err := os.MkdirTemp(colonRoot, "pi-reviewer-")
+	if err != nil {
+		t.Fatalf("MkdirTemp reviewer: %v", err)
+	}
+	execDir, err := os.MkdirTemp(colonRoot, "pi-reviewer-exec-")
+	if err != nil {
+		t.Fatalf("MkdirTemp reviewer-exec: %v", err)
+	}
+	if !strings.Contains(revDir, ":") || !strings.Contains(execDir, ":") {
+		t.Fatalf("fixture dirs must contain ':' to cover the colon-root defect: %q %q", revDir, execDir)
+	}
+
+	// 解码层断言：registeredPresetTempDirs 对含冒号清单精确还原两段。
+	manifest := mustJSONList(t, revDir, execDir)
+	got := registeredPresetTempDirs([]string{"PI_SANDBOX_PRESET_TMP_DIRS=" + manifest})
+	if len(got) != 2 || got[0] != revDir || got[1] != execDir {
+		t.Fatalf("registeredPresetTempDirs = %v, want [%q %q]", got, revDir, execDir)
+	}
+
+	// 清理层断言：cleanupPresetTempDirsFromPolicy 按 JSON 清单精确删除
+	// 两个真实目录（不误拆、不误删、不留泄漏）。
+	policy := sandbox.Policy{
+		Env: []string{
+			"TMPDIR=" + revDir,
+			"PI_SANDBOX_GO_EXEC_DIR=" + execDir,
+			"PI_SANDBOX_PRESET_TMP_DIRS=" + manifest,
+		},
+		ReadWrite: []string{revDir},
+		Exec:      []string{filepath.Join(execDir, "bin")},
+	}
+	cleanupPresetTempDirsFromPolicy(policy)
+
+	if _, err := os.Lstat(revDir); !os.IsNotExist(err) {
+		t.Fatalf("colon-root registered dir %q must be removed, stat err = %v", revDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("colon-root registered exec dir %q must be removed, stat err = %v", execDir, err)
+	}
+
+	// 旧冒号格式安全降级：外部塞入的旧格式清单解码失败不得 panic，
+	// 按「无清单」走 env 字段兜底。
+	legacy := "PI_SANDBOX_PRESET_TMP_DIRS=" + revDir + string(os.PathListSeparator) + execDir
+	legacyGot := registeredPresetTempDirs([]string{legacy})
+	_ = legacyGot // 不 panic 即达标（返回 nil 或还原结果均为安全降级）
+}
+
+// TestCleanupPresetTempDirsNonUTF8RootFallback 是 R3 发现 1 的兜底回归：
+// TMPDIR 指向含非 UTF-8 字节的根时，ReadOnlyReviewer 备用分支产生的
+// privateTmpDir/goExecDir 均为非 UTF-8 路径——preset.go 登记侧 utf8.ValidString
+// 校验使登记键缺失（JSON 无法无损承载非 UTF-8 路径），清理必须走保留原始
+// 字节的 env/ReadWrite 兜底。本用例验证兜底路径（isPresetTempDir 的
+// allowedTempRoots 以原始字节 os.TempDir() 前缀比对）对非 UTF-8 目录仍能精确
+// 删除——不 panic、不残留。
+func TestCleanupPresetTempDirsNonUTF8RootFallback(t *testing.T) {
+	// lastPresetTempDirs 是包级变量、由 buildPolicy 填充；隔离本用例，避免
+	// 先前测试（TestCleanupPresetTempDirsUsesBuildPolicyManifest 等）残留的
+	// 清单短路兜底路径造成假残留。
+	lastPresetTempDirs = nil
+	t.Cleanup(func() { lastPresetTempDirs = nil })
+
+	// 非 UTF-8 备用根（真实存在的目录，基名含 \xff）。
+	nonUTF8Root := filepath.Join(t.TempDir(), "root-"+string([]byte{0xff}))
+	if err := os.MkdirAll(nonUTF8Root, 0o700); err != nil {
+		t.Fatalf("MkdirAll non-UTF8 root: %v", err)
+	}
+	t.Setenv("TMPDIR", nonUTF8Root)
+
+	// 夹具两目录与 preset.go 备用分支同型（os.MkdirTemp(<非UTF8根>)）。
+	revDir, err := os.MkdirTemp(nonUTF8Root, "pi-reviewer-")
+	if err != nil {
+		t.Fatalf("MkdirTemp reviewer (non-UTF8 root): %v", err)
+	}
+	execDir, err := os.MkdirTemp(nonUTF8Root, "pi-reviewer-exec-")
+	if err != nil {
+		t.Fatalf("MkdirTemp reviewer-exec (non-UTF8 root): %v", err)
+	}
+	if utf8.ValidString(revDir) || utf8.ValidString(execDir) {
+		t.Fatalf("fixture dirs must be non-UTF-8: %q %q", revDir, execDir)
+	}
+
+	// 反向佐证：encoding/json 对非 UTF-8 字符串有损替换 U+FFFD 不报错——
+	// 证明登记侧若不校验 UTF-8 就会写入与真实目录不符的被损清单。
+	lossy := mustJSONList(t, revDir, execDir)
+	decoded := registeredPresetTempDirs([]string{"PI_SANDBOX_PRESET_TMP_DIRS=" + lossy})
+	if len(decoded) == 2 && decoded[0] == revDir && decoded[1] == execDir {
+		t.Fatalf("json round-trip of non-UTF-8 path unexpectedly lossless: %q", decoded)
+	}
+
+	// 兜底断言：policy.Env 无登记键，cleanupPresetTempDirsFromPolicy 经
+	// TMPDIR/PI_SANDBOX_GO_EXEC_DIR/ReadWrite 字段兜底删除两个非 UTF-8 目录。
+	policy := sandbox.Policy{
+		Env: []string{
+			"TMPDIR=" + revDir,
+			"PI_SANDBOX_GO_EXEC_DIR=" + execDir,
+		},
+		ReadWrite: []string{revDir},
+	}
+	cleanupPresetTempDirsFromPolicy(policy)
+
+	if _, err := os.Lstat(revDir); !os.IsNotExist(err) {
+		t.Fatalf("non-UTF-8 registered dir %q must be removed via fallback, stat err = %v", revDir, err)
+	}
+	if _, err := os.Lstat(execDir); !os.IsNotExist(err) {
+		t.Fatalf("non-UTF-8 exec dir %q must be removed via fallback, stat err = %v", execDir, err)
 	}
 }
 

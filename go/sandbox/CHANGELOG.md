@@ -46,15 +46,26 @@
     `PI_SANDBOX_HELPER_CFG`/`PI_SANDBOX_BROKER_CFG` 三枚内部指针键；
     `buildPolicy` 对 `reviewer` 与 `reviewer-agent` 两个预设统一捕获并
     回钉 `PI_SANDBOX_GO_EXEC_DIR`；`cleanupPresetTempDirsFromPolicy`
-    遍历 `Policy.Exec` 时同时识别条目本体或其父目录匹配
-    `pi-reviewer-exec-`（适配 `Policy.Exec` 收缩为 `<goExecDir>/bin`
-    后的兜底清理）。
-  - **行为变化预告（阶段 3 拆除 broker 前同步）**：`Policy.Exec` 收缩为
-    `<goExecDir>/bin` 后，沙盒内 `go test`/`go run` 的 `.test`/构建产物
-    不再对审查员主进程直接可执行——产物执行改经 `pi-test-runner`（位于
-    `bin/` 内）在自身 Landlock 域内经 `PI_SANDBOX_GO_TEST_WORK` 追加放行
-    后完成；直接 `exec` `<goExecDir>/work/*` 或在 `GOTMPDIR` 下执行
-    产物将收到 `EACCES`。
+    的清理身份改为「预设创建时经 `PI_SANDBOX_PRESET_TMP_DIRS` 登记的
+    私有临时目录清单」——`ReadOnlyReviewer` 创建 `privateTmpDir`/
+    `goExecDir` 后把二者绝对路径写入该内部 env 键，`buildPolicy`
+    返回前捕获并从最终 env 剔除；清理只删登记集合（逐项保留
+    `isPresetTempDir` 形态二次确认），不再对 `Policy.Exec` 做
+    「条目本体或父目录前缀命中即删」的推断式清理（调用方经
+    `--exec /tmp/pi-reviewer-exec-manual/bin` 传入的形似路径不再
+    被误判为本预设创建而递归误删其父目录）。无登记清单时（单测/
+    外部调用方手工构造 policy）才回退旧的 env 字段推断
+    （TMPDIR/GOTMPDIR/PI_SANDBOX_GO_EXEC_DIR）+ ReadWrite 前缀命中，
+    `Policy.Exec` 一律不参与清理推断。
+  - **行为变化预告（分阶段归属，阶段 3 拆除 broker 前同步）**：
+    `Policy.Exec` 收缩为 `<goExecDir>/bin` 是**本阶段（阶段 2）已生效**
+    的收紧——自此沙盒内 `go test`/`go run` 的 `.test`/构建产物不再对
+    审查员主进程直接可执行（直接 `exec` `<goExecDir>/work/*` 或在
+    `GOTMPDIR` 下执行产物收到 `EACCES`）；「产物执行改经
+    `pi-test-runner`（位于 `bin/` 内）在自身 Landlock 域内经
+    `PI_SANDBOX_GO_TEST_WORK` 追加放行后完成」是**阶段 3 才完整落地**
+    的收口——阶段 2 仍保留 broker/helper 旧路径，仅其 `Exec` 授权范围
+    已随 `<goExecDir>/bin` 收缩同步收紧。
 
 ### Added
 

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // ReviewerReportSubdir 是 ReadOnlyReviewer 在 workdir 下默认开放写权限的报告目录名。
@@ -34,6 +35,20 @@ var claudeSharedProjectsRoot = filepath.Join(herdrRoleSessionsRoot, "claude-proj
 
 const (
 	envGoExecDirKey = "PI_SANDBOX_GO_EXEC_DIR"
+	// envPresetTempDirsKey 登记预设构造阶段实际创建的私有临时目录清单
+	//（JSON 字符串数组序列化，绝不使用 os.PathListSeparator 分隔——
+	// 备用根 os.TempDir() 可经 TMPDIR 设为含 ":" 的目录，冒号分隔
+	// 序列化会把含冒号路径拆成无效段，导致 isPresetTempDir 校验全部
+	// 失败、非空清单短路返回不再回退兜底，两个真实目录（含私有凭据
+	// 副本）残留泄漏）。ReadOnlyReviewer 在 privateTmpDir/goExecDir
+	// 创建完成后把两条登记路径写入本键；sbx 在 buildPolicy 完成后
+	// 将该键从最终 env 删除并转交 cleanupPresetTempDirsFromPolicy——
+	// 清理集合必须来自本次创建的登记清单，绝不从 Policy.Exec/Env
+	// 用父目录前缀反推（调用方经 --exec /tmp/pi-reviewer-exec-manual/bin
+	// 传入的形似路径不属于本预设创建，推断式清理会递归误删其整个
+	// 父目录）。该键是内部实现细节，不进入受限子进程最终 env，不属
+	// 调用方可控输入。
+	envPresetTempDirsKey = "PI_SANDBOX_PRESET_TMP_DIRS"
 	// envGoTestWorkDirKey 仅在 broker 启动 go test 时由 helper 注入，让
 	// pi-test-runner 能把 <goExecDir>/work（.test 产物所在，helper 可写域）
 	// 经 cfg.Exec 单独放行执行；审查员进程侧绝不持有该键——Policy.Exec
@@ -677,6 +692,26 @@ func ReadOnlyReviewer(workdir string) Policy {
 		"GOCACHE=" + goCacheDir,
 		"PATH=" + newPath,
 		envGoExecDirKey + "=" + goExecDir,
+	}
+	// 创建清单登记（见 envPresetTempDirsKey）：本次预设实际创建的
+	// privateTmpDir/goExecDir 绝对路径，是清理动作唯一可信的身份来源。
+	// JSON 字符串数组序列化（不用 PathListSeparator 冒号分隔）：备用根
+	// os.TempDir() 可含 ":"，冒号序列化会被 Split 拆成无效段造成清单
+	// 校验全失败、真实目录泄漏。两绝对路径的 json.Marshal 不会失败，
+	// 仍按规范处理返回值：失败则不登记，清理走既有兜底而非携带
+	// 损坏清单。
+	// UTF-8 合法性前置校验：JSON 字符串类型无法无损承载任意字节路径——
+	// encoding/json 对字符串内非法 UTF-8 字节静默替换为 U+FFFD 且不报错
+	// （encode.go appendString）。备用根 os.TempDir() 经 TMPDIR 可含非 UTF-8
+	// 字节（Linux 合法路径），其下 privateTmpDir/goExecDir 若被有损登记，
+	// 消费侧还原出的路径与真实目录不符，isPresetTempDir 前缀比对全失败
+	// 且非空清单短路返回阻断 env/ReadWrite 兜底，两个真实目录（含私有
+	// 凭据副本）残留泄漏。登记侧 fail-safe 为「不登记」而非「有损登记」——
+	// 不登记时清理走保留原始字节的既有 env/ReadWrite 兜底。
+	if utf8.ValidString(privateTmpDir) && utf8.ValidString(goExecDir) {
+		if raw, err := json.Marshal([]string{privateTmpDir, goExecDir}); err == nil {
+			envList = append(envList, envPresetTempDirsKey+"="+string(raw))
+		}
 	}
 	if realGoBin != "" {
 		envList = append(envList, envRealGoBinKey+"="+realGoBin)

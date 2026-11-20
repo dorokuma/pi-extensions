@@ -813,12 +813,25 @@ func (f *warmTestFixture) stampPath() string {
 
 // removePresetTempDirs 清理 ReviewerAgentWithEnv 生成的私有临时目录
 // （pi-reviewer-* / pi-reviewer-exec-*），防止测试泄漏到 /tmp。
+// 优先使用预设登记的 PI_SANDBOX_PRESET_TMP_DIRS 清单（JSON 字符串数组，
+// Exec 收缩为 <goExecDir>/bin 后 basename 不再命中前缀，登记清单是
+// 唯一可靠的 execDir 身份来源）；无清单或解码失败时回退 ReadWrite/Exec
+// 前缀命中（旧行为）。
 func removePresetTempDirs(t *testing.T, p Policy) {
 	t.Helper()
 	drop := func(path string) {
 		base := filepath.Base(filepath.Clean(path))
 		if strings.HasPrefix(base, "pi-reviewer-") {
 			_ = os.RemoveAll(path)
+		}
+	}
+	if raw := lookupEnvValue(p.Env, "PI_SANDBOX_PRESET_TMP_DIRS"); raw != "" {
+		var dirs []string
+		if err := json.Unmarshal([]byte(raw), &dirs); err == nil && len(dirs) > 0 {
+			for _, dir := range dirs {
+				drop(dir)
+			}
+			return
 		}
 	}
 	for _, rw := range p.ReadWrite {
@@ -3234,12 +3247,26 @@ func TestValidateTrustedPigDirAncestorChain(t *testing.T) {
 			}
 		}
 		// 本地构造等价夹具（非 root/他属主场景同样覆盖末级 sticky 拒绝）。
+		// 注意：os.Chmod 的 FileMode 参数中 0o1000 位不映射为 sticky
+		//（实测 mode=020000000777、ModeSticky=false）——必须用
+		// syscall.Chmod 直接置 sticky 位，并在断言行显式确认
+		// ModeSticky 已生效，防止夹具「以为 sticky 实际只是 0777」。
 		stickyLeaf := filepath.Join(t.TempDir(), "sticky-home")
 		if err := os.MkdirAll(stickyLeaf, 0o777); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(stickyLeaf, 0o1777); err != nil {
+		if err := syscall.Chmod(stickyLeaf, 0o1777); err != nil {
 			t.Fatal(err)
+		}
+		info, err := os.Lstat(stickyLeaf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&os.ModeSticky == 0 {
+			t.Fatalf("fixture must carry real sticky bit (mode=%#o)", info.Mode())
+		}
+		if info.Mode().Perm()&0o022 == 0 {
+			t.Fatalf("fixture must be world-writable (perm=%#o)", info.Mode().Perm())
 		}
 		if validateTrustedPigDir(stickyLeaf, "PIG_HOME") {
 			t.Fatalf("sticky world-writable leaf %q must be rejected as PIG_HOME", stickyLeaf)
@@ -3328,26 +3355,84 @@ func TestValidateTrustedPigDirAncestorChain(t *testing.T) {
 		// 默认 <pigHome>/agent 为软链时 sel.sourceTrusted=false：配置
 		// 复制源回退空私有 pig-agent，宿主 settings.json 不得被拷入
 		//（闭合默认层校验，oracle 应修 #2）。
+		//
+		// 本用例直测真实 ReviewerAgentWithEnv（不再由测试模拟
+		// `if !sel.sourceTrusted { src = dst }` 回退）：若生产代码
+		// preset.go 的 `!sel.sourceTrusted` 条件被删，软链目标里的
+		// 宿主 settings.json 会被原样拷入私有 pig-agent，以下对真实
+		// Policy 输出/私有目录内容的断言立即 FAIL——断言对象必须是
+		// ReviewerAgentWithEnv 产物而非 resolveAgentDirSelection
+		// 中间字段（后者仅作辅助佐证）。
+		//
+		// 宿主 env 隔离（reviewer R2 F3）：显式清空 PIG_CODING_AGENT_DIR/
+		// PI_CODING_AGENT_DIR/PIG_USE_PI_DIRS，确保 ReviewerAgentWithEnv
+		// 实际进入「默认 <pigHome>/agent 不可信来源」分支，而非因宿主
+		// 环境残留走 HostEnv/Custom 路径——仅凭测试名不能证明覆盖默认层。
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		unsetEnv(t, "PIG_USE_PI_DIRS")
 		pigHome := t.TempDir()
 		realAgent := t.TempDir()
-		if err := os.WriteFile(filepath.Join(realAgent, "settings.json"), []byte(`{"extensions":["evil"]}`), 0o644); err != nil {
+		evilSettings := `{"extensions":["evil-marker-untrusted-default"]}`
+		if err := os.WriteFile(filepath.Join(realAgent, "settings.json"), []byte(evilSettings), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(realAgent, filepath.Join(pigHome, "agent")); err != nil {
 			t.Fatal(err)
 		}
-		dst := filepath.Join(t.TempDir(), "pig-agent")
-		sel := resolveAgentDirSelection(pigHome, nil)
-		if sel.sourceTrusted {
+		// 辅助断言：选源层同样必须判不可信（与 ReviewerAgentWithEnv
+		// 内部使用的同一 resolveAgentDirSelection 结果）。
+		if sel := resolveAgentDirSelection(pigHome, nil); sel.sourceTrusted {
 			t.Fatalf("default <pigHome>/agent symlink must be untrusted")
 		}
-		src := sel.sourceDir
-		if sel.sourceTrusted == false {
-			src = dst // 与 ReviewerAgentWithEnv 同口径回退私有
+
+		// 真实调用：pigHome 为可信根（t.TempDir 0700），其默认 agent
+		// 层是软链（不可信）→ ReviewerAgentWithEnv 必须把复制/扩展
+		// 发现源回退到空私有 pig-agent，并把有效 AgentDir 双键钉到
+		// 该私有目录；宿主 settings.json 绝不得进入私有副本。
+		policy := ReviewerAgentWithEnv(t.TempDir(), []string{"PIG_HOME=" + pigHome})
+		t.Cleanup(func() { removePresetTempDirs(t, policy) })
+
+		tmpDir := lookupEnvValue(policy.Env, "TMPDIR")
+		privatePigAgent := filepath.Join(tmpDir, "pig-agent")
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			if got := lookupEnvValue(policy.Env, key); got != privatePigAgent {
+				t.Fatalf("%s must point to private pig-agent %q, got %q", key, privatePigAgent, got)
+			}
 		}
-		preparePrivatePigAgentDirFromAgent(dst, src)
-		if _, err := os.Lstat(filepath.Join(dst, "settings.json")); !os.IsNotExist(err) {
-			t.Fatalf("host settings.json must not be copied from untrusted default agent dir")
+		// 私有 pig-agent 不得存在 settings.json（软链目标未含扩展目录，
+		// 无最小注入）；若存在也不得含宿主投毒内容。
+		if data, err := os.ReadFile(filepath.Join(privatePigAgent, "settings.json")); err == nil {
+			if strings.Contains(string(data), "evil-marker-untrusted-default") {
+				t.Fatalf("host settings.json content leaked into private pig-agent: %s", data)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat private settings.json: %v", err)
+		}
+
+		// 第二层：默认 agent 层 0777 全局可写（同型不可信）同样回退。
+		pigHome2 := t.TempDir()
+		agentDir2 := filepath.Join(pigHome2, "agent")
+		if err := os.MkdirAll(agentDir2, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(agentDir2, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		evil2 := `{"extensions":["evil-marker-ww-default"]}`
+		if err := os.WriteFile(filepath.Join(agentDir2, "settings.json"), []byte(evil2), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		policy2 := ReviewerAgentWithEnv(t.TempDir(), []string{"PIG_HOME=" + pigHome2})
+		t.Cleanup(func() { removePresetTempDirs(t, policy2) })
+		tmpDir2 := lookupEnvValue(policy2.Env, "TMPDIR")
+		privatePigAgent2 := filepath.Join(tmpDir2, "pig-agent")
+		if data, err := os.ReadFile(filepath.Join(privatePigAgent2, "settings.json")); err == nil {
+			if strings.Contains(string(data), "evil-marker-ww-default") {
+				t.Fatalf("host settings.json content leaked into private pig-agent (0777 dir): %s", data)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat private settings.json: %v", err)
 		}
 	})
 
@@ -3508,9 +3593,14 @@ func TestAppendCellCachePolicyResolvesArtifactRealPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	// digest0003 的 ready.json：size 按 linkRunner 的 Lstat（软链本体）
-	// 大小写入，保证 validCellEntryDir 能命中该条目（其 Lstat 口径读到
-	// 的是软链本体）；软链产物在 appendCellCachePolicy 的 Lstat+解析
-	// 校验处被拒之门外。
+	// 大小写入——软链本体 Lstat 大小与 ready.json 一致时，本夹具在
+	// 第一层就被 validCellEntryDir 的 `!info.Mode().IsRegular()` 拒绝
+	//（Lstat 读到的是软链本体、非常规文件，size 校验与其独立并列，
+	// 任何 ready size 都无法让软链通过 validCellEntryDir），ok=false
+	// 先于 appendCellCachePolicy 的 artifact Lstat 分支返回。
+	// appendCellCachePolicy 内第二层 artifact Lstat
+	//（`!IsRegular() || ModeSymlink != 0`）是独立再次检查，不由本例
+	// 直接覆盖——双重防线均在入 Policy.Exec 之前。
 	lst, err := os.Lstat(linkRunner)
 	if err != nil {
 		t.Fatal(err)
