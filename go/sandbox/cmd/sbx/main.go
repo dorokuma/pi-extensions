@@ -552,10 +552,36 @@ func isAgentPreset(name string) bool {
 	return name == "reviewer-agent"
 }
 
-// fd3Active 探测 fd 3 是否为有效打开描述符（F_GETFD）。
-func fd3Active() bool {
+// fd3Open 宽松判定 fd 3 当前是否为有效打开描述符（F_GETFD 成功）。
+// 仅用于「该 fd3 已被 sealInheritedFD3 确认为 debugW 写端」之后的内部
+// 状态检查（acquireFd3File / runChildFromEnv 恢复与转发判定）——身份识别
+// 一律走 fd3Active 的严格判定，绝不凭 fd3Open 接管描述符。
+func fd3Open() bool {
 	_, err := unix.FcntlInt(3, unix.F_GETFD, 0)
 	return err == nil
+}
+
+// fd3Active 判定 fd 3 是否是「claude-pty 经 ExtraFiles 继承的 debugW
+// 写端」形态的描述符（sealInheritedFD3 入口唯一身份判定点）：
+//   - F_GETFD 成功且 flags&FD_CLOEXEC==0：ExtraFiles 传入的 fd3 不携带
+//     CLOEXEC；带 CLOEXEC 的 fd3 一律是 Go runtime 自身描述符（plain 模式
+//     下 runtime 会把 fd 3 分给 epoll，anon_inode:[eventpoll] 且
+//     FD_CLOEXEC），绝不能冒认为 debugW 而接管关闭（误关 epoll 会触发
+//     runtime: epollwait on fd 3 failed with 9 的 netpoll fatal）；
+//   - unix.Fstat 类型必须是管道（S_IFIFO，claude-pty debugW 真实形态）
+//     或普通文件（S_IFREG，调用方以文件重定向 debug 写端的等价形态）；
+//     anon_inode/socket/目录/设备等一律拒绝。
+func fd3Active() bool {
+	flags, err := unix.FcntlInt(3, unix.F_GETFD, 0)
+	if err != nil || flags&unix.FD_CLOEXEC != 0 {
+		return false
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(3, &st); err != nil {
+		return false
+	}
+	mode := st.Mode & unix.S_IFMT
+	return mode == unix.S_IFIFO || mode == unix.S_IFREG
 }
 
 // sealInheritedFD3 在 agent 预设入口对继承的 fd3 置 FD_CLOEXEC：claude-pty
@@ -589,7 +615,8 @@ func acquireFd3File() (*os.File, error) {
 	if fd3Owner.f != nil {
 		return fd3Owner.f, nil
 	}
-	if !fd3Active() {
+	// fd3 身份已由 sealInheritedFD3（严格 fd3Active）确认，此处仅判「还开着」。
+	if !fd3Open() {
 		return nil, errors.New("fd3 not open")
 	}
 	f := os.NewFile(3, "claude-debug")
@@ -715,6 +742,12 @@ func runMain(args []string) int {
 	return runSandboxedChild(bin, cfg, policy, fd3Fwd)
 }
 
+// childSysProcAttrForRun 是派生受限子进程用的 SysProcAttr 取值点（默认
+// 直指 childSysProcAttr，Linux 下含三命名空间联合 Cloneflags）。提取为包内
+// 未导出变量仅供同包单测注入非法 Cloneflags 驱动真实 cmd.Start() 失败路径；
+// 无任何环境变量/命令行/配置开启入口，生产恒为 childSysProcAttr。
+var childSysProcAttrForRun = childSysProcAttr
+
 // runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与目标命令启动；
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
 // 能够在子进程退出后清理 /tmp/pi-reviewer-* 与 /tmp/pi-reviewer-exec-*。
@@ -741,7 +774,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd 
 	relay := maybeStartReportRelay(cfg, policy.Env)
 	defer relay.close()
 
-	sysProcAttr := childSysProcAttr()
+	sysProcAttr := childSysProcAttrForRun()
 	spec := childExecSpec{
 		Bin:               bin,
 		Command:           cfg.Command,
@@ -800,6 +833,10 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd 
 			}
 		}
 		if err != nil {
+			// Start 最终失败退 126 前对称释放 fd3 owner：撤销终结器并
+			// 关闭父侧 fd3，避免 relay.close() 期间悬持写端，且保证同
+			// 进程单测重入时 fd3Owner.f 归零（oracle T1/SF-2）。
+			closeFD3(fd3Fwd)
 			fmt.Fprintf(os.Stderr, "sbx: start sandboxed child failed: %v\n", err)
 			return 126
 		}
@@ -873,7 +910,7 @@ func runChildFromEnv() int {
 	// agent 预设：fd3 经外层 ExtraFiles 传入后为非 CLOEXEC，必须在
 	// sandbox.Apply 派生 helper/broker 前置 CLOEXEC，杜绝辅助进程继承
 	// debugW 写端；目标进程由 runAsSandboxInit 经 ExtraFiles 显式接收。
-	if spec.FD3Forward && fd3Active() {
+	if spec.FD3Forward && fd3Open() {
 		unix.CloseOnExec(3)
 	}
 	if err := sandbox.Apply(policy); err != nil {
@@ -895,7 +932,7 @@ func runChildFromEnv() int {
 	// FD_CLOEXEC=0，让内核 exec 保留 fd3 透传到目标进程（替代
 	// ExtraFiles——syscall.Exec 无 ExtraFiles 概念）；目标退出后
 	// drainDebug 收到 EOF。非 agent 预设保持 CLOEXEC 不转发。
-	if spec.FD3Forward && fd3Active() {
+	if spec.FD3Forward && fd3Open() {
 		_, _ = unix.FcntlInt(3, unix.F_SETFD, 0)
 	}
 	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
@@ -943,6 +980,10 @@ func runAsSandboxInit(bin string, argv []string, env []string, fd3Fwd bool) int 
 	// 置 CLOEXEC 阻断 helper/broker 继承；此处显式放行最终目标）。
 	forwardFD3ToChild(cmd, fd3Fwd)
 	if err := cmd.Start(); err != nil {
+		// Start 失败退 126 前对称释放 fd3 owner（与 runSandboxedChild
+		// 同口径）：撤销终结器并关闭父侧 fd3，避免目标启动失败时
+		// 写端残留劫持 drainDebug EOF。
+		closeFD3(fd3Fwd)
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
 		return 126
 	}

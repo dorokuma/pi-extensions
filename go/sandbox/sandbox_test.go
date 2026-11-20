@@ -917,6 +917,61 @@ func subprocReviewerGoToolchain() {
 		}
 	}
 
+	// 6. MF-1：沙盒内借 broker 写权限向 <goExecDir>/work 写入可执行文件的三路
+	//    攻击必须全部被封死，且即便有产物落入 work/ 也不得被审查员进程执行
+	//   （Policy.Exec 已收缩到 <goExecDir>/bin）。
+	goExecDir := os.Getenv("PI_SANDBOX_GO_EXEC_DIR")
+	if goExecDir != "" {
+		tmpDir := os.Getenv("TMPDIR")
+		// 路径 A：$TMPDIR 软链 -o 指向 <goExecDir>/work —— 包装器/broker 必须
+		// 解析首个存在祖先软链后拒绝，绝不在 work/ 下落产物。
+		symLink := filepath.Join(tmpDir, "sym-work")
+		if err := os.Symlink(filepath.Join(goExecDir, "work"), symLink); err == nil {
+			if out, err := exec.Command("go", "build", "-o", filepath.Join(symLink, "pwn1"), "./cmd/demo").CombinedOutput(); err == nil {
+				fmt.Fprintf(os.Stderr, "SECURITY BREACH: go build -o via symlink %s succeeded (wrote into goExecDir/work)\noutput:%s\n", symLink, string(out))
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "note: symlink %s failed: %v\n", symLink, err)
+		}
+		// 路径 B：缺省 -o + cwd=<goExecDir>/work —— broker 必须拒绝 cwd 落在
+		// 受保护可写执行目录内的构建。
+		if out, err := exec.Command("go", "build", "./cmd/demo").CombinedOutput(); err == nil {
+			// cwd 合法（workDir）时 build 成功属于正常流程，不在此断言。
+			_ = out
+		}
+		cwdCmd := exec.Command("go", "build", workDir)
+		cwdCmd.Dir = filepath.Join(goExecDir, "work")
+		if out, err := cwdCmd.CombinedOutput(); err == nil {
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go build with cwd=%s succeeded (default -o wrote into goExecDir/work)\noutput:%s\n", cwdCmd.Dir, string(out))
+			os.Exit(1)
+		}
+		// 路径 C：-ldflags/-gcflags 外部链接器外挂标志必须被拒。
+		for _, flagArgs := range [][]string{
+			{"build", "-ldflags=-linkmode=external -extld=/bin/sh", "-o", filepath.Join(tmpDir, "dummy1"), "./cmd/demo"},
+			{"build", "-gcflags=-N", "./cmd/demo"},
+			{"test", "-ldflags=all=-linkmode=external", "./..."},
+		} {
+			if out, err := exec.Command("go", flagArgs...).CombinedOutput(); err == nil {
+				fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded\noutput:%s\n", flagArgs, string(out))
+				os.Exit(1)
+			}
+		}
+		// 终态：<goExecDir>/work 下不得有可被执行的攻击产物——Policy.Exec
+		// 收缩到 bin/ 后，work/ 内任何文件对审查员均无执行授权。
+		if entries, err := os.ReadDir(filepath.Join(goExecDir, "work")); err == nil {
+			for _, ent := range entries {
+				p := filepath.Join(goExecDir, "work", ent.Name())
+				if st, statErr := os.Stat(p); statErr == nil && !st.IsDir() {
+					if execErr := exec.Command(p).Run(); execErr == nil {
+						fmt.Fprintf(os.Stderr, "SECURITY BREACH: %s under goExecDir/work executed!\n", p)
+						os.Exit(1)
+					}
+				}
+			}
+		}
+	}
+
 	os.Exit(0)
 }
 
@@ -1746,9 +1801,79 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		t.Setenv("PIG_CODING_AGENT_DIR", "/custom/agent")
 		policy := sandbox.ReviewerAgent(workDir)
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
-		got := parseEnvMap(policy.Env)["PIG_CODING_AGENT_DIR"]
-		if !strings.HasPrefix(got, os.TempDir()) || !strings.HasSuffix(got, "pig-agent") {
-			t.Fatalf("host PIG_CODING_AGENT_DIR must be pinned to private pig-agent, got %q", got)
+		envMap := parseEnvMap(policy.Env)
+		got := envMap["PIG_CODING_AGENT_DIR"]
+		// 生产 ReadOnlyReviewer 固定在 /tmp 创建 pi-reviewer-* 私有 TMPDIR
+		//（不跟随调用方 os.TempDir()）：断言必须相对策略实际产出的私有
+		// TMPDIR 拼接 pig-agent，而不是假设它落在 os.TempDir() 下——自定义
+		// TMPDIR 环境下旧断言恒红。
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		if want := filepath.Join(privateTmp, "pig-agent"); got != want {
+			t.Fatalf("host PIG_CODING_AGENT_DIR must be pinned to private pig-agent under policy TMPDIR, got %q want %q", got, want)
+		}
+		if got == "/custom/agent" {
+			t.Fatalf("host PIG_CODING_AGENT_DIR residual leaked: %q", got)
+		}
+		if !(strings.HasPrefix(privateTmp, "/tmp/pi-reviewer-") || strings.HasPrefix(privateTmp, os.TempDir())) {
+			t.Fatalf("policy TMPDIR %q is neither /tmp/pi-reviewer-* nor under os.TempDir()", privateTmp)
+		}
+	})
+
+	t.Run("host PI switch alone must not activate cfgEnv PI dir", func(t *testing.T) {
+		// resolveAgentDirSelection 收紧：显式层（agentDirOriginCfgEnv /
+		// trustedCustom）的 PI 入口要求 PIG_USE_PI_DIRS=1 与
+		// PI_CODING_AGENT_DIR 同在 cfgEnv 内显式声明；开关仅来自宿主
+		// 环境时 cfgEnv 的 PI 值不得冒认受信自定义，双键仍回钉私有
+		// pig-agent（宿主开关只在 HostEnv 层作复制/预热源）。
+		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+		t.Setenv("PIG_USE_PI_DIRS", "1") // 宿主开关残留
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		custom := filepath.Join(t.TempDir(), "pi-agent")
+		if err := os.MkdirAll(custom, 0o700); err != nil {
+			t.Fatalf("mkdir custom pi-agent: %v", err)
+		}
+		if err := os.Chmod(custom, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		policy := sandbox.ReviewerAgentWithEnv(workDir, []string{"PI_CODING_AGENT_DIR=" + custom})
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		want := filepath.Join(privateTmp, "pig-agent")
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			if got := envMap[key]; got != want {
+				t.Fatalf("%s = %q, want private %q: host-only PIG_USE_PI_DIRS=1 must not promote cfgEnv PI dir to trusted custom", key, got, want)
+			}
+		}
+	})
+
+	t.Run("host PI switch activates only host PI dir as copy source", func(t *testing.T) {
+		// 同一宿主开关只参与 HostEnv 层：宿主 PIG_USE_PI_DIRS=1 + 宿主
+		// PI_CODING_AGENT_DIR（均未经 --env 显式声明）选源仅作配置复制/
+		// 预热发现源，最终有效目录仍回钉私有 pig-agent。
+		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+		t.Setenv("PIG_USE_PI_DIRS", "1")
+		t.Setenv("PI_CODING_AGENT_DIR", "/host/pi-agent")
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		want := filepath.Join(privateTmp, "pig-agent")
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			if got := envMap[key]; got != want {
+				t.Fatalf("%s = %q, want private %q: host PI_CODING_AGENT_DIR must remain copy-source only", key, got, want)
+			}
 		}
 	})
 

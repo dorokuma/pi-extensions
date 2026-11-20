@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -925,7 +926,7 @@ func TestWarmGoExtensionCellsBundledColdStart(t *testing.T) {
 	// 受控 PATH 白名单：仅固定可信目录 + 首个条目允许为沙盒对齐的真实 go
 	// 所在目录（resolveRealGoBinary 与沙盒同口径选出，保证 cell 摘要命中）。
 	realGoDir := ""
-	if rg := resolveRealGoBinary(""); rg != "" {
+	if rg := resolveSandboxRealGoBinary(""); rg != "" {
 		realGoDir = filepath.Dir(rg)
 	}
 	for i, seg := range strings.Split(childPath, string(os.PathListSeparator)) {
@@ -1810,6 +1811,35 @@ func TestResolvePigHomeAndSourceAgentDirSemantics(t *testing.T) {
 		}
 	})
 
+	t.Run("PI via cfg dir but host-only PIG_USE_PI_DIRS is not CfgEnv", func(t *testing.T) {
+		// resolveAgentDirSelection 收紧：PIG_USE_PI_DIRS=1 仅来自宿主环境时，
+		// cfgEnv 显式 PI_CODING_AGENT_DIR 不得归入 CfgEnv（trustedCustom）；
+		// HostEnv 层要求 PI 键未在 cfgEnv 出现（!piInCfg 不成立），同样不
+		// 命中——直接回落 Default 层（私有回钉）。宿主开关残留是旧口径下
+		// 显式受信语义被越权激活的混淆通道。
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		t.Setenv("PIG_USE_PI_DIRS", "1")
+		custom := filepath.Join(t.TempDir(), "pi-agent")
+		if err := os.MkdirAll(custom, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(custom, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		sel := resolveAgentDirSelection(fakeHome, []string{"PI_CODING_AGENT_DIR=" + custom})
+		if sel.origin == agentDirOriginCfgEnv || sel.trustedCustom {
+			t.Fatalf("host-only PIG_USE_PI_DIRS=1 must not promote cfgEnv PI dir to CfgEnv/trustedCustom: sel=%+v", sel)
+		}
+		// cfgEnv 已显式声明 PI 键，HostEnv 层（要求键未在 cfg 出现）同样
+		// 不命中——既非 CfgEnv 受信也非 HostEnv 复制源，落 Default 回钉
+		// 私有目录：宿主开关残留无法借显式 PI 值冒认受信自定义，也不能
+		// 把显式 PI 值静默降级成宿主复制源。
+		if sel.origin != agentDirOriginDefault {
+			t.Fatalf("host-only switch + cfg PI dir must fall to Default (private pin): sel=%+v want origin=Default", sel)
+		}
+	})
+
 	t.Run("ReviewerAgentWithEnv pins resolved PIG_HOME into Policy.Env", func(t *testing.T) {
 		fx := newWarmTestFixture(t, "", true)
 		cfgEnv := []string{"PIG_HOME=" + fx.pigHome}
@@ -1911,7 +1941,23 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 	if err := os.WriteFile(fakeGo, []byte("#!/bin/sh\necho untrusted-fake-go\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile fake go: %v", err)
 	}
+	// 同一污染现场再叠加 PI_SANDBOX_REAL_GO 污染（resolveRealGoBinary 的
+	// Env 覆盖优先于 PATH）：伪造 go 不得成为预热/策略共用的受信实体。
+	t.Setenv("PI_SANDBOX_REAL_GO", fakeGo)
 	t.Setenv("PATH", untrustedDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// GOROOT 别名反例（先建壳）：伪造 GOROOT 的 bin/go 是指向受信 go 的软链，
+	// 旧实现据此把原始 envGR 加入 goRoots 并直接放行 envGR/pkg/tool——伪造
+	// pkg/tool 随别名根混进 Policy.Exec。修复后只接纳「已解析真实 go 的
+	// 规范化可信根」。bin/go 软链在下方 realGo 解析出后补建。
+	fakeGOROOT := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(fakeGOROOT, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeToolDir := filepath.Join(fakeGOROOT, "pkg", "tool")
+	if err := os.MkdirAll(fakeToolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	fx := newWarmTestFixture(t, "", true)
 	fx.setPigScript(t, fx.warmEnvLogScript(bundledCellSnippet, ""))
@@ -1924,8 +1970,8 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 		t.Fatal("cold start: fake pig was not invoked")
 	}
 
-	// 受信解析：resolveSandboxRealGoBinary 跳过不可信 PATH 前置的假 go，
-	// 命中固定可信工具链前缀内的真实 go；其所在目录即被前置进预热 PATH。
+	// 受信解析：resolveSandboxRealGoBinary 跳过不可信 PATH 前置与
+	// PI_SANDBOX_REAL_GO 污染的假 go，命中固定可信工具链前缀内的真实 go。
 	wantRealGo := resolveSandboxRealGoBinary("")
 	if wantRealGo == "" {
 		t.Skip("no trusted real go resolvable on host; cannot assert toolchain alignment")
@@ -1959,6 +2005,400 @@ func TestWarmGoExtensionCellsGoToolchainAlign(t *testing.T) {
 	// 受信前缀断言：选中 go 的真实路径位于可信工具链前缀内（回归点本身）。
 	if !pathWithinPrefixes(resolvedWant, trustedGoToolchainPrefixes()) {
 		t.Fatalf("trusted resolver returned %q outside trusted toolchain prefixes", resolvedWant)
+	}
+
+	// GOROOT 别名反例落成：<fakeGOROOT>/bin/go 软链指向受信 go（旧实现会
+	// 误判整根可信），pkg/tool 为伪造目录。同一污染现场调用
+	// ReadOnlyReviewer：policy 注入的 PI_SANDBOX_REAL_GO 必须与预热同一
+	// 受信实体，且 Policy.Exec 绝不含伪造 GOROOT/pkg/tool 与不可信 go。
+	if err := os.Symlink(wantRealGo, filepath.Join(fakeGOROOT, "bin", "go")); err != nil {
+		t.Fatalf("symlink fake GOROOT/bin/go -> trusted go: %v", err)
+	}
+	t.Setenv("GOROOT", fakeGOROOT)
+	policy := ReadOnlyReviewer(t.TempDir())
+	t.Cleanup(func() { removePresetTempDirs(t, policy) })
+	if got := lookupEnvValue(policy.Env, "PI_SANDBOX_REAL_GO"); got != wantRealGo {
+		t.Fatalf("policy PI_SANDBOX_REAL_GO = %q, want same trusted entity as warm resolver %q", got, wantRealGo)
+	}
+	execSet := make(map[string]struct{}, len(policy.Exec))
+	for _, ex := range policy.Exec {
+		execSet[filepath.Clean(ex)] = struct{}{}
+		if resolved, rerr := filepath.EvalSymlinks(ex); rerr == nil && resolved != "" {
+			execSet[filepath.Clean(resolved)] = struct{}{}
+		}
+	}
+	for _, bad := range []string{fakeToolDir, fakeGo, untrustedDir} {
+		if _, hit := execSet[filepath.Clean(bad)]; hit {
+			t.Fatalf("untrusted path %q must not enter Policy.Exec (GOROOT alias / PATH pollution)", bad)
+		}
+	}
+	// 正向锚点：受信真实 go 本体仍须在 Exec（防整列被清空后的空转假绿）。
+	if _, hit := execSet[filepath.Clean(wantRealGo)]; !hit {
+		t.Fatalf("trusted real go %q missing from Policy.Exec", wantRealGo)
+	}
+
+	// trustedRealGoCandidateWithPrefixes 边界分支（t.TempDir() 前缀注入）：
+	// 常规可执行 go 通过；perm&0o022!=0（组可写）拒绝；父目录 0777 拒绝；
+	// 非 go 基名拒绝。
+	prefix := t.TempDir()
+	good := filepath.Join(prefix, "bin", "go")
+	if err := os.MkdirAll(filepath.Dir(good), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(good, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, ok := trustedRealGoCandidateWithPrefixes(good, []string{prefix}); !ok || resolved == "" {
+		t.Fatalf("regular go under temp prefix must be accepted: resolved=%q ok=%v", resolved, ok)
+	}
+	groupWritable := filepath.Join(prefix, "bin", "go-gw")
+	if err := os.WriteFile(groupWritable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile 的 mode 受 umask 影响；显式 Chmod 0777 确保 perm&0o022!=0。
+	if err := os.Chmod(groupWritable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := trustedRealGoCandidateWithPrefixes(groupWritable, []string{prefix}); ok {
+		t.Fatalf("group/world-writable go must be rejected (perm&0o022!=0)")
+	}
+	worldWritableParent := filepath.Join(prefix, "wdir")
+	if err := os.MkdirAll(worldWritableParent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(worldWritableParent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	innerGo := filepath.Join(worldWritableParent, "go")
+	if err := os.WriteFile(innerGo, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := trustedRealGoCandidateWithPrefixes(innerGo, []string{prefix}); ok {
+		t.Fatalf("go under 0777 parent dir must be rejected (parent dir untrusted)")
+	}
+	notGo := filepath.Join(prefix, "bin", "notgo")
+	if err := os.WriteFile(notGo, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := trustedRealGoCandidateWithPrefixes(notGo, []string{prefix}); ok {
+		t.Fatalf("non-go basename must be rejected")
+	}
+}
+
+// TestTrustedToolDirPkgTool 是 trustedToolDir 前缀误拒的回归：pkg/tool 位于
+// 工具链根而非 bin 前缀之下，旧实现复用 trustedGoToolchainPrefixes（仅含
+// <root>/bin、/usr/lib、/usr/share、*.local/opt 与 standardBinDirs）会把
+// 合规的 /usr/local/go/pkg/tool 误拒出 Policy.Exec。修复后 trustedToolDir
+// 走专用 trustedGoToolDirPrefixes：
+//   - 正向：本机存在且合规（真实目录、perm&0o022==0、属主 0 或 euid）的
+//     /usr/local/go/pkg/tool、/usr/lib/go/pkg/tool 必须通过 trustedToolDir
+//     并被 resolveGoToolchainPaths 收录；
+//   - 反向：软链 pkg/tool、组/全局可写目录、可信前缀外的外部目录仍一律拒绝，
+//     trustedRealGoCandidate 的 bin 前缀未被放宽（见本文件既有校验）。
+func TestTrustedToolDirPkgTool(t *testing.T) {
+	// 正向：固定可信 pkg/tool 根，存在且合规时必须放行并被收录——生产
+	// trustedToolDir 返回解析后的规范真实路径且非空。
+	checked := 0
+	for _, toolDir := range []string{"/usr/local/go/pkg/tool", "/usr/lib/go/pkg/tool"} {
+		st, err := os.Stat(toolDir)
+		if err != nil || !st.IsDir() || st.Mode().Perm()&0o022 != 0 {
+			continue // 本机无此根或不合规（如自定义安装权限位），跳过该锚点
+		}
+		checked++
+		resolved, ok := trustedToolDir(toolDir)
+		if !ok || resolved == "" {
+			t.Fatalf("trustedToolDir must accept compliant %q (resolved=%q ok=%v)", toolDir, resolved, ok)
+		}
+		// resolveGoToolchainPaths 只收录解析后的规范真实路径（如
+		// /usr/lib/go-1.24/pkg/tool），不含祖先软链拼写（/usr/lib/go 是
+		// 软链）：与 trustedToolDir 返回的 resolved 逐一对齐断言。
+		found := false
+		for _, p := range resolveGoToolchainPaths() {
+			if filepath.Clean(p) == filepath.Clean(resolved) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("resolveGoToolchainPaths must include resolved %q (from compliant %q)", resolved, toolDir)
+		}
+	}
+	if checked == 0 {
+		t.Skip("no compliant /usr/local/go/pkg/tool or /usr/lib/go/pkg/tool on host; positive anchor unverifiable")
+	}
+
+	// trustedToolDirWithPrefixes（t.TempDir() 前缀注入）：真实覆盖
+	// 0777 组/全局可写拒绝分支（perm&0o022!=0，前缀检查已通过）与
+	// 本体软链拒绝分支（含指向前缀内真实目录与指向本机
+	// /usr/local/go/pkg/tool 的软链）——生产 trustedToolDir 走固定前缀
+	// 无法覆盖这些拒绝分支（前缀检查先短路），必须走注入版本（SF-2）。
+	prefix := t.TempDir()
+	prefixes := []string{prefix}
+
+	// 正向：前缀内合规目录命中并返回解析后规范路径。
+	goodTool := filepath.Join(prefix, "pkg", "tool")
+	if err := os.MkdirAll(goodTool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, ok := trustedToolDirWithPrefixes(goodTool, prefixes); !ok || filepath.Clean(resolved) != filepath.Clean(goodTool) {
+		t.Fatalf("trustedToolDirWithPrefixes must accept compliant %q (resolved=%q ok=%v)", goodTool, resolved, ok)
+	}
+
+	// 反向：0777 组/全局可写目录拒绝（覆盖 Perm()&0o022!=0 分支）。
+	badPerm := filepath.Join(prefix, "bad-perm")
+	if err := os.MkdirAll(badPerm, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(badPerm, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := trustedToolDirWithPrefixes(badPerm, prefixes); ok {
+		t.Fatalf("trustedToolDirWithPrefixes must reject 0777 group/world-writable %q", badPerm)
+	}
+
+	// 反向：软链本体拒绝——指向「前缀内」真实目录的软链同样拒绝
+	//（Lstat 口径优先于 EvalSymlinks/前缀检查）。
+	linkInside := filepath.Join(prefix, "link-inside")
+	if err := os.Symlink(goodTool, linkInside); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, ok := trustedToolDirWithPrefixes(linkInside, prefixes); ok {
+		t.Fatalf("trustedToolDirWithPrefixes must reject symlink %q (-> prefix-internal real dir)", linkInside)
+	}
+
+	// 反向：软链本体拒绝——指向本机 /usr/local/go/pkg/tool 的软链：
+	// 目标恰是固定可信前缀内的真实目录，Lstat 软链拒绝必须先于「目标
+	// 合规」判定生效（别名拼写不得获执行授权）。
+	hostTool := "/usr/local/go/pkg/tool"
+	if st, err := os.Stat(hostTool); err == nil && st.IsDir() {
+		linkHost := filepath.Join(prefix, "link-host")
+		if err := os.Symlink(hostTool, linkHost); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if _, ok := trustedToolDirWithPrefixes(linkHost, prefixes); ok {
+			t.Fatalf("trustedToolDirWithPrefixes must reject symlink %q (-> %s)", linkHost, hostTool)
+		}
+	} else {
+		t.Logf("%s absent on host; skip symlink-to-host-tool case", hostTool)
+	}
+
+	// 反向：生产 trustedToolDir（固定前缀）对 t.TempDir() 下合规目录
+	// 必须拒绝（前缀失配）——注入前缀不是外部开启入口。
+	if _, ok := trustedToolDir(goodTool); ok {
+		t.Fatalf("trustedToolDir must reject %q outside trusted prefixes", goodTool)
+	}
+
+	// 反向：不存在路径必须拒绝。
+	if _, ok := trustedToolDirWithPrefixes(filepath.Join(prefix, "missing"), prefixes); ok {
+		t.Fatal("trustedToolDirWithPrefixes must reject nonexistent dir")
+	}
+}
+
+// TestResolveGoToolchainPathsGOROOTAlias 是 MF-1 回归：GOROOT 指向伪造根
+// fake-goroot，其 pkg 为指向真实 GOROOT pkg 的中间软链（fake/pkg ->
+// <realGoRoot>/pkg），伪造根的 bin/go 缺失或只是普通文件。
+// 断言 resolveGoToolchainPaths() 与 ReadOnlyReviewer 的 Policy.Exec 绝不
+// 含 <fake>/pkg/tool 拼写（别名不得获执行授权），同时本机合规
+// /usr/local/go/pkg/tool 仍以规范真实路径收录。
+func TestResolveGoToolchainPathsGOROOTAlias(t *testing.T) {
+	// 受信真实 go 必须可解析：其真实根下的 pkg 即中间软链目标。
+	realGo := resolveSandboxRealGoBinary("")
+	if realGo == "" {
+		t.Skip("no trusted real go resolvable on host")
+	}
+	resolvedReal, err := filepath.EvalSymlinks(realGo)
+	if err != nil || resolvedReal == "" {
+		t.Fatalf("EvalSymlinks(%q): %v", realGo, err)
+	}
+	realGoRoot := filepath.Dir(filepath.Dir(resolvedReal))
+	hostTool := filepath.Join(realGoRoot, "pkg", "tool")
+	if st, err := os.Stat(hostTool); err != nil || !st.IsDir() {
+		t.Skipf("host tool dir %s not usable on this host", hostTool)
+	}
+
+	// 伪造 GOROOT：bin/go 缺失（未通过 trustedRealGoCandidate），pkg
+	// 中间软链指向受信根 pkg——Lstat(<fake>/pkg/tool) 是真实目录（跟随
+	// 中间软链）且解析后位于可信前缀内，旧实现据此把未解析的
+	// <fake>/pkg/tool 写进 Policy.Exec（MF-1 逃逸形态）。
+	fakeRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(fakeRoot, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(realGoRoot, "pkg"), filepath.Join(fakeRoot, "pkg")); err != nil {
+		t.Fatalf("symlink fake pkg -> host pkg: %v", err)
+	}
+	aliasTool := filepath.Join(fakeRoot, "pkg", "tool")
+	if st, err := os.Lstat(aliasTool); err != nil || !st.IsDir() {
+		t.Fatalf("fixture broken: %q via intermediate symlink is not a dir: %v", aliasTool, err)
+	}
+	t.Setenv("GOROOT", fakeRoot)
+
+	paths := resolveGoToolchainPaths()
+	for _, p := range paths {
+		cp := filepath.Clean(p)
+		if cp == filepath.Clean(aliasTool) {
+			t.Fatalf("unresolved alias %q must not enter resolveGoToolchainPaths output", aliasTool)
+		}
+		if strings.HasPrefix(cp, filepath.Clean(fakeRoot)+string(filepath.Separator)) {
+			t.Fatalf("path %q under untrusted fake GOROOT must not be trusted", cp)
+		}
+	}
+
+	// ReadOnlyReviewer 的 Policy.Exec 同口径：绝不含别名拼写或未解析路径。
+	policy := ReadOnlyReviewer(t.TempDir())
+	t.Cleanup(func() { removePresetTempDirs(t, policy) })
+	for _, ex := range policy.Exec {
+		cp := filepath.Clean(ex)
+		if cp == filepath.Clean(aliasTool) {
+			t.Fatalf("unresolved alias %q must not enter Policy.Exec", aliasTool)
+		}
+		if strings.HasPrefix(cp, filepath.Clean(fakeRoot)+string(filepath.Separator)) {
+			t.Fatalf("Policy.Exec entry %q under untrusted fake GOROOT", cp)
+		}
+	}
+
+	// 正向：本机合规 /usr/local/go/pkg/tool 仍以规范真实路径被收录
+	//（存在且合规时；缺该根则断言真实根 pkg/tool 被收录）。
+	wantTool := filepath.Clean(hostTool)
+	if st, err := os.Stat("/usr/local/go/pkg/tool"); err == nil && st.IsDir() && st.Mode().Perm()&0o022 == 0 {
+		wantTool = "/usr/local/go/pkg/tool"
+	}
+	foundTool := false
+	for _, p := range paths {
+		if filepath.Clean(p) == wantTool {
+			foundTool = true
+		}
+	}
+	if !foundTool {
+		t.Fatalf("compliant tool dir %q must be included in resolveGoToolchainPaths output: %v", wantTool, paths)
+	}
+}
+
+// TestReviewerAgentUntrustedPigHomeFailClosed 是 SF-1（方案 1A）回归：
+// PIG_HOME 为软链或 0777 公共可写目录时，ReviewerAgentWithEnv 不得
+// 读取其 <pigHome>/agent、不得改写其 usage.json、不得把其缓存产物
+// 枚举进 Policy.Exec、不得建指向它的宿主投影；同时
+// reviewerAgentCellTargets 记录错误——ReviewerAgentCellTargetError()
+// 返回非 nil，真实 pig 入口启动前 fail-closed，非 pig 命令以空私有根放行。
+func TestReviewerAgentUntrustedPigHomeFailClosed(t *testing.T) {
+	workdir := t.TempDir()
+
+	makeHostPigHome := func(t *testing.T) (string, string, string) {
+		t.Helper()
+		host := t.TempDir()
+		// 构造宿主 <pigHome>/cache/cells/go/<digest>：目录名必须与
+		// ready.json inputDigest 绑定（validCellEntryDir 口径），含
+		// usage.json（lastUsed=1 过期，若被刷新会改写为近期 now）与带
+		// 执行位且大小一致的 artifact。
+		entry := filepath.Join(host, "cache", "cells", "go", "digest0123")
+		if err := os.MkdirAll(entry, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runnerBody := []byte("#!/bin/sh\n")
+		runner := filepath.Join(entry, "runner")
+		if err := os.WriteFile(runner, runnerBody, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		ready := fmt.Sprintf(`{"inputDigest":"digest0123","artifact":"runner","size":%d,"created":1,"language":"go"}`, len(runnerBody))
+		if err := os.WriteFile(filepath.Join(entry, "ready.json"), []byte(ready), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeUsageJSON(t, entry, 1)
+		// 宿主 agent 目录（不可信时不得被读/作扩展源）。
+		if err := os.MkdirAll(filepath.Join(host, "agent"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return host, entry, runner
+	}
+
+	assertFailClosed := func(t *testing.T, cfgEnv []string, entry, runner, forbidden string) {
+		t.Helper()
+		policy := ReviewerAgentWithEnv(workdir, cfgEnv)
+		t.Cleanup(func() { removePresetTempDirs(t, policy) })
+
+		// usage.json 不得被改写：lastUsed 仍为夹具值 1。
+		if got := readUsageLastUsed(t, entry); got != 1 {
+			t.Fatalf("untrusted PIG_HOME usage.json must not be refreshed: lastUsed=%d", got)
+		}
+		// 不可信根的 artifact 不得进 Policy.Exec（含解析后形式）。
+		for _, ex := range policy.Exec {
+			cp := filepath.Clean(ex)
+			if cp == filepath.Clean(runner) || cp == filepath.Clean(forbidden) {
+				t.Fatalf("untrusted artifact %q must not enter Policy.Exec", cp)
+			}
+			if resolved, rerr := filepath.EvalSymlinks(cp); rerr == nil && filepath.Clean(resolved) == filepath.Clean(runner) {
+				t.Fatalf("untrusted artifact %q (as %q) must not enter Policy.Exec", runner, cp)
+			}
+		}
+		// reviewerAgentCellTargets 记录错误：ReviewerAgentCellTargetError 非 nil。
+		if err := ReviewerAgentCellTargetError(); err == nil {
+			t.Fatal("ReviewerAgentCellTargetError must be non-nil for untrusted PIG_HOME")
+		}
+		// PIG_HOME env 仍回钉到空私有根（<privateTmpDir>/pig-home）。
+		ph := lookupEnvValue(policy.Env, "PIG_HOME")
+		priv := lookupEnvValue(policy.Env, "TMPDIR")
+		if ph == "" || priv == "" || !strings.HasPrefix(ph, priv) || !strings.HasSuffix(ph, "pig-home") {
+			t.Fatalf("PIG_HOME env = %q, want private pig-home under TMPDIR=%q", ph, priv)
+		}
+	}
+
+	t.Run("symlink_pig_home", func(t *testing.T) {
+		host, entry, runner := makeHostPigHome(t)
+		linkDir := filepath.Join(t.TempDir(), "pig-link")
+		if err := os.Symlink(host, linkDir); err != nil {
+			t.Fatal(err)
+		}
+		for _, env := range []string{"PIG_HOME", "PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_USE_PI_DIRS"} {
+			unsetEnv(t, env)
+		}
+		assertFailClosed(t, []string{"PIG_HOME=" + linkDir}, entry, runner, linkDir)
+	})
+
+	t.Run("world_writable_pig_home", func(t *testing.T) {
+		host, entry, runner := makeHostPigHome(t)
+		if err := os.Chmod(host, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		for _, env := range []string{"PIG_HOME", "PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_USE_PI_DIRS"} {
+			unsetEnv(t, env)
+		}
+		assertFailClosed(t, []string{"PIG_HOME=" + host}, entry, runner, host)
+	})
+}
+
+// TestAppendCellCachePolicyNoLocksUnderSymlinkRoots 是 SF-1(c) 回归：
+// 合规 PIG_HOME 下 cache/ext 与 cache/cells 为指向外部空目录的软链时，
+// appendCellCachePolicy 绝不在外部目录内创建 .locks（旧实现在
+// resolvePolicyPathWithin 拒软链前先 MkdirAll，跟随软链在外部目录凭空
+// 建 .locks）。
+func TestAppendCellCachePolicyNoLocksUnderSymlinkRoots(t *testing.T) {
+	pigHome := t.TempDir()
+	cacheRoot := filepath.Join(pigHome, "cache")
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	extTarget := filepath.Join(external, "ext-target")
+	cellsTarget := filepath.Join(external, "cells-target")
+	for _, d := range []string{extTarget, cellsTarget} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// cache/ext 与 cache/cells 本体为指向外部空目录的软链。
+	if err := os.Symlink(extTarget, filepath.Join(cacheRoot, "ext")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cellsTarget, filepath.Join(cacheRoot, "cells")); err != nil {
+		t.Fatal(err)
+	}
+
+	var p Policy
+	appendCellCachePolicy(&p, pigHome)
+
+	for _, d := range []string{extTarget, cellsTarget} {
+		if _, err := os.Lstat(filepath.Join(d, ".locks")); !os.IsNotExist(err) {
+			t.Fatalf(".locks must not be created under symlinked root target %q (err=%v)", filepath.Join(d, ".locks"), err)
+		}
 	}
 }
 
@@ -2180,6 +2620,70 @@ func TestAppendAgyStateReadWriteMarksRootFilesOptional(t *testing.T) {
 			}
 		}
 	}
+
+	t.Run("root_symlinks_skipped", func(t *testing.T) {
+		// 隔离 HOME=t.TempDir() 覆盖根级软链与软链子目录被跳过：
+		// agyStateDir 根级符号链接（指向文件或目录）一律不进 ReadWrite/
+		// OptionalReadWrite——放行软链会与 Exec 重合叠出 RWX 提权面。
+		t.Setenv("HOME", t.TempDir())
+		stateRoot := filepath.Join(homeDir(), ".gemini", "antigravity-cli")
+		if err := os.MkdirAll(stateRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// 根级软链→普通文件：绝不被枚举为根级状态文件。
+		victimFile := filepath.Join(t.TempDir(), "victim.db")
+		if err := os.WriteFile(victimFile, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fileLink := filepath.Join(stateRoot, "linked.db")
+		if err := os.Symlink(victimFile, fileLink); err != nil {
+			t.Fatal(err)
+		}
+		// 根级软链→目录：DirEntry.IsDir 对软链为 false，必须按
+		// Type()&ModeSymlink 显式排除（不得进根级文件枚举）。
+		victimDir := t.TempDir()
+		dirLink := filepath.Join(stateRoot, "linked-dir")
+		if err := os.Symlink(victimDir, dirLink); err != nil {
+			t.Fatal(err)
+		}
+		// 对照：根级普通状态文件照常进 ReadWrite/OptionalReadWrite。
+		regular := filepath.Join(stateRoot, "regular.json")
+		if err := os.WriteFile(regular, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var p Policy
+		appendAgyStateReadWrite(&p)
+		all := append(append([]string(nil), p.ReadWrite...), p.OptionalReadWrite...)
+		for _, bad := range []string{fileLink, dirLink, victimFile, victimDir} {
+			for _, entry := range all {
+				if entry == bad {
+					t.Fatalf("symlink (or its target) %q must not enter ReadWrite/OptionalReadWrite", bad)
+				}
+				if resolved, rerr := filepath.EvalSymlinks(entry); rerr == nil && resolved == bad {
+					t.Fatalf("symlink target %q reached policy list via EvalSymlinks(%q)", bad, entry)
+				}
+			}
+		}
+		normReg, err := NormalizePath(regular)
+		if err != nil {
+			t.Fatalf("NormalizePath: %v", err)
+		}
+		foundRW, foundORW := false, false
+		for _, entry := range p.ReadWrite {
+			if entry == normReg || entry == regular {
+				foundRW = true
+			}
+		}
+		for _, entry := range p.OptionalReadWrite {
+			if entry == normReg || entry == regular {
+				foundORW = true
+			}
+		}
+		if !foundRW || !foundORW {
+			t.Fatalf("regular root state file %q must enter ReadWrite(%v) and OptionalReadWrite(%v)", regular, foundRW, foundORW)
+		}
+	})
 }
 
 // ── export_test 段：供外部测试包 sandbox_test 使用 ────────────────────────
@@ -2423,5 +2927,353 @@ func TestReviewerAgentCellTargetSymlinkCellsLangGate(t *testing.T) {
 		t.Fatalf("ReviewerAgentCellTargetError = nil, want error: cells/go symlink projection must not be allowed to satisfy completeness gate")
 	} else if !strings.Contains(err.Error(), "no valid Go extension cell artifact") && len(missing) == 0 {
 		t.Fatalf("ReviewerAgentCellTargetError = %v, want fail-closed error naming missing/empty projection", err)
+	}
+
+	// cleanupReviewerAgentPolicy 是 ReviewerAgentWithEnv 产出策略的预设定
+	// 时目录清理辅助（本文件多个 cell 目标用例共用）。
+	cleanupPolicy := func(p Policy) {
+		t.Helper()
+		for _, kv := range p.Env {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "TMPDIR" && strings.Contains(v, "pi-reviewer-") {
+				_ = os.RemoveAll(v)
+			}
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "PI_SANDBOX_GO_EXEC_DIR" && strings.Contains(v, "pi-reviewer-exec-") {
+				_ = os.RemoveAll(v)
+			}
+		}
+	}
+
+	t.Run("ext_root_symlink_to_external_cells_skipped", func(t *testing.T) {
+		// cache/ext 根本体为指向外部目录（内含有效可执行 Go cell）的软链
+		// 时：isRealDirNoSymlink 整体拒枚举——total==0、
+		// ReviewerAgentCellTargetError 非 nil、外部 usage.json 零改写、
+		// 外部产物绝不进 Policy.Exec。改回跟随软链的枚举本用例即红。
+		pigHome := t.TempDir()
+		extLinkTarget := t.TempDir()
+		extCell := filepath.Join(extLinkTarget, "ext-entry-aaaa0001")
+		writeFakeCellEntry(t, extCell, "aaaa0001", "bin", "go")
+		writeUsageJSON(t, extCell, 1700000000)
+		if err := os.MkdirAll(filepath.Join(pigHome, "cache"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(extLinkTarget, filepath.Join(pigHome, "cache", "ext")); err != nil {
+			t.Fatal(err)
+		}
+		goExt := filepath.Join(pigHome, "agent", "extensions", "fake-go-ext")
+		if err := os.MkdirAll(goExt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(goExt, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PIG_HOME", pigHome)
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		unsetEnv(t, "PIG_USE_PI_DIRS")
+
+		p := ReviewerAgentWithEnv(t.TempDir(), nil)
+		t.Cleanup(func() { cleanupPolicy(p) })
+
+		_, total, _ := ReviewerAgentCellTargets()
+		if total != 0 {
+			t.Fatalf("total = %d, want 0: ext symlink root must not be enumerated", total)
+		}
+		if err := ReviewerAgentCellTargetError(); err == nil {
+			t.Fatalf("ReviewerAgentCellTargetError = nil, want fail-closed error (ext symlink -> external Go cells)")
+		}
+		if got := readUsageLastUsed(t, extCell); got != 1700000000 {
+			t.Fatalf("external usage.json lastUsed = %d, want 1700000000 unchanged (refresh must not follow ext symlink)", got)
+		}
+		externalBin := filepath.Join(extCell, "bin")
+		for _, ex := range p.Exec {
+			if ex == externalBin {
+				t.Fatalf("external ext artifact %q must not enter Exec whitelist", externalBin)
+			}
+			if resolved, rerr := filepath.EvalSymlinks(ex); rerr == nil && resolved == externalBin {
+				t.Fatalf("external ext artifact %q reached Exec via symlink resolution", externalBin)
+			}
+		}
+	})
+
+	t.Run("cells_go_entry_symlink_and_hidden_skipped", func(t *testing.T) {
+		// 真实 cells/go 根下：条目级软链与 .hidden-* 目录经
+		// cellEntryHiddenOrSymlink 排除——不计入 total、不入 Exec；
+		// .tombstone-* 合法墓碑目录正常计入。改坏该谓词本用例即红。
+		pigHome := t.TempDir()
+		hostCellsGo := filepath.Join(pigHome, "cache", "cells", "go")
+		if err := os.MkdirAll(hostCellsGo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		externalCell := filepath.Join(t.TempDir(), "external-entry-bbbb0002")
+		writeFakeCellEntry(t, externalCell, "bbbb0002", "runner", "")
+		if err := os.Symlink(externalCell, filepath.Join(hostCellsGo, "bbbb0002")); err != nil {
+			t.Fatal(err)
+		}
+		writeFakeCellEntry(t, filepath.Join(hostCellsGo, ".hidden-cccc0003"), "cccc0003", "runner", "")
+		tombstone := filepath.Join(hostCellsGo, ".tombstone-dddd0004")
+		writeFakeCellEntry(t, tombstone, "dddd0004", "runner", "")
+		goExt := filepath.Join(pigHome, "agent", "extensions", "fake-go-ext")
+		if err := os.MkdirAll(goExt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(goExt, "go.mod"), []byte("module fake\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PIG_HOME", pigHome)
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		unsetEnv(t, "PIG_USE_PI_DIRS")
+
+		p := ReviewerAgentWithEnv(t.TempDir(), nil)
+		t.Cleanup(func() { cleanupPolicy(p) })
+
+		_, total, _ := ReviewerAgentCellTargets()
+		if total != 1 {
+			t.Fatalf("total = %d, want 1: only .tombstone-* entry counts; entry symlink and .hidden-* must be skipped", total)
+		}
+		execSet := make(map[string]struct{}, len(p.Exec))
+		for _, ex := range p.Exec {
+			execSet[filepath.Clean(ex)] = struct{}{}
+			if resolved, rerr := filepath.EvalSymlinks(ex); rerr == nil && resolved != "" {
+				execSet[filepath.Clean(resolved)] = struct{}{}
+			}
+		}
+		for _, bad := range []string{
+			filepath.Join(externalCell, "runner"),
+			filepath.Join(hostCellsGo, ".hidden-cccc0003", "runner"),
+		} {
+			if _, hit := execSet[filepath.Clean(bad)]; hit {
+				t.Fatalf("excluded cell artifact %q must not enter Exec whitelist", bad)
+			}
+		}
+		if _, hit := execSet[filepath.Join(tombstone, "runner")]; !hit {
+			t.Fatalf("tombstone cell artifact %s/runner missing from Exec (tombstone entry must count normally)", tombstone)
+		}
+	})
+
+	t.Run("verify_projected_missing_when_projection_absent", func(t *testing.T) {
+		// verifyProjectedGoCellTargets 负例：宿主存在有效可执行 Go 产物，
+		// 但私有投影根下缺失对应软链投影时，必须返回非空 missing 点名——
+		// 枚举/投影口径错配绝不假放行。
+		hostCache := filepath.Join(t.TempDir(), "cache")
+		writeFakeCellEntry(t, filepath.Join(hostCache, "ext", "fake-ext-eeee0005"), "eeee0005", "bin", "go")
+		privCacheRoot := filepath.Join(t.TempDir(), "priv-cache")
+		if err := os.MkdirAll(privCacheRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		missing := verifyProjectedGoCellTargets(hostCache, privCacheRoot)
+		if len(missing) == 0 {
+			t.Fatalf("verifyProjectedGoCellTargets = %v, want non-empty missing for unprojected host Go artifact", missing)
+		}
+		if !strings.Contains(missing[0], "ext/fake-ext-eeee0005") {
+			t.Fatalf("missing entry %q must name the unprojected ext entry", missing[0])
+		}
+	})
+
+}
+
+// ---------------------------------------------------------------------------
+// SF-1 回归（oracle9）：validateTrustedPigDir 祖先链逐级校验 +
+// appendCellCachePolicy 以 EvalSymlinks 规范真实路径入 Policy.Exec。
+//
+// 覆盖：PIG_HOME 祖先软链（末级存在 / 末级不存在）、非粘滞 0777 父目录、
+// 未解析软链 artifactPath 不得原样进 Exec（必须收敛为 EvalSymlinks 真实路径，
+// 且落在 resolvedCacheRoot 内）。
+
+// makeSF1HostPigHome 复刻 O8 SF-1 探针夹具：<host>/cache/cells/go/<digest>/
+// 内含 runner/ready.json/usage.json（lastUsed=1），以及空 cache/ext 与
+// agent/extensions/fake/go.mod。返回 (host, entry, runner)。
+func makeSF1HostPigHome(t *testing.T, host string) (entry, runner string) {
+	t.Helper()
+	entry = filepath.Join(host, "cache", "cells", "go", "digest0123")
+	if err := os.MkdirAll(entry, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runnerBody := []byte("#!/bin/sh\n")
+	runner = filepath.Join(entry, "runner")
+	if err := os.WriteFile(runner, runnerBody, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ready := `{"inputDigest":"digest0123","artifact":"runner","size":` +
+		strconv.Itoa(len(runnerBody)) + `,"created":1,"language":"go"}`
+	if err := os.WriteFile(filepath.Join(entry, "ready.json"), []byte(ready), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeUsageJSON(t, entry, 1)
+	if err := os.MkdirAll(filepath.Join(host, "cache", "ext"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(host, "agent", "extensions", "fake"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, "agent", "extensions", "fake", "go.mod"), []byte("module fake\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return entry, runner
+}
+
+// assertPigHomeFailClosedSF1 断言不可信 PIG_HOME 下 ReviewerAgentWithEnv
+// 未越界写 usage.json、未在外部建 .locks、未把未解析 runner 入 Exec，
+// 且 ReviewerAgentCellTargetError 非 nil（pig 入口启动前 fail-closed）。
+func assertPigHomeFailClosedSF1(t *testing.T, cfgEnv []string, entry, runner, pigHomePath string) {
+	t.Helper()
+	workdir := t.TempDir()
+	policy := ReviewerAgentWithEnv(workdir, cfgEnv)
+	t.Cleanup(func() { removePresetTempDirs(t, policy) })
+
+	if got := readUsageLastUsed(t, entry); got != 1 {
+		t.Fatalf("untrusted PIG_HOME usage.json must not be refreshed: lastUsed=%d", got)
+	}
+	// 不得在外部 cache/ext 下创建 .locks。
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(entry))), "ext", ".locks")); !os.IsNotExist(err) {
+		t.Fatalf(".locks must not be created under untrusted ext root (err=%v)", err)
+	}
+	for _, ex := range policy.Exec {
+		cp := filepath.Clean(ex)
+		if cp == filepath.Clean(runner) || cp == filepath.Clean(pigHomePath) {
+			t.Fatalf("untrusted artifact %q must not enter Policy.Exec", cp)
+		}
+		if resolved, rerr := filepath.EvalSymlinks(cp); rerr == nil && filepath.Clean(resolved) == filepath.Clean(runner) {
+			t.Fatalf("untrusted artifact %q (resolved as %q) must not enter Policy.Exec", runner, cp)
+		}
+	}
+	if err := ReviewerAgentCellTargetError(); err == nil {
+		t.Fatal("ReviewerAgentCellTargetError must be non-nil for untrusted PIG_HOME")
+	}
+}
+
+// TestValidateTrustedPigDirAncestorChain 是 SF-1 的直接单元回归：
+// 祖先软链、非粘滞 0777 父目录、末级不存在但祖先不安全的场景必须拒；
+// 正常 t.TempDir()（/tmp 01777 root 粘滞根下）与属主=euid 的目录必须放行。
+func TestValidateTrustedPigDirAncestorChain(t *testing.T) {
+	euid := os.Geteuid()
+
+	mkHost := func(t *testing.T) (extParent, host string) {
+		t.Helper()
+		extParent = t.TempDir()
+		host = filepath.Join(extParent, "host")
+		if err := os.MkdirAll(host, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return extParent, host
+	}
+
+	t.Run("ancestor symlink existing leaf", func(t *testing.T) {
+		extParent, host := mkHost(t)
+		link := filepath.Join(t.TempDir(), "pig-link")
+		if err := os.Symlink(extParent, link); err != nil {
+			t.Fatal(err)
+		}
+		if validateTrustedPigDir(filepath.Join(link, "host"), "PIG_HOME") {
+			t.Fatalf("ancestor symlink %q must be rejected (host=%q)", link, host)
+		}
+	})
+
+	t.Run("ancestor symlink missing leaf", func(t *testing.T) {
+		extParent, _ := mkHost(t)
+		link := filepath.Join(t.TempDir(), "pig-link")
+		if err := os.Symlink(extParent, link); err != nil {
+			t.Fatal(err)
+		}
+		missing := filepath.Join(link, "new-sub")
+		if validateTrustedPigDir(missing, "PIG_HOME") {
+			t.Fatalf("missing leaf under ancestor symlink %q must be rejected", missing)
+		}
+	})
+
+	t.Run("non-sticky 0777 ancestor", func(t *testing.T) {
+		worldParent := filepath.Join(t.TempDir(), "world-parent")
+		if err := os.MkdirAll(worldParent, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		// 显式去掉 sticky（TempDir 默认 0700，这里造 0777 非粘滞）。
+		if err := os.Chmod(worldParent, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		host := filepath.Join(worldParent, "host")
+		if err := os.MkdirAll(host, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if validateTrustedPigDir(host, "PIG_HOME") {
+			t.Fatalf("host under non-sticky 0777 ancestor %q must be rejected", worldParent)
+		}
+	})
+
+	t.Run("trusted existing dir accepted", func(t *testing.T) {
+		if euid == 0 {
+			// /tmp 下 t.TempDir()（root 01777 粘滞根 + euid 拥有的目录）应放行。
+			dir := t.TempDir()
+			if !validateTrustedPigDir(dir, "PIG_HOME") {
+				t.Fatalf("legit TempDir %q must be accepted", dir)
+			}
+		}
+	})
+
+	t.Run("missing leaf under trusted ancestors accepted", func(t *testing.T) {
+		// 末级不存在但整条已存在祖先链可信：交由后续 MkdirAll 报真实错误，
+		// 校验本身放行（与旧 ENOENT 语义一致但只放行可信祖先链）。
+		parent := t.TempDir()
+		missing := filepath.Join(parent, "new-pig-home")
+		if !validateTrustedPigDir(missing, "PIG_HOME") {
+			t.Fatalf("missing leaf under trusted ancestor %q must be accepted", missing)
+		}
+	})
+}
+
+// TestReviewerAgentPigHomeAncestorSymlinkFailClosed 端到端断言：PIG_HOME
+// 经祖先软链指向外部目录时 ReviewerAgentWithEnv 不越界写 usage.json、
+// 不建外部 .locks、不把 runner 入 Exec，且 CellTargetError 非 nil。
+func TestReviewerAgentPigHomeAncestorSymlinkFailClosed(t *testing.T) {
+	workdir := t.TempDir()
+	extParent := t.TempDir()
+	host := filepath.Join(extParent, "host")
+	if err := os.MkdirAll(host, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entry, runner := makeSF1HostPigHome(t, host)
+	link := filepath.Join(t.TempDir(), "pig-link")
+	if err := os.Symlink(extParent, link); err != nil {
+		t.Fatal(err)
+	}
+	pigHomeAlias := filepath.Join(link, "host")
+
+	for _, env := range []string{"PIG_HOME", "PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_USE_PI_DIRS"} {
+		unsetEnv(t, env)
+	}
+	assertPigHomeFailClosedSF1(t, []string{"PIG_HOME=" + pigHomeAlias}, entry, runner, pigHomeAlias)
+	_ = workdir
+}
+
+// TestAppendCellCachePolicyResolvesArtifactRealPath 断言：合规 PIG_HOME 的
+// artifact 入 Policy.Exec 时是 EvalSymlinks 后的规范真实路径（非软链别名）。
+// 宿主 cache 经祖先软链传入时入列路径必须解析到真实树并严格位于
+// resolvedCacheRoot 内；软链 artifact 本体或指到根外的目标一律不入列。
+func TestAppendCellCachePolicyResolvesArtifactRealPath(t *testing.T) {
+	pigHome := t.TempDir()
+	cacheRoot := filepath.Join(pigHome, "cache")
+	entryDir := filepath.Join(cacheRoot, "cells", "go", "digest0001")
+	writeFakeCellEntry(t, entryDir, "digest0001", "runner", "go")
+
+	p := &Policy{}
+	appendCellCachePolicy(p, pigHome)
+
+	// 真实 runner 必须以 EvalSymlinks 后路径入列。
+	realRunner := filepath.Join(entryDir, "runner")
+	resolvedRunner, err := filepath.EvalSymlinks(realRunner)
+	if err != nil {
+		t.Fatalf("EvalSymlinks runner: %v", err)
+	}
+	found := false
+	for _, ex := range p.Exec {
+		if filepath.Clean(ex) == filepath.Clean(resolvedRunner) {
+			found = true
+		}
+		if resolved, rerr := filepath.EvalSymlinks(ex); rerr == nil &&
+			filepath.Clean(resolved) != filepath.Clean(ex) {
+			t.Fatalf("unresolved/symlink path %q must not enter Policy.Exec (resolved=%q)", ex, resolved)
+		}
+	}
+	if !found {
+		t.Fatalf("resolved artifact %q must enter Policy.Exec, got %v", resolvedRunner, p.Exec)
 	}
 }

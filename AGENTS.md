@@ -56,11 +56,10 @@
 ## 命令入口
 
 ```bash
-# 唯一检查入口：make check = install-check + go-check
-# （install-check = bash -n install.sh/tests + tests/install.test.sh；
-#  go-check = go/ 全组件 fmt/sdk/vet/build/test，sandbox 带 -race；
-#  install.sh --audit 仅为宿主部署目录只读巡检，不是检查入口）
-make check                       # 仓库门禁：install-check + go-check
+# 检查入口（唯一）：zero-node 迁移（08f8c71 删顶层 package.json/pnpm/tsconfig）
+# 后顶层无 node 构建面，统一检查走 make check（= install-check + go-check）；
+# install.sh --audit 仅作宿主部署目录只读巡检，不属源码检查门禁。
+make check                       # 唯一检查入口：bash -n/install.test + go/ 全组件 fmt/sdk/vet/build/test
 
 bash install.sh --list           # 列出 10 扩展：名称/类别/权威源/目标/当前状态
 bash install.sh --audit          # 只读巡检 10 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警

@@ -79,13 +79,18 @@ func MaybeWarmGoExtensionCells(cfgPreset string, command []string, cfgEnv []stri
 	if !validatePigHomeDir(pigHome) {
 		return 0
 	}
-	// 显式 AgentDir（PIG_CODING_AGENT_DIR / PI_CODING_AGENT_DIR）与沙盒侧
-	// injectPigCodingAgentDir 同口径解析；自定义目录先做与 PIG_HOME 同等的
-	// 软链/权限/属主校验，不通过仅告警跳过预热（预热是性能优化，不阻断启动）。
-	srcAgentDir, customAgentDir := resolveSourcePigAgentDir(pigHome, cfgEnv)
-	if customAgentDir && !validateTrustedPigDir(srcAgentDir, "AgentDir") {
+	// AgentDir 单次选源（与 ReviewerAgentWithEnv 完全共用的
+	// resolveAgentDirSelection）：显式/宿主自定义目录已通过
+	// validateTrustedPigDir 才作扩展发现源；显式候选被拒时回退默认
+	// <pigHome>/agent 与沙盒侧同口径，不再独立判定（oracle MF-1 消除
+	// resolver 与 custom 判定分裂）。
+	sel := resolveAgentDirSelection(pigHome, cfgEnv)
+	if sel.origin == agentDirOriginCfgEnv && !sel.srcValid {
+		// 显式自定义候选被拒（软链/权限/属主不符）：预热跳过，不阻断启动
+		//（沙盒侧将回退私有目录，预热是性能优化）。
 		return 0
 	}
+	srcAgentDir := sel.sourceDir
 	cacheRoot := filepath.Join(pigHome, "cache")
 	tracked, extDirs, sdkDirs, settings := warmFingerprintInputs(pigBin, pigHome, srcAgentDir)
 	if len(extDirs) == 0 {
@@ -393,32 +398,127 @@ func validatePigHomeDir(pigHome string) bool {
 }
 
 // validateTrustedPigDir 是 PIG_HOME 与显式自定义 AgentDir 共用的可信度校验：
-// 语义与 validatePigHomeDir 一致，label 仅用于告警文案区分。
+// 语义与 validatePigHomeDir 一致（末级本体拒软链/非目录/0o022 可写/异属主），
+// 另加 SF-1 祖先链逐级校验——末级 Lstat 自动跟随中间软链，仅查末级会让
+// <tmp>/pig-link/host 或 <tmp>/world-0777/host 穿透；且末级不存在（ENOENT）
+// 时也必须校验首个已存在祖先及其上整条链，不能让 MkdirAll 跟随祖先软链在
+// 外部目标凭空建目录。label 仅用于告警文案区分。
+//
+// 放行边界（不因系统布局误拒合法临时根）：
+//   - 链上软链：仅豁免直接被 / 持有且属主为 0 的系统顶层软链（如 macOS
+//     /var -> /private/var、/tmp -> /private/tmp）；其余任何层级的软链一律拒；
+//   - 属主：每级目录 Uid 必须为 0 或当前 euid（异属主目录可被他方替换内容）；
+//   - 权限：Perm()&0o022 != 0 的目录一律拒，但豁免 Uid==0 且带 os.ModeSticky
+//     的临时根（/tmp、/var/tmp 的 01777——非粘滞 0777 父目录可被非特权方
+//     重命名替换 host，不能豁免）。
 func validateTrustedPigDir(dir, label string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		warmWarnf("sbx-warm: refusing empty %s", label)
+		return false
+	}
+	if !filepath.IsAbs(dir) {
+		if abs, err := filepath.Abs(dir); err == nil {
+			dir = abs
+		}
+	}
+	dir = filepath.Clean(dir)
+
+	// 末级本体校验（已存在时）：拒软链/非目录/0o022 可写/异属主，语义不变。
 	if isSymlinkPath(dir) {
 		warmWarnf("sbx-warm: refusing symlink %s %s", label, dir)
 		return false
 	}
 	info, err := os.Lstat(dir)
+	lastMissing := false
 	if err != nil {
-		// 不存在等暂态错误交由后续路径操作报真实错误。
-		return os.IsNotExist(err)
-	}
-	if !info.IsDir() {
-		warmWarnf("sbx-warm: %s %s is not a directory", label, dir)
-		return false
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		warmWarnf("sbx-warm: refusing group/world-writable %s %s", label, dir)
-		return false
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		if st.Uid != 0 && st.Uid != uint32(os.Geteuid()) {
-			warmWarnf("sbx-warm: refusing %s %s owned by uid %d", label, dir, st.Uid)
+		if !os.IsNotExist(err) {
+			// 非 ENOENT 暂态错误交由后续路径操作报真实错误。
+			return false
+		}
+		lastMissing = true
+	} else {
+		if !info.IsDir() {
+			warmWarnf("sbx-warm: %s %s is not a directory", label, dir)
+			return false
+		}
+		if !trustedPigDirModeOwnerOK(info) {
+			warmWarnf("sbx-warm: refusing group/world-writable or foreign-owner %s %s", label, dir)
 			return false
 		}
 	}
-	return true
+
+	// 祖先链逐级校验：从末级（已存在时）或首个已存在祖先（末级缺失时）
+	// 一路向上到 /，任一级命中拒收规则即 false。
+	ancestor := dir
+	if lastMissing {
+		ancestor = filepath.Dir(dir)
+	}
+	for {
+		if ancestor == "" || ancestor == "." {
+			return true
+		}
+		if ancestor == "/" {
+			return true
+		}
+		ai, lerr := os.Lstat(ancestor)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				// 继续向上找已存在祖先——末级不存在的场景须校验整条已存在链。
+				ancestor = filepath.Dir(ancestor)
+				continue
+			}
+			warmWarnf("sbx-warm: refusing %s %s (ancestor lstat error: %v)", label, dir, lerr)
+			return false
+		}
+		if ai.Mode()&os.ModeSymlink != 0 {
+			// 豁免：仅 / 直属且 uid==0 的系统顶层软链（macOS /var、/tmp）。
+			if st, ok := ai.Sys().(*syscall.Stat_t); ok && st.Uid == 0 && filepath.Dir(ancestor) == "/" {
+				ancestor = filepath.Dir(ancestor)
+				continue
+			}
+			warmWarnf("sbx-warm: refusing %s %s (ancestor %s is a symlink)", label, dir, ancestor)
+			return false
+		}
+		if !ai.IsDir() {
+			warmWarnf("sbx-warm: refusing %s %s (ancestor %s is not a directory)", label, dir, ancestor)
+			return false
+		}
+		if !trustedPigDirModeOwnerOK(ai) {
+			warmWarnf("sbx-warm: refusing %s %s (ancestor %s group/world-writable or foreign-owner)", label, dir, ancestor)
+			return false
+		}
+		if ancestor == dir {
+			// 末级目录本体已单独校验过；继续向上。
+			ancestor = filepath.Dir(ancestor)
+			continue
+		}
+		ancestor = filepath.Dir(ancestor)
+	}
+}
+
+// trustedPigDirModeOwnerOK 判定单级目录的权限与属主是否可信：
+//   - 属主必须是 0 或当前 euid；
+//   - Perm()&0o022 == 0 直接通过；Perm()&0o022 != 0 时仅豁免 Uid==0 且
+//     os.ModeSticky 置位的临时根（/tmp、/var/tmp 的 01777）；非粘滞 0777
+//     目录（任何用户都可 rmdir/mkdir 替换 host）一律不豁免。
+func trustedPigDirModeOwnerOK(info os.FileInfo) bool {
+	permWritable := info.Mode().Perm()&0o022 != 0
+	st, hasStat := info.Sys().(*syscall.Stat_t)
+	uidOK := true
+	uid := uint32(0)
+	if hasStat {
+		uid = st.Uid
+		uidOK = st.Uid == 0 || st.Uid == uint32(os.Geteuid())
+	}
+	if !permWritable {
+		return uidOK
+	}
+	// 可写目录：仅豁免 root 拥有且带 sticky 位的系统临时根；其余一律拒。
+	if hasStat && uid == 0 && info.Mode()&os.ModeSticky != 0 {
+		return true
+	}
+	return false
 }
 
 // warmTrackedBinaryPaths 返回除 pigBin 外参与指纹的真实 pig ELF 追踪目标：
@@ -671,50 +771,35 @@ func computeGoCellFingerprint(tracked []string, extDirs, sdkDirs []goDirEntry, s
 // 声明 language=="go"（排除宿主 node-runtime-* 等非 Go 产物）；cells/go
 // 目录本身已限定 go，允许 language 缺省或 =="go"。不扫描无关语言 cells/python 等。
 //
-// 枚举口径必须与 cellCacheEntryDirs / preparePrivatePigHome 投影完全一致：
-// cells/go 语言根本身是符号链接时跳过整个语言根的枚举（投影/Exec 同样不跟随
-// 该软链），否则 total 会因直接 ReadDir(cells/go) 跟随软链而计入投影为空的
-// 目标，造成完整性门禁零投影假放行。
+// 枚举口径与 cellCacheEntryDirs / preparePrivatePigHome / appendCellCachePolicy
+// 完全共用同一枚举实体：cacheRoot、cache/ext、cache/cells 根与各语言根本身
+// 是符号链接时对应根的整个枚举被跳过，total 不得再因独立 ReadDir 跟随根软链
+// 而计入投影为空的 target，造成完整性门禁零投影假放行。
 func countValidExecutableGoArtifacts(cacheRoot string) int {
 	count := 0
-	for _, root := range []struct {
-		path        string
-		requireLang bool // true: ready.json 必须显式 language=="go"
-	}{
-		{filepath.Join(cacheRoot, "cells", "go"), false},
-		{filepath.Join(cacheRoot, "ext"), true},
-	} {
-		// cells/<lang> 语言根本身是符号链接时跳过（与投影侧一致）；
-		// cache/ext 目录同理不接受软链本体。
-		if isSymlinkPath(root.path) {
+	for _, dir := range cellCacheEntryDirs(cacheRoot) {
+		rel := relToCache(cacheRoot, dir)
+		inCellsGo := strings.HasPrefix(rel, "cells"+string(filepath.Separator)+"go"+string(filepath.Separator))
+		meta, artifact, ok := validCellEntryDir(dir)
+		if !ok {
 			continue
 		}
-		entries, err := os.ReadDir(root.path)
-		if err != nil {
+		if inCellsGo {
+			// cells/go 已限定 go：language 缺省或 =="go"。
+			if meta.Language != "" && meta.Language != "go" {
+				continue
+			}
+		} else {
+			// cache/ext：ready.json 必须显式 language=="go"。
+			if meta.Language != "go" {
+				continue
+			}
+		}
+		info, err := os.Stat(artifact)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 			continue
 		}
-		for _, ent := range entries {
-			if cellEntryHiddenOrSymlink(ent) {
-				continue
-			}
-			dir := filepath.Join(root.path, ent.Name())
-			meta, artifact, ok := validCellEntryDir(dir)
-			if !ok {
-				continue
-			}
-			if root.requireLang {
-				if meta.Language != "go" {
-					continue
-				}
-			} else if meta.Language != "" && meta.Language != "go" {
-				continue
-			}
-			info, err := os.Stat(artifact)
-			if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-				continue
-			}
-			count++
-		}
+		count++
 	}
 	return count
 }

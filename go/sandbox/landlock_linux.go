@@ -330,8 +330,15 @@ func applyPolicy(p Policy) error {
 	return applyEnv(p.Env)
 }
 
+// startHelperForSetup 是 setupHelperAndSeccomp 派生辅助进程用的函数点
+// （默认直指 startHelperProcess）。提取为包内未导出变量仅供同包单测注入
+// 受控 helper（如就绪 ACK 后 notify 握手 EOF/非法字节），驱动真实
+// Apply→setup→post-install 失败路径；无任何环境变量/CLI/Policy 字段入口，
+// 生产恒为 startHelperProcess。
+var startHelperForSetup = startHelperProcess
+
 func setupHelperAndSeccomp(p Policy, goExecDir, realGoBin string) error {
-	ctrlFD, lifeWFD, err := startHelperProcess(p, goExecDir, realGoBin)
+	ctrlFD, lifeWFD, err := startHelperForSetup(p, goExecDir, realGoBin)
 	if err != nil {
 		return fmt.Errorf("start helper process: %w", err)
 	}
@@ -995,10 +1002,19 @@ func sendNotifyFDToHelper(ctrlFD int, notifyFD int) error {
 // 错误。就绪 ACK 与 notify-fd ACK 共用本路径：返回值被丢弃时，EINTR 中断
 // 未写出会让父进程阻塞读 ACK 而 helper 在 Recvmsg 等 notifyFD——双方互等；
 // 第二 ACK 写中断时 defer 关通道让父进程把正常启动误判失败（oracle M4）。
+// helperWriteEINTRObservedForTest 是包内未导出的 EINTR 观测回调：仅在
+// helperWriteAll 真实命中 unix.EINTR 分支时调用一次（默认 nil 零开销）。
+// 供同包单测以原子计数证明真实内核 EINTR 被命中并重试，杜绝「未命中前
+// 不排管道」的无界等待假绿；无任何环境变量/CLI/config 开启入口。
+var helperWriteEINTRObservedForTest func()
+
 func helperWriteAll(fd int, b []byte) error {
 	for len(b) > 0 {
 		n, err := unix.Write(fd, b)
 		if errors.Is(err, unix.EINTR) {
+			if helperWriteEINTRObservedForTest != nil {
+				helperWriteEINTRObservedForTest()
+			}
 			continue
 		}
 		if err != nil {
@@ -1068,22 +1084,27 @@ func runHelperProcess() {
 
 	// 1. 辅助进程自身施加 Landlock 约束，仅额外允许向 goExecDir/work 与 goExecDir/cache 写入编译产物。
 	// 任一步失败即 fail-closed：helper 不得在未受限状态下 ACK 并对外提供服务。
+	// MF-1：审查员 Policy.Exec 已收缩为 <goExecDir>/bin（不含 work/）；helper
+	// 仍须能执行 broker 拉起的 go test 产物（<goExecDir>/work/run-*/.../*.test）
+	// ——该授权仅存于 helper Landlock 域，审查员进程不享有。
 	abi, ok := supported()
 	if !ok {
 		fail("landlock not supported")
 	}
 	helperRW := append([]string{}, cfg.ReadWrite...)
+	helperExec := append([]string{}, cfg.Exec...)
 	if cfg.GoExecDir != "" {
 		helperRW = append(helperRW,
 			filepath.Join(cfg.GoExecDir, "work"),
 			filepath.Join(cfg.GoExecDir, "cache"),
 		)
+		helperExec = append(helperExec, filepath.Join(cfg.GoExecDir, "work"))
 	}
 	helperPolicy := Policy{
 		ReadOnly:          cfg.ReadOnly,
 		ReadWrite:         helperRW,
 		OptionalReadWrite: cfg.OptionalReadWrite,
-		Exec:              cfg.Exec,
+		Exec:              helperExec,
 		DenyNet:           cfg.DenyNet,
 		BestEffort:        cfg.BestEffort,
 	}
@@ -1155,8 +1176,8 @@ func runHelperProcess() {
 			return
 		}
 		// notify-fd ACK 同口径：EINTR 重试、校验完整写出；写失败时
-		// defer unix.Close(ctrlFD) 让父进程收 EOF（把正常启动判失败比
-		// 静默丢失 ACK 更符合 fail-closed，且父进程有超时兜底）。
+		// defer unix.Close(ctrlFD) 触发对端 EOF 唤醒父进程（把正常启动
+		// 判失败比静默丢失 ACK 更符合 fail-closed）。
 		_ = helperWriteAll(ctrlFD, []byte("1"))
 	}()
 
@@ -1244,9 +1265,18 @@ func handleGoBrokerConn(conn net.Conn, cfg helperConfig) {
 		return
 	}
 
-	realGo := cfg.RealGoBin
+	// 纵深防御：cfg.RealGoBin 必须过受信校验（真实常规可执行文件、非组/
+	// 全局可写、属主合规、固定前缀、父目录合规）；不通过或为空时回退
+	// resolveSandboxRealGoBinary——与预热/策略同一受信实体，绝不执行
+	// 未校验的任意路径（oracle MF-2 broker 侧污染面）。
+	realGo := ""
+	if cfg.RealGoBin != "" {
+		if trusted, ok := trustedRealGoCandidate(cfg.RealGoBin); ok {
+			realGo = trusted
+		}
+	}
 	if realGo == "" {
-		realGo = resolveRealGoBinary(filepath.Join(cfg.GoExecDir, "bin"))
+		realGo = resolveSandboxRealGoBinary(filepath.Join(cfg.GoExecDir, "bin"))
 	}
 	if realGo == "" {
 		_, _ = fmt.Fprintln(stdioFiles[2], "go: real go toolchain binary not found")
@@ -1268,7 +1298,7 @@ func handleGoBrokerConn(conn net.Conn, cfg helperConfig) {
 		finalArgs = injectGoTestExecFlag(req.Args, runnerPath)
 	}
 
-	sanitizedEnv := sanitizeGoBrokerEnv(req.Env, cfg, invWorkDir)
+	sanitizedEnv := sanitizeGoBrokerEnv(req.Env, cfg, invWorkDir, subcmd)
 
 	cmd := exec.Command(realGo, finalArgs...)
 	cmd.Dir = req.Dir
@@ -1296,6 +1326,51 @@ func writeBrokerExitCode(conn net.Conn, code int) {
 	_, _ = conn.Write(buf[:])
 }
 
+// resolvePathThroughAncestorSymlinks 把 path 中首个已存在的祖先目录经
+// filepath.EvalSymlinks 解析为真实路径，再拼回剩余相对段与末级名——
+// 末级不存在、中间级不存在或含多级软链时均能对齐最终真实落点。
+// 不解软链的 NormalizePath 无法发现 "$TMPDIR/sym -> <goExecDir>/work" 这类
+// 祖先软链别名（oracle9 MF-1）；本函数把校验锚定到真实文件系统。
+// 解析失败（路径完全不存在至根、软链环等）返回空串，调用方按 fail-closed
+// 拒绝处理。
+func resolvePathThroughAncestorSymlinks(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	// 逐级向上找首个已存在的祖先目录（Lstat 不跟随软链判定存在性，
+	// EvalSymlinks 在祖先上解析其真实目标）。
+	ancestor := filepath.Dir(abs)
+	missing := []string{filepath.Base(abs)}
+	for {
+		if ancestor == "/" || ancestor == "." {
+			return ""
+		}
+		if _, lerr := os.Lstat(ancestor); lerr == nil {
+			resolved, rerr := filepath.EvalSymlinks(ancestor)
+			if rerr != nil || resolved == "" {
+				return ""
+			}
+			parts := []string{filepath.Clean(resolved)}
+			for i := len(missing) - 1; i >= 0; i-- {
+				parts = append(parts, missing[i])
+			}
+			return filepath.Join(parts...)
+		} else if !os.IsNotExist(lerr) {
+			return ""
+		}
+		missing = append(missing, filepath.Base(ancestor))
+		ancestor = filepath.Dir(ancestor)
+	}
+}
+
 func validateGoWrapperArgs(args []string, cwd, goExecDir string) (string, error) {
 	if len(args) == 0 {
 		return "help", nil
@@ -1305,8 +1380,21 @@ func validateGoWrapperArgs(args []string, cwd, goExecDir string) (string, error)
 	if err != nil {
 		cleanExecDir = filepath.Clean(goExecDir)
 	}
+	// 受保护根一律取解析后的真实路径：$TMPDIR/sym -> <goExecDir>/work 这类
+	// 祖先软链别名必须落回真实树比较（oracle9 MF-1）。
+	realExecDir := cleanExecDir
+	if resolved := resolvePathThroughAncestorSymlinks(cleanExecDir); resolved != "" {
+		realExecDir = resolved
+	}
+	inProtected := func(candidate string) bool {
+		if candidate == "" {
+			return false
+		}
+		return candidate == realExecDir || strings.HasPrefix(candidate, realExecDir+string(filepath.Separator))
+	}
 
 	subcmd := ""
+	explicitOutput := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -1319,11 +1407,18 @@ func validateGoWrapperArgs(args []string, cwd, goExecDir string) (string, error)
 		switch flagName {
 		case "exec", "toolexec", "overlay", "C":
 			return "", fmt.Errorf("flag -%s is forbidden in ReadOnlyReviewer sandbox", flagName)
+		// MF-1：链接器/编译器外挂标志可在 broker Landlock 域内执行外部
+		// 命令（如 -ldflags=-linkmode=external -extld=<wrapper>），白名单
+		// 工具（objcopy/ld/gcc）由此可把任意 ELF 拷入 <goExecDir>/work；
+		// go build/vet/test 合法流程均不需要这些标志，一律封禁。
+		case "ldflags", "gcflags", "asmflags", "gccgoflags":
+			return "", fmt.Errorf("flag -%s is forbidden in ReadOnlyReviewer sandbox", flagName)
 		case "c":
 			if subcmd == "test" {
 				return "", errors.New("flag -c is forbidden in ReadOnlyReviewer go test")
 			}
 		case "o":
+			explicitOutput = true
 			outPath := flagVal
 			if !hasEq {
 				if i+1 >= len(args) {
@@ -1335,23 +1430,22 @@ func validateGoWrapperArgs(args []string, cwd, goExecDir string) (string, error)
 			if !filepath.IsAbs(outPath) && cwd != "" {
 				outPath = filepath.Join(cwd, outPath)
 			}
-			if normOut, err := NormalizePath(outPath); err == nil {
-				if normOut == cleanExecDir || strings.HasPrefix(normOut, cleanExecDir+string(filepath.Separator)) {
-					return "", fmt.Errorf("output path %q inside protected exec dir is forbidden", outPath)
-				}
+			resolvedOut := resolvePathThroughAncestorSymlinks(outPath)
+			if inProtected(resolvedOut) {
+				return "", fmt.Errorf("output path %q inside protected exec dir is forbidden", outPath)
 			}
 			continue
 		}
 
 		if strings.HasPrefix(arg, "-o") && len(arg) > 2 && !hasEq {
+			explicitOutput = true
 			outPath := arg[2:]
 			if !filepath.IsAbs(outPath) && cwd != "" {
 				outPath = filepath.Join(cwd, outPath)
 			}
-			if normOut, err := NormalizePath(outPath); err == nil {
-				if normOut == cleanExecDir || strings.HasPrefix(normOut, cleanExecDir+string(filepath.Separator)) {
-					return "", fmt.Errorf("output path %q inside protected exec dir is forbidden", outPath)
-				}
+			resolvedOut := resolvePathThroughAncestorSymlinks(outPath)
+			if inProtected(resolvedOut) {
+				return "", fmt.Errorf("output path %q inside protected exec dir is forbidden", outPath)
 			}
 			continue
 		}
@@ -1363,6 +1457,17 @@ func validateGoWrapperArgs(args []string, cwd, goExecDir string) (string, error)
 
 	if subcmd == "" {
 		return "help", nil
+	}
+
+	// MF-1：缺省 -o 时 go build/go test 会把产物写进 cwd（req.Dir）；cwd 位于
+	// <goExecDir>（其下 work 为 broker 可写域）时等同经 broker 向受保护
+	// 执行目录写二进制，必须拒绝。校验锚定 EvalSymlinks 后真实路径，
+	// 覆盖 cwd 经软链指向 goExecDir 的别名形态。
+	if !explicitOutput && cwd != "" {
+		resolvedCwd := resolvePathThroughAncestorSymlinks(cwd)
+		if inProtected(resolvedCwd) {
+			return "", fmt.Errorf("working directory %q inside protected exec dir is forbidden without explicit -o", cwd)
+		}
 	}
 
 	switch subcmd {
@@ -1386,7 +1491,7 @@ func injectGoTestExecFlag(args []string, runnerPath string) []string {
 	return out
 }
 
-func sanitizeGoBrokerEnv(baseEnv []string, cfg helperConfig, invWorkDir string) []string {
+func sanitizeGoBrokerEnv(baseEnv []string, cfg helperConfig, invWorkDir string, subcmd string) []string {
 	blockedKeys := map[string]bool{
 		"GOFLAGS":          true,
 		"CC":               true,
@@ -1420,19 +1525,26 @@ func sanitizeGoBrokerEnv(baseEnv []string, cfg helperConfig, invWorkDir string) 
 		envGoExecDirKey+"="+cfg.GoExecDir,
 		envBrokerCfgKey+"="+string(cfgBytes),
 	)
+	// MF-1：仅 go test 链路把 .test 产物执行根暴露给 pi-test-runner——
+	// runner 在叠加审查员规则集前需要经 cfg.Exec 放行 <goExecDir>/work；
+	// 非 test 子命令不注入，审查员侧 Policy.Env 同样不含该键。
+	if subcmd == "test" {
+		out = append(out, envGoTestWorkDirKey+"="+filepath.Join(cfg.GoExecDir, "work"))
+	}
 	return out
 }
 
 func runGoWrapperClient(goExecDir string) int {
-	subcmd, err := validateGoWrapperArgs(os.Args[1:], "", goExecDir)
-	if err != nil || subcmd == "" {
-		fmt.Fprintf(os.Stderr, "go: sandbox rejected command: %v\n", err)
-		return 2
-	}
-
+	// MF-1：先取真实 cwd 再做客户端预校验——空串会让缺省 -o 时的 cwd 校验
+	// 与 -o 相对路径拼接受阻（broker 侧还会以 req.Dir 复验，双端同口径）。
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "."
+	}
+	subcmd, err := validateGoWrapperArgs(os.Args[1:], cwd, goExecDir)
+	if err != nil || subcmd == "" {
+		fmt.Fprintf(os.Stderr, "go: sandbox rejected command: %v\n", err)
+		return 2
 	}
 
 	sockPath := filepath.Join(goExecDir, "broker.sock")
@@ -1504,15 +1616,23 @@ func runTestRunnerClient(goExecDir string) int {
 		fmt.Fprintln(os.Stderr, "pi-test-runner: landlock not supported")
 		return 126
 	}
-	reviewerPolicy := Policy{
+	// MF-1：审查员 Policy.Exec 已收缩为 <goExecDir>/bin；.test 产物位于
+	// helper 可写域 <goExecDir>/work 下，审查员侧不再持有该执行授权。
+	// pi-test-runner 在叠加审查员规则集时，仅经 broker 注入的
+	// envGoTestWorkDirKey 把该产物根追加进 Exec（仅本进程，非审查员全局）。
+	runnerExec := append([]string{}, cfg.Exec...)
+	if testWorkDir := os.Getenv(envGoTestWorkDirKey); testWorkDir != "" {
+		runnerExec = append(runnerExec, testWorkDir)
+	}
+	rulesetPolicy := Policy{
 		ReadOnly:          cfg.ReadOnly,
 		ReadWrite:         cfg.ReadWrite,
 		OptionalReadWrite: cfg.OptionalReadWrite,
-		Exec:              cfg.Exec,
+		Exec:              runnerExec,
 		DenyNet:           cfg.DenyNet,
 		BestEffort:        cfg.BestEffort,
 	}
-	rulesetFD, err := createAndPopulateRuleset(reviewerPolicy, abi, true, cfg.DenyNet && abi >= 4)
+	rulesetFD, err := createAndPopulateRuleset(rulesetPolicy, abi, true, cfg.DenyNet && abi >= 4)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pi-test-runner: create landlock ruleset failed: %v\n", err)
 		return 126
@@ -1534,6 +1654,8 @@ func runTestRunnerClient(goExecDir string) int {
 		env = overrideEnvKey(env, "GOCACHE", filepath.Join(privateTmp, "go-cache"))
 	}
 	env = removeEnvKey(env, envBrokerCfgKey)
+	// envGoTestWorkDirKey 仅本进程消费，不透传给被执行的 .test 二进制。
+	env = removeEnvKey(env, envGoTestWorkDirKey)
 
 	if err := syscall.Exec(targetBin, os.Args[1:], env); err != nil {
 		fmt.Fprintf(os.Stderr, "pi-test-runner: exec %s failed: %v\n", targetBin, err)
