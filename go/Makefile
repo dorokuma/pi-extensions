@@ -30,7 +30,7 @@ PIGSDK_META_FILES := \
 	./CHANGELOG.md
 PIGSDK_META_FIND := $(foreach f,$(PIGSDK_META_FILES),! -path "$(f)")
 
-.PHONY: all build test vet sdk-check install-test examples-smoke examples-run help
+.PHONY: all build test vet fmt-check check sdk-check install-test examples-smoke examples-run help
 
 all: help
 
@@ -39,6 +39,8 @@ help:
 	@echo "  build           - Compile root module and all component modules"
 	@echo "  test            - Run tests across root module and all component modules"
 	@echo "  vet             - Run static analysis on root module and all component modules"
+	@echo "  fmt-check       - Verify gofmt cleanliness of root module and all component modules"
+	@echo "  check           - fmt-check + sdk-check + vet + build + test (sandbox runs with -race)"
 	@echo "  sdk-check       - Compare local pigsdk against staged PiG SDK md5sum (plus declared local patches)"
 	@echo "  install-test    - Validate and install into isolated directory (PIG_ISOLATED_DIR)"
 	@echo "  examples-smoke  - Load examples/hello in PiG and call hello_ping (JSON output; makes one model call)"
@@ -54,11 +56,11 @@ build:
 	done
 
 test:
-	@echo "==> [root module] go test ./..."
-	@go test ./... || { echo "FAILED: ." >&2; exit 1; }
+	@echo "==> [root module] env -u PIG_EXT_HOST_INFO go test ./..."
+	@env -u PIG_EXT_HOST_INFO go test ./... || { echo "FAILED: ." >&2; exit 1; }
 	@for dir in $(COMPONENTS); do \
-		echo "==> [component: $$dir] go test ./..."; \
-		(cd "$$dir" && go test ./...) || { echo "FAILED: $$dir" >&2; exit 1; }; \
+		echo "==> [component: $$dir] env -u PIG_EXT_HOST_INFO go test ./..."; \
+		(cd "$$dir" && env -u PIG_EXT_HOST_INFO go test ./...) || { echo "FAILED: $$dir" >&2; exit 1; }; \
 	done
 
 vet:
@@ -68,6 +70,34 @@ vet:
 		echo "==> [component: $$dir] go vet ./..."; \
 		(cd "$$dir" && go vet ./...) || { echo "FAILED: $$dir" >&2; exit 1; }; \
 	done
+
+fmt-check:
+	@files=$$(gofmt -l .); \
+	if [ -n "$$files" ]; then \
+		echo "FAILED: ." >&2; \
+		echo "$$files" >&2; \
+		exit 1; \
+	fi
+	@for dir in $(COMPONENTS); do \
+		files=$$(cd "$$dir" && gofmt -l .); \
+		if [ -n "$$files" ]; then \
+			echo "FAILED: $$dir" >&2; \
+			echo "$$files" >&2; \
+			exit 1; \
+		fi; \
+	done
+	@echo "gofmt clean"
+
+check: fmt-check sdk-check vet build
+	@echo "==> [root module] env -u PIG_EXT_HOST_INFO go test -p 2 -count=1 ./..."
+	@env -u PIG_EXT_HOST_INFO go test -p 2 -count=1 ./... || { echo "FAILED: ." >&2; exit 1; }
+	@for dir in $(COMPONENTS); do \
+		raceflag=""; \
+		if [ "$$dir" = "sandbox" ]; then raceflag="-race"; fi; \
+		echo "==> [component: $$dir] env -u PIG_EXT_HOST_INFO go test -p 2 -count=1 $$raceflag ./..."; \
+		(cd "$$dir" && env -u PIG_EXT_HOST_INFO go test -p 2 -count=1 $$raceflag ./...) || { echo "FAILED: $$dir" >&2; exit 1; }; \
+	done
+	@echo "OK: go check passed"
 
 sdk-check:
 	@tmpdir=$$(mktemp -d /tmp/sdk-check.XXXXXX); \
