@@ -58,6 +58,12 @@ type Palette struct {
 	Arrow Colorize
 	// Tree colors ├─ and └─ connectors.
 	Tree Colorize
+	// Heading is the mdHeading foreground escape a heading-line pill
+	// reopens together with the bold weight when more title text follows
+	// (the host's headingInline opened both before the line reached
+	// Decorate; a pill's own SGR close drops them). Empty leaves the
+	// reopen to the weight alone.
+	Heading string
 	// RoundCaps draws rounded Nerd Font end caps; false draws square chips
 	// with a space on each side.
 	RoundCaps bool
@@ -468,6 +474,15 @@ func CreatePalette(theme ThemeLike, boldColor ...string) Palette {
 			ToneOwner:  solid(34),
 		},
 		Arrow: safeFg(theme, fg, "accent"),
+		// mdHeading resolves to the foreground escape a heading pill
+		// restores after its reset; an unresolvable token leaves Heading
+		// empty instead of panicking.
+		Heading: func() string {
+			if ansi, err := theme.GetFgAnsi("mdHeading"); err == nil {
+				return ansi
+			}
+			return ""
+		}(),
 		// PiG's UITheme.Fg("dim") appends the merged close "\x1b[22;39m", which
 		// ends an outer bold the host will not reopen. dimFg builds the
 		// colorizer from GetFgAnsi so the close is written split
@@ -579,11 +594,7 @@ func Decorate(markdown string, palette Palette) string {
 			// ran, so the state machine is unaffected.
 			out.WriteString(line)
 		} else if headingRe.MatchString(line) {
-			// Pi already colors headings; only the icon is added.
-			out.WriteString(headingSplit.ReplaceAllStringFunc(line, func(m string) string {
-				sub := headingSplit.FindStringSubmatch(m)
-				return sub[1] + withLabelIcon(sub[2])
-			}))
+			out.WriteString(decorateHeading(line, palette))
 		} else {
 			out.WriteString(decorateLine(line, palette, open, close))
 		}
@@ -600,6 +611,72 @@ func splitColorize(bold Colorize) (open, close string) {
 		return wrapped[:idx], wrapped[idx+len(sentinel):]
 	}
 	return wrapped, ""
+}
+
+// decorateHeading colors one heading line: the host already paints the
+// heading bold in mdHeading, so only the word icon and the [[pill]]s are
+// added here. The title's icon comes first (upstream withLabelIcon on the
+// split title), then the title is cut at the same protected fragments prose
+// obeys — a `code span` or [label](url) keeps [[...]] literal — and every
+// remaining [[label]] of 1–32 non-bracket characters renders as pill(). A
+// pill's own SGR close drops the heading weight and foreground the host
+// opened, so when more title text follows it the pair is reopened with
+// "\x1b[1m" + palette.Heading (empty Heading restores the weight alone); a
+// pill ending the line takes no reopen. Prose tokens the host's
+// headingInline handles — **bold**, →, ✓, ├── — stay untouched here.
+func decorateHeading(line string, palette Palette) string {
+	return headingSplit.ReplaceAllStringFunc(line, func(m string) string {
+		sub := headingSplit.FindStringSubmatch(m)
+		title := withLabelIcon(sub[2])
+		if palette.Pills == nil {
+			return sub[1] + title
+		}
+		spans := protectedSpans(title)
+		var sb strings.Builder
+		sb.Grow(len(title) + 32)
+		proseStart := 0
+		for _, s := range spans {
+			// A pill ending this fragment still sits inside the title (the
+			// protected span follows it), so the restore applies there too.
+			sb.WriteString(headingPills(title[proseStart:s.start], palette, true))
+			sb.WriteString(title[s.start:s.end])
+			proseStart = s.end
+		}
+		sb.WriteString(headingPills(title[proseStart:], palette, false))
+		return sub[1] + sb.String()
+	})
+}
+
+// headingPills renders the [[label]]s in one unprotected heading fragment.
+// A nonempty label of 1–32 characters becomes a pill; when more title text
+// follows the pill — inside the fragment, or (more) in a later fragment —
+// "\x1b[1m" + palette.Heading reopens the bold weight and mdHeading
+// foreground the host's headingInline opened (the same reopen()
+// decorateProse applies inside a bold span). A pill ending the title takes
+// no reopen: the host restores nothing at line end either.
+func headingPills(fragment string, palette Palette, more bool) string {
+	var sb strings.Builder
+	sb.Grow(len(fragment) + 32)
+	pos := 0
+	for _, m := range inlineRe.FindAllStringSubmatchIndex(fragment, -1) {
+		sb.WriteString(fragment[pos:m[0]])
+		match := fragment[m[0]:m[1]]
+		// m[6:8] is group 3, the [[label]]; empty means the match was a
+		// bold marker or escaped asterisks, which the host's headingInline
+		// owns and which pass through verbatim.
+		if m[6] < 0 || strings.TrimSpace(fragment[m[6]:m[7]]) == "" {
+			sb.WriteString(match)
+		} else {
+			reopen := ""
+			if m[1] < len(fragment) || more {
+				reopen = "\x1b[1m" + palette.Heading
+			}
+			sb.WriteString(pill(fragment[m[6]:m[7]], palette) + reopen)
+		}
+		pos = m[1]
+	}
+	sb.WriteString(fragment[pos:])
+	return sb.String()
 }
 
 // withLabelIcon prefixes a known label with its icon, unless it already opens

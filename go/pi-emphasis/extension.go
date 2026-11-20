@@ -281,7 +281,7 @@ func themeFingerprint(theme sdk.UITheme) string {
 	}
 	b.WriteByte('|')
 	b.WriteString(os.Getenv("PI_EMPHASIS_ROUND_CAPS"))
-	for _, token := range []string{"mdLink", "success", "error", "warning", "accent", "dim", "text"} {
+	for _, token := range []string{"mdLink", "mdHeading", "success", "error", "warning", "accent", "dim", "text"} {
 		ansi, _ := theme.GetFgAnsi(token)
 		b.WriteByte('|')
 		b.WriteString(ansi)

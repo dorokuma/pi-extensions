@@ -184,6 +184,94 @@ func TestUnknownHeadingUntouched(t *testing.T) {
 	}
 }
 
+// TestHeadingRendersPills is the bug regression: [[label]] inside a heading
+// line renders as a pill instead of staying literal (upstream paints every
+// pill; the heading branch only used to add the heading word's icon).
+func TestHeadingRendersPills(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"## 为什么会这样 [[Cause]]", "## 为什么会这样 |Cause|"},
+		{"## 女儿已做的处置 [[Done]]", "## 女儿已做的处置 |\uf00c Done|"},
+	}
+	for _, c := range cases {
+		if got := plain(c.in); got != c.want {
+			t.Errorf("plain(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// The heading word's own icon keeps its existing behaviour.
+	if got, want := plain("## Finding"), "## \uf002 Finding"; got != want {
+		t.Fatalf("plain(%q) = %q, want %q", "## Finding", got, want)
+	}
+}
+
+// TestHeadingPillRestoresStyle covers the new restore branch: a pill followed
+// by more heading text reopens the bold weight and the mdHeading foreground
+// the host's headingInline had opened (the pill's own SGR reset drops both);
+// a pill at line end takes no redundant restore.
+func TestHeadingPillRestoresStyle(t *testing.T) {
+	theme := newFakeTheme()
+	p := CreatePalette(theme)
+	headingAnsi, err := theme.GetFgAnsi("mdHeading")
+	if err != nil || headingAnsi == "" {
+		t.Skip("fake theme resolves no mdHeading foreground")
+	}
+	restore := "\x1b[1m" + headingAnsi
+	out := Decorate("## [[Done]] 第一阶段已完成", p)
+	pillEnd := strings.Index(out, "\x1b[22;27m\x1b[39m\x1b[49m")
+	restoreAt := strings.Index(out, restore)
+	tailAt := strings.Index(out, "第一阶段")
+	if pillEnd < 0 || restoreAt < 0 || tailAt < 0 || !(pillEnd < restoreAt && restoreAt < tailAt) {
+		t.Fatalf("heading style not reopened after mid-line pill: %q", out)
+	}
+	if got := plainP("## [[Done]] 第一阶段已完成", p); got != "## |\uf00c Done| 第一阶段已完成" {
+		t.Fatalf("plain render = %q", got)
+	}
+	// Pill at end of heading: nothing follows it, so no restore is appended.
+	outEnd := Decorate("## 已完成 [[Done]]", p)
+	if strings.Count(outEnd, restore) != 0 {
+		t.Fatalf("line-end pill took a redundant restore: %q", outEnd)
+	}
+	// An empty Heading (unresolvable mdHeading token) still reopens the bold
+	// weight alone when more title follows; a line-end pill stays bare. The
+	// weight must come after the pill's own close, which already contains a
+	// "\x1b[1m" of its own, so position (not count) distinguishes the restore.
+	closeSeq := "\x1b[22;27m\x1b[39m\x1b[49m"
+	noHeadingTheme := newFakeTheme()
+	noHeadingTheme.unknownFg = map[string]bool{"mdHeading": true}
+	noHeading := CreatePalette(noHeadingTheme)
+	outNH := Decorate("## [[Done]] 第一阶段已完成", noHeading)
+	peNH := strings.Index(outNH, closeSeq)
+	if peNH < 0 {
+		t.Fatalf("pill close missing: %q", outNH)
+	}
+	tailNH := outNH[peNH+len(closeSeq):]
+	weightAt := strings.Index(tailNH, "\x1b[1m")
+	textAt := strings.Index(tailNH, "第一阶段")
+	if weightAt < 0 || textAt < 0 || weightAt > textAt {
+		t.Fatalf("empty Heading did not restore the bold weight alone: %q", outNH)
+	}
+	outNH = Decorate("## 已完成 [[Done]]", noHeading)
+	if peNH = strings.Index(outNH, closeSeq); peNH < 0 || strings.Contains(outNH[peNH+len(closeSeq):], "\x1b[1m") {
+		t.Fatalf("empty Heading line-end pill took a restore: %q", outNH)
+	}
+}
+
+// TestHeadingProtectedSpansStayLiteral keeps `[[...]]` inside a heading's
+// protected fragments verbatim — the same protectedSpans contract prose
+// obeys: inline code spans, and a link the host's markedInlineLink scan
+// accepts (here the inner `[x]](url)` portion resolves as the link, so the
+// label text stays literal).
+func TestHeadingProtectedSpansStayLiteral(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"## 修复 `[[Done]]` 的显示", "## 修复 `[[Done]]` 的显示"},
+		{"## 查看 [文档 [[x]](https://example.com) 说明", "## 查看 [文档 [[x]](https://example.com) 说明"},
+	}
+	for _, c := range cases {
+		if got := plain(c.in); got != c.want {
+			t.Errorf("plain(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestLeadingBoldLabelTakesIcon(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"**Cause:** x", "**<mdLink> Cause:</>** x"},
