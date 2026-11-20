@@ -56,9 +56,11 @@
 ## 命令入口
 
 ```bash
-# 依赖安装（本机根目录有 /pnpm-workspace.yaml，勿改它，用 --ignore-workspace 摆脱干扰）
-pnpm setup                       # = pnpm install --ignore-workspace
-pnpm check                       # = tsc --noEmit（见 README『类型检查』的范围与局限）
+# 唯一检查入口：make check = install-check + go-check
+# （install-check = bash -n install.sh/tests + tests/install.test.sh；
+#  go-check = go/ 全组件 fmt/sdk/vet/build/test，sandbox 带 -race；
+#  install.sh --audit 仅为宿主部署目录只读巡检，不是检查入口）
+make check                       # 仓库门禁：install-check + go-check
 
 bash install.sh --list           # 列出 10 扩展：名称/类别/权威源/目标/当前状态
 bash install.sh --audit          # 只读巡检 10 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警

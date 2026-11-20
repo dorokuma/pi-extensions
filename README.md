@@ -28,9 +28,8 @@
 ## 命令用法
 
 ```bash
-# 依赖安装：本机根目录存在 /pnpm-workspace.yaml（勿改它），用 --ignore-workspace 摆脱工作区探测
-pnpm setup                 # = pnpm install --ignore-workspace
-pnpm check                 # = tsc --noEmit
+# 唯一检查入口：make check = install-check + go-check（install.sh --audit 仅为宿主部署目录只读巡检）
+make check                 # 仓库门禁：bash 语法/回归测试 + go/ 全组件 fmt/sdk/vet/build/test
 
 bash install.sh --list     # 列出 10 扩展：名称/类别/权威源/目标/当前状态
 bash install.sh --audit    # 只读巡检 10 扩展（md5/权限/外生脚本/herdr）+ dest 目录未登记条目差集告警
@@ -117,11 +116,13 @@ bash install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DES
     6. **`md5_of` 每文件调用两次（探测 + 取值）**：**现象**：`status_of`（`install.sh:230-235`）与 `audit_unregistered_dest`（`install.sh:411,456`）对每个普通文件先执行 `if md5_of "$f" >/dev/null 2>&1` 探测再执行 `$(md5_of "$f")` 取值，导致每文件派生 2 次 `md5sum`；**触发条件**：`--list` / `--audit` 校验任意普通文件（已登记源/目标 + 未登记普通文件）时均触发；**可复现命令**：`BASH_XTRACEFD=7 bash -x install.sh --audit 7>&1 >/dev/null 2>/dev/null | grep -c 'md5sum --'`（前提：registry 中 10 个非 `external` 扩展的权威源 `authority.sourcePath` 全部满足 `[ ! -L "$src" ] && [ -f "$src" ]` 普通文件判据［`install.sh:230`］；真实生产 dest 普通文件 21 个 + 满足该判据的权威源普通文件 10 个 = 31 个，每文件 2 次共调用 62 次）；**影响与是否影响当前生产**：目录文件多或体积大时有双倍 `md5sum` 开销，**不影响当前生产**（真实生产 dest 普通文件 21 个、最大文件 83803 字节，连同满足普通文件判据的权威源 10 个共 62 次调用，多次实测整次审计墙钟约 0.3–0.6s）；**是否为文档明示取舍**：属既有实现已知开销，**已排期在 R4 与第 1 项一并优化（见下文「后续计划（R4）」小节：合并 `md5_of` 的单文件双次调用），当前仅作文档登记**。
     7. **顶层与子目录（含 `__tests__/`）内 fifo 命名的 `.ts` 分类与专项点名三分支非对称**：**现象**：顶层 `[ -f ]` 判定在 `install.sh:410`、顶层 `.ts` 收集在 `install.sh:423-428`（`423` 为 `*.ts)` 分支头、`424-428` 为分支体，`429` 行起为 `*)` 的 `other-file` 分支），故顶层名为 `x.ts` 的 fifo 落 `other` 分支（`install.sh:438-443` 赋 `kind="other"` 与 `content check skipped`；明细行 `install.sh:444` 的 `DEST_MD5=----` 来自顶层循环默认赋值 `install.sh:391`）且**不**出现在 `unregistered *.ts in dest-dir:` 点名行；而子目录在 `find -P`（`install.sh:328`）收集阶段按后缀入列（`install.sh:344-346`）时不区分文件类型，随后按相对路径分两支（非普通文件在明细行 `install.sh:479` 的 `DEST_MD5=----` 来自子目录循环默认赋值 `install.sh:451`）——非 `__tests__/` 子目录内的 `sub/y.ts` fifo 归为 `nested *.ts`（`install.sh:471`、`ts_list` 入列在 `470`）并进入 `unregistered *.ts in dest-dir:` 专项点名 `echo`（`install.sh:484`），而任意层级 `__tests__/` 下的 `__tests__/t.ts`、`sub/__tests__/u.ts` fifo 则命中 `__tests__/*|*/__tests__/*` 分支归为 `__tests__ file`（`install.sh:459-467`，`kind` 赋值在 `461`）、`DEST_MD5=----`（`install.sh:451` 默认值）、**不进** `unregistered *.ts in dest-dir:` 点名行；**触发条件**：`DEST_DIR` 下存在以 `.ts` 结尾的 fifo（或 socket/device 等非普通文件），按位置分三分支：① 顶层（`[ -f ]` 为假 → 归 `other`、**不点名**）；② 非 `__tests__/` 子目录（归 `nested *.ts`、**会点名**）；③ 任意层级 `__tests__/` 下（归 `__tests__ file`、**不点名**）；**可复现命令**：`D="$(mktemp -d)"; mkfifo "$D/x.ts"; mkdir -p "$D/sub" "$D/__tests__" "$D/sub/__tests__"; mkfifo "$D/sub/y.ts" "$D/__tests__/t.ts" "$D/sub/__tests__/u.ts"; bash install.sh --dest-dir "$D" --audit; rm -rf "$D"`；**影响与是否影响当前生产**：三类位置的 `.ts` 命名特殊文件在 `KIND` 分类（`other` / `nested *.ts` / `__tests__ file`）及是否进入 `unregistered *.ts in dest-dir:` 专项点名上存在非对称（三者均跳过 `md5sum` 不挂死），**不影响当前生产**（真实生产 dest 无 fifo/socket/device 等特殊文件）；**是否为文档明示取舍**：属顶层先按文件类型分流、子目录先按后缀收集再按 `__tests__/` 路径分流的实现路径差异所致已知非对称边界，如实记录于此。
     8. **换行、空白与反斜杠文件名的拆行、漏分类、空白分列破坏及 `DEST_MD5` 前导 `\`**：**现象**：除顶层换行 `.ts` 文件名（如 `$'line1\nline2.ts'`）既拆明细表（见第 2 条，`install.sh:444`）又将末尾专项点名 `echo "$PROG WARN: unregistered *.ts in dest-dir: ${ts_list[*]} ..."`（`install.sh:484`；`483` 为 `if`、`485` 为 `fi`）拆成两行外，同类控制字符/空白/反斜杠文件名还存在以下边界：① **嵌套换行 `.ts` 同样拆专项 `WARN`，且含 `\n` 或 `\` 的文件名会给 `DEST_MD5` 加前导 `\`**：如 `sub/$'nline1\nnline2.ts'` 既拆明细表嵌套行（`install.sh:479`）又拆 `install.sh:484` 专项 `WARN`；同时凡文件名含换行符（`$'\n'`）或反斜杠（`\`，如 `back\slash.ts`）的普通文件，GNU `md5sum -- "$1"`（`install.sh:79`）会在输出行首加转义前缀 `\`，令 `${out%% *}`（`install.sh:82`）截出的 `DEST_MD5` 带前导 `\`（如 `\d41d8cd98f00b204e9800998ecf8427e`）；② **尾空格文件名（`trail.ts `）不进 `*.ts` 分类，且在表上显示成 `trail.ts`**：顶层 `trail.ts `（末尾为空格）在 `case "$base_lc" in *.ts)`（`install.sh:422-423`）不匹配 `*.ts` 而落入 `other-file`（`install.sh:429-434`），且因 `printf '%-42s'`（`install.sh:444`）以空格右填充会吃掉尾空格，**在表上显示成 `trail.ts`**、看起来像普通 `.ts` 被错分成 `other-file`；嵌套 `sub/trail.ts ` 在 `case "$rel_lc" in *.ts)`（`install.sh:344-345`）不匹配而落入 `nested non-.ts (count-only)`（`install.sh:348-350`），二者均**不进** `other *.ts` / `nested *.ts` 与专项 `WARN` 点名；③ **首空格、内部空格或制表符（`tab\t.ts`）破坏按空白分列**：顶层 ` .ts`、嵌套 `sub/ .ts` 及含制表符的 `$'tab\t.ts'`（或 `sub/$'ntab\t.ts'`）虽仍归 `other *.ts` / `nested *.ts`（`$'tab\t.ts'` 的 `DEST_MD5` 无前导 `\`）且不拆行，但在明细表（`install.sh:444,479`）与 `install.sh:484` 以空格拼接的 `${ts_list[*]}` 中，空格与 `\t` 均会破坏按空白分列（`\t` 还会因制表位展开破坏明细表列对齐）；**触发条件**：`DEST_DIR` 顶层或子目录内存在含换行符（`$'\n'`）、制表符（`$'\t'`）、反斜杠（`\`）、尾随空格或前导/内部空格的文件名；**可复现命令**（复现命令需在 bash 下执行，`$'…'` 为 bash ANSI-C 引用，`/bin/sh`［dash］下不展开；单测顶层换行：`D="$(mktemp -d)"; touch "$D/"$'line1\nline2.ts'; bash install.sh --dest-dir "$D" --audit; rm -rf "$D"`；六类同测）：`D="$(mktemp -d)"; mkdir -p "$D/sub"; touch "$D/"$'line1\nline2.ts' "$D/sub/"$'nline1\nnline2.ts' "$D/trail.ts " "$D/ .ts" "$D/"$'tab\t.ts' "$D/"$'back\\slash.ts'; bash install.sh --dest-dir "$D" --audit; rm -rf "$D"`；**影响与是否影响当前生产**：第 2 条所述「自动化应消费单行 `WARN`」在顶层/嵌套换行、尾空格漏分类及空格/`\t` 破坏空白分列场景下**同样受限或失效**（含 `\` 或 `\n` 时 `DEST_MD5` 列还多出前导 `\`），**不影响当前生产**（真实生产 dest 无含换行符、制表符、反斜杠或首尾空白的文件名）；**是否为文档明示取舍**：属直接拼接原始文件名与 `md5sum` 首字段、未对控制字符/空白/反斜杠做转义或归一化的已知边界（与第 2 条交叉关联），如实记录于此。
-- **`pnpm setup` 返回 exit 1 属已知告警**：pnpm 的 approve-builds 机制会以
+- **`pnpm setup` 返回 exit 1 属已知告警（zero-node 历史标注）**：pnpm 的 approve-builds 机制会以
   `ERR_PNPM_IGNORED_BUILDS`（`Ignored build scripts: @google/genai / esbuild / protobufjs`）
   令 `pnpm install --ignore-workspace` 整体 exit 1。此时依赖**已装全**（`Already up to date`），
   `pnpm check` / `tsc --noEmit` 实测可用（exit 0）；需要时再 `pnpm approve-builds` 显式挑选用
   哪些依赖的构建脚本。这不是离线退化，也不影响本仓类型检查结论。
+  （zero-node 历史标注：顶层 node 构建面已随 `08f8c71` 删除，`pnpm setup`/`pnpm check` 不再是
+  本仓检查路径，本条仅作历史记录保留。）
 - **`--dest-dir` 对 federated 只是尽力传递、不构成隔离保证**：本仓只按各宿主仓约定的 dest
   环境变量（`PI_EXT_DEST` / `PI_CTXMODE_EXT`）把目标路径传给他们各自的 `install.sh`；宿主脚本
   内部逻辑不透明，理论上可忽略该变量写到别处，本仓**不校验**其写后落点。冷目录演练实测
@@ -140,7 +141,9 @@ install.sh                           # 统一安装/巡检入口
 
 ## 类型检查
 
-- 主路径：`pnpm setup`（= `pnpm install --ignore-workspace`）+ `tsc --noEmit`，覆盖 6 个
+- 主路径：`make check`（= install-check + go-check，见根 `Makefile`）。顶层 node 构建面已随
+  `08f8c71` 删除（原 `pnpm setup`/`tsc --noEmit` 路径不再适用；下文 `pnpm`/`tsc` 说明保留为历史）。
+  历史路径：`pnpm setup`（= `pnpm install --ignore-workspace`）+ `tsc --noEmit`，覆盖 6 个
   自包含内生扩展 `auto-continue` / `ctx-orchestrate` / `exclude-tools-guard` / `jev-gate` /
   `magpie-image` / `no-tables`（实测通过，exit 0）。
 - **2026-10-09 补 `exclude-tools-guard`**：此前 `extensions/exclude-tools-guard/src/**` 不在
