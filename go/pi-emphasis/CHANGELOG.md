@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 标题行内 `[[Word]]` 现渲染为胶囊：此前 `Decorate` 的 heading 分支只给标题词加图标，
+  `[[…]]` 原样透传；现按正文同一 `protectedSpans` 契约在非受保护片段中调用 `pill()`，
+  并在胶囊后仍有后续字符时追加 `\x1b[1m` + `mdHeading` 前景色（新增 `Palette.Heading`，
+  经 `theme.GetFgAnsi("mdHeading")` 解析、查不到留空），恢复宿主 headingInline 的粗体与
+  颜色；`themeFingerprint` 固定 fg token 列表同步加入 `mdHeading`，主题切换可正确重建。
+  行内代码/可解析链接内的 `[[…]]` 保持原样，行尾胶囊不冗余追加恢复序列。
+
 ## [0.1.0] - 2026-11-19
 
 首次发布。Go port of [johnlindquist/pi-emphasis](https://github.com/johnlindquist/pi-emphasis)
