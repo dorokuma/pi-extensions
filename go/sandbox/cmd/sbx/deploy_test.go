@@ -231,6 +231,13 @@ func mustWriteFile(t *testing.T, path, content string, mode os.FileMode) {
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatalf("WriteFile %s: %v", path, err)
 	}
+	// os.WriteFile 的 mode 受进程 umask 掩蔽：宿主默认 umask 0077 下
+	// 预置 0o444 备份会落成 0o400，使断言权限位的用例（如
+	// TestDeployChattrProbeFailureBlocks）误红。写入后显式 Chmod 钉回
+	// 期望权限，保证 umask 0077 与 umask 022 下均稳定。
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("Chmod %s to %v: %v", path, mode, err)
+	}
 }
 
 func assertTargetAbsent(t *testing.T, target string) {

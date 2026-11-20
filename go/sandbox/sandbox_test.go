@@ -51,6 +51,9 @@ func TestMain(m *testing.M) {
 	case "missing_rw_strict":
 		subprocMissingRWStrict()
 		return
+	case "nonutf8_preset":
+		subprocNonUTF8Preset()
+		return
 	}
 	os.Exit(m.Run())
 }
@@ -270,10 +273,17 @@ func TestBuildExecWhitelistAndReadOnlyReviewerPolicy(t *testing.T) {
 		t.Fatalf("ReadOnlyReviewer Validate failed: %v", err)
 	}
 
-	// 验证 <workdir>/reports 已创建且在 ReadWrite 列表中
+	// <workdir>/reports 不再创建：报告统一走 /tmp/herdr-role-reports，
+	// 避免在目标 Git 工作树凭空创建 reports/ 子目录污染 git status
+	//（oracle SF-2）。断言该目录不存在且不在 ReadWrite 列表中。
 	reportDir := filepath.Join(workDir, sandbox.ReviewerReportSubdir)
-	if st, err := os.Stat(reportDir); err != nil || !st.IsDir() {
-		t.Fatalf("expected report dir %s to exist, err=%v", reportDir, err)
+	if _, err := os.Lstat(reportDir); !os.IsNotExist(err) {
+		t.Fatalf("report dir %s must not be created under workdir, err=%v", reportDir, err)
+	}
+	for _, rw := range policy.ReadWrite {
+		if filepath.Clean(rw) == filepath.Clean(reportDir) {
+			t.Fatalf("report dir %s must not be in ReadWrite", reportDir)
+		}
 	}
 
 	// 验证 W^X：ReadOnlyReviewer 下没有任何 ReadWrite 目录同时出现在 Exec 白名单中（也不存在父子目录交叠）
@@ -350,6 +360,60 @@ func requireLandlock(t *testing.T) {
 	t.Logf("Landlock supported on host kernel (ABI v%d)", abi)
 }
 
+// hostSystemReadOnlyDirs 返回子进程 Policy.ReadOnly 中的宿主系统目录前缀：
+// 必需目录（/usr、/lib、/bin、/etc、/proc）缺失时调用方 t.Fatal（静默剔除会让
+// 沙盒内缺失预期只读面，掩盖测试环境异常）；可选库目录（/lib64、/usr/lib64）
+// 仅在实际存在时加入——x86-64 专属、本机 arm64 rootfs 无 /lib64，Policy
+// 对不存在路径的 open 会失败。子进程内部使用须以 hostSystemReadOnlyDirsOrDie 包裹。
+func hostSystemReadOnlyDirs(t *testing.T) []string {
+	t.Helper()
+	readOnly, err := systemReadOnlyDirs()
+	if err != nil {
+		t.Fatalf("required host read-only dir missing: %v", err)
+	}
+	return readOnly
+}
+
+// hostSystemReadOnlyDirsOrDie 是 hostSystemReadOnlyDirs 的子进程版本：子进程函数
+// 无 *testing.T，必需宿主目录缺失时打印到 stderr 并 os.Exit(1)（与既有子进程
+// 失败路径一致），绝不静默剔除。
+func hostSystemReadOnlyDirsOrDie() []string {
+	readOnly, err := systemReadOnlyDirs()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "required host read-only dir missing: %v\n", err)
+		os.Exit(1)
+	}
+	return readOnly
+}
+
+// subprocSystemReadOnlyDirs 在子进程内重建与宿主一致的 ReadOnly 列表：
+// 宿主侧 hostSystemReadOnlyDirs 已按存在性过滤可选库目录并把结果经
+// TEST_SYS_RO_DIRS 传入；子进程直接信任该列表（宿主侧已对必需目录 Fatal），
+// 避免子进程重复 t.Fatal 路径。未注入时回退本地探测（与旧行为等价）。
+func subprocSystemReadOnlyDirs() []string {
+	if raw := os.Getenv("TEST_SYS_RO_DIRS"); raw != "" {
+		return strings.Split(raw, string(os.PathListSeparator))
+	}
+	return hostSystemReadOnlyDirsOrDie()
+}
+
+// systemReadOnlyDirs 校验必需宿主目录存在、按实际存在性追加可选库目录。
+func systemReadOnlyDirs() ([]string, error) {
+	dirs := []string{"/usr", "/lib", "/bin", "/etc", "/proc"}
+	for _, d := range dirs {
+		st, err := os.Stat(d)
+		if err != nil || !st.IsDir() {
+			return nil, fmt.Errorf("%s: %w", d, err)
+		}
+	}
+	for _, opt := range []string{"/lib64", "/usr/lib64"} {
+		if st, err := os.Stat(opt); err == nil && st.IsDir() {
+			dirs = append(dirs, opt)
+		}
+	}
+	return dirs, nil
+}
+
 func TestLandlockReadOnlyVsReadWrite(t *testing.T) {
 	requireLandlock(t)
 
@@ -366,11 +430,13 @@ func TestLandlockReadOnlyVsReadWrite(t *testing.T) {
 		t.Fatalf("write hello.txt: %v", err)
 	}
 
+	readOnly := append(hostSystemReadOnlyDirs(t), roDir)
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		testSubprocEnv+"=ro_vs_rw",
 		"TEST_RO_DIR="+roDir,
 		"TEST_RW_DIR="+rwDir,
+		"TEST_SYS_RO_DIRS="+strings.Join(readOnly, string(os.PathListSeparator)),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("ro_vs_rw subprocess failed: %v\noutput:\n%s", err, string(out))
@@ -382,7 +448,7 @@ func subprocROvsRW() {
 	rwDir := os.Getenv("TEST_RW_DIR")
 
 	p := sandbox.Policy{
-		ReadOnly:  []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", roDir},
+		ReadOnly:  subprocSystemReadOnlyDirs(),
 		ReadWrite: []string{rwDir},
 	}
 	if err := sandbox.Apply(p); err != nil {
@@ -436,6 +502,7 @@ func TestLandlockExecWhitelistAndLdLinuxBlock(t *testing.T) {
 		}
 	}
 
+	readOnly := append(hostSystemReadOnlyDirs(t), tmp)
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		testSubprocEnv+"=exec_whitelist",
@@ -444,6 +511,7 @@ func TestLandlockExecWhitelistAndLdLinuxBlock(t *testing.T) {
 		"TEST_DENIED_BIN="+deniedBin,
 		"TEST_FAKE_AGY="+fakeAgy,
 		"TEST_FAKE_PIG="+fakePig,
+		"TEST_SYS_RO_DIRS="+strings.Join(readOnly, string(os.PathListSeparator)),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("exec_whitelist subprocess failed: %v\noutput:\n%s", err, string(out))
@@ -451,14 +519,13 @@ func TestLandlockExecWhitelistAndLdLinuxBlock(t *testing.T) {
 }
 
 func subprocExecWhitelist() {
-	binDir := os.Getenv("TEST_BIN_DIR")
 	allowedBin := os.Getenv("TEST_ALLOWED_BIN")
 	deniedBin := os.Getenv("TEST_DENIED_BIN")
 	fakeAgy := os.Getenv("TEST_FAKE_AGY")
 	fakePig := os.Getenv("TEST_FAKE_PIG")
 
 	p := sandbox.Policy{
-		ReadOnly: []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", binDir},
+		ReadOnly: subprocSystemReadOnlyDirs(),
 		Exec:     []string{allowedBin},
 	}
 	if err := sandbox.Apply(p); err != nil {
@@ -515,12 +582,14 @@ func TestLandlockSeccompGuardFailureHandling(t *testing.T) {
 		t.Fatalf("mkdir rw: %v", err)
 	}
 
+	readOnly := append(hostSystemReadOnlyDirs(t), roDir)
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		testSubprocEnv+"=seccomp_failure",
 		"TEST_RO_DIR="+roDir,
 		"TEST_RW_DIR="+rwDir,
 		"TEST_ALLOWED_BIN="+trueBin,
+		"TEST_SYS_RO_DIRS="+strings.Join(readOnly, string(os.PathListSeparator)),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("seccomp_failure subprocess failed: %v\noutput:\n%s", err, string(out))
@@ -543,7 +612,7 @@ func subprocSeccompFailure() {
 
 	// 1. 非 BestEffort 模式下，seccomp 安装失败必须直接返回错误（包装 ErrSeccomp），且不应用环境变量
 	strictPolicy := sandbox.Policy{
-		ReadOnly:   []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", roDir},
+		ReadOnly:   subprocSystemReadOnlyDirs(),
 		ReadWrite:  []string{rwDir},
 		Exec:       []string{allowedBin},
 		Env:        []string{"PI_SECCOMP_STRICT_SHOULD_NOT_APPLY=1"},
@@ -657,7 +726,8 @@ func subprocReviewerPreset() {
 		os.Exit(1)
 	}
 
-	// 1. 代码仓库只读，只有 <workdir>/reports 可写
+	// 1. 代码仓库完全只读：<workdir>/reports 不再创建（报告走
+	// /tmp/herdr-role-reports，oracle SF-2），workdir 任何写入须拒绝。
 	if _, err := os.ReadFile(filepath.Join(workDir, "README.md")); err != nil {
 		fmt.Fprintf(os.Stderr, "reading workDir/README.md failed: %v\n", err)
 		os.Exit(1)
@@ -666,13 +736,12 @@ func subprocReviewerPreset() {
 		fmt.Fprintln(os.Stderr, "expected write to workDir root to fail, but it succeeded")
 		os.Exit(1)
 	}
-	reportPath := filepath.Join(workDir, sandbox.ReviewerReportSubdir, "audit.md")
-	if err := os.WriteFile(reportPath, []byte("ok\n"), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "expected write to reports dir to succeed, got: %v\n", err)
+	if err := os.WriteFile(filepath.Join(workDir, sandbox.ReviewerReportSubdir, "audit.md"), []byte("ok\n"), 0o644); err == nil {
+		fmt.Fprintln(os.Stderr, "expected write under workdir/reports to fail (dir not created, workdir read-only)")
 		os.Exit(1)
 	}
 
-	// 2. 把 agy 或任意可读 ELF 拷进所有可写目录（TMPDIR、GOTMPDIR、GOCACHE、reports）后再直接执行，必须被拒绝
+	// 2. 把 agy 或任意可读 ELF 拷进所有可写目录（TMPDIR、GOTMPDIR、GOCACHE）后再直接执行，必须被拒绝
 	elfData, err := os.ReadFile(fakeAgy)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "expected fakeAgy (%s) to be readable, got: %v\n", fakeAgy, err)
@@ -682,7 +751,6 @@ func subprocReviewerPreset() {
 		os.Getenv("TMPDIR"),
 		os.Getenv("GOTMPDIR"),
 		os.Getenv("GOCACHE"),
-		filepath.Join(workDir, sandbox.ReviewerReportSubdir),
 	}
 	var copiedPaths []string
 	for _, dir := range writableDirs {
@@ -729,6 +797,9 @@ func subprocReviewerPreset() {
 	os.Exit(0)
 }
 
+// TestLandlockReviewerGoToolchain 验证 ReadOnlyReviewer 预设下真实 go
+// 工具链直链后的可用性：go list/build/vet 等只读编译子命令原样工作，
+// 动态产物按其落点 W^X 语义拒绝执行（go test/go run 自然 EACCES）。
 func TestLandlockReviewerGoToolchain(t *testing.T) {
 	requireLandlock(t)
 
@@ -810,25 +881,35 @@ func subprocReviewerGoToolchain() {
 		os.Exit(1)
 	}
 
-	// 1. go build ./... 必须正常通过
-	if out, err := exec.Command("go", "build", "./...").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "go build ./... failed: %v\noutput:\n%s\n", err, string(out))
+	// 阶段 3：broker 拆除后 <goExecDir>/bin/go 是真实 go 直链——只读编译
+	// 子命令原样执行，动态产物按其落点目录的 W^X（可写不执）自然拒绝。
+	goExecDir := os.Getenv("PI_SANDBOX_GO_EXEC_DIR")
+
+	// 1. go list ./... 必须正常通过（只读编译域）
+	if out, err := exec.Command("go", "list", "./...").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go list ./... failed: %v\noutput:\n%s\n", err, string(out))
 		os.Exit(1)
 	}
 
-	// 2. go vet ./... 必须正常通过
+	// 2. go build -o <TMPDIR> 必须正常通过（产物落私有可写域；缺省 -o
+	//    会把 demo 二进制写进 cwd 即 workDir，而 workDir 对审查员只读——
+	//    直链真实 go 后该写被 Landlock 正确拒绝，故用显式 -o 到可写域）。
+	demoOut := filepath.Join(os.Getenv("TMPDIR"), "demo-out")
+	if out, err := exec.Command("go", "build", "-o", demoOut, "./cmd/demo").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go build -o %s ./cmd/demo failed: %v\noutput:\n%s\n", demoOut, err, string(out))
+		os.Exit(1)
+	}
+
+	// 3. go vet ./... 必须正常通过
 	if out, err := exec.Command("go", "vet", "./...").CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "go vet ./... failed: %v\noutput:\n%s\n", err, string(out))
 		os.Exit(1)
 	}
 
-	// 3. go test ./... 必须正常编译并执行测试二进制通过
-	if out, err := exec.Command("go", "test", "-v", "./...").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "go test -v ./... failed: %v\noutput:\n%s\n", err, string(out))
-		os.Exit(1)
-	}
-
-	// 4. 若用 go build -o 将二进制输出到可写的 TMPDIR，编译本身允许，但执行该产物必须被拒绝
+	// 4. go build -o 到可写 TMPDIR 允许（写面归私有 TMPDIR），但执行产物
+	//    必须被 W^X 拒绝（可写目录无执行授权 → EACCES）。Go 侧 exec 失败
+	//    返回 *os.PathError（execve EACCES），断言 errors.Is(err, EACCES)
+	//    或错误文本含 permission denied——不得把任何非 nil 错误当拒绝。
 	builtInTmp := filepath.Join(os.Getenv("TMPDIR"), "demo-bin")
 	if out, err := exec.Command("go", "build", "-o", builtInTmp, "./cmd/demo").CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "go build -o %s ./cmd/demo failed: %v\noutput:\n%s\n", builtInTmp, err, string(out))
@@ -837,17 +918,75 @@ func subprocReviewerGoToolchain() {
 	if err := exec.Command(builtInTmp).Run(); err == nil {
 		fmt.Fprintf(os.Stderr, "SECURITY BREACH: executing go build output %s inside TMPDIR succeeded!\n", builtInTmp)
 		os.Exit(1)
+	} else if !errors.Is(err, unix.EACCES) && !strings.Contains(err.Error(), "permission denied") {
+		fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: exec %s rejected with unexpected error (want EACCES): %v\n", builtInTmp, err)
+		os.Exit(1)
 	}
 
-	// 5. 试图通过 go run、go test -exec、go test -toolexec、go test -c 绕过受控执行的行为必须被拒绝
-	for _, forbiddenArgs := range [][]string{
+	// 5. go test -c -o <TMPDIR> 编译本身允许，执行 .test 产物同样被 W^X
+	//    拒绝（不再经 pi-test-runner 降权执行）；同锁 EACCES 原因。
+	testBin := filepath.Join(os.Getenv("TMPDIR"), "demo.test")
+	if out, err := exec.Command("go", "test", "-c", "-o", testBin, ".").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "go test -c -o %s . failed: %v\noutput:\n%s\n", testBin, err, string(out))
+		os.Exit(1)
+	}
+	if err := exec.Command(testBin).Run(); err == nil {
+		fmt.Fprintf(os.Stderr, "SECURITY BREACH: executing go test binary %s succeeded!\n", testBin)
+		os.Exit(1)
+	} else if !errors.Is(err, unix.EACCES) && !strings.Contains(err.Error(), "permission denied") {
+		fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: exec %s rejected with unexpected error (want EACCES): %v\n", testBin, err)
+		os.Exit(1)
+	}
+
+	// 6. go test / go run 需在沙盒内执行动态产物，按 W^X 自然拒——锁
+	//    *exec.ExitError 非零退出 + 输出含 "fork/exec <GOTMPDIR 产物>:
+	//    permission denied"：go 命令自身编译/启动失败同样非零退出，绝不能
+	//    把 exit 127/编译错误报为 W^X 拒绝；仅锁 "permission denied" 子串
+	//    会把非执行期 EACCES（如 chmod 000 测试源文件的 open EACCES）假绿，
+	//    故 fork/exec 前缀与 permission denied 后缀必须同时命中（verifier
+	//    实测真实形态：fork/exec <tmp>/... reviewcheck.test: permission
+	//    denied，退出码 1；产物目录名 go-tmp/go-build<random> 不固定）。
+	for _, runArgs := range [][]string{
+		{"test", "./..."},
 		{"run", "./cmd/demo"},
-		{"test", "-exec=/bin/sh", "./..."},
-		{"test", "-toolexec=/bin/sh", "./..."},
-		{"test", "-c", "./..."},
 	} {
-		if out, err := exec.Command("go", forbiddenArgs...).CombinedOutput(); err == nil {
-			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded:\n%s\n", forbiddenArgs, string(out))
+		out, err := exec.Command("go", runArgs...).CombinedOutput()
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: go %v unexpectedly succeeded in sandbox:\n%s\n", runArgs, string(out))
+			os.Exit(1)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+			fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: go %v failed without a non-zero ExitError (compile/startup error?): %v\noutput:\n%s\n", runArgs, err, string(out))
+			os.Exit(1)
+		}
+		if !strings.Contains(string(out), "fork/exec") || !strings.Contains(string(out), "permission denied") {
+			fmt.Fprintf(os.Stderr, "SECURITY CHECK FAILED: go %v exit=%d but output lacks 'fork/exec ... permission denied' (want exec-time EACCES, not open/compile EACCES):\n%s\n", runArgs, exitErr.ExitCode(), string(out))
+			os.Exit(1)
+		}
+	}
+
+	// 7. <goExecDir>/bin 与 <goExecDir> 对审查员只读不执写：写入必须被拒；
+	//    broker.sock / work/ / cache/ / bin/pi-test-runner 已随 broker 拆除消失。
+	if goExecDir != "" {
+		if f, err := os.Create(filepath.Join(goExecDir, "bin", "pwn")); err == nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: write into <goExecDir>/bin succeeded\n")
+			os.Exit(1)
+		}
+		if f, err := os.Create(filepath.Join(goExecDir, "pwn")); err == nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: write into <goExecDir> succeeded\n")
+			os.Exit(1)
+		}
+		for _, gone := range []string{"work", "cache", "broker.sock"} {
+			if _, err := os.Lstat(filepath.Join(goExecDir, gone)); !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "SECURITY BREACH: <goExecDir>/%s still exists after broker removal (err=%v)\n", gone, err)
+				os.Exit(1)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(goExecDir, "bin", "pi-test-runner")); !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "SECURITY BREACH: <goExecDir>/bin/pi-test-runner still exists (err=%v)\n", err)
 			os.Exit(1)
 		}
 	}
@@ -1108,12 +1247,14 @@ func TestReviewerAgentEntryExecIntegration(t *testing.T) {
 		t.Fatalf("write fake dispatch-agent: %v", err)
 	}
 
+	readOnly := append(hostSystemReadOnlyDirs(t), tmp)
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		testSubprocEnv+"=reviewer_agent_entry",
 		"TEST_BIN_DIR="+tmp,
 		"TEST_FAKE_AGY="+fakeAgy,
 		"TEST_FAKE_DISPATCH="+denied,
+		"TEST_SYS_RO_DIRS="+strings.Join(readOnly, string(os.PathListSeparator)),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("reviewer_agent_entry subprocess failed: %v\noutput:\n%s", err, string(out))
@@ -1121,12 +1262,11 @@ func TestReviewerAgentEntryExecIntegration(t *testing.T) {
 }
 
 func subprocReviewerAgentEntry() {
-	binDir := os.Getenv("TEST_BIN_DIR")
 	fakeAgy := os.Getenv("TEST_FAKE_AGY")
 	fakeDispatch := os.Getenv("TEST_FAKE_DISPATCH")
 
 	p := sandbox.Policy{
-		ReadOnly:    []string{"/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", binDir},
+		ReadOnly:    subprocSystemReadOnlyDirs(),
 		Exec:        []string{fakeAgy},
 		EntryAgents: []string{fakeAgy},
 	}
@@ -1179,17 +1319,113 @@ func TestIsEntryAgentPath(t *testing.T) {
 
 // TestReviewerAgentAgyHooks 回归：ReviewerAgent 必须以最小权限放行 agy 生命周期钩子
 // （herdsman/herdsman-go 本体 + agy-rules-hook/moshi-hook/agy-recover-400/agy-recall，
-// 含符号链接目标），且不放宽 ReadOnlyReviewer、不把 /root/.herdsman 加入 ReadWrite、
+// 含符号链接目标），且不放宽 ReadOnlyReviewer、不把 /.herdsman 加入 ReadWrite、
 // 保持 W^X（Exec 与 ReadWrite 无父子目录交叠）。
+// 钩子二进制全部使用 t.TempDir() 下自有夹具（系统 true 的 ELF 副本），经生产
+// ResolveAgyHookPaths 既有的 PATH / HERDSMAN_GO_BIN 注入面喂入——resolver 逐项
+// 仅采纳实际存在的可执行路径（preset.go:617），因此已退役的 herdsman 及缺失的
+// 宿主钩子无需真实安装，也绝不靠缺宿主程序 t.Skip。
 func TestReviewerAgentAgyHooks(t *testing.T) {
 	// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
 	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		// true 是整组钩子授权安全断言的必要夹具来源（ELF 副本）；缺项属夹具
+		// 不可用，必须显式 FAIL 而非 skip——skip 会让全部安全断言静默不运行。
+		t.Fatalf("fixture prerequisite 'true' binary not found in PATH: %v", err)
+	}
+	trueBin, err = filepath.EvalSymlinks(trueBin)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(true): %v", err)
+	}
+	trueData, err := os.ReadFile(trueBin)
+	if err != nil {
+		t.Fatalf("read %s: %v", trueBin, err)
+	}
 
 	tmp := t.TempDir()
 	workDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir repo: %v", err)
 	}
+
+	// 夹具目录：hookBin 模拟 ~/.local/bin，herdsmanGoDir 模拟 ~/.local/lib/herdsman-go；
+	// hookBinEarly 位于 PATH 前段，只放负向候选。
+	hookBin := filepath.Join(tmp, "hook-bin")
+	hookBinEarly := filepath.Join(tmp, "hook-bin-early")
+	herdsmanGoDir := filepath.Join(tmp, "herdsman-go")
+	for _, d := range []string{hookBin, hookBinEarly, herdsmanGoDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	// herdsman 软链解析目标与 HERDSMAN_GO_BIN 覆盖本体必须是两个不同的自有
+	// ELF 文件：同源会让「软链目标存在」与「覆盖本体存在」两条断言互为冗余
+	// （任一路径缺失即双双失败），无法分别证明两条收录面都真实到达。
+	// linkTarget 模拟 ~/.local/lib/herdsman-go/herdsman；herdsmanGo 为独立覆盖本体。
+	linkTarget := filepath.Join(herdsmanGoDir, "herdsman")
+	if err := os.WriteFile(linkTarget, trueData, 0o755); err != nil {
+		t.Fatalf("write herdsman link target ELF: %v", err)
+	}
+	herdsmanGo := filepath.Join(tmp, "herdsman-go-override")
+	if err := os.WriteFile(herdsmanGo, trueData, 0o755); err != nil {
+		t.Fatalf("write herdsman-go override ELF: %v", err)
+	}
+	// herdsman 为 hookBin 中同名软链包装（软链→真实可执行目标），模拟
+	// ~/.local/bin/herdsman → ~/.local/lib/herdsman-go/herdsman 形态。
+	herdsmanLink := filepath.Join(hookBin, "herdsman")
+	if err := os.Symlink(linkTarget, herdsmanLink); err != nil {
+		t.Fatalf("symlink herdsman: %v", err)
+	}
+
+	// 五类钩子：herdsman 为软链，其余四个为普通可执行 ELF 副本。
+	hookBins := []string{
+		herdsmanLink,
+		filepath.Join(hookBin, "agy-rules-hook"),
+		filepath.Join(hookBin, "moshi-hook"),
+		filepath.Join(hookBin, "agy-recover-400"),
+		filepath.Join(hookBin, "agy-recall"),
+	}
+	for _, hb := range hookBins[1:] {
+		if err := os.WriteFile(hb, trueData, 0o755); err != nil {
+			t.Fatalf("write hook %s: %v", hb, err)
+		}
+	}
+
+	// PATH 前段目录放同名劣等候选：悬空软链（目标缺失）与 0644 不可执行文件。
+	// 它们的唯一真实意义是证明 exec.LookPath 不因 PATH 顺序误中前段无效项而
+	// 遮蔽后段合法钩子——LookPath 自带可执行性预过滤，这些候选根本到不了
+	// resolver.add 的 Stat/可执行位校验面，不能承担「resolver 拒收」断言。
+	danglingHook := filepath.Join(hookBinEarly, "agy-recover-400")
+	if err := os.Symlink(filepath.Join(tmp, "nonexistent-target"), danglingHook); err != nil {
+		t.Fatalf("symlink dangling hook: %v", err)
+	}
+	noExecHook := filepath.Join(hookBinEarly, "moshi-hook")
+	if err := os.WriteFile(noExecHook, trueData, 0o644); err != nil {
+		t.Fatalf("write non-exec hook: %v", err)
+	}
+
+	t.Setenv("PATH", hookBinEarly+string(os.PathListSeparator)+hookBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// resolver.add 的负向校验面必须经 HERDSMAN_GO_BIN 直接到达（LookPath 预过滤
+	// 使 PATH 内劣等候选覆盖不到它）：逐项注入悬空/0644 候选，核对
+	// ResolveAgyHookPaths 返回的原始清单不含候选；随后恢复合法覆盖值再构造主
+	// policy，保持既有 Validate/W^X/Readonly/禁 herdr 等断言。
+	for _, cand := range []string{danglingHook, noExecHook} {
+		t.Setenv("HERDSMAN_GO_BIN", cand)
+		norm, err := sandbox.NormalizePath(cand)
+		if err != nil {
+			t.Fatalf("NormalizePath %q: %v", cand, err)
+		}
+		for _, p := range sandbox.ResolveAgyHookPaths() {
+			if p == norm {
+				t.Fatalf("resolver unexpectedly accepted candidate %q", cand)
+			}
+		}
+	}
+	t.Setenv("HERDSMAN_GO_BIN", herdsmanGo)
 
 	policy := sandbox.ReviewerAgent(workDir)
 	t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
@@ -1198,7 +1434,33 @@ func TestReviewerAgentAgyHooks(t *testing.T) {
 		t.Fatalf("ReviewerAgent Validate failed: %v", err)
 	}
 
+	// 原始 policy.Exec 字面清单直接断言：必须由生产 resolver 的 add 真实输出，
+	// 不由测试侧 EvalSymlinks 补出。三者是独立收录面——hookBin 软链
+	// （LookPath/目录枚举面）、软链解析目标（add 的 EvalSymlinks 面）、
+	// HERDSMAN_GO_BIN 独立覆盖本体（env 覆盖面）——任一面丢授权都必须分别 FAIL。
+	execRaw := make(map[string]struct{}, len(policy.Exec))
+	for _, ep := range policy.Exec {
+		execRaw[ep] = struct{}{}
+	}
+	for _, want := range []struct {
+		name string
+		path string
+	}{
+		{"hook symlink", herdsmanLink},
+		{"hook symlink resolved target", linkTarget},
+		{"HERDSMAN_GO_BIN override binary", herdsmanGo},
+	} {
+		norm, err := sandbox.NormalizePath(want.path)
+		if err != nil {
+			t.Fatalf("NormalizePath %s %q: %v", want.name, want.path, err)
+		}
+		if _, ok := execRaw[norm]; !ok {
+			t.Fatalf("%s %s not literally in ReviewerAgent Exec", want.name, want.path)
+		}
+	}
+
 	// Exec 集合：规范化 + 符号链接解析两份都进 set，模拟 Landlock 按路径授予时对软链与目标的放行。
+	// 仅用于 W^X/负向集合比对；授权存在性断言一律走上方原始清单。
 	execSet := make(map[string]struct{}, len(policy.Exec)*2)
 	for _, ep := range policy.Exec {
 		execSet[ep] = struct{}{}
@@ -1206,36 +1468,39 @@ func TestReviewerAgentAgyHooks(t *testing.T) {
 			execSet[r] = struct{}{}
 		}
 	}
-
-	// 宿主机真实存在的钩子二进制必须能解析进 Exec；不存在的直接 fail（防 silently skip）。
-	hookBins := []string{
-		"/root/.local/bin/herdsman",
-		"/root/.local/bin/agy-rules-hook",
-		"/root/.local/bin/moshi-hook",
-		"/root/.local/bin/agy-recover-400",
-		"/root/.local/bin/agy-recall",
-	}
-	for _, hb := range hookBins {
-		if _, err := os.Stat(hb); err != nil {
-			t.Fatalf("host hook binary %s missing: %v", hb, err)
+	inExec := func(p string) bool {
+		norm, err := sandbox.NormalizePath(p)
+		if err != nil {
+			t.Fatalf("NormalizePath %q: %v", p, err)
 		}
-		if _, ok := execSet[hb]; !ok {
+		_, ok := execSet[norm]
+		return ok
+	}
+
+	// 五类钩子二进制（含 herdsman 软链字面路径）必须全部解析进 Exec。
+	for _, hb := range hookBins {
+		if !inExec(hb) {
 			t.Fatalf("hook %s not in ReviewerAgent Exec", hb)
 		}
 	}
-	// herdsman 包装脚本 exec 的 ELF 本体也必须在 Exec 中。
-	herdsmanGo := "/root/.local/lib/herdsman-go/herdsman"
-	if _, err := os.Stat(herdsmanGo); err != nil {
-		t.Fatalf("herdsman-go ELF %s missing: %v", herdsmanGo, err)
+
+	// 缺失（悬空软链）与不可执行候选不得被纳入 Exec。
+	if inExec(danglingHook) {
+		t.Fatalf("dangling-symlink candidate %s unexpectedly in ReviewerAgent Exec", danglingHook)
 	}
-	if _, ok := execSet[herdsmanGo]; !ok {
-		t.Fatalf("herdsman-go ELF %s not in ReviewerAgent Exec", herdsmanGo)
+	if inExec(noExecHook) {
+		t.Fatalf("non-executable candidate %s unexpectedly in ReviewerAgent Exec", noExecHook)
 	}
 
-	// 不得把 /root/.local/bin 整个目录放进 Exec（会连带放行 herdr/dispatch-agent）。
+	// 目录级禁授：不得把 hook bin 目录（夹具目录 hookBin/hookBinEarly）与旧宿主映射
+	// /root/.local/bin 整个放进 Exec（会连带放行 herdr/dispatch-agent）。逐条目比对
+	// 原始清单，同时捕获干净形式与尾斜杠形式。
+	deniedExecDirs := []string{hookBin, hookBinEarly, "/root/.local/bin", "/root/.local/bin/"}
 	for _, ep := range policy.Exec {
-		if ep == "/root/.local/bin" || ep == "/root/.local/bin/" {
-			t.Fatal("ReviewerAgent must not Exec-allow whole /root/.local/bin")
+		for _, d := range deniedExecDirs {
+			if ep == d {
+				t.Fatalf("ReviewerAgent must not Exec-allow whole hook bin dir %s", ep)
+			}
 		}
 		base := filepath.Base(ep)
 		if base == "herdr" || base == "dispatch-agent" || base == "grok" {
@@ -1243,7 +1508,7 @@ func TestReviewerAgentAgyHooks(t *testing.T) {
 		}
 	}
 
-	// /root/.herdsman 保持只读，绝不进 ReadWrite（W^X + 最小权限）。
+	// /.herdsman 保持只读，绝不进 ReadWrite（W^X + 最小权限）。
 	for _, rw := range policy.ReadWrite {
 		if strings.Contains(rw, "/.herdsman") {
 			t.Fatalf("ReviewerAgent must not grant ReadWrite to %s", rw)
@@ -1547,14 +1812,87 @@ func TestReviewerAgentPigAgentDirIsolation(t *testing.T) {
 		}
 	})
 
-	t.Run("explicit PIG_CODING_AGENT_DIR preserved", func(t *testing.T) {
-		// SBX-S3：隔离 PIG_HOME，ReviewerAgent 不得触碰宿主 /root/.pig/cache。
+	t.Run("host PIG_CODING_AGENT_DIR pinned to private dir", func(t *testing.T) {
+		// 宿主 PIG_CODING_AGENT_DIR 属残留面：新口径（oracle FM-4）下
+		// ReviewerAgent 仍将其回钉为每会话私有 pig-agent 目录，防止宿主
+		// 残留变量被 pig 包装器后置的 PIG_USE_PI_DIRS=1 激活生效。
 		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
 		t.Setenv("PIG_CODING_AGENT_DIR", "/custom/agent")
 		policy := sandbox.ReviewerAgent(workDir)
 		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
-		if got := parseEnvMap(policy.Env)["PIG_CODING_AGENT_DIR"]; got != "" {
-			t.Fatalf("PIG_CODING_AGENT_DIR must not be overridden, got %q", got)
+		envMap := parseEnvMap(policy.Env)
+		got := envMap["PIG_CODING_AGENT_DIR"]
+		// 生产 ReadOnlyReviewer 固定在 /tmp 创建 pi-reviewer-* 私有 TMPDIR
+		//（不跟随调用方 os.TempDir()）：断言必须相对策略实际产出的私有
+		// TMPDIR 拼接 pig-agent，而不是假设它落在 os.TempDir() 下——自定义
+		// TMPDIR 环境下旧断言恒红。
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		if want := filepath.Join(privateTmp, "pig-agent"); got != want {
+			t.Fatalf("host PIG_CODING_AGENT_DIR must be pinned to private pig-agent under policy TMPDIR, got %q want %q", got, want)
+		}
+		if got == "/custom/agent" {
+			t.Fatalf("host PIG_CODING_AGENT_DIR residual leaked: %q", got)
+		}
+		if !(strings.HasPrefix(privateTmp, "/tmp/pi-reviewer-") || strings.HasPrefix(privateTmp, os.TempDir())) {
+			t.Fatalf("policy TMPDIR %q is neither /tmp/pi-reviewer-* nor under os.TempDir()", privateTmp)
+		}
+	})
+
+	t.Run("host PI switch alone must not activate cfgEnv PI dir", func(t *testing.T) {
+		// resolveAgentDirSelection 收紧：显式层（agentDirOriginCfgEnv /
+		// trustedCustom）的 PI 入口要求 PIG_USE_PI_DIRS=1 与
+		// PI_CODING_AGENT_DIR 同在 cfgEnv 内显式声明；开关仅来自宿主
+		// 环境时 cfgEnv 的 PI 值不得冒认受信自定义，双键仍回钉私有
+		// pig-agent（宿主开关只在 HostEnv 层作复制/预热源）。
+		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+		t.Setenv("PIG_USE_PI_DIRS", "1") // 宿主开关残留
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		unsetEnv(t, "PI_CODING_AGENT_DIR")
+		custom := filepath.Join(t.TempDir(), "pi-agent")
+		if err := os.MkdirAll(custom, 0o700); err != nil {
+			t.Fatalf("mkdir custom pi-agent: %v", err)
+		}
+		if err := os.Chmod(custom, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		policy := sandbox.ReviewerAgentWithEnv(workDir, []string{"PI_CODING_AGENT_DIR=" + custom})
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		want := filepath.Join(privateTmp, "pig-agent")
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			if got := envMap[key]; got != want {
+				t.Fatalf("%s = %q, want private %q: host-only PIG_USE_PI_DIRS=1 must not promote cfgEnv PI dir to trusted custom", key, got, want)
+			}
+		}
+	})
+
+	t.Run("host PI switch activates only host PI dir as copy source", func(t *testing.T) {
+		// 同一宿主开关只参与 HostEnv 层：宿主 PIG_USE_PI_DIRS=1 + 宿主
+		// PI_CODING_AGENT_DIR（均未经 --env 显式声明）选源仅作配置复制/
+		// 预热发现源，最终有效目录仍回钉私有 pig-agent。
+		t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+		t.Setenv("PIG_USE_PI_DIRS", "1")
+		t.Setenv("PI_CODING_AGENT_DIR", "/host/pi-agent")
+		unsetEnv(t, "PIG_CODING_AGENT_DIR")
+		policy := sandbox.ReviewerAgent(workDir)
+		t.Cleanup(func() { cleanupReviewerTempDirs(policy) })
+		envMap := parseEnvMap(policy.Env)
+		privateTmp := envMap["TMPDIR"]
+		if privateTmp == "" {
+			t.Fatalf("policy.Env missing TMPDIR (env=%v)", policy.Env)
+		}
+		want := filepath.Join(privateTmp, "pig-agent")
+		for _, key := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"} {
+			if got := envMap[key]; got != want {
+				t.Fatalf("%s = %q, want private %q: host PI_CODING_AGENT_DIR must remain copy-source only", key, got, want)
+			}
 		}
 	})
 
@@ -2569,4 +2907,51 @@ func subprocMissingRWStrict() {
 	}
 	fmt.Fprintln(os.Stderr, "SECURITY REGRESSION: Apply succeeded for non-optional missing ReadWrite path")
 	os.Exit(2)
+}
+
+// TestReadOnlyReviewerNonUTF8RootSkipsManifest 是 R3 发现 1 的回归：
+// ReadOnlyReviewer 备用分支经 os.TempDir()（TMPDIR 指向含非 UTF-8 字节的根）
+// 产生非 UTF-8 privateTmpDir/goExecDir 时，PI_SANDBOX_PRESET_TMP_DIRS 登记键
+// 必须不出现（encoding/json 会把非法 UTF-8 字节有损替换为 U+FFFD 且不报错，
+// 登记的是错误路径）。子进程在独立 mount ns 里把 /tmp 重挂为只读 tmpfs 强制
+// 走备用分支。去掉 preset.go 的 utf8.ValidString 校验后本用例 FAIL（登记键
+// 出现且还原路径被损），红绿对照已本地验证。
+func TestReadOnlyReviewerNonUTF8RootSkipsManifest(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("requires linux mount namespace (GOOS=%s)", runtime.GOOS)
+	}
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), testSubprocEnv+"=nonutf8_preset")
+	out, err := cmd.CombinedOutput()
+	s := string(out)
+	if err != nil {
+		t.Fatalf("nonutf8_preset subprocess failed: %v\noutput:\n%s", err, s)
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "SKIP=") {
+			t.Skipf("subprocess reported unmet precondition: %s", strings.TrimPrefix(line, "SKIP="))
+		}
+		if strings.HasPrefix(line, "FATAL=") {
+			t.Fatalf("subprocess fixture failure: %s", strings.TrimPrefix(line, "FATAL="))
+		}
+	}
+	// 登记键断言：非 UTF-8 路径下必须不登记（policy.Env 无该键）。
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "ENV=") && strings.HasPrefix(strings.TrimPrefix(line, "ENV="), "PI_SANDBOX_PRESET_TMP_DIRS=") {
+			t.Fatalf("non-UTF-8 preset dirs must NOT register %s:\n%s", "PI_SANDBOX_PRESET_TMP_DIRS", s)
+		}
+	}
+	// 夹具生效断言：两目录确为非 UTF-8（备用分支确走到了非 UTF-8 根）。
+	var sawTmpValid, sawExecValid bool
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "VALID_TMP=false") {
+			sawTmpValid = true
+		}
+		if strings.HasPrefix(line, "VALID_EXEC=false") {
+			sawExecValid = true
+		}
+	}
+	if !sawTmpValid || !sawExecValid {
+		t.Fatalf("fixture must produce non-UTF-8 TMPDIR and PI_SANDBOX_GO_EXEC_DIR, output:\n%s", s)
+	}
 }

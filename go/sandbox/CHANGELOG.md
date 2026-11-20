@@ -4,8 +4,119 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **`ReadOnlyReviewer` 移除 `<workdir>/reports` 自动创建与写授权**：`reviewer`/
+  `reviewer-agent` 预设不再在目标 Git 工作树内创建 `reports/` 子目录，`<workdir>`
+  与其 `reports/` 子目录不再获得任何写授权——报告统一收敛到
+  `/tmp/herdr-role-reports`（仅 `ReviewerAgentWithEnv`/`--preset reviewer-agent`
+  白名单）或各角色私有 `TMPDIR`。依赖 `<workdir>/reports` 旧写面的调用方须改经
+  `DISPATCH_REPORT_PATH`/`--report-to` 或角色私有 `TMPDIR` 落盘（oracle SF-2）。
+- **阶段 3：拆除 `go` 受控构建代理（broker）与 `pi-test-runner` 整条链路**：
+  `<goExecDir>` 不再创建 `work/`/`cache/` 子目录，不再监听 `broker.sock`；
+  `Policy.Exec` 收缩为 `<goExecDir>/bin`（`bin/go` 直链 + `bin/hc` 受限
+  客户端）且**不再放行整目录**——审查员在 `<goExecDir>` 下无任何
+  写/执权限。`<goExecDir>/bin/go` 改为直接软链 `resolveSandboxRealGoBinary`
+  受信解析出的**真实 `go`**（其本体与 `<goroot>/pkg/tool` 工具目录
+  同步收录 `Policy.Exec`），`Policy.Env` 把 `GOROOT` 回钉该受信根并
+  移除 `PI_SANDBOX_REAL_GO`/`PI_SANDBOX_GO_TEST_WORK` 注入（env 键随
+  链路删除）。沙盒内 `go list`/`go build`/`go vet` 等只读编译子命令
+  由真实 `go` 原样执行，不再经包装器参数白名单校验；**`go test -c
+  -o <可写路径>` 仅编译产物成功（退 0），随后**执行**产物才按落点
+  `W^X`（可写目录一律不授予执行授权）拒绝（`EACCES`）；`go test`
+  （非 `-c`）/`go run` 内部 fork/exec 动态产物被同一 `W^X` 自然拒绝
+  （`EACCES`）**——被审查仓库的 `*_test.go` 不再于沙盒内运行，动态
+  测试应交独立隔离验证环境。
+  helper 进程（seccomp notify 监听）与审查员**同权**（不再追加
+  `<goExecDir>/work`/`cache` 写执域），`helperConfig` 删除
+  `GoExecDir`/`RealGoBin`/`HasBroker` 字段，内部配置键
+  `PI_SANDBOX_BROKER_CFG` 改名 `PI_SANDBOX_HELPER_CFG`。
+  被删符号：`goBrokerRequest`/`serveGoBroker`/`handleGoBrokerConn`/
+  `writeBrokerExitCode`/`resolvePathThroughAncestorSymlinks`/
+  `validateGoWrapperArgs`/`injectGoTestExecFlag`/`sanitizeGoBrokerEnv`/
+  `runGoWrapperClient`/`runTestRunnerClient`。
+- **阶段 2 安全收口（W10 非 broker 收紧项，4 处缺陷修补）**：
+  - `validateTrustedPigDir` 末级本体严格化：`Perm()&0o022 != 0` 无条件拒
+    （含 `01777` sticky——`/tmp`/`var/tmp` 不得再被当作可信 `PIG_HOME`/
+    AgentDir）；sticky 豁免仅留给 `filepath.Dir(dir)` 及之上的祖先级
+    临时根。祖先链上的 `/` 直属 `uid==0` 顶层软链不再跳回 `/` 提前结束，
+    改为 `os.Readlink` 单跳跟随（限 8 跳防环、悬空/越出根拒绝），继续
+    逐级校验真实目标及其全部祖先——顶层软链指向非粘滞 `0777`、异属主
+    目录或目标链内含非顶层嵌套软链的穿透路径全部被拒（兼容 macOS
+    `/tmp -> private/tmp`、`/var -> private/var` 布局）。新增包内同口径
+    seam `validateTrustedPigDirWithRoot(dir, label, sysRoot)`，生产固定
+    `sysRoot="/"`，零外部入口。
+  - `resolveAgentDirSelection` 默认层 `<pigHome>/agent` 闭合校验：新增
+    `sourceTrusted` 字段，默认层与「候选被拒后回退默认目录」两条路径
+    都对默认目录执行 `validateTrustedPigDir`；`MaybeWarmGoExtensionCells`
+    与 `ReviewerAgentWithEnv` 在最终来源目录不可信（软链/`0777`/异属主）
+    时一律回退空私有 `pig-agent`，绝不读取不可信 `<pigHome>/agent`。
+  - `preparePrivatePigAgentDirFromAgent` 软链穿透封堵：`extensions` 目录
+    与 `pigAgentConfigFiles` 白名单配置文件均由 `os.Stat` 改 `os.Lstat`，
+    软链本体一律不作来源（私有 `pig-agent` 不再被越界拷入外部目标）。
+  - `sandboxEnvStripKeys` 补剔 `PI_SANDBOX_INTERNAL_MODE`/
+    `PI_SANDBOX_HELPER_CFG`（阶段 3 随 broker 拆除由 `PI_SANDBOX_BROKER_CFG`
+    改名而来，剥离键名以最终生效者为准）两枚内部指针键；
+    `buildPolicy` 对 `reviewer` 与 `reviewer-agent` 两个预设统一捕获并
+    回钉 `PI_SANDBOX_GO_EXEC_DIR`；`cleanupPresetTempDirsFromPolicy`
+    的清理身份改为「预设创建时经 `PI_SANDBOX_PRESET_TMP_DIRS` 登记的
+    私有临时目录清单」——`ReadOnlyReviewer` 创建 `privateTmpDir`/
+    `goExecDir` 后把二者绝对路径写入该内部 env 键，`buildPolicy`
+    返回前捕获并从最终 env 剔除；清理只删登记集合（逐项保留
+    `isPresetTempDir` 形态二次确认），不再对 `Policy.Exec` 做
+    「条目本体或父目录前缀命中即删」的推断式清理（调用方经
+    `--exec /tmp/pi-reviewer-exec-manual/bin` 传入的形似路径不再
+    被误判为本预设创建而递归误删其父目录）。无登记清单时（单测/
+    外部调用方手工构造 policy）才回退旧的 env 字段推断
+    （TMPDIR/GOTMPDIR/PI_SANDBOX_GO_EXEC_DIR）+ ReadWrite 前缀命中，
+    `Policy.Exec` 一律不参与清理推断。
+  - **行为变化（阶段 3 已落地）**：`Policy.Exec` 收缩为 `<goExecDir>/bin`
+    在阶段 2 已生效；阶段 3 进一步拆除 broker/`pi-test-runner` 后，
+    `go test -c -o <可写路径>` 仅完成编译（退 0），随后执行产物按落点
+    `W^X` 自然拒绝（`EACCES`）；`go test`（非 `-c`）/`go run` 内部
+    fork/exec 动态产物同样被 `W^X` 拒绝，不再存在任何 runner 降权
+    放行路径；`go build`/`go vet`/`go list` 等只读编译子命令经
+    `bin/go` 真实直链原样可用。
+
 ### Added
 
+- **reviewer-agent fd3（claude-pty debugW）CLOEXEC 收口 + ExtraFiles 单路转发**：
+  `runMain` 入口对 agent 预设继承的 fd3 置 `FD_CLOEXEC`（`sealInheritedFD3`），
+  杜绝其泄漏进 `MaybeWarmGoExtensionCells` 预热子进程、`codegraph-go
+  -warm-daemon` 常驻 daemon、`reportRelay` 的 `hc send` 及 `sandbox.Apply`
+  派生的 helper 辅助进程（无 CLOEXEC 的 debugW 写端被常驻 daemon 继承会永久
+  劫持 `claude-pty` `drainDebug` 的 EOF）。`newChildCmd` 与 `runAsSandboxInit`
+  经 `ExtraFiles` 显式单路转发给最终目标进程，父进程 `Start()` 后立即关闭
+  自身 fd3 副本；无 mountns 的 `syscall.Exec` 分支在 `Exec` 前恢复
+  `FD_CLOEXEC=0` 透传。`childExecSpec` 新增 `FD3Forward` 标记跨两跳传递；
+  非 agent 预设不改变 fd3 语义。
+- **helper 握手与限制施加 fail-closed + BestEffort 透传 + EINTR 重试**：
+  `landlock_linux.go` 引入 `errSeccompFilterInstalled` 标记 seccomp
+  PROT_EXEC 过滤器装入后的下游失败——post-install 失败不可撤销，
+  BestEffort 也不得降级（否则 PROT_EXEC 映射永久阻塞在无人服务的 notify
+  应答上）。helper 就绪握手 ACK 需 `n==1 && byte=='1'`，读错/EOF/非法字节
+  均视为拒绝启动并 kill+wait 回收；`createAndPopulateRuleset`/
+  `enforceRuleset`/`installSeccompExecGuard` 失败均 fail-closed
+  退出（`helperFailf`），绝不以未受限状态 ACK 继续服务。
+  `helperConfig` 新增 `BestEffort` 透传父策略降级口径（缺省 false 会让
+  helper 对 BestEffort 策略内容许的瞬态缺失路径 fail-closed，语义不一致）；
+  `helperPolicy`/`reviewerPolicy` 均携带。握手链 `unix.Read`/`Sendmsg`/
+  `Recvmsg` 包 `EINTR` 重试（SIGURG 异步抢占打断阻塞读不再误判为握手失败）。
+- **reviewer-agent 私有 PIG_HOME + 宿主产物软链投影 + 启动前 fail-closed**：
+  `ReviewerAgentWithEnv` 不再把 `Policy.Env["PIG_HOME"]` 指向宿主 `<PIG_HOME>`，
+  改为指向 `<privateTmpDir>/pig-home`（0700，进 `ReadWrite` 不进 `Exec`）。
+  私有 `bin`/`docs`/`state` 以软链指向宿主同名目录（pig 读 SDK/文档/本体
+  均落宿主只读域，SDK 物理路径与宿主 prepare 完全一致）；`cache/cells/<lang>`
+  与 `cache/ext` 为真实可写目录承载 `.build-*` 构建 scratch 与 `.locks`
+  （目录本身不进 `Exec`，冷路径自建产物不可执行，W^X 不破）；宿主已构建的
+  有效缓存单元经同名软链投影进私有 `cells/<lang>/<digest>` 与 `ext/<entry>`，
+  沙盒内 pig 命中后经软链 exec 宿主真实 runner（已逐文件枚举进 `Policy.Exec`），
+  修复原「宿主 cache 只读致 `.build-*` scratch 创建 EACCES」缺陷。新增
+  `ReviewerAgentCellTargetError`/`ReviewerAgentCellTargets`：`buildPolicy` 在
+  启动前对「扩展集（`sourceAgentGoExtensionDirs`）× 宿主有效产物集
+  （`cellCacheEntryDirs`+`validCellEntryDir`）× 投影/Exec 命中」做完整性
+  校验——有 Go 扩展但宿主产物为 0 或存在未成功投影/Exec 未命中项时启动前
+  报错拒绝并指名缺失项，不进入「build 成功但 exec 失败」的不完全兼容态。
 - **独立 PID 命名空间 + 专属 procfs（闭环 `/proc/<pid>/root` 魔链绕过与进程控制面）**：
   `CLONE_NEWNS` 派生升级为 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC`（Go
   `Cloneflags`，受限子进程直接以新 PID ns 的 PID 1 启动，并同时获得
@@ -23,11 +134,21 @@
   宿主进程的控制面因宿主 PID 不可达而天然失效。此前共享宿主 PID ns
   时 `/proc/1/root/run/docker.sock` 一行即可绕过全部挂载覆盖，等价
   沙盒外任意命令执行。
+- **`validateTrustedPigDir` 祖先链逐级校验 + `appendCellCachePolicy` 仅入
+  解析后真实 `artifactPath`（oracle9 SF-1）**：PIG_HOME/AgentDir 的末级
+  `Lstat` 自动跟随中间软链，仅查末级会让 `pig-link/host` 或 `world-0777/host`
+  穿透；末级不存在（ENOENT）时也必须校验整条已存在祖先链（否则 `MkdirAll`
+  跟随祖先软链在外部目标建 `.locks`）。新增 `trustedPigDirModeOwnerOK`：
+  每级目录须 Uid==0||euid 且非 0o022 可写，仅豁免 `/` 直属 uid==0 的系统顶层
+  软链（macOS `/var`）与 uid==0 且带 `os.ModeSticky` 的 01777 临时根
+  （`/tmp`、`/var/tmp`）；`artifactPath` 入 `Policy.Exec` 前先 `EvalSymlinks`
+  并要求落在 `resolvedCacheRoot` 内（不写未解析软链别名——Apply 前改指别名
+  可把任意/0777 二进制带入沙盒执行）。
 - **轻量 PID 1 init**：`MountNS` 路径下 `sbx` 不再以 `syscall.Exec` 顶替
   PID 1（PID 1 忽略默认未捕获信号且无人回收孤儿僵尸），改由
   `runAsSandboxInit` 担任 init：派生目标命令（记录其实际 PID 并向它转发
-  信号——`sandbox.Apply` 会先派生 helper/broker 辅助进程，业务进程 PID
-  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`，
+  信号——`sandbox.Apply` 会先派生 helper 辅助进程，业务进程 PID
+  不固定为 2），外层 `sbx` 转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`,
   容器内 init 另监听 `SIGUSR1`/`SIGUSR2`/`SIGWINCH`/`SIGCHLD`；每轮先
   `Wait4(-1, WNOHANG)` 排空已退出子孙（孤儿收尸），目标子进程退出
   即返回其退出码/`128+信号`；`MountNS=false`（`--best-effort` 降级）
@@ -52,7 +173,7 @@
   set（`CAP_SETPCAP` 留到循环最后一步——内核要求调用时仍持该能力），
   `PR_CAP_AMBIENT_CLEAR_ALL` 清空 ambient，`capset` 把
   Effective/Permitted 置为 `0x22`（仅 `CAP_DAC_OVERRIDE|CAP_KILL`）
-  Inheritable 置 0；helper/broker、目标命令与 `go test` 子孙经
+  Inheritable 置 0；helper、目标命令与其子孙经
   fork/exec 继承同一已裁剪能力集，`reboot`/载模块/改时钟/`bpf` 等
   capability 门控宿主副作用在能力校验层整体失效。优先
   `syscall.AllThreadsSyscall` 全线程生效，`-race`/cgo 下 `ENOTSUP`
@@ -85,6 +206,184 @@
 
 ### Fixed
 
+- **reviewer-agent 私有 AgentDir 身份不得从用户可控 TMPDIR 重建（N1）**：
+  `buildPolicy` 原先在 `mergeEnv` 后用合并后的 `TMPDIR` 重新
+  `filepath.Join(tmpdir, "pig-agent")` 推导回钉目标——`--env TMPDIR=`
+  与 `--env PIG_CODING_AGENT_DIR=` 同时覆盖时，重建出的路径可指向宿主
+  不可信目录（如 `--env TMPDIR=/root/.pig` 重建得 `/root/.pig/pig-agent`），
+  重新消费宿主配置。修复为引入结构化 merge 前事实 `reviewerAgentDirFact`
+  （`captureReviewerAgentDirFact` 在 `ReviewerAgentWithEnv` 产出、`cfgEnv`
+  merge 前捕获：私有目录本体 / 受信自定义 / 有效目录三项），
+  `normalizeEffectiveAgentDirs` 只消费该事实，绝不从合并后 env 重建私有
+  目录身份。
+- **宿主 `os.Environ()` 中 `PIG_USE_PI_DIRS`/`PI_CODING_AGENT_DIR` 残留
+  透传进最终 exec 环境（N2）**：`stripSandboxEnv` 原只剔除
+  `GPG_AGENT_INFO`/`SSH_AUTH_SOCK`/`DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR`，
+  宿主残留的 `PIG_USE_PI_DIRS=1` + `PI_CODING_AGENT_DIR=<路径>` 会穿透进
+  受限子进程——pig 包装器后置 `export PIG_USE_PI_DIRS=1` 时激活宿主 PI
+  目录、打穿私有 AgentDir 隔离。修复：`stripHostEnv` 在 `stripSandboxEnv`
+  之上仅对宿主 `os.Environ()` 追加剔除这两个键（`sandboxHostStripExtraKeys`），
+  作用于 `runSandboxedChild` 受限子进程环境与 `runChildFromEnv` 最终
+  `execEnv`；`--env` 显式声明的合法 PI 自定义入口不受剥离影响。
+- **受信自定义 AgentDir 规范化拼写误丢 + 明确 PI 入口被遮蔽（N7）**：
+  `trustedCustom` 判定原先用「解析后规范化路径 == cfgEnv 原始字符串」比较——
+  通过 `validateTrustedPigDir` 校验的相对路径、冗余分隔（`a/./b`）、点段
+  （`a/sub/..`）写法会因拼写不同被误丢、回钉私有目录；且仅
+  `PIG_CODING_AGENT_DIR` 入口受信，`PIG_USE_PI_DIRS=1` + `PI_CODING_AGENT_DIR`
+  的明确 PI 自定义入口被 PIG 预值遮蔽。修复：`customFromCfgEnv` 仅认
+  `cfgEnv` 显式声明（PIG 与 `PIG_USE_PI_DIRS=1`+PI 双入口同权），与
+  `srcTrusted` 合并成 `trustedCustom`；受信自定义经 `absCleanPath` 规范化
+  后保留为有效目录，预热、配置复制与最终 exec 用同一解析结果。
+- **宿主 `PIG_USE_PI_DIRS=1` 开关不得激活 `cfgEnv` 的 `PI_CODING_AGENT_DIR`
+  为受信自定义（AgentDir 跨源选源显式化收敛）**：原实现把「显式自定义」
+  判定分散在 `resolveSourcePigAgentDir`（复制/预热源，`lookup` 允许宿主
+  兜底开关）、`customFromCfgEnv`（trustedCustom 有效目录，仅 cfgEnv）与
+  `injectPigCodingAgentDir`（注入保持，仅 cfgEnv）三处——trustedCustom 与
+  inject 虽已仅认 cfgEnv 开关，但复制/预热源的 `lookup` 允许宿主
+  `PIG_USE_PI_DIRS=1` 兜底激活 `cfgEnv` 的 PI 值为自定义源，三处口径
+  分裂易再冒认。收敛为统一 `resolveAgentDirSelection` 三层模型：显式层
+  （`agentDirOriginCfgEnv`/`trustedCustom`）要求开关与 PI 键同在 `cfgEnv`
+  内显式声明（`piDirsInCfg && strings.TrimSpace(piDirsV)=="1"`）；开关仅
+  来自宿主环境时，cfgEnv 的 PI 值因 PI 键已在 cfgEnv 出现而不满足
+  HostEnv 层「键未在 cfgEnv 出现」前提（`!piInCfg` 不成立），显式层
+  与宿主回退层均不命中，直接回落第 3 层 `agentDirOriginDefault`
+  （完全忽略未配对显式开关的 cfgEnv PI 值，既不置 `trustedCustom` 也
+  不作复制/预热源），预热 `warm.go` 被拒分支口径与显式层一致——宿主
+  残留开关无法借显式 PI 值冒认受信自定义。
+- **GOROOT 别名漏洞（`resolveGoToolchainPaths`）**：旧实现对
+  `os.Getenv("GOROOT")` 校验 `<GOROOT>/bin/go` 后把原始 `envGR` 加入
+  `goRoots`，再直接放行 `filepath.Join(root, "pkg", "tool")`——伪造
+  GOROOT 的 `bin/go` 只要是指向受信 go 的软链，伪造的
+  `<GOROOT>/pkg/tool` 仍会整目录混入 `Policy.Exec`。修复：绝不把原始
+  `envGR` 加入 `goRoots`，只从 `trustedRealGoCandidate` 返回的已解析
+  真实 go 推导规范化可信根 `filepath.Dir(filepath.Dir(trusted))`；新增
+  `trustedToolDir` 对 `pkg/tool` 做非软链真实目录 + 固定可信前缀 +
+  `perm&0o022==0` + 属主（0 或当前 euid）四重校验，软链/外部/可写
+  `pkg/tool` 一律不进 `Policy.Exec`。
+- **GOROOT 中间软链别名彻底闭合（oracle8 MF-1）**：上项修复后仍有三条
+  残余逃逸面——① `runtime.GOROOT()`（Go 标准库优先返回进程启动时
+  `GOROOT` 环境变量原始值）未经任何校验直接进入 `goRoots`，伪造
+  `GOROOT=<tmp>/fake-goroot` 绕过 `envGR` 受信判定；② `goRoots` 遍历时
+  `<root>/bin/go` 未通过 `trustedRealGoCandidate` 并不跳过该 `root`，
+  未认证根的 `pkg/tool` 仍被收录；③ `trustedToolDir` 仅 `Lstat` 末级
+  `tool`——伪造根 `pkg -> /usr/local/go/pkg` 中间软链下
+  `<fake>/pkg/tool` Lstat 为真实目录、`EvalSymlinks` 解析在可信前缀内，
+  未解析的原始 `toolDir` 被写入 `Policy.Exec`（别名拼写获执行授权）。
+  修复：`runtime.GOROOT()` 入口移除（绝不信任原始环境变量 GOROOT）；
+  `bin/go` 未通过校验直接 `continue`，且 `pkg/tool` 只基于已解析真实
+  go 推导的规范真实根 `filepath.Dir(filepath.Dir(trusted))` 收录；
+  `trustedToolDir` 改为返回 `(string, bool)`（拆出包内可注入前缀的
+  `trustedToolDirWithPrefixes`，生产固定 `trustedGoToolDirPrefixes` 零
+  外部开启入口），调用点只把解析后的规范真实路径写入 `Policy.Exec`。
+- **`ReviewerAgentWithEnv` 统一 `PIG_HOME` 受信校验 + `.locks` 先建后验
+  修复（oracle8 SF-1，方案 1A）**：`warm.go` 预热已有
+  `validatePigHomeDir`（拒软链/`0777`/异属主），但策略构造侧未执行同
+  一校验——不可信 `PIG_HOME` 下 `<pigHome>/agent` 仍被作配置/扩展源、
+  `usage.json` 仍被改写、其缓存产物仍枚举进 `Policy.Exec`；且
+  `appendCellCachePolicy` 在 `resolvePolicyPathWithin` 拒软链前先
+  `os.MkdirAll(..., ".locks")`，会跟随软链在外部目录凭空创建
+  `.locks`。修复：`resolvePigHomeDir` 后立即 `validatePigHomeDir`；
+  不可信时默认层 `AgentDir` 源回退为空私有 `pig-agent`（`cfgEnv` 独立
+  可信自定义 `AgentDir` 不受牵连仍生效），跳过 `refreshCellUsageMetadata`/
+  `appendCellCachePolicy` 与宿主 `bin/docs/state` 投影（经
+  `prepareEmptyPrivatePigHome` 退回空私有 `pig-home`），并向
+  `reviewerAgentCellTargets` 记录错误项（`hasGoExt` 强制为 true）使
+  `ReviewerAgentCellTargetError()` 非 nil——真实 `pig` 入口启动前
+  fail-closed，非 `pig` 命令以空私有根放行。`appendCellCachePolicy`
+  在 `os.MkdirAll` 前冻结 `cache/ext`、`cache/cells` 与各 `cells/<lang>`
+  的 `isRealDirNoSymlink` 判定，任一级软链即不为其创建 `.locks`；
+  `artifactPath` 入 `Policy.Exec` 前追加 `Lstat` 普通文件 +
+  `Perm()&0o022==0` + 属主合规校验，`0777` 全局可写二进制不再混入。
+- **fd3 身份误认导致 `runtime: epollwait on fd 3 failed with 9`（plain
+  模式 netpoll fatal）**：plain 模式（未注入调试管道）下 Go runtime 自身把
+  fd 3 分配给 epoll（`anon_inode:[eventpoll]`，带 `FD_CLOEXEC`），旧
+  `fd3Active()` 仅凭 `F_GETFD` 成功就把 fd3 当作 claude-pty 继承的
+  debugW 管道，`acquireFd3File`/`closeFD3` 关闭了 runtime 的 epoll fd。
+  修复：`fd3Active()` 收紧为「`flags&FD_CLOEXEC==0`（ExtraFiles 传入无
+  CLOEXEC）且 `unix.Fstat` 为管道 `S_IFIFO` 或普通文件 `S_IFREG`」，
+  `anon_inode`/socket/目录/带 CLOEXEC 的 runtime 内部描述符一律不接管；
+  plain 与 pipe 两模式均不再误关 runtime epoll。
+- **`TestReviewerAgentPigAgentDirIsolation` 私有 TMPDIR 路径假设修正**：
+  生产 `ReadOnlyReviewer` 固定于 `/tmp` 创建 `pi-reviewer-*` 私有
+  `TMPDIR`，旧断言 `HasPrefix(got, os.TempDir())` 在自定义 `TMPDIR`
+  环境恒红；改以预设实际产出的 `policy.Env["TMPDIR"]` 拼接 `pig-agent`
+  校验，不迁移生产私有根。
+- **cell 目标集枚举口径分裂：`cells/go` 语言根软链逃逸（N4）**：
+  `countValidExecutableGoArtifacts`（total）直接 `ReadDir(cells/go)` 会
+  跟随符号链接，而投影侧 `preparePrivatePigHome` 与 Exec 完整性校验拒绝
+  跟随语言根软链——宿主 `cache/cells/go` 为指向外部目录的软链时
+  `total>0` 但投影为空、`missing` 为空，完整性门禁零投影假放行。修复：
+  抽出共用谓词 `cellEntryHiddenOrSymlink`（软链/非目录/隐藏条目一律排除，
+  `.tombstone-*` 除外），total、投影与 Exec 校验三方统一走
+  `cellCacheEntryDirs` 同一枚举；`countValidExecutableGoArtifacts` 对
+  `cells/go`/`ext` 根先 `isSymlinkPath` 拒绝跟随软链，并新增
+  「宿主可执行 Go 产物 × 私有投影」一致性复核——任一有效 Go 产物未被
+  软链投影进私有 cache 即记入 missing fail-closed。
+- **预热子进程前置 go 目录可被调用方 PATH 投毒（N5）**：
+  `runPigWarmSubprocess` 为对齐 cell 摘要把 `resolveRealGoBinary` 按宿主
+  `PATH` 选中的目录前置进预热 `PATH`——该解析不校验
+  可信前缀，工作树/任意目录内放「假 go」并前置宿主 `PATH` 即让该不可信
+  父目录被前置，预热子进程在 Landlock 生效前以宿主权限执行它
+  （`controlledWarmPath` 刻意不读调用方 `PATH` 的既有防线被打穿）。修复：
+  新增 `resolveSandboxRealGoBinary` 受信解析——先同口径解析，再经
+  `trustedRealGoCandidate` 校验真实路径（`EvalSymlinks` 后）必须落在
+  `trustedGoToolchainPrefixes`（版本化/系统 Go 安装根与 `standardBinDirs`
+  标准 bin）之下；不可信命中直接放弃 PATH 对齐、回退固定可信目录顺序
+  取首个可信 go（兜底与沙盒侧 `resolveRealGoBinary` 固定目录回退一致）。
+- **reviewer-agent cell 校验三处缺陷（oracle FM-2）**：① cell 校验失败时
+  `buildPolicy` 丢弃已创建 `policy` 返回空结构，早于
+  `cleanupPresetTempDirsFromPolicy` defer——`/tmp/pi-reviewer-*`（含
+  `0600` `pig-agent/auth.json` 凭据副本）与 `pi-reviewer-exec-*` 永久
+  泄漏；修复为 fail-closed 前先清理。② fail-closed 对所有
+  `reviewer-agent` 命令无条件执行——`claude`/`agy`/`sh` 等非 pig 命令
+  `MaybeWarmGoExtensionCells` 不预热，冷缓存下被误拒启动；修复为仅对
+  真实 pig 入口（`IsPigEntryCommand`，与预热同口径）执行校验。③
+  `total` 用 `validCellEntryDir` 统计漏掉 `language=="go"` 与可执行位
+  门禁——宿主 `cache/ext/node-runtime-*`（`language:"node"`）即让
+  `total>0` 假通过；修复为改用 `countValidExecutableGoArtifacts`
+  （语言门 + `mode&0o111`）。
+- **`PIG_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` 注入三缺陷（oracle FM-4）**：
+  ① `injectPigCodingAgentDir` 未接 `cfgEnv`，`--env PIG_CODING_AGENT_DIR=`
+  空覆盖屏蔽宿主变量后函数仍见宿主 `os.Getenv` 非空提前返回，空串写进
+  最终 env；② 宿主残留恶意/旧 `PI_CODING_AGENT_DIR` 会在 pig 包装器后置
+  `export PIG_USE_PI_DIRS=1` 时被激活生效；③ 仅 `PIG_USE_PI_DIRS=1` 时
+  才对称注入 `PI_CODING_AGENT_DIR`。修复：函数接收 `cfgEnv`，「显式自定义」
+  仅认 `cfgEnv`（`--env` 显式声明）；默认可信 `AgentDir` 下双变量一律经
+  `overrideEnvKey` 回钉私有 `pig-agent`（空覆盖不再产生空路径）；宿主
+  残留变量一律覆写。
+- **reviewer-agent 在 `<workdir>/reports` 创建目录污染目标工作树
+  （oracle SF-2）**：`ReadOnlyReviewer` 原在 `os.MkdirAll(<workdir>/reports)`
+  并将其放入 `ReadWrite[0]`——目标 Git 工作树未忽略 `reports/` 时每次
+  启动 sbx 都弄脏 `git status`，且使只读角色在源仓内拥有可写子目录。
+  报告根已统一收敛 `/tmp/herdr-role-reports`，故移除该创建与写权限；
+  原 `runTestRunnerClient`（阶段 3 已随 `pi-test-runner` 一并删除）曾
+  将私有 `TMPDIR` 判定从硬编码 `reviewerRW[1]` 改为读 env `TMPDIR`
+  （ReadWrite 列表移除 reports 后按位置取会错位）。
+- **arm64 测试夹具（`fix-sbx-portable-baseline` 移植 + TMPDIR 隔离）**：
+  `sandbox_test.go` 系统只读目录枚举改为必需目录存在性校验 + 可选库目录
+  （`/lib64`/`/usr/lib64`，x86-64 专属）按实际存在追加——arm64 rootfs 无
+  `/lib64`，原硬编码致 `addPathRule` 对非 optional 路径 ENOENT fail-closed；
+  `TestReviewerAgentAgyHooks` 改 `t.TempDir` 夹具 + `HERDSMAN_GO_BIN`/`PATH`
+  注入，不再依赖已退役的 `/root/.local/bin/herdsman`；
+  `TestWarmGoExtensionCellsSignalInterrupt` 用 `t.Setenv("TMPDIR",
+  t.TempDir())` 隔离 `os.TempDir()`，消除宿主 `/tmp` 历史 `sbx-warm-*`
+  诊断文件污染零残留 glob 断言。
+- **reviewer-agent 预热 cell 与沙盒内实际构建 toolchain 错配，导致 pig
+  扩展在只读 `cells/go` 下重建 `.build-*` scratch 撞 `permission denied`**：
+  `goPackedCellHash` 把 Go 工具链的 `commandVersion`/`goroot`/`compiler`
+  折进 cell 摘要——预热 `pig --help` 与沙盒内 pig 必须解析到**同一个 go**
+  才会命中同一个 `cells/go/<digest>/runner`。沙盒内 `go` 经 `goExecDir`
+  包装器由 `resolveRealGoBinary`（宿主 `PATH` 顺序）选出真实 go；预热子进程
+  原先只用 `controlledWarmPath()` 的固定目录顺序（`/usr/local/go/bin` 在
+  `/usr/bin` 之前），在宿主 `PATH` 先命中 `/usr/bin/go` 的机器上解析出
+  不同 go → cell 摘要必然错配 → 沙盒内 pig 在 `cells/go` 下
+  `os.MkdirTemp(".build-*")` 重建被拒（`cells/go` 本身不在 ReadWrite，
+  只放行 `.locks` 与已构建 artifact），15 个 Go 扩展全部加载失败、进程
+  `exit 1`。修复：`runPigWarmSubprocess` 在与沙盒同口径 `resolveRealGoBinary("")`
+  解析出真实 go 后，把其所在目录提前到受控 `PATH` 之首，保证预热/沙盒两侧
+  `exec.LookPath("go")` 解析一致、cell 摘要命中宿主已构建 cell。
+  **未放宽整个 `cells/go`、未把 `cells/go` 加入 ReadWrite 或 Exec，
+  W^X 断言（`cells/go` 不得同时 ReadWrite+Exec）不变。**
 - **`[pattern:verifier-transient-fail]` 结案（agy 瞬态状态文件 TOCTOU 击穿
   `sbx`）**：`appendAgyStateReadWrite` 经 `os.ReadDir` 快照枚举
   antigravity-cli 状态根下的根级文件（`settings.json`/`history.jsonl`/
@@ -98,8 +397,7 @@
   `appendAgyStateReadWrite` 枚举出的根级文件同步登记（授权仍完全由
   `ReadWrite` 决定，`OptionalReadWrite` 仅标记「缺失可容忍」）；该字段
   随 `childExecSpec.orw` 与 `helperConfig.orw` 跨
-  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 与 broker/helper/`pi-test-runner`
-  全链路 100% 透传。`buildPathRuleEntries` 将 OptionalReadWrite 归一化为
+  `PI_SANDBOX_INTERNAL_CHILD_SPEC` 与 helper 配置链路 100% 透传。`buildPathRuleEntries` 将 OptionalReadWrite 归一化为
   集合打标 `transient`，`addPathRule` 仅对 `transient` 条目容忍
   `ENOENT`（含悬空软链）安全跳过；未登记的普通 `ReadWrite` 缺失路径
   （显式 `--rw`、`<workdir>/reports`、私有 `TMPDIR`、agyStateDataSubdirs
@@ -110,7 +408,7 @@
   的是后者，已更正为两类失败路径区分。
 - **init 文档口径修正**：README/CHANGELOG 中「派生目标命令为 PID 2」
   更正为「记录的目标子进程 PID」——`sandbox.Apply` 先派生
-  helper/broker，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
+  helper 辅助进程，业务进程 PID 不固定为 2；同时区分 CLI 外层 `sbx`
   父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 4 种信号，
   与容器内 PID-1 init 监听的 8 种信号（`SIGCHLD` 仅用于唤醒 `Wait4`
   收尸不转发，其余 7 种转发给目标子进程），不再混述为同一端到端
@@ -173,6 +471,35 @@
   注入 `hostHome`（与生产 `resolveEntryAgentPaths(trustedHomeDir())`
   同一代码路径，生产 HOME 信任边界不变），消除干净容器/CI 未安装
   `claude` 或 `agy` 时的静默 `t.Skip`。
+- **`ReadOnlyReviewer` 把 `GOROOT` 回钉受信真实 `go` 根**：阶段 3 直链
+  真实 `go` 后，宿主环境携带的 `GOROOT`（如 `go test` 父进程传给测试
+  二进制的 toolchain module 缓存路径 `/root/go/pkg/mod/golang.org/
+  toolchain@*`，或调用方伪造根）会被沙盒内 `go` 继承——其 `pkg/tool`
+  既不在受信前缀（编译产物 `EACCES`）又是污染源。`Policy.Env` 显式
+  注入 `GOROOT=<受信真实 go 根>`，保证沙盒内 `go` 命中的 `pkg/tool`
+  与 `resolveGoToolchainPaths` 收录的受信 `pkg/tool` 同一实体。
+  同批把 `GOROOT` 加入 `sandboxEnvStripKeys` 全剥离（方案 B）：
+  `--env GOROOT=<伪根>` 与宿主 `os.Environ()` 携带的 GOROOT 一律剔除
+  （剥离只作用于 `cfg.Env` 与宿主继承，不动 `Policy.Env` 注入），
+  杜绝外部 GOROOT 经 `mergeEnv` 覆盖受信回钉、把沙盒内 `go` 的
+  `pkg/tool` 指到不可信根。
+
+### Known Risks
+
+- **`memfd_create`/`execveat` 与匿名 `PROT_EXEC` 旁路（Q1 决策：不改
+  seccomp 黑名单，仅文档披露）**：seccomp `PROT_EXEC` 守卫只拦截带
+  `PROT_EXEC` 标志的 `mmap`/`mprotect` 且以 `/proc/<pid>/fd`/`exe` 判定
+  文件来源；`memfd_create` 创建的匿名内存 fd 无文件路径可判定，写入
+  任意代码后经 `execveat(AT_EMPTY_PATH)` 或匿名 `mprotect(PROT_EXEC)`
+  属内核接口级旁路，本沙盒不封堵。护栏级定位（防误操作）下接受该
+  边界；强对抗隔离需求应使用独立的内核级方案（容器/VM）。
+- **沙盒内 `go test`/`go run` 产物按 `W^X` 一律拒执行**：阶段 3 起
+  不再有任何 runner 放行路径，被审查仓库的 `*_test.go` 不在沙盒内
+  运行——属设计内行为变更（护栏定位），非回归；需要运行测试的环节
+  应交独立隔离验证环境。
+- **`/` 整树只读可读面与 `DenyNet:false` 网络面保持原状**：护栏定位
+  下按设计保留，本批不改动；文档（模块 README「威胁模型」节）已
+  如实披露两边界含义。
 
 ## [0.4.0] - 2026-11-07
 

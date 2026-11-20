@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,6 +80,11 @@ type childExecSpec struct {
 	// 子进程才执行挂载命名空间内的 socket 白名单视图（--best-effort 下
 	// unshare 失败回退不 unshare 时绝不碰宿主挂载命名空间）。
 	MountNS bool `json:"mount_ns"`
+	// FD3Forward 标记 agent 预设下 fd3（claude-pty debugW 写端）须经
+	// ExtraFiles 显式单路转发给最终目标进程：内层子进程在 Apply（派生
+	// helper）前先对 fd3 置 CLOEXEC，再由 runAsSandboxInit 经
+	// ExtraFiles 传给目标，杜绝辅助进程/常驻 daemon 继承（oracle FM-3）。
+	FD3Forward bool `json:"fd3_forward"`
 }
 
 const usageLine = "usage: sbx [--reviewer WORKDIR | --preset reviewer|reviewer-agent --workdir DIR] [--ro PATH]... [--rw PATH]... [--exec PATH]... [--env KEY=VALUE]... [--deny-net] [--best-effort] [--check] [--version] [--report-to ID] -- COMMAND [ARGS...]"
@@ -183,12 +189,37 @@ func parseArgs(args []string) (cliConfig, error) {
 // （HC_TERMINAL_SOCKET/HC_SCOPE/HC_SOCKET/HC_SESSION 等），以及凭据与
 // 会话 socket 指针。--env 显式传入这些键同样被剔除（buildPolicy 对
 // cfg.Env 同口径过滤）；预设自身注入的值（如 reviewer-agent 私有
-// XDG_RUNTIME_DIR 指向沙盒内 0700 目录）不属于外部指针，不剔除。
+// XDG_RUNTIME_DIR 指向沙盒内 0700 目录，以及 ReadOnlyReviewer 经
+// Policy.Env 回钉的受信 GOROOT 根）不属于外部指针——剥离只作用于
+// cfg.Env 与宿主继承，不动 Policy.Env 注入，故受信注入不受影响。
+//
+// GOROOT 全剥离（方案 B）：宿主 os.Environ() 携带的 toolchain module
+// 缓存 GOROOT 与调用方 --env GOROOT=<伪根> 一律剔除——否则其经
+// mergeEnv 覆盖 ReadOnlyReviewer 注入的受信根，把沙盒内 go 的
+// <GOROOT>/pkg/tool 指到不可信根。
+//
+// PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 不入本集合：仅对宿主
+// os.Environ() 经 sandboxHostStripExtraKeys 追加剔除（--env 显式声明
+// 的合法 PI 自定义入口不能被误伤，N7）。
 var sandboxEnvStripKeys = map[string]bool{
-	"GPG_AGENT_INFO":           true,
-	"SSH_AUTH_SOCK":            true,
-	"DBUS_SESSION_BUS_ADDRESS": true,
-	"XDG_RUNTIME_DIR":          true,
+	"GPG_AGENT_INFO":             true,
+	"SSH_AUTH_SOCK":              true,
+	"DBUS_SESSION_BUS_ADDRESS":   true,
+	"XDG_RUNTIME_DIR":            true,
+	"GOROOT":                     true,
+	"PI_SANDBOX_INTERNAL_MODE":   true,
+	"PI_SANDBOX_HELPER_CFG":      true,
+	"PI_SANDBOX_PRESET_TMP_DIRS": true,
+}
+
+// sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：宿主
+// 残留的 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 属外部指针——pig 包装器
+// 后置 export PIG_USE_PI_DIRS=1 会激活宿主 PI_* 目录，仅删 policy.Env 侧
+// 同名键而保留 os.Environ() 中的宿主值，会让宿主 PIG_USE_PI_DIRS=1 /
+// PI_CODING_AGENT_DIR 直接进入最终目标 env（N2）。
+var sandboxHostStripExtraKeys = map[string]bool{
+	"PIG_USE_PI_DIRS":     true,
+	"PI_CODING_AGENT_DIR": true,
 }
 
 // stripSandboxEnv 剔除 env 列表中的外部指针类变量。
@@ -210,14 +241,48 @@ func stripSandboxEnv(env []string) []string {
 	return out
 }
 
+// stripHostEnv 在 stripSandboxEnv 之上额外剔除宿主残留 AgentDir/PI-dirs
+// 指针（sandboxHostStripExtraKeys）；仅用于最终 exec 环境与受限子进程
+// 环境构造，不作用于 --env 显式声明。
+func stripHostEnv(env []string) []string {
+	out := stripSandboxEnv(env)
+	res := make([]string, 0, len(out))
+	for _, kv := range out {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if sandboxHostStripExtraKeys[k] {
+			continue
+		}
+		res = append(res, kv)
+	}
+	return res
+}
+
+// lastPresetTempDirs 记录最近一次 buildPolicy 产出的策略在预设构造阶段
+// 实际创建的私有临时目录清单（由预设经 PI_SANDBOX_PRESET_TMP_DIRS 内部
+// env 键携带，buildPolicy 返回前捕获并从 Policy.Env 剔除）。
+// cleanupPresetTempDirsFromPolicy 只删除该清单中登记的目录——清理身份
+// 必须来自创建时登记，绝不从 Policy.Exec/Env 用父目录前缀反推，否则
+// 调用方经 --exec /tmp/pi-reviewer-exec-manual/bin 传入的「形似预设」
+// 路径会让其整个父目录被递归误删。
+var lastPresetTempDirs []string
+
 // buildPolicy 根据解析后的命令行配置构造最终的 sandbox.Policy。
 func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// 先剔除 --env 中的外部指针类变量，防止它们经 policy.Env 写回沙盒。
 	cfg.Env = stripSandboxEnv(cfg.Env)
 	var policy sandbox.Policy
+	lastPresetTempDirs = nil
 	var pigHome string
 	var claudeConfigDir string
 	var goExecDir string
+	// N1/N7：在 cfgEnv merge 前捕获 ReviewerAgentWithEnv 判定的结构化受信
+	// AgentDir 事实（哪个目录是真正预建的私有目录、哪个是经校验的自定义
+	// 目录、有效目录是谁），merge 后只使用该事实做归一化——绝不从用户可控
+	// TMPDIR 重新 filepath.Join 重建私有目录身份。
+	var agentFact reviewerAgentDirFact
 	if cfg.Preset != "" {
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
@@ -226,12 +291,40 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 				wd = "."
 			}
 			policy = sandbox.ReadOnlyReviewer(wd)
+			// reviewer 预设同样回钉 PI_SANDBOX_GO_EXEC_DIR（与 reviewer-agent
+			// 同口径）：ReadOnlyReviewer 注入的受控执行目录不得被 --env 劫持。
+			goExecDir = envListValue(policy.Env, "PI_SANDBOX_GO_EXEC_DIR")
 		case "reviewer-agent":
 			wd := cfg.WorkDir
 			if strings.TrimSpace(wd) == "" {
 				wd = "."
 			}
 			policy = sandbox.ReviewerAgentWithEnv(wd, cfg.Env)
+			// merge 前捕获：预设已经把受信判定结果写进 policy.Env
+			//（effective = 受信自定义或私有；private = 预建 pig-agent 目录）。
+			agentFact = captureReviewerAgentDirFact(policy)
+			if captureReviewerAgentDirFactHook != nil {
+				captureReviewerAgentDirFactHook(agentFact)
+			}
+			// 启动前 fail-closed：本次目标集（宿主已构建的有效 Go 缓存单元）经
+			// ReviewerAgentWithEnv 枚举与投影校验；有 Go 扩展但宿主产物为 0，或
+			// 存在未成功投影/Exec 未命中的目标时，此处返回错误拒绝启动并指名
+			// 缺失项，绝不进入「沙盒内 build 成功但 exec 失败」的不完全兼容态。
+			// fail-closed 仅对真实 pig 入口生效：claude/agy/sh 等非 pig 命令
+			// MaybeWarmGoExtensionCells 不会预热，冷缓存下无条件校验会把它们
+			// 误拒启动（oracle FM-2B）。校验失败时必须先清理已创建的
+			// pi-reviewer-*/pi-reviewer-exec-*（含 pig-agent/auth.json 凭据副本），
+			// 再返回错误，不得在 /tmp 泄漏私有目录（oracle FM-2A）。
+			if sandbox.IsPigEntryCommand(cfg.Command) {
+				if err := sandbox.ReviewerAgentCellTargetError(); err != nil {
+					// 清理只针对登记清单中本预设实际创建的目录：
+					// Policy.Env 仍含预设注入的 PI_SANDBOX_PRESET_TMP_DIRS 登记
+					// 条目，cleanupPresetTempDirsFromPolicy 按清单精确删除，
+					// 绝不凭 Exec/env 前缀推断误删外部目录。
+					cleanupPresetTempDirsFromPolicy(policy)
+					return sandbox.Policy{}, fmt.Errorf("sbx: reviewer-agent pig cell target check failed: %w", err)
+				}
+			}
 			// ReviewerAgentWithEnv 把与预热对齐的 PIG_HOME 固定注入 Policy.Env；
 			// 记下来供 mergeEnv 之后回钉（--env PIG_HOME= 空覆盖会把空串写进
 			// 最终 env，导致沙盒内 pig 按外部 HOME 另算缓存根打穿预热对齐）。
@@ -243,7 +336,7 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 			// ~/.claude 或与 ReadWrite 策略脱配。
 			claudeConfigDir = envListValue(policy.Env, "CLAUDE_CONFIG_DIR")
 			// PI_SANDBOX_GO_EXEC_DIR 同理：ReviewerAgentWithEnv 把受控执行目录
-			//（/tmp/pi-reviewer-exec-*，go 包装器/broker.sock/report.sock 所在）
+			//（/tmp/pi-reviewer-exec-*，bin/go 直链/report.sock 所在）
 			// 注入 Policy.Env；记下来供 mergeEnv 之后回钉，防 --env
 			// PI_SANDBOX_GO_EXEC_DIR=<其他路径> 把回报中继监听路径与 go
 			// 包装器目录劫持到调用方指定的任意目录。
@@ -266,11 +359,20 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	if cfg.Preset == "reviewer-agent" && claudeConfigDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir})
 	}
-	// 仅 reviewer-agent 预设回钉 PI_SANDBOX_GO_EXEC_DIR：把最终 env 中该键
-	// 强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME 同口径），
-	// 防 --env 劫持回报中继监听路径或 go 包装器/broker 目录。
-	if cfg.Preset == "reviewer-agent" && goExecDir != "" {
+	// reviewer 与 reviewer-agent 预设统一回钉 PI_SANDBOX_GO_EXEC_DIR：把最终
+	// env 中该键强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME
+	// 同口径），防 --env 劫持回报中继监听路径或 go 直链目录。
+	if (cfg.Preset == "reviewer" || cfg.Preset == "read-only-reviewer" || cfg.Preset == "reviewer-agent") && goExecDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PI_SANDBOX_GO_EXEC_DIR=" + goExecDir})
+	}
+	// M1/M2：cfgEnv 合并完成后统一归一化有效 AgentDir。显式空串（含重复
+	// 键末项为空）不得把空串写进最终 env（M1）；显式非空自定义分支也须
+	// 清理宿主残留的 PI_CODING_AGENT_DIR / PIG_USE_PI_DIRS（M2），否则 pig
+	// 包装器后置 export PIG_USE_PI_DIRS=1 时会激活宿主 PI 残留。
+	// N1：私有目录身份只使用 merge 前捕获的预设事实 agentFact（绝不从
+	// 用户可控 TMPDIR 重建）；预热、配置复制与最终 exec 使用同一有效目录。
+	if cfg.Preset == "reviewer-agent" {
+		policy.Env = normalizeEffectiveAgentDirs(policy.Env, agentFact)
 	}
 	if cfg.DenyNet {
 		policy.DenyNet = true
@@ -278,7 +380,126 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	if cfg.BestEffort {
 		policy.BestEffort = true
 	}
+	// 预设创建清单在 cfgEnv merge/回钉全部完成后捕获（此时预设注入的登记
+	// 条目仍原样位于 Policy.Env），随后把该内部键从最终 env 剔除——登记
+	// 只服务宿主侧清理，不得进入受限子进程环境。
+	lastPresetTempDirs = append(lastPresetTempDirs, registeredPresetTempDirs(policy.Env)...)
+	policy.Env = removeEnvKey(policy.Env, "PI_SANDBOX_PRESET_TMP_DIRS")
 	return policy, nil
+}
+
+// reviewerAgentDirFact 是 ReviewerAgentWithEnv 在 merge 前写入 policy.Env
+// 的结构化受信 AgentDir 判定结果：哪个目录是真正预建的私有 pig-agent、
+// 哪个是经校验的自定义目录、有效目录最终是谁。该事实在 cfgEnv merge
+// 之前捕获，merge 后只使用它做归一化，绝不从用户可控 TMPDIR 重新推导
+// （N1：TMPDIR 与 AgentDir 同时被 --env 覆盖时，从 TMPDIR filepath.Join
+// 重建出的目录会重新消费宿主配置，如 --env TMPDIR=/root/.pig +
+// --env PIG_CODING_AGENT_DIR= 得 /root/.pig/pig-agent）。
+type reviewerAgentDirFact struct {
+	// privateDir 是 ReviewerAgentWithEnv 实际预建的私有 pig-agent 目录
+	//（<privateTmpDir>/pig-agent，0700 已存在）；非空时即可信私有目录本体。
+	privateDir string
+	// effectiveDir 是 ReviewerAgentWithEnv 最终判定的有效 AgentDir：
+	// 受信自定义（trustedCustom）= 解析后的自定义目录；其余 = privateDir。
+	effectiveDir string
+	// trustedCustom 记录受信自定义是否真实存在（effectiveDir != privateDir）。
+	trustedCustom bool
+}
+
+// captureReviewerAgentDirFactHook 是可注入的 merge 前事实捕获 seam：
+// 单测把它置为记录函数即可在同一 buildPolicy 调用内拿到真实私有目录
+// （privateTmpDir 随机名跨次构造不同，断言必须用本次 buildPolicy 的
+// 那一次），生产路径为 nil 零开销。
+var captureReviewerAgentDirFactHook func(reviewerAgentDirFact)
+
+// captureReviewerAgentDirFact 从 ReviewerAgentWithEnv 产出的 policy.Env
+// 读取 merge 前的事实：privateDir 取预设注入的 PIG_CODING_AGENT_DIR
+// （此时即有效目录；trustedCustom 分支下预设已把受信自定义写入同一键，
+// 私有目录本体可由 privateTmpDir 推导但判定本身已可信），effectiveDir
+// 与 privateDir 的区分仅靠 PIG_CODING_AGENT_DIR 是否等于 <TMPDIR>/pig-agent。
+func captureReviewerAgentDirFact(policy sandbox.Policy) reviewerAgentDirFact {
+	tmp := envListValue(policy.Env, "TMPDIR")
+	pig := envListValue(policy.Env, "PIG_CODING_AGENT_DIR")
+	fact := reviewerAgentDirFact{}
+	if tmp == "" || pig == "" {
+		return fact
+	}
+	fact.privateDir = filepath.Join(tmp, "pig-agent")
+	if pig != fact.privateDir {
+		fact.trustedCustom = true
+		fact.effectiveDir = pig
+	} else {
+		fact.effectiveDir = fact.privateDir
+	}
+	return fact
+}
+
+// normalizeEffectiveAgentDirs 统一归一化最终 env 中两个 AgentDir 键与
+// PIG_USE_PI_DIRS；输入只用 merge 前捕获的结构化事实 agentFact：
+//   - agentFact.trustedCustom：经 ReviewerAgentWithEnv 校验的非空自定义
+//     PIG_CODING_AGENT_DIR 保留为有效目录；PI_CODING_AGENT_DIR 归一到同一
+//     目录（宿主残留 PI 键不得生效），PIG_USE_PI_DIRS 不再注入。
+//   - 其余情形（键缺失 / 显式空串 / 不可信被拒）两个键都回钉
+//     agentFact.privateDir（真实预建私有目录，非 TMPDIR 重建值）。
+//
+// cfgEnv 空覆盖语义：显式空串屏蔽宿主同名变量后仍归一化回钉，不得把
+// 空串写进最终 env（M1）。有效目录一律来自预设事实，绝不从合并后的
+// TMPDIR 重新 filepath.Join 重建（N1）。
+func normalizeEffectiveAgentDirs(env []string, agentFact reviewerAgentDirFact) []string {
+	// 受信自定义：agentFact.effectiveDir 即 ReviewerAgentWithEnv 校验过的
+	// 自定义目录（trustedCustom=true）；privateDir 仍是真实私有目录本体。
+	if agentFact.trustedCustom && agentFact.effectiveDir != "" {
+		eff := agentFact.effectiveDir
+		env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", eff)
+		env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", eff)
+		env = removeEnvKey(env, "PIG_USE_PI_DIRS")
+		return env
+	}
+	// 非受信自定义（含不可信被拒 / 显式空串 / 键缺失）：两键统一回钉
+	// agentFact.privateDir——真实预建私有目录；显式空串被归一化覆盖，
+	// 不再把空串写进最终 env（M1）。PIG_USE_PI_DIRS 不注入。
+	privateDir := agentFact.privateDir
+	env = overrideEnvKeyLocal(env, "PIG_CODING_AGENT_DIR", privateDir)
+	env = overrideEnvKeyLocal(env, "PI_CODING_AGENT_DIR", privateDir)
+	env = removeEnvKey(env, "PIG_USE_PI_DIRS")
+	return env
+}
+
+// overrideEnvKeyLocal 与 sandbox.overrideEnvKey 同语义（package main 无法
+// 访问未导出符号）：替换首个 key= 条目并去除重复，未命中则追加。
+func overrideEnvKeyLocal(env []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			if replaced {
+				continue
+			}
+			out = append(out, prefix+val)
+			replaced = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !replaced {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
+// removeEnvKey 从 env 切片中删除所有 key= 前缀条目（mergeEnv 无法删除键，
+// 只能覆盖——清理宿主 PIG_USE_PI_DIRS 残留需真正的删除）。
+func removeEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // envListValue 返回 env 中首个 KEY= 前缀条目的值；未命中返回空串。
@@ -357,6 +578,122 @@ func main() {
 	os.Exit(runMain(os.Args[1:]))
 }
 
+// agentPreset 统一判定需要 fd3（claude-pty debugW 写端）显式单路转发的
+// agent 预设：reviewer-agent。未来 exec-agent 同名加入。非 agent 预设
+// 不改变 fd3 语义。
+func isAgentPreset(name string) bool {
+	return name == "reviewer-agent"
+}
+
+// fd3Open 宽松判定 fd 3 当前是否为有效打开描述符（F_GETFD 成功）。
+// 仅用于「该 fd3 已被 sealInheritedFD3 确认为 debugW 写端」之后的内部
+// 状态检查（acquireFd3File / runChildFromEnv 恢复与转发判定）——身份识别
+// 一律走 fd3Active 的严格判定，绝不凭 fd3Open 接管描述符。
+func fd3Open() bool {
+	_, err := unix.FcntlInt(3, unix.F_GETFD, 0)
+	return err == nil
+}
+
+// fd3Active 判定 fd 3 是否是「claude-pty 经 ExtraFiles 继承的 debugW
+// 写端」形态的描述符（sealInheritedFD3 入口唯一身份判定点）：
+//   - F_GETFD 成功且 flags&FD_CLOEXEC==0：ExtraFiles 传入的 fd3 不携带
+//     CLOEXEC；带 CLOEXEC 的 fd3 一律是 Go runtime 自身描述符（plain 模式
+//     下 runtime 会把 fd 3 分给 epoll，anon_inode:[eventpoll] 且
+//     FD_CLOEXEC），绝不能冒认为 debugW 而接管关闭（误关 epoll 会触发
+//     runtime: epollwait on fd 3 failed with 9 的 netpoll fatal）；
+//   - unix.Fstat 类型必须是管道（S_IFIFO，claude-pty debugW 真实形态）
+//     或普通文件（S_IFREG，调用方以文件重定向 debug 写端的等价形态）；
+//     anon_inode/socket/目录/设备等一律拒绝。
+func fd3Active() bool {
+	flags, err := unix.FcntlInt(3, unix.F_GETFD, 0)
+	if err != nil || flags&unix.FD_CLOEXEC != 0 {
+		return false
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(3, &st); err != nil {
+		return false
+	}
+	mode := st.Mode & unix.S_IFMT
+	return mode == unix.S_IFIFO || mode == unix.S_IFREG
+}
+
+// sealInheritedFD3 在 agent 预设入口对继承的 fd3 置 FD_CLOEXEC：claude-pty
+// 经 ExtraFiles 传入的 debugW 写端进入 sbx 时无 CLOEXEC，若不收口会被
+// 后续派生的 codegraph-go -warm-daemon 常驻 daemon、pig 预热子进程与
+// reportRelay hc send 子进程继承，永久劫持 drainDebug 的 EOF（oracle FM-3）。
+// 返回 fd3 是否有效（供转发决策）；非 agent 预设不动。
+func sealInheritedFD3(preset string) bool {
+	if !isAgentPreset(preset) || !fd3Active() {
+		return false
+	}
+	unix.CloseOnExec(3)
+	return true
+}
+
+// fd3Owner 持有 fd3（claude-pty debugW 写端）在父进程生命周期内的唯一
+// *os.File 包装器，保证 forwardFD3ToChild 跨 mountns 重试复用同一 owner
+// （不产生第二个带终结器的 wrapper），releaseFd3File 显式 Close 后终结器
+// 被撤销——杜绝旧 wrapper 的 GC 终结器在重试前关闭仍需转发的 fd3，或关闭
+// 被复用的 fd3 槽位（oracle FM-3）。
+var fd3Owner struct {
+	sync.Mutex
+	f *os.File
+}
+
+// acquireFd3File 返回 fd3 的唯一 owner *os.File；首次调用建立 owner，后续
+// 调用直接复用（不新建 wrapper）。fd3 无效时返回错误。
+func acquireFd3File() (*os.File, error) {
+	fd3Owner.Lock()
+	defer fd3Owner.Unlock()
+	if fd3Owner.f != nil {
+		return fd3Owner.f, nil
+	}
+	// fd3 身份已由 sealInheritedFD3（严格 fd3Active）确认，此处仅判「还开着」。
+	if !fd3Open() {
+		return nil, errors.New("fd3 not open")
+	}
+	f := os.NewFile(3, "claude-debug")
+	if f == nil {
+		return nil, errors.New("fd3 not open")
+	}
+	fd3Owner.f = f
+	return f, nil
+}
+
+// releaseFd3File 显式 Close fd3 owner：Close 撤销 (*file).close 终结器，
+// 后续 GC 不会对已关闭的整数 3 二次关闭，也不会关闭被复用的 fd3 槽位。
+// 仅在确认子进程已接管（Start 成功）或明确放弃时调用。
+func releaseFd3File() error {
+	fd3Owner.Lock()
+	defer fd3Owner.Unlock()
+	if fd3Owner.f == nil {
+		return nil
+	}
+	err := fd3Owner.f.Close()
+	fd3Owner.f = nil
+	return err
+}
+
+// forwardFD3ToChild 在 agent 预设下把 fd3 经 ExtraFiles 显式单路转发给目标
+// 子进程。调用方负责在 cmd.Start() 成功后调用 releaseFd3File 关闭本进程侧
+// fd3 owner（解除 drainDebug 的 EOF 悬挂）。
+func forwardFD3ToChild(cmd *exec.Cmd, active bool) {
+	if !active {
+		return
+	}
+	if f, err := acquireFd3File(); err == nil && f != nil {
+		cmd.ExtraFiles = []*os.File{f}
+	}
+}
+
+// closeFD3 关闭父进程侧 fd3 owner（Start 后调用），解除 drainDebug 的 EOF
+// 悬挂；同时撤销 owner 的终结器，杜绝幽灵关闭复用槽位。
+func closeFD3(active bool) {
+	if active {
+		_ = releaseFd3File()
+	}
+}
+
 func runMain(args []string) int {
 	cfg, err := parseArgs(args)
 	if err != nil {
@@ -378,6 +715,13 @@ func runMain(args []string) int {
 		fmt.Printf("sbx: Landlock supported (ABI v%d)\n", abi)
 		return 0
 	}
+
+	// agent 预设入口先对继承 fd3 置 FD_CLOEXEC：claude-pty 经 ExtraFiles
+	// 传入的 debugW 写端无 CLOEXEC，不收口会被 MaybeWarmGoExtensionCells
+	// 预热子进程、codegraph-go -warm-daemon 常驻 daemon 及 reportRelay
+	// hc send 继承，永久劫持 drainDebug 的 EOF。仅在真实有效时记录
+	// active 供 runSandboxedChild/runAsSandboxInit 经 ExtraFiles 单路转发。
+	fd3Fwd := sealInheritedFD3(cfg.Preset)
 
 	// reviewer-agent 启动 pig 前：宿主态按需预热 Go 扩展 cell，确保
 	// appendCellCachePolicy 在 buildPolicy 内扫描时能命中已构建 runner。
@@ -428,8 +772,14 @@ func runMain(args []string) int {
 		}
 	}
 
-	return runSandboxedChild(bin, cfg, policy)
+	return runSandboxedChild(bin, cfg, policy, fd3Fwd)
 }
+
+// childSysProcAttrForRun 是派生受限子进程用的 SysProcAttr 取值点（默认
+// 直指 childSysProcAttr，Linux 下含三命名空间联合 Cloneflags）。提取为包内
+// 未导出变量仅供同包单测注入非法 Cloneflags 驱动真实 cmd.Start() 失败路径；
+// 无任何环境变量/命令行/配置开启入口，生产恒为 childSysProcAttr。
+var childSysProcAttrForRun = childSysProcAttr
 
 // runSandboxedChild 在当前父进程中派生子进程，由子进程完成 sandbox.Apply 与目标命令启动；
 // 父进程保持在 Landlock 规则集之外，负责转发信号、等待子进程结束并返回其退出码，使外层 defer
@@ -439,11 +789,11 @@ func runMain(args []string) int {
 // （继承 /dev/mqueue 挂载未覆盖）；
 // 子进程即新 PID ns
 // 的 PID 1，完成隔离后担任轻量 init 派生目标命令（记录目标子进程 PID——
-// sandbox.Apply 会先派生 helper/broker，业务进程 PID 不固定为 2；socket
+// sandbox.Apply 会先派生 helper 辅助进程，业务进程 PID 不固定为 2；socket
 // 白名单视图见 mountns_linux.go）；
 // --best-effort 下 unshare 失败时告警回退不 unshare。reviewer-agent + --report-to 时先在
 // <goExecDir>/report.sock 起回报中继再派生子进程，子进程退出后先关中继再清目录。
-func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
+func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy, fd3Fwd bool) int {
 	selfExe, err := os.Executable()
 	if err != nil || selfExe == "" {
 		fmt.Fprintf(os.Stderr, "sbx: resolve executable failed: %v\n", err)
@@ -457,7 +807,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 	relay := maybeStartReportRelay(cfg, policy.Env)
 	defer relay.close()
 
-	sysProcAttr := childSysProcAttr()
+	sysProcAttr := childSysProcAttrForRun()
 	spec := childExecSpec{
 		Bin:               bin,
 		Command:           cfg.Command,
@@ -470,6 +820,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 		BestEffort:        policy.BestEffort,
 		EntryAgents:       policy.EntryAgents,
 		MountNS:           sysProcAttr != nil,
+		FD3Forward:        fd3Fwd,
 	}
 	specBytes, err := json.Marshal(spec)
 	if err != nil {
@@ -478,7 +829,7 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 	}
 
 	// 传入子进程的环境同样剔除外部指针类变量（子进程 Apply 前的辅助进程不继承 HC_*）。
-	childEnv := mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+	childEnv := mergeEnv(stripHostEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
 
 	newChildCmd := func() *exec.Cmd {
 		cmd := exec.Command(selfExe)
@@ -487,6 +838,9 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 		cmd.Stderr = os.Stderr
 		cmd.Env = childEnv
 		cmd.SysProcAttr = sysProcAttr
+		// agent 预设：fd3 经 ExtraFiles 显式单路转发给子进程（继承 fd3 已在
+		// runMain 入口置 CLOEXEC，不转发即不会泄漏到子进程树）。
+		forwardFD3ToChild(cmd, fd3Fwd)
 		return cmd
 	}
 	cmd := newChildCmd()
@@ -506,16 +860,23 @@ func runSandboxedChild(bin string, cfg cliConfig, policy sandbox.Policy) int {
 			sysProcAttr = nil
 			spec.MountNS = false
 			if specBytes, err = json.Marshal(spec); err == nil {
-				childEnv = mergeEnv(stripSandboxEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
+				childEnv = mergeEnv(stripHostEnv(os.Environ()), []string{envSbxChildSpecKey + "=" + string(specBytes)})
 				cmd = newChildCmd()
 				err = cmd.Start()
 			}
 		}
 		if err != nil {
+			// Start 最终失败退 126 前对称释放 fd3 owner：撤销终结器并
+			// 关闭父侧 fd3，避免 relay.close() 期间悬持写端，且保证同
+			// 进程单测重入时 fd3Owner.f 归零（oracle T1/SF-2）。
+			closeFD3(fd3Fwd)
 			fmt.Fprintf(os.Stderr, "sbx: start sandboxed child failed: %v\n", err)
 			return 126
 		}
 	}
+	// 父进程 Start 成功后立即关闭自身 fd3 副本：debugW 仅剩目标子进程树
+	// 持有的写端，claude-pty drainDebug 在目标退出后能正确收到 EOF。
+	closeFD3(fd3Fwd)
 
 	waitCh := make(chan error, 1)
 	go func() {
@@ -540,7 +901,7 @@ func runChildFromEnv() int {
 	// -race/cgo 下 syscall.AllThreadsSyscall 返回 ENOTSUP 时，降权、封锁与
 	// Apply 会回退到「当前线程」口径，必须保证 isolateRuntimeSockets
 	//（drop-capabilities/seal-mount-namespace）→ sandbox.Apply（派生 helper
-	// 及后续 go test 子进程）→ runAsSandboxInit（派生目标子进程）全程跑在
+	// 及后续子进程）→ runAsSandboxInit（派生目标子进程）全程跑在
 	// 同一个已降权/已封锁的 OS 线程上，子孙经 fork/exec 继承同一能力集。
 	runtime.LockOSThread()
 
@@ -579,6 +940,12 @@ func runChildFromEnv() int {
 			return 1
 		}
 	}
+	// agent 预设：fd3 经外层 ExtraFiles 传入后为非 CLOEXEC，必须在
+	// sandbox.Apply 派生 helper 前置 CLOEXEC，杜绝辅助进程继承
+	// debugW 写端；目标进程由 runAsSandboxInit 经 ExtraFiles 显式接收。
+	if spec.FD3Forward && fd3Open() {
+		unix.CloseOnExec(3)
+	}
 	if err := sandbox.Apply(policy); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: apply sandbox policy failed: %v\n", err)
 		return 1
@@ -586,12 +953,20 @@ func runChildFromEnv() int {
 
 	// mergeEnv 只能覆盖不能删：对宿主继承部分剔除外部指针类变量后再合并，
 	// policy.Env 中预设注入的同名键（如私有 XDG_RUNTIME_DIR）不受影响。
-	execEnv := mergeEnv(stripSandboxEnv(os.Environ()), policy.Env)
+	// 宿主侧额外剔除 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 残留（N2）。
+	execEnv := mergeEnv(stripHostEnv(os.Environ()), policy.Env)
 	// MountNS 路径下本进程是新 PID 命名空间的 PID 1：不得直接 syscall.Exec
 	// 顶替 PID 1（业务进程作为 PID 1 会忽略默认未捕获信号，且无人回收孤儿
 	// 僵尸进程），改由 runAsSandboxInit 担任轻量 init 派生目标子进程。
 	if spec.MountNS {
-		return runAsSandboxInit(spec.Bin, spec.Command, execEnv)
+		return runAsSandboxInit(spec.Bin, spec.Command, execEnv, spec.FD3Forward)
+	}
+	// 无 mountns 分支直接 syscall.Exec：agent 预设下恢复 fd3 的
+	// FD_CLOEXEC=0，让内核 exec 保留 fd3 透传到目标进程（替代
+	// ExtraFiles——syscall.Exec 无 ExtraFiles 概念）；目标退出后
+	// drainDebug 收到 EOF。非 agent 预设保持 CLOEXEC 不转发。
+	if spec.FD3Forward && fd3Open() {
+		_, _ = unix.FcntlInt(3, unix.F_SETFD, 0)
 	}
 	if err := syscall.Exec(spec.Bin, spec.Command, execEnv); err != nil {
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", spec.Bin, err)
@@ -602,7 +977,7 @@ func runChildFromEnv() int {
 
 // runAsSandboxInit 在新 PID 命名空间内以 PID 1 运行轻量 init：派生目标
 // 命令并记录其子进程 PID（不固定为 2——sandbox.Apply 会先派生
-// helper/broker 辅助进程），转发信号并回收孤儿僵尸进程。PID 1 有特殊
+// helper 辅助进程），转发信号并回收孤儿僵尸进程。PID 1 有特殊
 // 语义——默认未捕获的信号对它不生效（kill 不掉），且其退出的子孙会被
 // 内核转给它收尸；让业务进程直接当 PID 1 会导致 SIGTERM 等被静默吞掉
 // 并残留僵尸。
@@ -619,7 +994,7 @@ func runChildFromEnv() int {
 // ECHILD（无任何子进程，含目标子进程已被收割）时直接返回 0，绝不落入
 // <-sigCh 空转阻塞。cmd.Process.Release() 避免 os/exec 的
 // pidfd Wait 路径与 Wait4(-1) 竞争 ECHILD。
-func runAsSandboxInit(bin string, argv []string, env []string) int {
+func runAsSandboxInit(bin string, argv []string, env []string, fd3Fwd bool) int {
 	sigCh := make(chan os.Signal, 16)
 	signal.Notify(sigCh,
 		syscall.SIGCHLD, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP,
@@ -634,10 +1009,19 @@ func runAsSandboxInit(bin string, argv []string, env []string) int {
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
 	}
+	// agent 预设：fd3 经 ExtraFiles 显式单路转发给目标进程（已在 Apply 前
+	// 置 CLOEXEC 阻断 helper 继承；此处显式放行最终目标）。
+	forwardFD3ToChild(cmd, fd3Fwd)
 	if err := cmd.Start(); err != nil {
+		// Start 失败退 126 前对称释放 fd3 owner（与 runSandboxedChild
+		// 同口径）：撤销终结器并关闭父侧 fd3，避免目标启动失败时
+		// 写端残留劫持 drainDebug EOF。
+		closeFD3(fd3Fwd)
 		fmt.Fprintf(os.Stderr, "sbx: exec %q failed: %v\n", bin, err)
 		return 126
 	}
+	// PID 1 父进程 Start 后关闭自身 fd3 副本：目标进程树独占写端。
+	closeFD3(fd3Fwd)
 	childPid := cmd.Process.Pid
 	_ = cmd.Process.Release()
 
@@ -704,26 +1088,97 @@ func exitCodeFromWaitErr(err error) int {
 	return 1
 }
 
-// cleanupPresetTempDirsFromPolicy 综合 Policy.Env、Policy.ReadWrite 与 Policy.Exec
-// 清理预设构造阶段创建的私有临时目录（即便用户通过 --env 覆盖了 TMPDIR 也不会漏删）。
+// cleanupPresetTempDirsFromPolicy 清理预设构造阶段创建的私有临时目录
+// （即便用户通过 --env 覆盖了 TMPDIR 也不会漏删）。
+//
+// 身份来源（严格按序，绝不回退到 Policy.Exec 前缀推断）：
+//  1. Policy.Env 中 PI_SANDBOX_PRESET_TMP_DIRS 登记条目（预设返回前
+//     尚未被 buildPolicy 剥离的 policy 直接携带）；
+//  2. buildPolicy 捕获的 lastPresetTempDirs（剔除内部键后的最终 policy）；
+//  3. 两者皆无时（单测/外部调用方手工构造 policy）才回退旧的 env
+//     字段推断（TMPDIR/GOTMPDIR/PI_SANDBOX_GO_EXEC_DIR）+ ReadWrite 前缀
+//     命中——该兜底路径绝不遍历 Policy.Exec：Exec 收缩为 <goExecDir>/bin
+//     后，「条目本体或父目录前缀命中即删」会把调用方经 --exec 传入的
+//     /tmp/pi-reviewer-exec-manual/bin 误判为本预设创建，递归误删其整个
+//     父目录（含无关数据）。登记清单存在时唯一可信，逐项 Lstat + 前缀
+//     二次确认后递归删除（防御性保留 isPresetTempDir 形态校验）。
 func cleanupPresetTempDirsFromPolicy(policy sandbox.Policy) {
+	registered := registeredPresetTempDirs(policy.Env)
+	if len(registered) == 0 {
+		registered = append(registered, lastPresetTempDirs...)
+	}
+	if len(registered) > 0 {
+		seen := make(map[string]struct{}, len(registered))
+		for _, dir := range registered {
+			clean := filepath.Clean(dir)
+			if _, dup := seen[clean]; dup {
+				continue
+			}
+			seen[clean] = struct{}{}
+			// 前缀二次确认：登记清单是唯一身份来源，但仍保留形态校验
+			//（/tmp 或 os.TempDir() 第一层子目录、pi-reviewer- 前缀）
+			// 兜底防御清单被意外污染时删错目录。
+			if isPresetTempDir(clean, "pi-reviewer-") {
+				removePresetTempDir(clean)
+			}
+		}
+		return
+	}
+	// 兜底（无登记清单）：仅从 env 字段与 ReadWrite 前缀命中推断；
+	// Policy.Exec 一律不参与清理推断。
 	cleanupPresetTempDirsFromEnv(policy.Env)
 	for _, rw := range policy.ReadWrite {
 		if isPresetTempDir(rw, "pi-reviewer-") && !isPresetTempDir(rw, "pi-reviewer-exec-") {
 			removePresetTempDir(rw)
 		}
 	}
-	for _, ex := range policy.Exec {
-		if isPresetTempDir(ex, "pi-reviewer-exec-") {
-			removePresetTempDir(ex)
+}
+
+// registeredPresetTempDirs 解析 env 中 PI_SANDBOX_PRESET_TMP_DIRS 登记的
+// 目录清单（JSON 字符串数组），返回规范化后的非空绝对路径。
+// 序列化不使用 os.PathListSeparator：备用根 os.TempDir() 可经 TMPDIR 设为
+// 含 ":" 的目录，冒号分隔会把含冒号路径拆成无效段导致清理清单整体失效。
+// 解码出的真实路径不做 strings.TrimSpace——路径首尾空白是合法字符，
+// TrimSpace 会破坏真实目录名；解码失败/非数组/空数组返回 nil，按「无
+// 清单」交由调用方走既有兜底（含外部塞入旧冒号格式时的安全降级）。
+func registeredPresetTempDirs(env []string) []string {
+	raw := envListValue(env, "PI_SANDBOX_PRESET_TMP_DIRS")
+	if raw == "" {
+		return nil
+	}
+	var dirs []string
+	if err := json.Unmarshal([]byte(raw), &dirs); err != nil || len(dirs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		if d := filepath.Clean(dir); d != "" && d != "." {
+			out = append(out, d)
 		}
 	}
+	return out
 }
 
 // cleanupPresetTempDirsFromEnv 删除预设构造阶段创建的私有临时目录
 // （pi-reviewer-* 与 pi-reviewer-exec-*），同时覆盖 /tmp 与 os.TempDir() 兜底路径。
 // 仅删位于合法临时根下且带固定前缀的第一层子目录，绝不递归删除任意 TMPDIR。
+// env 含 PI_SANDBOX_PRESET_TMP_DIRS 登记清单时以清单为准（与
+// cleanupPresetTempDirsFromPolicy 同口径），否则走字段推断兜底。
 func cleanupPresetTempDirsFromEnv(env []string) {
+	if registered := registeredPresetTempDirs(env); len(registered) > 0 {
+		seen := make(map[string]struct{}, len(registered))
+		for _, dir := range registered {
+			clean := filepath.Clean(dir)
+			if _, dup := seen[clean]; dup {
+				continue
+			}
+			seen[clean] = struct{}{}
+			if isPresetTempDir(clean, "pi-reviewer-") {
+				removePresetTempDir(clean)
+			}
+		}
+		return
+	}
 	m := make(map[string]string, len(env))
 	for _, kv := range env {
 		if k, v, ok := strings.Cut(kv, "="); ok {

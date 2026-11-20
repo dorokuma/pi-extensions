@@ -30,8 +30,9 @@ var (
 // 当 ReadOnly、ReadWrite 或 Exec 中任意一项非空时，文件系统进入白名单模式：
 // 除显式声明的路径外，其余所有受 Landlock 管控的文件系统访问均被拒绝。
 // ReadWrite 默认仅授予读写、创建、删除、截断权限，不授予执行权限（严格遵循 W^X 原则）。
-// 在 ReadOnlyReviewer 预设下，所有可写目录（含 <workdir>/reports、TMPDIR、GOTMPDIR、GOCACHE）
-// 均不具备执行权限；go test 编译产物由受控的 Go 工具链包装器在独立的只读可执行目录中构建并降权运行。
+// 在 ReadOnlyReviewer 预设下，所有可写目录（TMPDIR、GOTMPDIR、GOCACHE）
+// 均不具备执行权限；沙盒内 go test/go run 的动态产物按 W^X 语义在
+// 执行时自然被拒（EACCES），不再经构建代理降权运行。
 // ReadWrite 中的路径在构建 Landlock 规则集时按 fail-closed 处理：
 // 除 BestEffort 降级外，路径不存在（ENOENT）即报错。例外是同时登记在
 // OptionalReadWrite 中的瞬态状态文件——例如经目录快照枚举的 SQLite 瞬态文件
@@ -46,7 +47,7 @@ type Policy struct {
 	// 仅用于目录快照枚举产生的瞬态状态文件（如 agy SQLite .db-shm/.db-wal）；
 	// 不授予任何额外权限（授权仍完全由 ReadWrite 决定），仅在该路径以
 	// O_PATH 打开返回 ENOENT 时安全跳过而非 fail-closed 报错。
-	// 显式声明的读写路径（显式 --rw、<workdir>/reports、私有 TMPDIR、
+	// 显式声明的读写路径（显式 --rw、私有 TMPDIR、
 	// agyStateDataSubdirs 数据子目录等）绝不登记于此——它们的缺失仍按
 	// 原契约 ENOENT 报错。
 	OptionalReadWrite []string
