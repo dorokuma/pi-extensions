@@ -3218,6 +3218,189 @@ func TestValidateTrustedPigDirAncestorChain(t *testing.T) {
 			t.Fatalf("missing leaf under trusted ancestor %q must be accepted", missing)
 		}
 	})
+
+	t.Run("sticky 01777 leaf rejected", func(t *testing.T) {
+		// 末级 sticky 回归：/tmp、/var/tmp 这类 01777 顶层粘滞目录不得被
+		// 当作可信 PIG_HOME——sticky 豁免只适用于真正的祖先级临时根，
+		// 末级本体 0o022 可写一律拒（oracle 应修 #1）。
+		if euid == 0 {
+			for _, dir := range []string{"/tmp", "/var/tmp"} {
+				if st, err := os.Lstat(dir); err == nil && st.IsDir() &&
+					st.Mode()&os.ModeSticky != 0 && st.Mode().Perm()&0o022 != 0 {
+					if validateTrustedPigDir(dir, "PIG_HOME") {
+						t.Fatalf("sticky world-writable leaf %q must be rejected as PIG_HOME", dir)
+					}
+				}
+			}
+		}
+		// 本地构造等价夹具（非 root/他属主场景同样覆盖末级 sticky 拒绝）。
+		stickyLeaf := filepath.Join(t.TempDir(), "sticky-home")
+		if err := os.MkdirAll(stickyLeaf, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(stickyLeaf, 0o1777); err != nil {
+			t.Fatal(err)
+		}
+		if validateTrustedPigDir(stickyLeaf, "PIG_HOME") {
+			t.Fatalf("sticky world-writable leaf %q must be rejected as PIG_HOME", stickyLeaf)
+		}
+	})
+
+	// 顶层 uid==0 软链目标链（oracle 应修 #4 红绿对照）：经
+	// validateTrustedPigDirWithRoot 的 sysRoot 注入 seam 构造假根
+	// sysRoot/top -> sysRoot/<target>，Linux 上确定性覆盖「祖先链顶层
+	// 软链不跳回 / 提前结束、跟随目标继续逐级校验」的分支。
+	// euid 必须匹配顶层软链属主判定（仅 root 跑时有意义）。
+	if euid == 0 {
+		t.Run("top symlink to compliant dir accepted", func(t *testing.T) {
+			sysRoot := t.TempDir()
+			world := filepath.Join(sysRoot, "world")
+			if err := os.MkdirAll(world, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			top := filepath.Join(sysRoot, "top")
+			if err := os.Symlink(world, top); err != nil {
+				t.Fatal(err)
+			}
+			if !validateTrustedPigDirWithRoot(filepath.Join(top, "host"), "PIG_HOME", sysRoot) {
+				t.Fatalf("top-level symlink to compliant dir under sysRoot must be accepted")
+			}
+		})
+
+		t.Run("top symlink to non-sticky 0777 rejected", func(t *testing.T) {
+			sysRoot := t.TempDir()
+			world := filepath.Join(sysRoot, "world")
+			if err := os.MkdirAll(world, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(world, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			top := filepath.Join(sysRoot, "top")
+			if err := os.Symlink(world, top); err != nil {
+				t.Fatal(err)
+			}
+			if validateTrustedPigDirWithRoot(filepath.Join(top, "host"), "PIG_HOME", sysRoot) {
+				t.Fatalf("top-level symlink to non-sticky 0777 dir must be rejected")
+			}
+		})
+
+		t.Run("top symlink to nested second-level link rejected", func(t *testing.T) {
+			// 顶层软链目标链内含二级（非顶层）嵌套软链：跟随到目标后
+			// 中间级软链仍属拒绝项（sysRoot 直属豁免不适用于更深层）。
+			sysRoot := t.TempDir()
+			realWorld := filepath.Join(sysRoot, "real-world")
+			if err := os.MkdirAll(realWorld, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			real2 := filepath.Join(sysRoot, "real2")
+			if err := os.MkdirAll(real2, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// <sysRoot>/real-world/sub 是指向 real2 的第二级软链（其父级
+			// realWorld 不直属 sysRoot，不满足顶层豁免）。
+			secondLink := filepath.Join(realWorld, "sub")
+			if err := os.Symlink(real2, secondLink); err != nil {
+				t.Fatal(err)
+			}
+			top := filepath.Join(sysRoot, "top")
+			if err := os.Symlink(secondLink, top); err != nil {
+				t.Fatal(err)
+			}
+			if validateTrustedPigDirWithRoot(filepath.Join(top, "host"), "PIG_HOME", sysRoot) {
+				t.Fatalf("top-level symlink chain containing second-level symlink must be rejected")
+			}
+		})
+
+		t.Run("dangling top symlink rejected", func(t *testing.T) {
+			sysRoot := t.TempDir()
+			top := filepath.Join(sysRoot, "top")
+			if err := os.Symlink(filepath.Join(sysRoot, "no-such-target"), top); err != nil {
+				t.Fatal(err)
+			}
+			if validateTrustedPigDirWithRoot(filepath.Join(top, "host"), "PIG_HOME", sysRoot) {
+				t.Fatalf("dangling top-level symlink must be rejected")
+			}
+		})
+	}
+
+	t.Run("untrusted default agent dir falls back to private", func(t *testing.T) {
+		// 默认 <pigHome>/agent 为软链时 sel.sourceTrusted=false：配置
+		// 复制源回退空私有 pig-agent，宿主 settings.json 不得被拷入
+		//（闭合默认层校验，oracle 应修 #2）。
+		pigHome := t.TempDir()
+		realAgent := t.TempDir()
+		if err := os.WriteFile(filepath.Join(realAgent, "settings.json"), []byte(`{"extensions":["evil"]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realAgent, filepath.Join(pigHome, "agent")); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(t.TempDir(), "pig-agent")
+		sel := resolveAgentDirSelection(pigHome, nil)
+		if sel.sourceTrusted {
+			t.Fatalf("default <pigHome>/agent symlink must be untrusted")
+		}
+		src := sel.sourceDir
+		if sel.sourceTrusted == false {
+			src = dst // 与 ReviewerAgentWithEnv 同口径回退私有
+		}
+		preparePrivatePigAgentDirFromAgent(dst, src)
+		if _, err := os.Lstat(filepath.Join(dst, "settings.json")); !os.IsNotExist(err) {
+			t.Fatalf("host settings.json must not be copied from untrusted default agent dir")
+		}
+	})
+
+	t.Run("world-writable default agent dir falls back to private", func(t *testing.T) {
+		pigHome := t.TempDir()
+		agentDir := filepath.Join(pigHome, "agent")
+		if err := os.MkdirAll(agentDir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(agentDir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), []byte(`{"extensions":["evil"]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sel := resolveAgentDirSelection(pigHome, nil)
+		if sel.sourceTrusted {
+			t.Fatalf("world-writable default <pigHome>/agent must be untrusted")
+		}
+	})
+
+	t.Run("symlink config file not copied", func(t *testing.T) {
+		// 单配置文件为软链时不得越界拷入私有 pig-agent
+		//（preparePrivatePigAgentDirFromAgent 的 Lstat 口径，oracle 应修 #2）。
+		src := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "outside-settings.json")
+		if err := os.WriteFile(outside, []byte(`{"extensions":["evil"]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(src, "settings.json")); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(t.TempDir(), "pig-agent")
+		preparePrivatePigAgentDirFromAgent(dst, src)
+		if _, err := os.Lstat(filepath.Join(dst, "settings.json")); !os.IsNotExist(err) {
+			t.Fatalf("symlinked settings.json must not be copied into private pig-agent")
+		}
+	})
+
+	t.Run("symlink extensions dir not projected", func(t *testing.T) {
+		// <agent>/extensions 本体为软链时不得被认作宿主扩展目录注入
+		// settings.json（Lstat 口径）。
+		src := t.TempDir()
+		outsideExt := t.TempDir()
+		if err := os.Symlink(outsideExt, filepath.Join(src, "extensions")); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(t.TempDir(), "pig-agent")
+		preparePrivatePigAgentDirFromAgent(dst, src)
+		if _, err := os.Lstat(filepath.Join(dst, "settings.json")); !os.IsNotExist(err) {
+			t.Fatalf("symlinked extensions dir must not trigger settings.json injection")
+		}
+	})
 }
 
 // TestReviewerAgentPigHomeAncestorSymlinkFailClosed 端到端断言：PIG_HOME
@@ -3244,36 +3427,107 @@ func TestReviewerAgentPigHomeAncestorSymlinkFailClosed(t *testing.T) {
 	_ = workdir
 }
 
-// TestAppendCellCachePolicyResolvesArtifactRealPath 断言：合规 PIG_HOME 的
-// artifact 入 Policy.Exec 时是 EvalSymlinks 后的规范真实路径（非软链别名）。
-// 宿主 cache 经祖先软链传入时入列路径必须解析到真实树并严格位于
-// resolvedCacheRoot 内；软链 artifact 本体或指到根外的目标一律不入列。
+// TestAppendCellCachePolicyResolvesArtifactRealPath 断言：appendCellCachePolicy
+// 对经祖先软链别名传入的 PIG_HOME 严格落真实路径——合规产物必须以
+// EvalSymlinks 后的规范真实路径入 Policy.Exec 且绝不写未解析别名；
+// 0777 全局可写产物与指向 cacheRoot 外的软链产物一律不入列。
+// 旧版仅写未解析路径的实现在①②断言下必 FAIL（红绿对照）。
 func TestAppendCellCachePolicyResolvesArtifactRealPath(t *testing.T) {
-	pigHome := t.TempDir()
-	cacheRoot := filepath.Join(pigHome, "cache")
-	entryDir := filepath.Join(cacheRoot, "cells", "go", "digest0001")
-	writeFakeCellEntry(t, entryDir, "digest0001", "runner", "go")
+	realParent := t.TempDir()
+	realPigHome := filepath.Join(realParent, "host")
+	if err := os.MkdirAll(realPigHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(realPigHome, "cache")
+	// 祖先软链别名：parentLink -> realParent，pigHomeAlias 经软链拼写。
+	parentLink := filepath.Join(t.TempDir(), "parent-link")
+	if err := os.Symlink(realParent, parentLink); err != nil {
+		t.Fatal(err)
+	}
+	pigHomeAlias := filepath.Join(parentLink, "host")
+
+	execContains := func(p *Policy, path string) bool {
+		want := filepath.Clean(path)
+		for _, ex := range p.Exec {
+			if filepath.Clean(ex) == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// ① 合规 0755 产物：必须以 EvalSymlinks 解析后的真实路径入列，
+	// 且未解析的别名拼写绝不入列。
+	entryGood := filepath.Join(cacheRoot, "cells", "go", "digest0001")
+	writeFakeCellEntry(t, entryGood, "digest0001", "runner", "go")
+	realRunnerGood := filepath.Join(entryGood, "runner")
+	resolvedGood, err := filepath.EvalSymlinks(realRunnerGood)
+	if err != nil {
+		t.Fatalf("EvalSymlinks good runner: %v", err)
+	}
+	aliasRunnerGood := filepath.Join(pigHomeAlias, "cache", "cells", "go", "digest0001", "runner")
 
 	p := &Policy{}
-	appendCellCachePolicy(p, pigHome)
+	appendCellCachePolicy(p, pigHomeAlias)
+	if !execContains(p, resolvedGood) {
+		t.Fatalf("resolved artifact %q must enter Policy.Exec, got %v", resolvedGood, p.Exec)
+	}
+	if execContains(p, aliasRunnerGood) {
+		t.Fatalf("unresolved alias %q must not enter Policy.Exec", aliasRunnerGood)
+	}
 
-	// 真实 runner 必须以 EvalSymlinks 后路径入列。
-	realRunner := filepath.Join(entryDir, "runner")
-	resolvedRunner, err := filepath.EvalSymlinks(realRunner)
+	// ② 0777 全局可写产物：绝不放行执行（权限收紧后不入列）。
+	entryWorld := filepath.Join(cacheRoot, "cells", "go", "digest0002")
+	writeFakeCellEntry(t, entryWorld, "digest0002", "runner", "go")
+	worldRunner := filepath.Join(entryWorld, "runner")
+	if err := os.Chmod(worldRunner, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	resolvedWorld, err := filepath.EvalSymlinks(worldRunner)
 	if err != nil {
-		t.Fatalf("EvalSymlinks runner: %v", err)
+		t.Fatalf("EvalSymlinks world runner: %v", err)
 	}
-	found := false
-	for _, ex := range p.Exec {
-		if filepath.Clean(ex) == filepath.Clean(resolvedRunner) {
-			found = true
-		}
-		if resolved, rerr := filepath.EvalSymlinks(ex); rerr == nil &&
-			filepath.Clean(resolved) != filepath.Clean(ex) {
-			t.Fatalf("unresolved/symlink path %q must not enter Policy.Exec (resolved=%q)", ex, resolved)
-		}
+	p2 := &Policy{}
+	appendCellCachePolicy(p2, pigHomeAlias)
+	if execContains(p2, resolvedWorld) {
+		t.Fatalf("world-writable artifact %q must not enter Policy.Exec", resolvedWorld)
 	}
-	if !found {
-		t.Fatalf("resolved artifact %q must enter Policy.Exec, got %v", resolvedRunner, p.Exec)
+
+	// ③ 指向 cacheRoot 外的软链产物：软链与外部目标均不入列。
+	outsideDir := t.TempDir()
+	outsideRunner := filepath.Join(outsideDir, "outside-runner")
+	if err := os.WriteFile(outsideRunner, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entryLink := filepath.Join(cacheRoot, "cells", "go", "digest0003")
+	if err := os.MkdirAll(entryLink, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkRunner := filepath.Join(entryLink, "runner")
+	if err := os.Symlink(outsideRunner, linkRunner); err != nil {
+		t.Fatal(err)
+	}
+	// digest0003 的 ready.json：size 按 linkRunner 的 Lstat（软链本体）
+	// 大小写入，保证 validCellEntryDir 能命中该条目（其 Lstat 口径读到
+	// 的是软链本体）；软链产物在 appendCellCachePolicy 的 Lstat+解析
+	// 校验处被拒之门外。
+	lst, err := os.Lstat(linkRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := fmt.Sprintf(`{"inputDigest":"digest0003","artifact":"runner","size":%d,"created":1,"language":"go"}`, lst.Size())
+	if err := os.WriteFile(filepath.Join(entryLink, "ready.json"), []byte(ready), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p3 := &Policy{}
+	appendCellCachePolicy(p3, pigHomeAlias)
+	resolvedLink, err := filepath.EvalSymlinks(linkRunner)
+	if err != nil {
+		t.Fatalf("EvalSymlinks link runner: %v", err)
+	}
+	if execContains(p3, linkRunner) || execContains(p3, resolvedLink) || execContains(p3, outsideRunner) {
+		t.Fatalf("symlink artifact %q (resolved %q / outside %q) must not enter Policy.Exec",
+			linkRunner, resolvedLink, outsideRunner)
 	}
 }

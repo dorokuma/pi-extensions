@@ -85,9 +85,10 @@ func MaybeWarmGoExtensionCells(cfgPreset string, command []string, cfgEnv []stri
 	// <pigHome>/agent 与沙盒侧同口径，不再独立判定（oracle MF-1 消除
 	// resolver 与 custom 判定分裂）。
 	sel := resolveAgentDirSelection(pigHome, cfgEnv)
-	if sel.origin == agentDirOriginCfgEnv && !sel.srcValid {
-		// 显式自定义候选被拒（软链/权限/属主不符）：预热跳过，不阻断启动
-		//（沙盒侧将回退私有目录，预热是性能优化）。
+	if (sel.origin == agentDirOriginCfgEnv && !sel.srcValid) || !sel.sourceTrusted {
+		// 显式自定义候选被拒（软链/权限/属主不符）或最终来源目录本身
+		// 未过受信校验（默认 <pigHome>/agent 为软链/0777/异属主）：预热跳过，
+		// 不阻断启动（沙盒侧将回退私有目录，预热是性能优化）。
 		return 0
 	}
 	srcAgentDir := sel.sourceDir
@@ -410,8 +411,27 @@ func validatePigHomeDir(pigHome string) bool {
 //   - 属主：每级目录 Uid 必须为 0 或当前 euid（异属主目录可被他方替换内容）；
 //   - 权限：Perm()&0o022 != 0 的目录一律拒，但豁免 Uid==0 且带 os.ModeSticky
 //     的临时根（/tmp、/var/tmp 的 01777——非粘滞 0777 父目录可被非特权方
-//     重命名替换 host，不能豁免）。
+//     重命名替换 host，不能豁免）；该豁免仅适用于 filepath.Dir(dir) 及之上
+//     的真正祖先目录，末级本体 0o022 可写（含 01777 sticky）一律拒——
+//     /tmp、/var/tmp 自身不得被当作可信 PIG_HOME/AgentDir。
 func validateTrustedPigDir(dir, label string) bool {
+	return validateTrustedPigDirWithRoot(dir, label, "/")
+}
+
+// trustedPigTopLinkMaxHops 是祖先链上允许的顶层软链（/ 直属且 uid==0）
+// 单跳跟随总上限：超限视为软链环，拒绝。
+const trustedPigTopLinkMaxHops = 8
+
+// validateTrustedPigDirWithRoot 与 validateTrustedPigDir 同口径，但文件系统
+// 根由 sysRoot 显式给定：祖先链向上遍历到 sysRoot 即终止，「/ 直属顶层软链」
+// 判定与 os.Readlink 单跳目标解析均以 sysRoot 为根（单测可注入 t.TempDir()
+// 假根确定性覆盖顶层软链目标链分支，Linux 上无需依赖 macOS 布局）。
+// 生产一律经 validateTrustedPigDir 固定传 sysRoot="/"，零外部开启入口。
+func validateTrustedPigDirWithRoot(dir, label, sysRoot string) bool {
+	sysRoot = filepath.Clean(sysRoot)
+	if sysRoot == "" || sysRoot == "." {
+		sysRoot = "/"
+	}
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		warmWarnf("sbx-warm: refusing empty %s", label)
@@ -423,8 +443,16 @@ func validateTrustedPigDir(dir, label string) bool {
 		}
 	}
 	dir = filepath.Clean(dir)
+	// dir 必须位于 sysRoot 之下（不含 sysRoot 本身）：sysRoot="/" 时所有
+	// 绝对路径均在根内；注入根之外的 dir 既无意义也会让顶层软链豁免
+	// 判定失真。
+	if dir == sysRoot || (sysRoot != "/" && !strings.HasPrefix(dir, sysRoot+string(filepath.Separator))) {
+		warmWarnf("sbx-warm: refusing %s %s outside sysRoot %s", label, dir, sysRoot)
+		return false
+	}
 
-	// 末级本体校验（已存在时）：拒软链/非目录/0o022 可写/异属主，语义不变。
+	// 末级本体校验（已存在时）：拒软链/非目录/异属主；末级 0o022 可写
+	// 一律拒（含 01777 sticky——sticky 豁免只留给真正的祖先级临时根）。
 	if isSymlinkPath(dir) {
 		warmWarnf("sbx-warm: refusing symlink %s %s", label, dir)
 		return false
@@ -442,23 +470,29 @@ func validateTrustedPigDir(dir, label string) bool {
 			warmWarnf("sbx-warm: %s %s is not a directory", label, dir)
 			return false
 		}
-		if !trustedPigDirModeOwnerOK(info) {
-			warmWarnf("sbx-warm: refusing group/world-writable or foreign-owner %s %s", label, dir)
+		if info.Mode().Perm()&0o022 != 0 {
+			warmWarnf("sbx-warm: refusing group/world-writable %s %s", label, dir)
+			return false
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok &&
+			st.Uid != 0 && st.Uid != uint32(os.Geteuid()) {
+			warmWarnf("sbx-warm: refusing foreign-owner %s %s", label, dir)
 			return false
 		}
 	}
 
 	// 祖先链逐级校验：从末级（已存在时）或首个已存在祖先（末级缺失时）
-	// 一路向上到 /，任一级命中拒收规则即 false。
+	// 一路向上到 sysRoot，任一级命中拒收规则即 false。
 	ancestor := dir
 	if lastMissing {
 		ancestor = filepath.Dir(dir)
 	}
+	topLinkHops := 0
 	for {
 		if ancestor == "" || ancestor == "." {
 			return true
 		}
-		if ancestor == "/" {
+		if ancestor == sysRoot {
 			return true
 		}
 		ai, lerr := os.Lstat(ancestor)
@@ -472,9 +506,39 @@ func validateTrustedPigDir(dir, label string) bool {
 			return false
 		}
 		if ai.Mode()&os.ModeSymlink != 0 {
-			// 豁免：仅 / 直属且 uid==0 的系统顶层软链（macOS /var、/tmp）。
-			if st, ok := ai.Sys().(*syscall.Stat_t); ok && st.Uid == 0 && filepath.Dir(ancestor) == "/" {
-				ancestor = filepath.Dir(ancestor)
+			// 豁免：仅 sysRoot 直属且 uid==0 的系统顶层软链（macOS /var、/tmp）
+			// ——且不直接跳回 sysRoot 结束，而是 os.Readlink 单跳读取目标，
+			// 把 ancestor 切换到真实目标路径继续沿同一循环逐级向上校验
+			// 目标本体及其全部祖先：顶层软链指向非粘滞 0777、异属主目录或
+			// 目标链内含非顶层中间软链一律拒；悬空软链（Readlink 目标不可
+			// 解析为绝对路径或越出 sysRoot）同样拒。
+			st, statOK := ai.Sys().(*syscall.Stat_t)
+			if statOK && st.Uid == 0 && filepath.Dir(ancestor) == sysRoot {
+				topLinkHops++
+				if topLinkHops > trustedPigTopLinkMaxHops {
+					warmWarnf("sbx-warm: refusing %s %s (top-level symlink hop limit exceeded)", label, dir)
+					return false
+				}
+				target, rerr := os.Readlink(ancestor)
+				if rerr != nil {
+					warmWarnf("sbx-warm: refusing %s %s (top-level symlink %s readlink: %v)", label, dir, ancestor, rerr)
+					return false
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(sysRoot, target)
+				}
+				target = filepath.Clean(target)
+				if target == sysRoot || (sysRoot != "/" && !strings.HasPrefix(target, sysRoot+string(filepath.Separator))) {
+					warmWarnf("sbx-warm: refusing %s %s (top-level symlink %s escapes sysRoot)", label, dir, ancestor)
+					return false
+				}
+				if _, terr := os.Lstat(target); terr != nil {
+					// 悬空顶层软链（目标不存在或暂态错误）一律拒：不得让
+					// ENOENT 跳级把未校验目标当作缺失祖先吞掉。
+					warmWarnf("sbx-warm: refusing %s %s (top-level symlink %s target lstat: %v)", label, dir, ancestor, terr)
+					return false
+				}
+				ancestor = target
 				continue
 			}
 			warmWarnf("sbx-warm: refusing %s %s (ancestor %s is a symlink)", label, dir, ancestor)
@@ -487,11 +551,6 @@ func validateTrustedPigDir(dir, label string) bool {
 		if !trustedPigDirModeOwnerOK(ai) {
 			warmWarnf("sbx-warm: refusing %s %s (ancestor %s group/world-writable or foreign-owner)", label, dir, ancestor)
 			return false
-		}
-		if ancestor == dir {
-			// 末级目录本体已单独校验过；继续向上。
-			ancestor = filepath.Dir(ancestor)
-			continue
 		}
 		ancestor = filepath.Dir(ancestor)
 	}

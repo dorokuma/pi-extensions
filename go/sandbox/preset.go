@@ -1470,11 +1470,13 @@ func ReviewerAgentWithEnv(workdir string, cfgEnv []string) Policy {
 	// 非 pig 命令（claude/agy/sh）照常以空私有根放行。
 	pigHomeTrusted := validatePigHomeDir(pigHome)
 	sel := resolveAgentDirSelection(pigHome, cfgEnv)
-	if !pigHomeTrusted && !sel.trustedCustom {
-		// 不可信 pigHome 下默认层回退目录 <pigHome>/agent 同属不可信域：
-		// 复制/扩展发现源改为空私有 pig-agent。显式 cfgEnv 受信自定义
-		// AgentDir（sel.trustedCustom）独立于 pigHome 校验通过，按既有
-		// 显式层规则保留。
+	if (!pigHomeTrusted && !sel.trustedCustom) || !sel.sourceTrusted {
+		// 不可信 pigHome 下默认层回退目录 <pigHome>/agent 同属不可信域，
+		// 且 sourceDir 本体未过受信校验（默认 <pigHome>/agent 为软链/
+		// 0777/异属主）时同样回退：复制/扩展发现源一律改为空私有
+		// pig-agent，绝不读取不可信 <pigHome>/agent。显式 cfgEnv 受信
+		// 自定义 AgentDir（sel.trustedCustom）独立于 pigHome 校验通过，
+		// 按既有显式层规则保留。
 		sel.sourceDir = filepath.Join(privateTmpDir, "pig-agent")
 	}
 	// sel.sourceDir 是配置复制与扩展发现的来源（单次选源结果，与预热
@@ -1659,15 +1661,17 @@ const (
 )
 
 // resolvedAgentDir 是 AgentDir 单次选源的结构化结果：哪个键、候选路径、
-// 复制/扩展发现来源（sourceDir）、是否通过受信校验（srcValid）、是否为
-// 显式受信自定义（trustedCustom）。预热、配置复制与最终 exec 共用同一结果，
-// 杜绝「resolver 选 A、customFromCfgEnv 判 B」的分裂（oracle MF-1 / reviewer5 F1）。
+// 复制/扩展发现来源（sourceDir）、是否通过受信校验（srcValid）、最终来源
+// 目录本体是否可信（sourceTrusted）、是否为显式受信自定义（trustedCustom）。
+// 预热、配置复制与最终 exec 共用同一结果，杜绝「resolver 选 A、
+// customFromCfgEnv 判 B」的分裂（oracle MF-1 / reviewer5 F1）。
 type resolvedAgentDir struct {
 	origin        agentDirOrigin // 来源层级（Default/HostEnv/CfgEnv）
 	key           string         // 实际选中的环境变量键（Default 层为空）
 	candidateDir  string         // 校验前的规范化候选路径（Default 层为空）
 	sourceDir     string         // 配置复制/扩展发现来源（校验失败回退默认）
 	srcValid      bool           // 候选是否通过 validateTrustedPigDir
+	sourceTrusted bool           // sourceDir 本体是否通过 validateTrustedPigDir
 	trustedCustom bool           // 是否为显式（cfgEnv）受信自定义有效目录
 }
 
@@ -1733,14 +1737,23 @@ func resolveAgentDirSelection(pigHome string, cfgEnv []string) resolvedAgentDir 
 	}
 
 	// 单次受信校验：仅非 Default 候选。通过则 sourceDir=candidateDir，
-	// 且仅 CfgEnv 来源才成为显式受信自定义（HostEnv 永不生效目录）。
-	if sel.origin != agentDirOriginDefault && sel.candidateDir != "" {
+	// 且仅 CfgEnv 来源才成为显式受信自定义（HostEnv 永不生效目录）；
+	// 被拒时 sourceDir 回退默认目录且该回退目录须另行校验（sourceTrusted）
+	// ——默认 <pigHome>/agent 为软链/0777/异属主时同样不可作配置复制源。
+	if sel.origin == agentDirOriginDefault {
+		ok := validateTrustedPigDir(defaultDir, "AgentDir")
+		sel.srcValid = ok
+		sel.sourceTrusted = ok
+	} else if sel.candidateDir != "" {
 		if validateTrustedPigDir(sel.candidateDir, "AgentDir") {
 			sel.srcValid = true
+			sel.sourceTrusted = true
 			sel.sourceDir = sel.candidateDir
 			sel.trustedCustom = sel.origin == agentDirOriginCfgEnv
 		} else {
+			sel.srcValid = false
 			sel.sourceDir = defaultDir
+			sel.sourceTrusted = validateTrustedPigDir(defaultDir, "AgentDir")
 		}
 	}
 	return sel
@@ -1959,13 +1972,13 @@ func preparePrivatePigAgentDirFromAgent(dir, srcAgentDir string) string {
 	src := filepath.Clean(srcAgentDir)
 	srcExt := filepath.Join(src, "extensions")
 	hasHostExt := false
-	if info, err := os.Stat(srcExt); err == nil && info.IsDir() {
+	if info, err := os.Lstat(srcExt); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 		hasHostExt = true
 	}
 	for _, name := range pigAgentConfigFiles {
 		srcFile := filepath.Join(src, name)
-		info, err := os.Stat(srcFile)
-		if err != nil || !info.Mode().IsRegular() {
+		info, err := os.Lstat(srcFile)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
 		data, err := os.ReadFile(srcFile)

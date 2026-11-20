@@ -199,6 +199,9 @@ var sandboxEnvStripKeys = map[string]bool{
 	"SSH_AUTH_SOCK":            true,
 	"DBUS_SESSION_BUS_ADDRESS": true,
 	"XDG_RUNTIME_DIR":          true,
+	"PI_SANDBOX_INTERNAL_MODE": true,
+	"PI_SANDBOX_HELPER_CFG":    true,
+	"PI_SANDBOX_BROKER_CFG":    true,
 }
 
 // sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：宿主
@@ -270,6 +273,9 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 				wd = "."
 			}
 			policy = sandbox.ReadOnlyReviewer(wd)
+			// reviewer 预设同样回钉 PI_SANDBOX_GO_EXEC_DIR（与 reviewer-agent
+			// 同口径）：ReadOnlyReviewer 注入的受控执行目录不得被 --env 劫持。
+			goExecDir = envListValue(policy.Env, "PI_SANDBOX_GO_EXEC_DIR")
 		case "reviewer-agent":
 			wd := cfg.WorkDir
 			if strings.TrimSpace(wd) == "" {
@@ -331,10 +337,10 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	if cfg.Preset == "reviewer-agent" && claudeConfigDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir})
 	}
-	// 仅 reviewer-agent 预设回钉 PI_SANDBOX_GO_EXEC_DIR：把最终 env 中该键
-	// 强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME 同口径），
-	// 防 --env 劫持回报中继监听路径或 go 包装器/broker 目录。
-	if cfg.Preset == "reviewer-agent" && goExecDir != "" {
+	// reviewer 与 reviewer-agent 预设统一回钉 PI_SANDBOX_GO_EXEC_DIR：把最终
+	// env 中该键强制回写为预设注入的 pi-reviewer-exec-* 目录（与 PIG_HOME
+	// 同口径），防 --env 劫持回报中继监听路径或 go 包装器/broker 目录。
+	if (cfg.Preset == "reviewer" || cfg.Preset == "read-only-reviewer" || cfg.Preset == "reviewer-agent") && goExecDir != "" {
 		policy.Env = mergeEnv(policy.Env, []string{"PI_SANDBOX_GO_EXEC_DIR=" + goExecDir})
 	}
 	// M1/M2：cfgEnv 合并完成后统一归一化有效 AgentDir。显式空串（含重复
@@ -1065,8 +1071,14 @@ func cleanupPresetTempDirsFromPolicy(policy sandbox.Policy) {
 		}
 	}
 	for _, ex := range policy.Exec {
+		// Policy.Exec 已收缩为 <goExecDir>/bin（MF-1）：Exec 条目本体或其
+		// 父目录命中 pi-reviewer-exec-* 前缀都纳入清理。
 		if isPresetTempDir(ex, "pi-reviewer-exec-") {
 			removePresetTempDir(ex)
+			continue
+		}
+		if parent := filepath.Dir(filepath.Clean(ex)); isPresetTempDir(parent, "pi-reviewer-exec-") {
+			removePresetTempDir(parent)
 		}
 	}
 }

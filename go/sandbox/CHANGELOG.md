@@ -23,6 +23,38 @@
   `<goExecDir>/work` 执行授权，`pi-test-runner` 经 broker 注入的
   `PI_SANDBOX_GO_TEST_WORK` 获得该产物根放行（仅本进程、非审查员全局）。
   调用方若在沙盒内直接 `exec` `<goExecDir>/work/*` 将收到 `EACCES`。
+- **阶段 2 安全收口（W10 非 broker 收紧项，4 处缺陷修补）**：
+  - `validateTrustedPigDir` 末级本体严格化：`Perm()&0o022 != 0` 无条件拒
+    （含 `01777` sticky——`/tmp`/`var/tmp` 不得再被当作可信 `PIG_HOME`/
+    AgentDir）；sticky 豁免仅留给 `filepath.Dir(dir)` 及之上的祖先级
+    临时根。祖先链上的 `/` 直属 `uid==0` 顶层软链不再跳回 `/` 提前结束，
+    改为 `os.Readlink` 单跳跟随（限 8 跳防环、悬空/越出根拒绝），继续
+    逐级校验真实目标及其全部祖先——顶层软链指向非粘滞 `0777`、异属主
+    目录或目标链内含非顶层嵌套软链的穿透路径全部被拒（兼容 macOS
+    `/tmp -> private/tmp`、`/var -> private/var` 布局）。新增包内同口径
+    seam `validateTrustedPigDirWithRoot(dir, label, sysRoot)`，生产固定
+    `sysRoot="/"`，零外部入口。
+  - `resolveAgentDirSelection` 默认层 `<pigHome>/agent` 闭合校验：新增
+    `sourceTrusted` 字段，默认层与「候选被拒后回退默认目录」两条路径
+    都对默认目录执行 `validateTrustedPigDir`；`MaybeWarmGoExtensionCells`
+    与 `ReviewerAgentWithEnv` 在最终来源目录不可信（软链/`0777`/异属主）
+    时一律回退空私有 `pig-agent`，绝不读取不可信 `<pigHome>/agent`。
+  - `preparePrivatePigAgentDirFromAgent` 软链穿透封堵：`extensions` 目录
+    与 `pigAgentConfigFiles` 白名单配置文件均由 `os.Stat` 改 `os.Lstat`，
+    软链本体一律不作来源（私有 `pig-agent` 不再被越界拷入外部目标）。
+  - `sandboxEnvStripKeys` 补剔 `PI_SANDBOX_INTERNAL_MODE`/
+    `PI_SANDBOX_HELPER_CFG`/`PI_SANDBOX_BROKER_CFG` 三枚内部指针键；
+    `buildPolicy` 对 `reviewer` 与 `reviewer-agent` 两个预设统一捕获并
+    回钉 `PI_SANDBOX_GO_EXEC_DIR`；`cleanupPresetTempDirsFromPolicy`
+    遍历 `Policy.Exec` 时同时识别条目本体或其父目录匹配
+    `pi-reviewer-exec-`（适配 `Policy.Exec` 收缩为 `<goExecDir>/bin`
+    后的兜底清理）。
+  - **行为变化预告（阶段 3 拆除 broker 前同步）**：`Policy.Exec` 收缩为
+    `<goExecDir>/bin` 后，沙盒内 `go test`/`go run` 的 `.test`/构建产物
+    不再对审查员主进程直接可执行——产物执行改经 `pi-test-runner`（位于
+    `bin/` 内）在自身 Landlock 域内经 `PI_SANDBOX_GO_TEST_WORK` 追加放行
+    后完成；直接 `exec` `<goExecDir>/work/*` 或在 `GOTMPDIR` 下执行
+    产物将收到 `EACCES`。
 
 ### Added
 
