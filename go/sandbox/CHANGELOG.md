@@ -328,18 +328,23 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
   成员（agy/pig/pi/claude 及其过身份校验的软链目标）经 fd 被
   `PROT_EXEC` 映射属合法运行期行为，不再与毒软链目标一同被拒。
 
-- **二进制收录面撤出调用方可控 `$HOME`（`c9f81bd`+`d2ced59`）**：
-  `agentLookupDirs`/`agyHookLookupDirs`/herdsman-go bin/版本化 pig
-  glob/`agyStateBin` 改经 `trustedLookupHomes()` 枚举——
+- **二进制收录面撤出调用方可控 `$HOME`（`c9f81bd`+`d2ced59`，表述经
+  `bd8d32a` 修正）**：`agentLookupDirs`/`agyHookLookupDirs`/herdsman-go
+  bin/版本化 pig glob/`agyStateBin` 改经 `trustedLookupHomes()` 枚举——
   `trustedHomeDir()`（`/etc/passwd` 解析的宿主真实 HOME，被隔离覆盖的
   `$HOME` 下仍解析到宿主）+ 硬编码 `/root` 与 `/root/.agy-pro-home`
   （agy 硬编码 HOME 约定），绝不读 `$HOME`/`homeDir()`（调用方可控输入
-  不作二进制收录的信任边界输入）；相对修复前枚举是超集（passwd-HOME +
-  `/root` + `.agy-pro-home`），不丢合法项。隔离 `$HOME` 下经
-  `trustedHomeDir()`（生产 `resolveEntryAgentPaths` 固定入口，测试经
-  `ResolveEntryAgentPathsForTest` 注入夹具）保留宿主受信安装根，
-  `entryAgentInstallRoots` 维持 `trustedAgentHomes()+/root` 既有口径
-  （含 `homeDir()`）不动。
+  不作二进制收录的信任边界输入）。**仅 `agentLookupDirs` 与版本化 pig
+  glob 两面相对修复前（仅 `/root` 硬编码两项）枚举是超集**（passwd-HOME
+  + `/root` + `.agy-pro-home`），不丢合法项；`agyHookLookupDirs`、
+  herdsman-go bin、`agyStateBin` 三面修复前本就经 `homeDir()` 枚举环境
+  `$HOME`，现同步撤销该项——非受信自定义 `$HOME` 下原本可收录的合法
+  路径不再收录，属有意安全收紧（用户批准方案一部分，见 `bd8d32a`）。
+  隔离 `$HOME` 下经 `trustedHomeDir()`（生产 `resolveEntryAgentPaths`
+  固定入口，测试经 `ResolveEntryAgentPathsForTest` 注入夹具）保留宿主
+  受信安装根，`entryAgentInstallRoots` 维持
+  `trustedAgentHomesFor(hostHome)+/root` 既有口径（含 `homeDir()`）
+  不动。
 
 ### Changed
 
@@ -692,11 +697,13 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
   下按设计保留，本批不改动；文档（模块 README「威胁模型」节）已
   如实披露两边界含义。
 
-- mount-seal seccomp 锁仅在受限子进程的 `CLONE_NEWNS|CLONE_NEWPID`
-  路径安装：`--best-effort` 下 unshare 失败回退不 unshare 时，既不施加
-  socket 覆盖也不安装挂载锁（与挂载步骤同口径告警降级），此时沙盒内
-  root 仍可执行挂载类与进程控制类系统调用——降级属可观察 WARN，不作
-  静默承诺。
+- mount-seal seccomp 锁仅在受限子进程的
+  `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC` 路径安装：`--best-effort` 下
+  unshare 失败回退不 unshare 时，既不施加 socket 覆盖也不安装挂载锁
+  （与挂载步骤同口径告警降级），完全降级还同时跳过 capabilities 裁剪
+  与独立 IPC ns 隔离（与 README「威胁模型」O5′ 口径一致）——此时沙盒内
+  root 仍可执行挂载类与进程控制类系统调用并持完整宿主 capabilities，
+  降级属可观察 WARN，不作静默承诺。
 
 - mount-seal 过滤器支持 `linux/amd64` 与 `linux/arm64`；其它 Linux
   架构跳过安装（不拒绝启动），挂载逃逸面在该架构上保持旧行为。
