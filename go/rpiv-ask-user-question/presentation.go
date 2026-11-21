@@ -3,6 +3,8 @@ package rpivaskuserquestion
 // Ports presentation.ts (v2.15.0): inline-vs-overlay presentation, the inline
 // row budget, and the editor-slot claim.
 
+import "sync"
+
 // Inline row budget. A component in the editor slot only receives a width and
 // the host clips the slot from the bottom when the dock outgrows the screen, so
 // the inline dialog caps itself.
@@ -63,17 +65,26 @@ var StackedOverlayPresentation = Presentation{
 }
 
 // inlineSlotHeld guards the single editor slot: a second inline mount would
-// replace the first, whose promise would never settle.
-var inlineSlotHeld = false
+// replace the first, whose promise would never settle. Two concurrent
+// tool_call handlers resolve their presentations at once, so the flag is held
+// behind a mutex: claim and release must stay atomic.
+var (
+	inlineSlotMu   sync.Mutex
+	inlineSlotHeld = false
+)
 
 // claimInlineSlot mirrors claimInlineSlot.
 func claimInlineSlot() func() {
+	inlineSlotMu.Lock()
+	defer inlineSlotMu.Unlock()
 	if inlineSlotHeld {
 		return nil
 	}
 	inlineSlotHeld = true
 	released := false
 	return func() {
+		inlineSlotMu.Lock()
+		defer inlineSlotMu.Unlock()
 		if released {
 			return
 		}

@@ -782,3 +782,667 @@ func TestAnswerDispatchVerdictRidesTheDispatchContext(t *testing.T) {
 		t.Fatal("extension did not stop after shutdown")
 	}
 }
+
+// ── wire-level host: full ask_user_question flows over net.Pipe ──────────────
+
+// wireHost plays the host for the real Extension() over a net.Pipe.
+//
+// Concurrency model: one pump goroutine owns the read side of the pipe. It
+// classifies each frame, auto-answers extension→host calls with the canned
+// call_result the flow needs, and pushes an immutable wireEvent onto the
+// events channel. The test goroutine is the only consumer: it records the
+// handler id, verdict emits, mounted custom components and request responses
+// as it drains events, so every piece of observed state has exactly one
+// writer and one reader. Nothing is ever polled or slept on — waitEvent only
+// drains the channel.
+type wireHost struct {
+	t      *testing.T
+	conn   net.Conn
+	runErr chan error
+
+	events chan wireEvent
+	sendMu sync.Mutex
+
+	// pendingCustom is owned by the pump alone: ui.custom calls the host holds
+	// until the matching ui.custom.close notify arrives, keyed by component
+	// key.
+	pendingCustom map[string]string
+
+	// Observed state, owned by the test goroutine (written only while draining
+	// events).
+	answerHandlerID string
+	verdicts        []wireEmit
+	responses       map[string]map[string]any
+	mountedKeys     []string
+}
+
+// wireEvent is one classified frame the pump produced. Only the test
+// goroutine reads it.
+type wireEvent struct {
+	kind string // "call", "response", "notify", "other"
+
+	// call frames:
+	method  string
+	callID  string
+	parent  string // parent_request_id
+	timer   bool
+	channel string         // events.on / events.emit channel
+	handler string         // events.on handlerId
+	json    map[string]any // events.emit decoded json
+	key     string         // ui.custom key
+	overlay bool           // ui.custom overlay flag
+
+	// response frames:
+	reqID string
+	msg   map[string]any // the whole response frame
+
+	// notify frames (ui.custom.close):
+	closeKey string
+}
+
+// wireEmit is one events.emit call the extension made.
+type wireEmit struct {
+	channel string
+	parent  string
+	timer   bool
+	json    map[string]any
+}
+
+// newWireHost builds the extension, starts it over a pipe and runs the
+// register→ready handshake.
+func newWireHost(t *testing.T) *wireHost {
+	t.Helper()
+	t.Setenv("PIG_EXT_SOCKET", "")
+	t.Setenv("HOME", t.TempDir())
+
+	// These flows exercise the external-answer path, which closes a mounted
+	// dialog through its OverlayHandle — a path only an overlay presentation
+	// has. Holding the inline slot makes every mount an overlay, the
+	// presentation a second concurrent questionnaire would get in production.
+	release := claimInlineSlot()
+	if release == nil {
+		t.Fatal("the inline slot was already held")
+	}
+	t.Cleanup(release)
+
+	hostEnd, extEnd := net.Pipe()
+	h := &wireHost{
+		t:             t,
+		conn:          hostEnd,
+		runErr:        make(chan error, 1),
+		events:        make(chan wireEvent, 256),
+		responses:     map[string]map[string]any{},
+		pendingCustom: map[string]string{},
+	}
+	go func() { h.runErr <- Extension().RunWithConn(extEnd) }()
+
+	reg := h.nextFrame()
+	if reg["type"] != "register" {
+		t.Fatalf("first frame = %v, want register", reg)
+	}
+	tools, _ := reg["register"].(map[string]any)["tools"].([]any)
+	found := false
+	for _, tool := range tools {
+		if name, _ := tool.(map[string]any)["name"].(string); name == ToolName {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("register carried no %s tool: %v", ToolName, tools)
+	}
+	// Ready carries a real TUI session: hasUI through the state snapshot.
+	state, err := json.Marshal(map[string]any{"hasUI": true})
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	h.send(map[string]any{
+		"type": "ready",
+		"ready": map[string]any{
+			"cwd": t.TempDir(), "mode": "tui", "width": 80, "height": 40,
+			"state": json.RawMessage(state),
+		},
+	})
+	go h.pump()
+	t.Cleanup(h.shutdown)
+	return h
+}
+
+func (h *wireHost) deadline() { _ = h.conn.SetDeadline(time.Now().Add(15 * time.Second)) }
+
+func (h *wireHost) nextFrame() map[string]any {
+	h.t.Helper()
+	h.deadline()
+	msg, err := readWireFrame(h.conn)
+	if err != nil {
+		h.t.Fatalf("read host frame: %v", err)
+	}
+	return msg
+}
+
+func (h *wireHost) send(msg map[string]any) {
+	h.t.Helper()
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	if err := writeWireFrame(h.conn, msg); err != nil {
+		h.t.Fatalf("write host frame %v: %v", msg, err)
+	}
+}
+
+// pump is the single reader of the extension's frames. It auto-answers every
+// extension→host call (so the extension never stalls on the host) and hands a
+// classified wireEvent to the test. ui.custom is answered {ok:false}: the
+// dialog stays mounted until the component itself emits ui.custom.close
+// (which is how an external answer closes it), so waitCall then sees the
+// pending call end with no result — the genuine "host could not take the
+// answer" path is not what is under test here.
+func (h *wireHost) pump() {
+	defer close(h.events)
+	for {
+		h.deadline()
+		msg, err := readWireFrame(h.conn)
+		if err != nil {
+			return
+		}
+		switch msg["type"] {
+		case "call":
+			call, _ := msg["call"].(map[string]any)
+			args, _ := call["args"].(map[string]any)
+			ev := wireEvent{
+				kind:    "call",
+				method:  stringArg(call, "method"),
+				callID:  stringArg(msg, "id"),
+				parent:  stringArg(call, "parent_request_id"),
+				timer:   call["timer"] == true,
+				channel: stringArg(args, "channel"),
+				handler: stringArg(args, "handlerId"),
+				json:    mapArg(args, "json"),
+				key:     stringArg(args, "key"),
+			}
+			ev.overlay = args["overlay"] == true
+			switch ev.method {
+			case "ui.custom":
+				// The host holds ui.custom until the component closes: its
+				// call_result goes out when the matching ui.custom.close
+				// notify arrives below. That is what keeps the dialog mounted
+				// while an external answer settles it.
+				h.pendingCustom[ev.key] = ev.callID
+			case "ui.custom.control":
+				// hide disposes the component: the host ends its ui.custom
+				// call with no result, which is what frees the mount. The
+				// control itself answers with the component's last state.
+				h.writeRaw(map[string]any{
+					"type": "call_result", "id": ev.callID,
+					"call_result": map[string]any{"result": map[string]any{
+						"hidden": false, "focused": false, "visible": true,
+					}},
+				})
+				if stringArg(args, "action") == "hide" {
+					if pendingID, ok := h.pendingCustom[ev.key]; ok {
+						delete(h.pendingCustom, ev.key)
+						h.writeRaw(map[string]any{
+							"type": "call_result", "id": pendingID,
+							"call_result": map[string]any{"result": nil},
+						})
+					}
+				}
+			default:
+				h.writeRaw(map[string]any{
+					"type": "call_result", "id": ev.callID,
+					"call_result": map[string]any{"result": nil},
+				})
+			}
+			select {
+			case h.events <- ev:
+			default:
+			}
+		case "response":
+			ev := wireEvent{kind: "response", reqID: stringArg(msg, "id"), msg: msg}
+			select {
+			case h.events <- ev:
+			default:
+			}
+		case "notify":
+			n, _ := msg["notify"].(map[string]any)
+			ev := wireEvent{kind: "notify", method: stringArg(n, "method")}
+			if stringArg(n, "method") == "ui.custom.close" {
+				args, _ := n["args"].(map[string]any)
+				ev.closeKey = stringArg(args, "key")
+				// The component closed: end the pending ui.custom call as the
+				// host does, with no component result — the answer already
+				// travelled the answer channel.
+				if callID, ok := h.pendingCustom[ev.closeKey]; ok {
+					delete(h.pendingCustom, ev.closeKey)
+					h.writeRaw(map[string]any{
+						"type": "call_result", "id": callID,
+						"call_result": map[string]any{"result": nil},
+					})
+				}
+			}
+			select {
+			case h.events <- ev:
+			default:
+			}
+		default:
+			select {
+			case h.events <- wireEvent{kind: "other", msg: msg}:
+			default:
+			}
+		}
+	}
+}
+
+// writeRaw answers a call from the pump without t.Helper — a closed pipe
+// must not fail a test that already finished its assertions.
+func (h *wireHost) writeRaw(msg map[string]any) {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	_ = writeWireFrame(h.conn, msg)
+}
+
+func stringArg(m map[string]any, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
+func mapArg(m map[string]any, key string) map[string]any {
+	v, _ := m[key].(map[string]any)
+	return v
+}
+
+// drain folds one pump event into the test-side observed state.
+func (h *wireHost) drain(ev wireEvent) {
+	switch ev.kind {
+	case "call":
+		switch ev.method {
+		case "events.on":
+			if ev.channel == AskUserAnswerEvent && ev.handler != "" {
+				h.answerHandlerID = ev.handler
+			}
+		case "events.emit":
+			if ev.channel == AskUserAnswerResultEvent {
+				h.verdicts = append(h.verdicts, wireEmit{
+					channel: ev.channel, parent: ev.parent, timer: ev.timer, json: ev.json,
+				})
+			}
+		case "ui.custom":
+			h.mountedKeys = append(h.mountedKeys, ev.key)
+			// Tell the extension the component mounted, so its OnHandle
+			// callback gets the handle an external answer closes through.
+			h.send(map[string]any{
+				"type": "notify",
+				"notify": map[string]any{
+					"method": "ui.custom.opened",
+					"args":   map[string]any{"key": ev.key, "hidden": false, "focused": true, "visible": true},
+				},
+			})
+		}
+	case "response":
+		h.responses[ev.reqID] = ev.msg
+	}
+}
+
+// waitEvent drains events until pred holds, applying each one first. It is
+// the only way the test observes the extension — a direct read of observed
+// state only ever runs from the test goroutine, so there is nothing to race.
+func (h *wireHost) waitEvent(what string, pred func() bool) {
+	h.t.Helper()
+	if pred() {
+		return
+	}
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-h.events:
+			if !ok {
+				h.t.Fatalf("the extension closed the connection while waiting for %s", what)
+			}
+			h.drain(ev)
+			if pred() {
+				return
+			}
+		case <-timer.C:
+			h.t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+}
+
+// sendToolCall issues one ask_user_question tool_call request.
+func (h *wireHost) sendToolCall(requestID, toolCallID string, args map[string]any) {
+	h.t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		h.t.Fatalf("marshal tool args: %v", err)
+	}
+	h.send(map[string]any{
+		"type": "request", "id": requestID,
+		"request": map[string]any{
+			"method":       "tool_call",
+			"tool":         ToolName,
+			"tool_call_id": toolCallID,
+			"args":         json.RawMessage(raw),
+		},
+	})
+}
+
+// sendAnswerDispatch issues one events.dispatch of rpiv:ask-user:answer under
+// its own request id. payload is the event payload, already a JSON value.
+func (h *wireHost) sendAnswerDispatch(requestID string, payload any) {
+	h.t.Helper()
+	if h.answerHandlerID == "" {
+		h.t.Fatal("no answer handler: the extension never subscribed events.on")
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		h.t.Fatalf("marshal answer payload: %v", err)
+	}
+	dispatchArgs, err := json.Marshal(map[string]any{
+		"handlerId": h.answerHandlerID,
+		"channel":   AskUserAnswerEvent,
+		"json":      json.RawMessage(raw),
+	})
+	if err != nil {
+		h.t.Fatalf("marshal dispatch args: %v", err)
+	}
+	h.send(map[string]any{
+		"type": "request", "id": requestID,
+		"request": map[string]any{
+			"method": "events.dispatch",
+			"args":   json.RawMessage(dispatchArgs),
+		},
+	})
+}
+
+// sendCancel cancels a host request the way the host does.
+func (h *wireHost) sendCancel(requestID, reason string) {
+	h.t.Helper()
+	h.send(map[string]any{
+		"type":   "cancel",
+		"cancel": map[string]any{"request_id": requestID, "reason": reason},
+	})
+}
+
+func (h *wireHost) subscribed() bool { return h.answerHandlerID != "" }
+func (h *wireHost) mounted() bool    { return len(h.mountedKeys) > 0 }
+
+// emitFor returns the recorded verdict emit for one dispatch request id.
+func (h *wireHost) emitFor(dispatchID string) *wireEmit {
+	for i := range h.verdicts {
+		emit := &h.verdicts[i]
+		if emit.parent == dispatchID {
+			return emit
+		}
+	}
+	return nil
+}
+
+func (h *wireHost) sawResponse(id string) bool        { _, ok := h.responses[id]; return ok }
+func (h *wireHost) response(id string) map[string]any { return h.responses[id] }
+
+// shutdown asks the extension to stop and waits for the serve loop to end.
+func (h *wireHost) shutdown() {
+	h.writeRaw(map[string]any{"type": "shutdown"})
+	select {
+	case err := <-h.runErr:
+		if err != nil {
+			h.t.Errorf("RunWithConn returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		h.t.Error("extension did not stop after shutdown")
+	}
+	_ = h.conn.Close()
+}
+
+// oneQuestionArgs is the tool_call args of a one-question questionnaire.
+func oneQuestionArgs(question string) map[string]any {
+	return map[string]any{
+		"questions": []any{map[string]any{
+			"question": question,
+			"header":   "Q",
+			"options": []any{
+				map[string]any{"label": "A", "description": "desc A"},
+				map[string]any{"label": "B", "description": "desc B"},
+			},
+		}},
+	}
+}
+
+// answerPayload builds an inbound rpiv:ask-user:answer payload answering the
+// single question with the given option index.
+func answerPayload(toolCallID, requestID string, optionIndex int) map[string]any {
+	return map[string]any{
+		"toolCallId": toolCallID,
+		"requestId":  requestID,
+		"answers":    []any{map[string]any{"questionIndex": 0, "optionIndexes": []any{optionIndex}}},
+	}
+}
+
+// toolResultDetails decodes the details member of a tool_call response result.
+func toolResultDetails(t *testing.T, response map[string]any) map[string]any {
+	t.Helper()
+	resp, _ := response["response"].(map[string]any)
+	if resp == nil {
+		t.Fatalf("response frame has no response member: %v", response)
+	}
+	if resp["error"] != nil {
+		t.Fatalf("tool_call response carried an error: %v", resp["error"])
+	}
+	raw, _ := resp["result"].(json.RawMessage)
+	if len(raw) == 0 {
+		// The test rig decodes frames into map[string]any; the result arrives
+		// as a map then.
+		if m, ok := resp["result"].(map[string]any); ok {
+			return mapArg(m, "details")
+		}
+		t.Fatalf("tool_call response carried no result: %v", resp)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode tool result: %v", err)
+	}
+	return mapArg(result, "details")
+}
+
+// TestWireAnswerClosesTheQuestionnaire drives the full flow at the wire with a
+// nil-constructor channel: tool_call → ui.custom mounts → an answer dispatch
+// settles the questionnaire → the verdict rides the dispatch's request context
+// and the tool result returns the accepted answer.
+func TestWireAnswerClosesTheQuestionnaire(t *testing.T) {
+	h := newWireHost(t)
+	h.waitEvent("the answer-channel subscription", h.subscribed)
+
+	h.sendToolCall("req-tool-1", "call-a", oneQuestionArgs("Pick one?"))
+	// The TUI path mounts the questionnaire through ctx.ui.custom; the host
+	// call reaching us proves the dialog mounted (and stayed pending).
+	h.waitEvent("the ui.custom mount", h.mounted)
+
+	h.sendAnswerDispatch("req-dispatch-a", answerPayload("call-a", "req-a", 0))
+	h.waitEvent("the verdict emit of req-dispatch-a", func() bool {
+		return h.emitFor("req-dispatch-a") != nil
+	})
+	h.waitEvent("the tool_call response", func() bool { return h.sawResponse("req-tool-1") })
+
+	emit := h.emitFor("req-dispatch-a")
+	if emit == nil {
+		t.Fatal("no verdict emit rode req-dispatch-a")
+	}
+	if emit.timer {
+		t.Fatalf("the verdict emit was detached (timer): %v", emit)
+	}
+	verdict := emit.json
+	if ok, _ := verdict["ok"].(bool); !ok {
+		t.Fatalf("verdict = %v, want ok:true", verdict)
+	}
+	if got := stringArg(verdict, "toolCallId"); got != "call-a" {
+		t.Fatalf("verdict toolCallId = %q, want call-a: %v", got, verdict)
+	}
+	if got := stringArg(verdict, "requestId"); got != "req-a" {
+		t.Fatalf("verdict requestId = %q, want req-a: %v", got, verdict)
+	}
+
+	details := toolResultDetails(t, h.response("req-tool-1"))
+	if cancelled, _ := details["cancelled"].(bool); cancelled {
+		t.Fatalf("tool result cancelled: %v", details)
+	}
+	answers, _ := details["answers"].([]any)
+	if len(answers) != 1 {
+		t.Fatalf("answers = %v, want exactly one", details)
+	}
+	first, _ := answers[0].(map[string]any)
+	if got := stringArg(first, "kind"); got != string(AnswerKindOption) {
+		t.Fatalf("answer kind = %q, want option: %v", got, first)
+	}
+	if got := stringArg(first, "answer"); got != "A" {
+		t.Fatalf("answer = %q, want the picked label A: %v", got, first)
+	}
+}
+
+// TestWireConcurrentCallsAnswerByToolCallID opens two questionnaires
+// concurrently (call-a and call-b, sent without a batch so both start at
+// once) and answers them through independent dispatches in reverse order:
+// call-b settles before call-a. Each verdict must ride its own dispatch
+// request and each tool result must carry its own answer — zero cross-talk.
+func TestWireConcurrentCallsAnswerByToolCallID(t *testing.T) {
+	h := newWireHost(t)
+	h.waitEvent("the answer-channel subscription", h.subscribed)
+
+	h.sendToolCall("req-tool-a", "call-a", oneQuestionArgs("Question A?"))
+	h.sendToolCall("req-tool-b", "call-b", oneQuestionArgs("Question B?"))
+	h.waitEvent("both ui.custom mounts", func() bool { return len(h.mountedKeys) >= 2 })
+
+	// Answer call-b first while call-a is still open: the dispatch is served
+	// concurrently with the still-pending tool_call of call-a.
+	h.sendAnswerDispatch("req-dispatch-b", answerPayload("call-b", "req-b", 1))
+	h.waitEvent("the verdict emit of req-dispatch-b", func() bool {
+		return h.emitFor("req-dispatch-b") != nil
+	})
+	h.sendAnswerDispatch("req-dispatch-a", answerPayload("call-a", "req-a", 0))
+	h.waitEvent("the verdict emit of req-dispatch-a", func() bool {
+		return h.emitFor("req-dispatch-a") != nil
+	})
+	h.waitEvent("both tool_call responses", func() bool {
+		return h.sawResponse("req-tool-a") && h.sawResponse("req-tool-b")
+	})
+
+	for _, tc := range []struct {
+		dispatchID, toolCallID, requestID string
+		wantLabel                         string
+	}{
+		{"req-dispatch-a", "call-a", "req-a", "A"},
+		{"req-dispatch-b", "call-b", "req-b", "B"},
+	} {
+		emit := h.emitFor(tc.dispatchID)
+		if emit == nil {
+			t.Fatalf("no verdict emit rode %s", tc.dispatchID)
+		}
+		if got := stringArg(emit.json, "toolCallId"); got != tc.toolCallID {
+			t.Fatalf("verdict on %s carried toolCallId %q, want %s: %v", tc.dispatchID, got, tc.toolCallID, emit.json)
+		}
+		if got := stringArg(emit.json, "requestId"); got != tc.requestID {
+			t.Fatalf("verdict on %s carried requestId %q, want %s: %v", tc.dispatchID, got, tc.requestID, emit.json)
+		}
+		if ok, _ := emit.json["ok"].(bool); !ok {
+			t.Fatalf("verdict on %s = %v, want ok:true", tc.dispatchID, emit.json)
+		}
+	}
+
+	for _, tc := range []struct {
+		requestID, wantLabel string
+	}{
+		{"req-tool-a", "A"},
+		{"req-tool-b", "B"},
+	} {
+		details := toolResultDetails(t, h.response(tc.requestID))
+		answers, _ := details["answers"].([]any)
+		if len(answers) != 1 {
+			t.Fatalf("%s answers = %v, want exactly one", tc.requestID, details)
+		}
+		first, _ := answers[0].(map[string]any)
+		if got := stringArg(first, "answer"); got != tc.wantLabel {
+			t.Fatalf("%s answer = %q, want %q: cross-talk: %v", tc.requestID, got, tc.wantLabel, details)
+		}
+	}
+}
+
+// TestWireLateAnswerAfterCancelEmitsNotFound cancels the tool_call request
+// after the questionnaire opened, then delivers a late answer for it. The
+// registry already closed the questionnaire, so the dispatch must still emit
+// its verdict — not_found, carrying the answer's requestId — and it must ride
+// the dispatch's own request context even though the asking context is gone.
+func TestWireLateAnswerAfterCancelEmitsNotFound(t *testing.T) {
+	h := newWireHost(t)
+	h.waitEvent("the answer-channel subscription", h.subscribed)
+
+	h.sendToolCall("req-tool-1", "call-a", oneQuestionArgs("Pick one?"))
+	h.waitEvent("the ui.custom mount", h.mounted)
+
+	// The host aborts the tool call (the user interrupted the turn). The
+	// handler's context is cancelled; the questionnaire closes with the
+	// request's cleanup.
+	h.sendCancel("req-tool-1", "user interrupt")
+	h.waitEvent("the cancelled tool_call response", func() bool { return h.sawResponse("req-tool-1") })
+
+	h.sendAnswerDispatch("req-dispatch-late", answerPayload("call-a", "req-late", 0))
+	h.waitEvent("the verdict emit of req-dispatch-late", func() bool {
+		return h.emitFor("req-dispatch-late") != nil
+	})
+
+	emit := h.emitFor("req-dispatch-late")
+	if emit == nil {
+		t.Fatal("no verdict emit rode req-dispatch-late")
+	}
+	if emit.timer {
+		t.Fatalf("the verdict emit was detached (timer): %v", emit)
+	}
+	verdict := emit.json
+	if ok, _ := verdict["ok"].(bool); ok {
+		t.Fatalf("verdict ok = true, want the not_found reject: %v", verdict)
+	}
+	if got := stringArg(verdict, "code"); got != string(RejectNotFound) {
+		t.Fatalf("verdict code = %q, want %q: %v", got, RejectNotFound, verdict)
+	}
+	if got := stringArg(verdict, "requestId"); got != "req-late" {
+		t.Fatalf("verdict requestId = %q, want req-late: %v", got, verdict)
+	}
+	if got := stringArg(verdict, "toolCallId"); got != "call-a" {
+		t.Fatalf("verdict toolCallId = %q, want call-a: %v", got, verdict)
+	}
+}
+
+// TestWireInvalidPayloadEmitsInvalidPayloadVerdict dispatches malformed
+// rpiv:ask-user:answer payloads — a missing toolCallId, and a non-object — and
+// asserts each gets its own invalid_payload verdict bound to its own dispatch.
+func TestWireInvalidPayloadEmitsInvalidPayloadVerdict(t *testing.T) {
+	h := newWireHost(t)
+	h.waitEvent("the answer-channel subscription", h.subscribed)
+
+	h.sendAnswerDispatch("req-dispatch-bad-1", map[string]any{
+		"requestId": "req-bad-1",
+		"answers":   []any{map[string]any{"questionIndex": 0, "optionIndexes": []any{0}}},
+	})
+	h.waitEvent("the verdict emit of req-dispatch-bad-1", func() bool {
+		return h.emitFor("req-dispatch-bad-1") != nil
+	})
+
+	// A non-object payload crosses the bus as its JSON value.
+	h.sendAnswerDispatch("req-dispatch-bad-2", "not-an-object")
+	h.waitEvent("the verdict emit of req-dispatch-bad-2", func() bool {
+		return h.emitFor("req-dispatch-bad-2") != nil
+	})
+
+	emit := h.emitFor("req-dispatch-bad-1")
+	if got := stringArg(emit.json, "code"); got != string(RejectInvalidPayload) {
+		t.Fatalf("missing-toolCallId verdict = %v, want code %q", emit.json, RejectInvalidPayload)
+	}
+	if got := stringArg(emit.json, "requestId"); got != "req-bad-1" {
+		t.Fatalf("verdict requestId = %q, want req-bad-1: %v", got, emit.json)
+	}
+
+	emit = h.emitFor("req-dispatch-bad-2")
+	if emit.timer {
+		t.Fatalf("the verdict emit was detached (timer): %v", emit)
+	}
+	if got := stringArg(emit.json, "code"); got != string(RejectInvalidPayload) {
+		t.Fatalf("non-object verdict = %v, want code %q", emit.json, RejectInvalidPayload)
+	}
+}

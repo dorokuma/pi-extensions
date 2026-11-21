@@ -702,8 +702,14 @@ func TestResolvePresentationClaimsTheSlot(t *testing.T) {
 // resetInlineSlot clears the package-level slot flag between tests.
 func resetInlineSlot(t *testing.T) {
 	t.Helper()
+	inlineSlotMu.Lock()
 	inlineSlotHeld = false
-	t.Cleanup(func() { inlineSlotHeld = false })
+	inlineSlotMu.Unlock()
+	t.Cleanup(func() {
+		inlineSlotMu.Lock()
+		inlineSlotHeld = false
+		inlineSlotMu.Unlock()
+	})
 }
 
 func TestStackedOverlayPresentation(t *testing.T) {

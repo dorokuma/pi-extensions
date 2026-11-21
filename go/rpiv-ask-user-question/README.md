@@ -90,6 +90,18 @@ Go 侧按原版目录结构平铺为单一 `package rpivaskuserquestion`（Go �
 | `events.ts` | `events.go`（4 个 `rpiv:ask-user:*` 频道常量与 payload 类型） |
 | `answer-channel.ts` | `answer-channel.go`（`missing_tool_call_id` / `unknown_tool_call` / `rpc_host_unsupported` / `already_settled`、first-answer-wins） |
 
+判定（verdict）派发走**监听回调的请求上下文**：`OnLoaded` 里订阅
+`rpiv:ask-user:answer` 的处理器拿到 `dispatchCtx`（本次 `events.dispatch`
+请求的 Context），用 `dispatchCtx.Events().Emit` 回执
+`rpiv:ask-user:answer-result`——这条 emit 绑定 dispatch 自己的
+`parent_request_id`，排在请求内其它调用之后、随请求取消而被取消。构造期
+`NewAnswerChannel(nil)`：**不在构造期持有无请求绑定的
+`Extension.Events()`**（那条 emit 与请求无关，会排在扩展其它非请求调用
+之后；`/reload` 期间还可能在 host 尚未就绪时阻塞）。
+`NewAnswerChannel(emit)` 的签名保留给单测注入总线；`HandleEmit` 传入 nil
+时回退到构造期 emit——生产恒为非 nil dispatch emit，该回退在生产即丢
+弃，而非降级成无绑定 emit。
+
 ### 状态机层
 
 | TS 源 | Go 文件 |
@@ -220,7 +232,7 @@ PiG 无对应访问器，因此改为**可注入探针**（`MustYieldInlineSlot(
 
 ## 6. 测试覆盖
 
-**338 个测试函数，86.3% 语句覆盖**，`-race` 全绿（DATA RACE=0）。
+**343 个测试函数，89.5% 语句覆盖**，`-race` 全绿（DATA RACE=0）。
 
 | 测试文件 | 覆盖对象 |
 |---|---|
@@ -240,7 +252,7 @@ PiG 无对应访问器，因此改为**可注入探针**（`MustYieldInlineSlot(
 | `transcript_test.go` | 调用/结果渲染、`(Recommended)` 剥离、预览竖线、笔记、表格对齐 |
 | `rpc-fallback_test.go` | 单选/多选/自定义/取消、数字与标签回复、预览折叠、reconcile |
 | `questionnaire-session_test.go` | 端到端会话：确认/取消/自定义/笔记/全局笔记/折叠（含**折叠行 dim 着色**、隐藏门控）/外部编辑器/多选（含**忽略 preview**）/预览布局（含**预览面板跟随当前 Tab**） |
-| `extension_test.go` | `Extension()` 构建、guidance 覆盖、外部编辑器、**编辑器交还后的重绘走 invalidate 而非 notify**、**折叠监听门控与隐藏提示文案**、key 匹配委托 |
+| `extension_test.go` | `Extension()` 构建、guidance 覆盖、外部编辑器、**编辑器交还后的重绘走 invalidate 而非 notify**、**折叠监听门控与隐藏提示文案**、key 匹配委托、**wire 级 net.Pipe 全链路**： verdict 骑 dispatch 请求上下文（`parent_request_id` 断言）、外部答题关闭浮层闭环、两个并发在途 ask 按 `toolCallId` 对号零串线、tool_call 取消后迟到答题回 `not_found`、缺 `toolCallId`/非对象 payload 回 `invalid_payload` —— 全部经真帧、无 `time.Sleep` 同步 |
 
 测试隔离：`main_test.go` 用 `TestMain` 固定 `LocaleSource` 为空，使整包在
 **无 locale（纯英文 fallback）** 下运行——不受构建机 `LANG=zh_CN.UTF-8` 影响；
@@ -264,14 +276,14 @@ $ go vet ./...
 
 $ go test -count=1 -race -v ./...
 ok  github.com/dorokuma/pi-extensions/go/rpiv-ask-user-question
-（338 个顶层测试全 PASS，DATA RACE=0，FAIL=0）
+（343 个顶层测试全 PASS，DATA RACE=0，FAIL=0）
 
 $ go test -count=1 -cover .
-ok  ...  coverage: 86.3% of statements
+ok  ...  coverage: 89.5% of statements
 ```
 
-上一轮记录的 335 个 / 86.8% 已按本轮实测重写（新增 7 个测试、删除 3 个偏离原版的
-测试，净 +4）。
+上一轮记录的 338 个 / 86.3% 已按本轮实测重写（新增 5 个测试：1 个
+verdict-ride-dispatch 断言 + 4 个 wire 级 net.Pipe 全链路，净 +5）。
 
 ### 7.2 PiG 实际编译与加载
 
