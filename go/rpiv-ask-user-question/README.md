@@ -232,7 +232,7 @@ PiG 无对应访问器，因此改为**可注入探针**（`MustYieldInlineSlot(
 
 ## 6. 测试覆盖
 
-**343 个测试函数，89.5% 语句覆盖**，`-race` 全绿（DATA RACE=0）。
+**351 个测试函数，89.5% 语句覆盖**，`-race` 全绿（DATA RACE=0）。
 
 | 测试文件 | 覆盖对象 |
 |---|---|
@@ -276,14 +276,17 @@ $ go vet ./...
 
 $ go test -count=1 -race -v ./...
 ok  github.com/dorokuma/pi-extensions/go/rpiv-ask-user-question
-（343 个顶层测试全 PASS，DATA RACE=0，FAIL=0）
+（351 个顶层测试全 PASS，DATA RACE=0，FAIL=0）
 
 $ go test -count=1 -cover .
 ok  ...  coverage: 89.5% of statements
 ```
 
-上一轮记录的 338 个 / 86.3% 已按本轮实测重写（新增 5 个测试：1 个
-verdict-ride-dispatch 断言 + 4 个 wire 级 net.Pipe 全链路，净 +5）。
+`main` 基线为 347 个，本分支新增 4 个 wire 级 `net.Pipe` 全链路测试
+（`TestWireAnswerClosesTheQuestionnaire`、`TestWireConcurrentCallsAnswerByToolCallID`、
+`TestWireLateAnswerAfterCancelEmitsNotFound`、`TestWireInvalidPayloadEmitsInvalidPayloadVerdict`），
+净 +4 至 351 个；`TestAnswerDispatchVerdictRidesTheDispatchContext` 与
+`TestAnswerChannelHandleEmitOverride` 已在 `9685996` 合入 `main`。
 
 ### 7.2 PiG 实际编译与加载
 
@@ -337,10 +340,10 @@ EXIT=0
 
 | 项 | 数值（本轮实测） |
 |---|---|
-| 生产代码 | 9,370 行（40 个 `.go`） |
-| 测试代码 | 8,007 行（19 个 `_test.go`） |
+| 生产代码 | 9,532 行（40 个 `.go`） |
+| 测试代码 | 9,331 行（19 个 `_test.go`） |
 | 嵌入 locale | 9 个 JSON / 329 行 |
-| 合计 | 17,706 行（含测试与 locale） |
+| 合计 | 19,192 行（含测试与 locale） |
 
 ---
 
