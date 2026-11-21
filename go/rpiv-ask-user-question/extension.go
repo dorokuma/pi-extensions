@@ -79,9 +79,14 @@ Preview content is rendered as markdown in a monospace box. Multi-line text with
 func Extension() *sdk.Extension {
 	e := sdk.New(logName)
 
-	answers := NewAnswerChannel(func(channel string, payload any) error {
-		return e.Events().Emit(channel, payload)
-	})
+	// No constructor-bound emit: the only production verdict path is the
+	// listener below, which replies through dispatchCtx.Events().Emit — the
+	// emit bound to the dispatch's own request context. An emit made through
+	// e.Events() here would be tied to no request and would wait behind the
+	// extension's other non-request calls. NewAnswerChannel keeps its emit
+	// parameter so unit tests can still inject a bus; HandleEmit's nil-emit
+	// fallback is then a drop, never an unbound emit.
+	answers := NewAnswerChannel(nil)
 	// Subscribed from OnLoaded rather than in the factory: a subscription made
 	// while the factory runs dials the host socket itself and waits on a
 	// synchronous host RPC (EventBus.On -> factoryBusConn), which deadlocks
@@ -549,6 +554,13 @@ func mountQuestionnaire(
 			mu.Lock()
 			handled = handle
 			mu.Unlock()
+			// The handle lands on the component's own queue, so an external
+			// answer that settled before it arrived already ran the closer
+			// above with a nil handle: re-check and close on its behalf, or
+			// the settled dialog would stay mounted for ever.
+			if open.Settled() != nil {
+				_ = handle.Hide()
+			}
 		}
 	}
 	// The inline branch leaves options.Overlay at its zero value: RemoteOverlayOptions
