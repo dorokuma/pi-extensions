@@ -33,10 +33,10 @@ func entriesFor(activity TrackedCommandActivity, name string) []string {
 // TestVerifyEqi12_SyntheticMixed reproduces the verify script's section C: a
 // mix of bash, ctx_run (argv/commands/command shapes) and non-shell tools.
 func TestVerifyEqi12_SyntheticMixed(t *testing.T) {
-	trackCommands := []string{"git", "herdr", "gh", "journalctl", "docker"}
+	trackCommands := []string{"git", "hc", "gh", "journalctl", "docker"}
 	blocks := []NormalizedBlock{
 		toolCall("bash", map[string]any{"command": "journalctl -u docker -n 5; git diff --stat"}),
-		toolCall("ctx_run", map[string]any{"action": "execute", "argv": []any{"herdr", "pane", "read", "wA:p6V", "--lines", "120"}}),
+		toolCall("ctx_run", map[string]any{"action": "execute", "argv": []any{"hc", "terminals", "list"}}),
 		toolCall("ctx_run", map[string]any{"action": "batch", "commands": []any{map[string]any{"label": "a", "command": "gh run list --limit 3"}}}),
 		toolCall("ctx_run", map[string]any{"action": "execute", "command": "cd /root/workspace/prism && git status --porcelain | head -5"}),
 		toolCall("ctx_run", map[string]any{"action": "execute", "argv": []any{"git", "log", "--oneline", "-3"}}),
@@ -48,11 +48,11 @@ func TestVerifyEqi12_SyntheticMixed(t *testing.T) {
 
 	// The five assertions verify-eqi12.mjs makes on section C.
 	for _, want := range []string{
-		"journalctl -u docker -n 5",          // bash path still works
-		"herdr pane read wA:p6V --lines 120", // argv captured
-		"gh run list --limit 3",              // batch commands captured
-		"git status --porcelain",             // ctx_run.command scanned
-		"git log --oneline -3",               // ctx_run.argv joined
+		"journalctl -u docker -n 5", // bash path still works
+		"hc terminals list",         // argv captured
+		"gh run list --limit 3",     // batch commands captured
+		"git status --porcelain",    // ctx_run.command scanned
+		"git log --oneline -3",      // ctx_run.argv joined
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("section C output is missing %q\noutput:\n%s", want, out)
@@ -395,7 +395,7 @@ func TestExtractTrackedCommands_SessionFileReplay(t *testing.T) {
 	if len(blocks) != 4 {
 		t.Fatalf("replayed %d tool calls, want 4", len(blocks))
 	}
-	out := activityLines(ExtractTrackedCommands(blocks, []string{"git", "gh", "herdr"}))
+	out := activityLines(ExtractTrackedCommands(blocks, []string{"git", "gh", "hc"}))
 	for _, want := range []string{"git log --oneline -3", "git status --porcelain", "gh run list --limit 3"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("replay output is missing %q\noutput:\n%s", want, out)

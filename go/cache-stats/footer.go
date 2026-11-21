@@ -14,8 +14,9 @@ import (
 // segment.
 
 // footerIcons is FOOTER_ICON: one geometric symbol family, no emoji mixin.
+// The shepherd/herdsman "●" segment went away with the retired herdsman
+// extension.
 const (
-	footerIconSheep   = "●"
 	footerIconHit     = "◆"
 	footerIconLatest  = "◇"
 	footerIconContext = "▲"
@@ -151,28 +152,18 @@ func captureFooterSnapshot(state *instanceState) (snap footerRenderSnapshot, ent
 	return snap, entriesFn, usageFn
 }
 
-// footerRender renders the single footer line. statuses is
-// footerData.getExtensionStatuses(). TS: the render() body of installFooter
-// (L617-700).
+// footerRender renders the single footer line. TS: the render() body of
+// installFooter (L617-700). The extension-statuses input is gone with the
+// retired herdsman/shepherd segment.
 //
 // It is the function the SDK calls from a background goroutine, so it takes a
 // consistent snapshot under the lock and renders from that copy. It must never
 // call back into the SDK while holding instanceState.mu (see instanceState).
-func footerRender(state *instanceState, theme themeStyler, statuses map[string]string, width int) string {
+func footerRender(state *instanceState, theme themeStyler, width int) string {
 	snap, _, usageFn := captureFooterSnapshot(state)
 	parts := []string{}
-	// 1. shepherd/herdsman status (only if results returned) - icon ●
-	var sheep *string
-	if value, ok := statuses["herdsman"]; ok {
-		sheep = &value
-	} else if value, ok := statuses["shepherd"]; ok {
-		sheep = &value
-	}
-	if herdsmanStatus := formatHerdsmanStatus(sheep); herdsmanStatus != nil {
-		parts = append(parts, theme.Fg("dim", footerIconSheep)+" "+theme.Fg("text", *herdsmanStatus))
-	}
 
-	// 2. cache hit rate (live dual display: cumulative ◆, latest ◇)
+	// 1. cache hit rate (live dual display: cumulative ◆, latest ◇)
 	var agg, latest *int
 	if snap.hitRates != nil {
 		agg = snap.hitRates.aggregate
@@ -188,7 +179,7 @@ func footerRender(state *instanceState, theme themeStyler, statuses map[string]s
 	}
 	parts = append(parts, theme.Fg("dim", footerIconHit)+" "+aggStr+" "+theme.Fg("dim", footerIconLatest)+" "+latestStr)
 
-	// 3. context usage - icon ▲ (percent/compact contextWindow)
+	// 2. context usage - icon ▲ (percent/compact contextWindow)
 	context := snap.context
 	if usageFn != nil {
 		if raw, ok := usageFn(); ok && raw != nil {
@@ -210,7 +201,7 @@ func footerRender(state *instanceState, theme themeStyler, statuses map[string]s
 	}
 	parts = append(parts, theme.Fg("dim", footerIconContext)+" "+contextStr)
 
-	// 4. model name + thinking level - icon ■ (single segment, merged)
+	// 3. model name + thinking level - icon ■ (single segment, merged)
 	if snap.modelName != "" {
 		label := stripProvider(snap.modelName)
 		if snap.thinking != nil && *snap.thinking != "" {

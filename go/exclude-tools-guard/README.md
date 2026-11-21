@@ -14,22 +14,15 @@
 ### 1. 子代理身份判定（SUBAGENT-IDENTITY 块，fail-closed）
 - **判定模型**：主代理必须具备四项正向证据（S1-S4）全部成立；任一项缺位、查询失败、超时或无法确证，一律 fail-closed 判定为子代理。
   - **负向标记直接推断**：若 `PI_SUBAGENT=1`、`PI_ROLE` 非空、或 `argv`（包含通过 `PIG_HARNESS_ARGV_FILE` 重建的宿主参数）含有 `--name role-`、`/tmp/herdr-role-sessions`、`/tmp/dispatch-`，立即判定为子代理。
-  - **S1 pane id 必要条件（pane 命名不构成判据）**：`HERDR_PANE_ID` 必须非空——它只是向 herdr 查询 `shell_pid` 的**查找键**。**pane 命名（是否以 `:p1` 结尾等）绝不参与判定**：pane 可被用户或 herdr 重命名/重编号，命名与「谁拥有这个会话」无关。pane id 只作为辅助证据写入 reason 字符串（例如 `pane=w32:p23 (aux)`）。**判据分叉如实记录**：这是本组件的**家族实现**口径——`go/jev-gate` 的共享核心与 TS 源都要求 S1 以 `:p1` 结尾，本组件未随其同步，两轮实现刻意保留差异（packed-cell 跨扩展测试只校验共享 argv 桥，不校验判据一致）。
-  - **S2 herdr 运行态查询**：向运行中的 herdr unix socket（常量写死 `/root/.config/herdr/herdr.sock`，避免环境变量伪造）发送 JSON-RPC 请求：
+  - **S1/S2 herdr-core（`hc`）身份形状（终端命名不构成判据）**：`HC_TERMINAL_ID` 必须匹配 `^t[0-9a-z]+$`——它只是向 herdr-core 查询终端记录的**查找键**，终端命名本身绝不参与判定，只作为辅助证据写入 reason 字符串（例如 `terminal=t12t`）。向运行中的 herdr-core unix socket（常量写死 `/run/user/0/herdr-core/default.sock`，刻意不读 `HC_TERMINAL_SOCKET`，避免环境变量伪造）发送 JSON-RPC 2.0 `terminal.get` 请求：
     ```json
-    {"id":"pi-identity","method":"pane.process_info","params":{"pane_id":"<paneId>"}}
+    {"id":"pi-identity","jsonrpc":"2.0","method":"terminal.get","params":{"caller":"<termId>","terminal":"<termId>"}}
     ```
-    一次查询硬上限 1500ms（从函数入口起算的总预算硬上限，**不延长预算、不叠加阻塞式重试层**）。回执必须满足 `reply.id === "pi-identity"`、`reply.result.process_info.pane_id === paneId`、且 `shell_pid > 0`。查询失败/超时一律 fail-closed 判子代理，并只向 stderr 记**一条** warning（`sync.Once` 去重）。**S1/S3/S4 的 fail-closed 分支同样走这条去重 warning**（reason 里带分支名，例如 `S1: HERDR_PANE_ID unset or empty`、`S3: no agent-runtime ancestor …`、`S4: agent runtime ancestor …`），`PI_IDENTITY_DEBUG=1` 只增加细节、不改变判定。
+    一次查询硬上限 1500ms（从函数入口起算的总预算硬上限，**不延长预算、不叠加阻塞式重试层**）。回执必须满足 `reply.id === "pi-identity"`、`result.address === termId`、`state` 字段存在时必须为 `"live"`（`"finished"` 等一律 fail-closed）、`parent` 键必须存在且为 JSON 字面 `null`（顶层主终端；`hc run --bg` 派生的子代理终端必带父地址，因此 `parent` 缺失/`""`/非字符串同样 fail-closed）、且 `pid > 0` 后作为 `shell_pid` 进入 S3/S4。查询失败/超时一律 fail-closed 判子代理，并只向 stderr 记**一条** warning（`sync.Once` 去重）。**S1/S3/S4 的 fail-closed 分支同样走这条去重 warning**（reason 里带分支名，例如 `S1: HC_TERMINAL_ID unset or empty`、`S3: no agent-runtime ancestor …`、`S4: agent runtime ancestor …`），`PI_IDENTITY_DEBUG=1` 只增加细节、不改变判定。
     > **已知局限（stderr 在部署形态可能不可见）**：pig 会把扩展子进程的 stderr 重定向到临时文件且通常不保留（`ref/PiG/coding/extension/host/subprocess/host.go:3238-3248`，D56），所以这条 warning 在真实部署里**可能看不到**。它只是尽力而为的信号，不是可依赖的交付通道；排障时以 `PI_IDENTITY_DEBUG=1` 的前台运行或 reason 字符串为准。
-  - **S1/S2 的 herdr-core（`hc`）形状**：`HERDR_PANE_ID` 为空且导出的 `HC_TERMINAL_ID` 匹配
-    `^t[0-9a-z]+$` 时，正证明改走 `hc` 分支——连接写死的 `/run/user/0/herdr-core/default.sock`
-    （同样绝不读 `HC_TERMINAL_SOCKET`）发送 JSON-RPC 2.0 `terminal.get`，回执必须 `id` 与
-    `address` 均回环、`state` 字段存在时必须为 `"live"`（`"finished"` 等一律 fail-closed）、
-    `parent` 键必须存在且为 JSON 字面 `null`（顶层主终端，等价于老 herdr 的主窗格；`hc run
-    --bg` 派生的子代理终端必带父地址，因此 `parent` 缺失/`""`/非字符串同样 fail-closed），
-    `pid > 0` 后作为 `shell_pid` 继续跑 S3 严格祖先链与 S4。
-  - **S3 内核进程表祖先链与宿主锚定**：通过回溯本进程的 `/proc/<pid>/stat`（最多 32 跳），提取祖先进程链。该祖先链必须包含 S2 查询得到的 `shell_pid`，且 `shell_pid` 必须位于宿主进程的严格祖先方向（`shellIndex > hostIndex`）。宿主位置由**进程拓扑**锚定，与 pane 命名无关：
-    - **subprocess 形态（主判别式 `DetectSubprocessForm`）**：从 self 向上遍历，**第一个** `IsAgentRuntimeCmdline(cmdline)` 为真的祖先即宿主；若到 pane shell 之前都没找到 → fail-closed 判子代理（reason 写清 `no agent-runtime ancestor` 与命中的环境键）。subprocess 形态的判据覆盖全部三种 out-of-process 传输形态：
+  - **判据分叉如实记录**：经典 herdr 协议分支（`HERDR_*` pane 环境变量 + `herdr.sock` + `pane.process_info`）已从本组件删除，判据分叉注释仍保留——这是本组件的**家族实现**口径：TS 源与 `go/jev-gate` 的共享核心都要求主 pane 以 `:p1` 结尾（TS 源码仍如此要求），本组件刻意不随其同步（packed-cell 跨扩展测试只校验共享 argv 桥，不校验判据一致）。
+  - **S3 内核进程表祖先链与宿主锚定**：通过回溯本进程的 `/proc/<pid>/stat`（最多 32 跳），提取祖先进程链。该祖先链必须包含 S2 查询得到的 `shell_pid`，且 `shell_pid` 必须位于宿主进程的严格祖先方向（`shellIndex > hostIndex`）。宿主位置由**进程拓扑**锚定，与终端命名无关：
+    - **subprocess 形态（主判别式 `DetectSubprocessForm`）**：从 self 向上遍历，**第一个** `IsAgentRuntimeCmdline(cmdline)` 为真的祖先即宿主；若到终端 shell 之前都没找到 → fail-closed 判子代理（reason 写清 `no agent-runtime ancestor` 与命中的环境键）。subprocess 形态的判据覆盖全部三种 out-of-process 传输形态：
       - isolated 进程：`PIG_EXT_SOCKET` 非空；
       - packed cell 成员：任一以 `PIG_EXT_SOCKET_` 为前缀且**值非空**的环境变量（真实键名由 `runtimecell.SocketEnvName` 生成，本组件为 `PIG_EXT_SOCKET_EXCLUDE_TOOLS_GUARD`）；
       - packed cell 进程标记：`PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS` 非空。
@@ -38,7 +31,7 @@
     - **fused 形态（上述全部缺失）**：self 即宿主（`hostIndex = 0`）；若 self cmdline 识别不出 agent runtime → fail-closed 判子代理。
   - **S4 无中间 agent 嵌套**：宿主进程（`hostIndex`）与 `shell_pid` 之间的所有祖先进程，其 `/proc/<pid>/cmdline` 绝不能含有 agent 运行时（`pi`、`pig`、`ctxmode`、`pi-coding-agent`、`bundle/cli.js`）。扫描范围严格限定为 `for hop := hostIndex + 1; hop < shellIndex; hop++`，跳过宿主自身。
 - **fail-closed 处置**：任何 socket 连接失败、读取超时、JSON 解析错误、字段不匹配、宿主锚定失败或内核链断裂，均按子代理会话处置。
-- **诊断开关**：`PI_IDENTITY_DEBUG=1` 时向 stderr 输出判定理由（如 `[subagent-identity] subagent: S1: HERDR_PANE_ID unset or empty`），不改变判定逻辑。
+- **诊断开关**：`PI_IDENTITY_DEBUG=1` 时向 stderr 输出判定理由（如 `[subagent-identity] subagent: S1: HC_TERMINAL_ID unset or empty`），不改变判定逻辑。
 
 ### 2. 排除工具集合
 - **所有会话（主代理 + 子代理）**：强制剔除 `grep`、`find`、`ls`、`bash`（强制走 CodeGraph、`ctx_fs`、`ctx_run`）。
@@ -65,14 +58,14 @@
 
 | 行为模块 | TS 原版 (`exclude-tools-guard.ts`) | Go 移植版 (`exclude-tools-guard/extension.go`) | 说明 |
 |---|---|---|---|
-| **常量定义** | L49-L53, L240-L242 | `HerdrSocketFile`, `IdentityQueryTimeout`, `IdentityAncestorMaxHops`, `excludedTools`, `subagentExcludedTools`, `ExcludedTools()`, `SubagentExcludedTools()` | 常量与内部过滤集合及只读访问函数 |
-| **查询 herdr socket** | L69-L128 (`queryPaneShellPid`) | `QueryPaneShellPid` | 从函数入口起算硬上限 1500ms 总预算，使用标准库 `net.DialTimeout`，严格支持超时、1MB 缓冲截断与 JSON 验证，fail-closed |
+| **常量定义** | L49-L53, L240-L242 | `HcSocketFile`, `IdentityQueryTimeout`, `IdentityAncestorMaxHops`, `excludedTools`, `subagentExcludedTools`, `ExcludedTools()`, `SubagentExcludedTools()` | 常量与内部过滤集合及只读访问函数（Go 侧只剩 herdr-core `HcSocketFile`；`HerdrSocketFile` 已随经典 herdr 分支删除） |
+| **查询终端运行态** | L69-L128 (`queryPaneShellPid`) | `QueryHcTerminalInfo` | Go 侧移植为 herdr-core `terminal.get`（JSON-RPC 2.0，校验 `address`/`state`/`parent:null`/`pid`），不再保留经典 `pane.process_info` 查询；从函数入口起算硬上限 1500ms 总预算，标准库 `net.DialTimeout`，1MB 缓冲截断与 JSON 验证，fail-closed |
 | **读取 /proc ppid** | L131-L142 (`readProcPpid`) | `ReadProcPpid` | 按最后一个 `)` 之后切分并读取第 2 个字段，防御性处理空格与括号 |
 | **读取 /proc cmdline** | L145-L151 (`readProcCmdline`) | `ReadProcCmdline` | 以 `\0` 分隔并过滤空串，空格拼接 |
 | **进程祖先链回溯** | L154-L168 (`readAncestorChain`) | `ReadAncestorChain` | 32 跳上限，环路与终止检测（`ppid == 0 \|\| ppid == current`） |
 | **agent 运行时特征检测** | L171-L177 (`isAgentRuntimeCmdline`) | `IsAgentRuntimeCmdline` | 匹配 `pi`、`pig`、`ctxmode` 及正则 `pi-coding-agent\|bundle/cli\.js` |
 | **负向标记检测** | L180-L189 (`subagentLaunchMarker`) | `SubagentLaunchMarker`, `LoadEffectiveArgs` | 检测 `PI_SUBAGENT=1`、`PI_ROLE` 与 argv 特征（含通过 `PIG_HARNESS_ARGV_FILE` 桥接宿主参数） |
-| **fail-closed 身份推断** | L194-L236 (`resolveAgentIdentity`, `isSubagentSession`) | `ResolveAgentIdentityWithEnv`, `ResolveAgentIdentity`, `IsSubagentSession`, `DetectSubprocessForm`, `failClosed` | 形态判据为 `DetectSubprocessForm`（`PIG_EXT_SOCKET` / `PIG_EXT_SOCKET_<NAME>` / `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`），宿主锚定为第一个 agent-runtime 祖先（subprocess）或 self（fused），S3 校验 `shellIndex > hostIndex`，S4 只扫中间进程，pane 命名仅作辅助证据，S1-S4 任一失败均 fail-closed + 单次去重 warning |
+| **fail-closed 身份推断** | L194-L236 (`resolveAgentIdentity`, `isSubagentSession`) | `ResolveAgentIdentityWithEnv`, `ResolveAgentIdentity`, `IsSubagentSession`, `DetectSubprocessForm`, `failClosed` | 形态判据为 `DetectSubprocessForm`（`PIG_EXT_SOCKET` / `PIG_EXT_SOCKET_<NAME>` / `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`），宿主锚定为第一个 agent-runtime 祖先（subprocess）或 self（fused），S3 校验 `shellIndex > hostIndex`，S4 只扫中间进程，终端命名仅作辅助证据，S1-S4 任一失败均 fail-closed + 单次去重 warning |
 | **工具过滤纯函数** | L244-L255 (`enforceExclusions`) | `FilterActiveTools`, `EnforceToolExclusions` | 纯切片过滤保持相对顺序；无变更时不调用 `SetActiveTools`；debug 下记录打点 |
 | **提示词清理** | L266-L277 (before_agent_start) | `StripAddendumBlock`, `CleanPromptOptions`, `DeleteAddendumSection` | 清空 `appendSystemPrompt` + 删除 `sections` 里的 `addendum` section + 两段式剥离 `forceSystemPrompt` 中的 `<addendum>` 块，含非字符串防护。**与 TS 加固版的行为差**：TS 加固版只清 `appendSystemPrompt`、不删 `sections["addendum"]`，Go 版多做了这一步（PiG 会用 custom section 覆盖并重包 `<addendum>`，只清 `appendSystemPrompt` 会被重新叠回） |
 | **扩展工厂与事件接线** | L239, L258-L278 | `Extension` | 导出 `func Extension() *sdk.Extension`，挂载 `session_start` 与 `before_agent_start`，首错去重 warning |
@@ -82,21 +75,21 @@
 ## 与 TS 原版的细微差异
 
 1. **进程拓扑假设与宿主锚定（M1 必修，已定稿）**：
-   - **TS 原版拓扑**：跑在 Node 宿主同进程（fused / in-process），`process.pid` 即宿主本身，祖先链 `chain[0]=pi(宿主)`、`chain[1]=pane shell`。其 S4 检查循环 `for (let hop = 1; hop < index; hop++)` 在 `index = 1` 时遍历区间为空，实际执行 0 次，自然跳过了宿主本身。
-   - **Go 移植版拓扑**：作为 PiG subprocess 运行时，`os.Getpid()` 为扩展子进程（`chain[0]`），其 agent-runtime 祖先才是宿主进程，再往上一级才是 pane shell。若原样按照 hop=1 检查，循环将直接检查到宿主本身，因 `IsAgentRuntimeCmdline("pi")`（或将来的 `pig`）命中而误将主代理判为子代理。
-   - **主判别式与宿主锚定（最终语义）**：以 **`DetectSubprocessForm`** 区分形态——命中即 subprocess 形态，全不命中即 fused 形态。判据覆盖三种 out-of-process 形态：isolated 的 `PIG_EXT_SOCKET`、packed cell 成员的 `PIG_EXT_SOCKET_<NAME>`（前缀枚举 + 逐个回查非空）、packed cell 标记 `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`。**pane 命名（`HERDR_PANE_ID` 是否以 `:p1` 结尾）不参与判定**，只作为辅助证据写入 reason。宿主位置由拓扑推导：
-     - subprocess：从 self 向上取**第一个** agent-runtime 祖先为 `hostIndex`；到 pane shell 之前仍未找到 → fail-closed 判子代理（`no agent-runtime ancestor`）。
+   - **TS 原版拓扑**：跑在 Node 宿主同进程（fused / in-process），`process.pid` 即宿主本身，祖先链 `chain[0]=pi(宿主)`、`chain[1]=终端 shell`。其 S4 检查循环 `for (let hop = 1; hop < index; hop++)` 在 `index = 1` 时遍历区间为空，实际执行 0 次，自然跳过了宿主本身。
+   - **Go 移植版拓扑**：作为 PiG subprocess 运行时，`os.Getpid()` 为扩展子进程（`chain[0]`），其 agent-runtime 祖先才是宿主进程，再往上一级才是终端 shell。若原样按照 hop=1 检查，循环将直接检查到宿主本身，因 `IsAgentRuntimeCmdline("pi")`（或将来的 `pig`）命中而误将主代理判为子代理。
+   - **主判别式与宿主锚定（最终语义）**：以 **`DetectSubprocessForm`** 区分形态——命中即 subprocess 形态，全不命中即 fused 形态。判据覆盖三种 out-of-process 形态：isolated 的 `PIG_EXT_SOCKET`、packed cell 成员的 `PIG_EXT_SOCKET_<NAME>`（前缀枚举 + 逐个回查非空）、packed cell 标记 `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`。**终端命名绝不参与判定**，终端 id 只作为辅助证据写入 reason。宿主位置由拓扑推导：
+     - subprocess：从 self 向上取**第一个** agent-runtime 祖先为 `hostIndex`；到终端 shell 之前仍未找到 → fail-closed 判子代理（`no agent-runtime ancestor`）。
      - fused：`hostIndex = 0`（self 即宿主）；self cmdline 识别不出 agent runtime → fail-closed 判子代理。
    - **已移除的旁路**：早先的 `|| len(chain) >= 2` 推断（`PIG_EXT_SOCKET` 缺失时靠链长猜宿主）会误锚定扫描窗口，把 `ext→sh→pi→bash` 这类隔层 spawn 拓扑误判为子代理，已删除。
-   - S3 校验 `shellIndex > hostIndex`，S4 扫描范围限定为 `for hop := hostIndex + 1; hop < shellIndex; hop++`，跳过宿主自身，只扫描「宿主之上、pane shell 之下」的中间进程。若中间嵌套了其他 agent runtime，依然判定为子代理，兼顾了正确识别主代理与高强度防御。同时扩展 `IsAgentRuntimeCmdline` 识别 `pig`，为后续宿主切换至 pig 提供无缝支撑。
-   - **herdr 查询失败/超时**：一律 fail-closed 判子代理，只向 stderr 记一条 warning（`sync.Once` 去重），**不延长 1500ms 预算、不叠加阻塞式重试层**。
+   - S3 校验 `shellIndex > hostIndex`，S4 扫描范围限定为 `for hop := hostIndex + 1; hop < shellIndex; hop++`，跳过宿主自身，只扫描「宿主之上、终端 shell 之下」的中间进程。若中间嵌套了其他 agent runtime，依然判定为子代理，兼顾了正确识别主代理与高强度防御。同时扩展 `IsAgentRuntimeCmdline` 识别 `pig`，为后续宿主切换至 pig 提供无缝支撑。
+   - **herdr-core 查询失败/超时**：一律 fail-closed 判子代理，只向 stderr 记一条 warning（`sync.Once` 去重），**不延长 1500ms 预算、不叠加阻塞式重试层**。
    - **packed-go cell 形态修复（阻断项，2026-10-24 修复）**：Go 扩展在真实 PiG 下**默认作为 packed cell 成员运行**——进程环境里没有 `PIG_EXT_SOCKET`，只有每成员一条 `PIG_EXT_SOCKET_<NAME>`（`runtimecell.SocketEnvName`，`host/runtimecell/go_packed.go:844-846`；`host/subprocess/packed_go.go:422` 逐个写入）以及 `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`（`packed_go.go:495-497`）。早先「只看 `PIG_EXT_SOCKET`」会把 packed runner（cmdline 形如 `<cells>/go/<hash>/runner`）误判为 fused 形态、自身 cmdline 认不出 → fail-closed 把**真实主代理**判成子代理，进而摘掉 `jev_check` / `ask_user_question` 并每个 turn 清 `appendSystemPrompt`。现由 `DetectSubprocessForm` 覆盖三种形态，回归用例用真实键名 `PIG_EXT_SOCKET_EXCLUDE_TOOLS_GUARD` 断言判 main、夹 agent runtime 时判 subagent、isolated 形态不回归。
 2. **宿主 argv 桥接策略（M2 与 packed cell 共享）**：
    - 原 TS 注释明确拒绝依赖可被伪造的环境变量；但由于 PiG 派生 Go 扩展子进程时为无参（`os.Args` 仅包含自身二进制路径），不得不通过宿主写入的 `PIG_HARNESS_ARGV_FILE` 文件桥接宿主参数（aligned with `runtime-node/process-identity.mjs:21-22` 及 `harness_identity.go:24`）。
    - **Fail-closed 防御策略**：若 `PIG_HARNESS_ARGV_FILE` 环境变量存在但文件缺失或包含坏 JSON，立即 fail-closed 判定为子代理（防止攻击者通过篡改环境变量屏蔽 `--name role-` 等负向标记）；仅当该环境变量完全未设置时，才安全退化为仅使用 `os.Args`。
    - **packed cell 共享保留（MF-2 语义反转）**：`PIG_HARNESS_ARGV_FILE` 在读取后**刻意保留、不 unset**——同一 packed cell 内的兄弟扩展共享进程环境，单个扩展 unset 会致盲后续解析身份的兄弟（如在 EventSessionStart 时机）。该变量只是额外的负向标记来源：它只能把判据推向 subagent，永远无法把会话抬升为 main。（历史：此前按 TS `delete process.env.PIG_HARNESS_ARGV_FILE` 对齐做 unset，packed-cell 回归证明会破坏兄弟读取，已反转。）
    - **进程内 argv 缓存（M2 回归修复）**：`ResolveAgentIdentityWithEnv` 每个 turn 都会调用身份判定；缓存只在变量已读成功后生效，保证宿主清理变量（置空/未设）后，后续 turn 仍能复用已桥接的 argv。缓存只区分三种情形：① env 未设且无缓存 → 合法回落 `os.Args`，**不写入缓存**（避免把合法回落误当成缓存事实）；② env 已设且解析成功 → 缓存结果，供变量消失后的 turn 复用；③ env 已设但读/解析失败 → 返回错误并 fail-closed 判子代理，**不缓存失败**，因此每次调用都会重新判定，不会把一次故障永久固化成「永远子代理」。注意：**变量非空时总是重新读文件、不走缓存**——宿主把变量重指到另一路径时会按新路径读取，重指到坏路径会按 ③ 报错，而非复用旧缓存。
-3. **`shell_pid` 类型解析与严格校验**：
+3. **`pid` 类型解析与严格校验**：
    - TS 原版使用 `Number(info?.shell_pid)`，对于 JSON 字符串形式（如 `"4242"`）会宽松转换为数字并通过验证。
    - Go 移植版严格遵循 JSON-RPC 类型规范，只认 JSON number（float64 整数或 int），对字符串形式的 pid 一律拒绝（fail-closed 判子代理）。
 4. **`ReadProcPpid` 字段切分差异**：
@@ -106,17 +99,17 @@
    - TS 原版直接对 `forceSystemPrompt` 调用 `replaceAll`，若上游传入非字符串可能触发异常。
    - Go 移植版在 `CleanPromptOptions` 中对 `forceSystemPrompt` 进行显式字符串类型断言（`isStr`），非字符串时安全忽略，不 panic。
 6. **平台支持与通信协议（仅 Linux/macOS）**：
-   - TS 原版写死 Linux 路径 `/root/.config/herdr/herdr.sock`。
-   - Go 早期移植保留的 `HerdrNamedPipeWindows` / `network="npipe"` 属死代码（Go 标准库 `net` 原生不支持 `npipe` 协议，在 Windows 运行时会导致拨号错误）。现已彻底移除 Windows npipe 死代码，明确说明 herdr socket 查询仅支持 Unix domain socket（Linux/macOS）。
+   - TS 原版写死 Linux 路径 `/root/.config/herdr/herdr.sock`；Go 移植版的终端查询已整体切换到 herdr-core `default.sock`（见上），经典 herdr socket 分支已删除。
+   - Go 早期移植保留的 `HerdrNamedPipeWindows` / `network="npipe"` 属死代码（Go 标准库 `net` 原生不支持 `npipe` 协议，在 Windows 运行时会导致拨号错误）。已彻底移除 Windows npipe 死代码，终端查询仅支持 Unix domain socket（Linux/macOS）。
 7. **错误处理、告警去重与已知 fail-open 面**：
    - TS 原版在 handler 中静默忽略异常。
    - Go 移植版在 `session_start` 与 `before_agent_start` 中，若 `EnforceToolExclusions` 失败，采用 `sync.Once` 进行首次无条件 warning 告警（输出到 stderr），避免每个 turn 重复刷屏；debug 模式下输出详细诊断，且不改变事件返回值（保持返回 `nil, nil`）。
    - 当 `SetActiveTools` 执行时，因底层 SDK 无返回值，在 `PI_IDENTITY_DEBUG=1` 下增加 debug 打点确认生效。
    - **已知 fail-open 面**：
      - 若 `ctx.GetActiveTools()` 出错，当前策略为保留错误并放弃本次工具过滤，依赖上层或后续 turn 恢复。
-     - **子代理在自己 pane 且不带任何负向标记时会被判 main**。现网证据：`herdr agent start --kind pi` 不注入 `--name role-` / `--session-dir` / `--system-prompt`；实测本会话的子代理 pane = `w32:p26`、`shell_pid=2475328`、pi cmdline 仅为 `pi`、`env` 里没有 `PI_SUBAGENT` / `PI_ROLE`。此时 S1-S4 全部成立（宿主是 pi、父进程是 pane shell、无中间 agent runtime），故判 main，`jev_check` / `ask_user_question` 不会被摘、addendum 不会被清。
-     - **TS 原块自认的另一条残余面**：「另一个 pi 塞进主代理 pane shell」——即某个 pi 进程被嵌在主代理 pane 的 shell 之下但不带负向标记，同样满足 S1-S4 而被判 main。
-     - **pane 命名不作判据的代价**：判定面从「非 `:p1` 的 pane」扩大到了「任意 pane」。早先靠 `:p1` 后缀能顺手挡掉一部分子代理 pane（代价是误伤被重命名/重编号的主代理 pane，且语义上并不成立）；现在身份完全由负向标记 + herdr 运行态 + 进程拓扑决定，pane 命名只写进 reason 作辅助证据。**受管派发（走 dispatch-agent）的判定依赖宿主 argv 桥（带前提）**：三条负向标记（`--name role-`、`/tmp/herdr-role-sessions`、`/tmp/dispatch-`）确实在宿主 argv 里，但**能否被 Go 扩展看到取决于宿主是否写 `PIG_HARNESS_ARGV_FILE`**（PiG 的 subprocess / packed cell 宿主会写，见 `ref/PiG/coding/extension/host/subprocess/harness_identity.go`）。在 PiG 宿主下三条标记可见，受管派发稳定判子代理；若运行在没有该桥的宿主上（例如 TS 版 pi 的进程内扩展），`/proc/<pid>/argv` 可能已被进程 title 改写成 `pi`，标记就不可见，此时落回残余面 1（子代理在自己 pane 且无可见负向标记时判 main）。
+     - **子代理在自己顶层终端且不带任何负向标记时会被判 main**。现网证据：`hc run`（不带 `--bg`）与手工 `bin/pi` 都不注入 `--name role-` / `PI_SUBAGENT` / `PI_ROLE`；此时 S1-S4 全部成立（宿主是 pi、`terminal.get` 顶层记录、无中间 agent runtime），故判 main，`jev_check` / `ask_user_question` 不会被摘、addendum 不会被清。
+     - **TS 原块自认的另一条残余面**：「另一个 pi 塞进主代理终端 shell」——即某个 pi 进程被嵌在主代理终端的 shell 之下但不带负向标记，同样满足 S1-S4 而被判 main。
+     - **终端命名不作判据的代价**：判定面从「非 `:p1` 的 pane」（TS/jev-gate 共享核心判据）扩大到了「任意 herdr-core 顶层终端」。现在身份完全由负向标记 + herdr-core 运行态 + 进程拓扑决定，终端命名只写进 reason 作辅助证据。**受管派发（走 dispatch-agent）的判定依赖宿主 argv 桥（带前提）**：三条负向标记（`--name role-`、`/tmp/herdr-role-sessions`、`/tmp/dispatch-`）确实在宿主 argv 里，但**能否被 Go 扩展看到取决于宿主是否写 `PIG_HARNESS_ARGV_FILE`**（PiG 的 subprocess / packed cell 宿主会写，见 `ref/PiG/coding/extension/host/subprocess/harness_identity.go`）。在 PiG 宿主下三条标记可见，受管派发稳定判子代理；若运行在没有该桥的宿主上（例如 TS 版 pi 的进程内扩展），`/proc/<pid>/argv` 可能已被进程 title 改写成 `pi`，标记就不可见，此时落回残余面 1（子代理在自己终端且无可见负向标记时判 main）。
 8. **TS 侧残留实现的核实记录（pi 1.4.0，仅核实与记录，不删实现）**：
    - `forceSystemPrompt` 在 pi 1.4.0 **并非不存在**：`dist/core/system-prompt.d.ts` 的 `BuildSystemPromptOptions` 里有 `/** Exact full prompt replacement set by a before_agent_start handler. */ forceSystemPrompt?: string;`，且只在某个 handler 返回 `systemPrompt` 覆盖时被填充（`agent-session.ts:1724`）。
    - 因此 TS 侧 `StripAddendumBlock(forceSystemPrompt, …)` **不是死代码**，但实际几乎不触发（常规子代理会话不会强制整块提示词）；**保留作防御**，不因「很少命中」而删除。Go 侧对本分支另有非字符串类型断言防护（见差异 5）。
@@ -143,11 +136,11 @@ go test -count=1 -race -v ./...
 ```
 
 测试覆盖内容：
-- **真实 Unix Socket 假服务端测试**：模拟真实 socket 通信，覆盖主代理成功响应、`pane_id` 不符、半开连接断开、字符串 `shell_pid` 严格拒绝、`shell_pid <= 0`、垃圾 JSON、不应答超时（50ms）、socket 文件不存在等所有 fail-closed 分支；另有 hc `terminal.get` 报文边界测试（`TestQueryHcTerminalInfo_HcSocket`）：`parent:null,state:"live"` 成功、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id 一律 fail-closed。
-- **S1-S4 身份推导测试（M1/M3 实证）**：覆盖全部负向标记（`PI_SUBAGENT=1`、`PI_ROLE`、各种 argv）、S1 pane id 未设、S2 socket 失败、S3 祖先链丢失 `shell_pid`、S3 祖先链为空；重点验证正向拓扑（扩展是 `pi`/`pig` 宿主子进程判定为 main agent）与反向拓扑（宿主与 shell 之间存在 agent runtime 判定为 subagent）。
-- **身份判据重构回归（oracle2 反例 A/B 实证）**：六条定点用例——① subprocess 拓扑下宿主自身 cmdline 带 `--name role-reviewer`（经 `PIG_HARNESS_ARGV_FILE` 桥接）判 subagent；② 隔层 spawn `ext→sh→pi→bash` 判 main；③ fused 形态但 self cmdline 为 `node /x/index.js` 判 subagent（fail-closed）；④ subprocess 拓扑但链上无 agent-runtime 祖先判 subagent；⑤ 同进程第二次调用仍判 subagent（argv 缓存）；⑥ `HERDR_PANE_ID=w32:p23`（非 `:p1`）且其余条件都像主代理时判 main（证明 pane 命名不再作判据）。另验证 herdr 查询失败/超时时 fail-closed 判子代理且只记一条 warning（`sync.Once` 去重、1500ms 预算不被改写）。
+- **真实 Unix Socket 假服务端测试（`TestQueryHcTerminalInfo_HcSocket`）**：模拟 herdr-core `terminal.get` 应答，覆盖 `parent:null,state:"live"` 成功、`parent` 为父地址（`t9t`）返回 Parent、`state` 缺失容忍、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id 一律 fail-closed。
+- **S1-S4 身份推导测试（M1/M3 实证）**：覆盖全部负向标记（`PI_SUBAGENT=1`、`PI_ROLE`、各种 argv）、S1 终端 id 未设/不合法、S2 hc 查询失败、S3 祖先链丢失 `shell_pid`、S3 祖先链为空；重点验证正向拓扑（扩展是 `pi`/`pig` 宿主子进程判定为 main agent）与反向拓扑（宿主与终端 shell 之间存在 agent runtime 判定为 subagent）。另有 hc 顶层终端用例（`TestResolveAgentIdentity_HcTerminal`）：`parent:null` 判 main、`parent=t9t` 判 subagent、顶层记录但 pid 不在祖先链仍 S3 fail-closed。
+- **身份判据重构回归（oracle2 反例 A/B 实证）**：六条定点用例——① subprocess 拓扑下宿主自身 cmdline 带 `--name role-reviewer`（经 `PIG_HARNESS_ARGV_FILE` 桥接）判 subagent；② 隔层 spawn `ext→sh→pi→bash` 判 main；③ fused 形态但 self cmdline 为 `node /x/index.js` 判 subagent（fail-closed）；④ subprocess 拓扑但链上无 agent-runtime 祖先判 subagent；⑤ 同进程第二次调用仍判 subagent（argv 缓存）；⑥ `HC_TERMINAL_ID=t23t`（任意合法终端地址）且其余条件都像主代理时判 main（证明终端命名不作判据）。另验证 hc 查询失败/超时时 fail-closed 判子代理且只记一条 warning（`sync.Once` 去重、1500ms 预算不被改写）。
 - **PIG_HARNESS_ARGV_FILE 宿主参数桥接测试（M2 实证）**：覆盖文件包含 role-reviewer、herdr-role-sessions、dispatch 任务；覆盖环境变量存在但文件缺失或坏 JSON 时 fail-closed 判定为 subagent；覆盖环境变量未设时安全 fallback 为 main；覆盖读取后变量**保留可读**供 packed cell 兄弟使用。
-- **packed-go cell 形态回归（阻断项实证）**：四条定点用例——① 只注入真实键名 `PIG_EXT_SOCKET_EXCLUDE_TOOLS_GUARD`（不设 `PIG_EXT_SOCKET`）、宿主为 `pi`、父进程为 pane shell → **判 main**（并断言 `DetectSubprocessForm` 的证明键就是该成员键）；② 同一形态下宿主与 pane shell 之间夹 agent runtime（`pi-coding-agent`）→ **判 subagent**（S4）；③ isolated 形态只有 `PIG_EXT_SOCKET` → 仍走 subprocess 分支、**仍判 main**（原行为不回归）；④ 成员键列在环境里但**值为空** → 不算 subprocess 证明，退化为 fused 形态并 fail-closed 判 subagent。
+- **packed-go cell 形态回归（阻断项实证）**：四条定点用例——① 只注入真实键名 `PIG_EXT_SOCKET_EXCLUDE_TOOLS_GUARD`（不设 `PIG_EXT_SOCKET`）、宿主为 `pi`、父进程为终端 shell → **判 main**（并断言 `DetectSubprocessForm` 的证明键就是该成员键）；② 同一形态下宿主与终端 shell 之间夹 agent runtime（`pi-coding-agent`）→ **判 subagent**（S4）；③ isolated 形态只有 `PIG_EXT_SOCKET` → 仍走 subprocess 分支、**仍判 main**（原行为不回归）；④ 成员键列在环境里但**值为空** → 不算 subprocess 证明，退化为 fused 形态并 fail-closed 判 subagent。
 - **身份降级可见性（S1/S3/S4 去重 warning）**：三条分支各调三次，断言每次仍 fail-closed 判 subagent、reason 带分支名，且 stderr 上只出现 **1** 条 `identity not verified, fail-closed to subagent:` warning（`sync.Once` 去重）。
 - **工具过滤与 Setter 记录测试**：验证主代理排除 4 个、子代理排除 6 个、顺序不变；验证工具无变化时 `SetActiveTools` 绝不被调用；验证失败时不假装已过滤且留下诊断。
 - **提示词清理测试**：验证带 `\n\n` 与不带 `\n\n` 的 `<addendum>` 块剥离、多块替换、`sections` 里 `addendum` section 的删除（其他 section 保留，非空 section 也不再被重新叠回）、未知 `sections` 形态不 panic 不改动、以及非子代理保持不动。

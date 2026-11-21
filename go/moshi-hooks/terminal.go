@@ -127,27 +127,14 @@ func resolveTerminalContext(getenv func(string) string, run func(string, []strin
 	zellijSession := getenv("ZELLIJ_SESSION_NAME")
 	zellijPane := getenv("ZELLIJ_PANE_ID")
 
-	// Herdr stamps pane identity into every pane's environment; labels are
-	// resolved daemon-side from these ids, so no herdr CLI runs in-process.
-	inHerdr := getenv("HERDR_ENV") == "1"
-	herdrSession := ""
-	if inHerdr {
-		herdrSession = getenv("HERDR_SESSION")
-	}
-	herdrPane, herdrWorkspaceID, herdrTabID := "", "", ""
-	if inHerdr {
-		herdrPane = getenv("HERDR_PANE_ID")
-		herdrWorkspaceID = getenv("HERDR_WORKSPACE_ID")
-		herdrTabID = getenv("HERDR_TAB_ID")
-	}
-
-	// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET instead of
-	// HERDR_* variables; when the classic herdr env is absent a hc terminal is
-	// still reported with terminalKind "herdr": the terminal id fills
+	// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET; a hc
+	// terminal is reported with terminalKind "herdr": the terminal id fills
 	// herdrPane and the session name is parsed from the socket path. The
-	// daemon resolves labels from those ids exactly as for classic herdr.
+	// daemon resolves labels from those ids.
+	herdrSession := ""
+	herdrPane, herdrWorkspaceID, herdrTabID := "", "", ""
 	hcTerminalID := getenv("HC_TERMINAL_ID")
-	if hcTerminalID != "" && !inHerdr {
+	if hcTerminalID != "" {
 		herdrPane = hcTerminalID
 		if socket := getenv("HC_TERMINAL_SOCKET"); socket != "" {
 			herdrSession = hcSessionFromSocket(socket)
@@ -158,7 +145,7 @@ func resolveTerminalContext(getenv func(string) string, run func(string, []strin
 	switch {
 	case tmuxSession != "":
 		terminalKind = "tmux"
-	case inHerdr || hcTerminalID != "":
+	case hcTerminalID != "":
 		terminalKind = "herdr"
 	case getenv("ZELLIJ") != "" || zellijSession != "" || zellijPane != "":
 		terminalKind = "zellij"

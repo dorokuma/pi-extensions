@@ -66,42 +66,8 @@ func TestResolveTerminalContextTmuxProbeFailure(t *testing.T) {
 	}
 }
 
-func TestResolveTerminalContextHerdr(t *testing.T) {
-	context := resolveTerminalContext(envFunc(map[string]string{
-		"HERDR_ENV":           "1",
-		"HERDR_SESSION":       "main",
-		"HERDR_PANE_ID":       "pane-1",
-		"HERDR_WORKSPACE_ID":  "ws-9",
-		"HERDR_TAB_ID":        "tab-4",
-		"ZELLIJ_SESSION_NAME": "zellij-should-lose",
-	}), runFunc("", nil))
-
-	if context.TerminalKind != "herdr" {
-		t.Fatalf("TerminalKind = %q, want herdr (herdr wins over zellij)", context.TerminalKind)
-	}
-	if context.HerdrSession != "main" || context.HerdrPane != "pane-1" ||
-		context.HerdrWorkspaceID != "ws-9" || context.HerdrTabID != "tab-4" {
-		t.Fatalf("herdr ids = %+v", context)
-	}
-	// Labels are resolved daemon-side, so both stay empty.
-	if context.HerdrWorkspace != "" || context.HerdrTab != "" {
-		t.Fatalf("herdr labels = %q/%q, want empty", context.HerdrWorkspace, context.HerdrTab)
-	}
-}
-
-func TestResolveTerminalContextIgnoresHerdrIdsWithoutEnv(t *testing.T) {
-	context := resolveTerminalContext(envFunc(map[string]string{
-		"HERDR_PANE_ID": "pane-1",
-	}), runFunc("", nil))
-
-	if context.HerdrPane != "" || context.TerminalKind != "" {
-		t.Fatalf("herdr without HERDR_ENV = %+v, want empty", context)
-	}
-}
-
-// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET instead of the
-// HERDR_* variables; a pig session inside a hc terminal must still report a
-// herdr-shaped identity.
+// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET; a pig session
+// inside a hc terminal reports a herdr-shaped identity.
 func TestResolveTerminalContextHc(t *testing.T) {
 	context := resolveTerminalContext(envFunc(map[string]string{
 		"HC_TERMINAL_ID":     "t12t",

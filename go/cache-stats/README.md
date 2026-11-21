@@ -1,7 +1,7 @@
 # cache-stats（Go / PiG 移植）
 
 PiG 的**提示缓存观测扩展**：分别统计当前 run 与全会话的命中率，可选择显示 TUI
-页脚（herdsman 状态、双命中率菱形、上下文占用、模型），对每个模型首次返回
+页脚（双命中率菱形、上下文占用、模型），对每个模型首次返回
 400 时告警一次，并注册 `/cache-stats` 命令（`enable` / `disable` / `reset` / `prefix`）。
 默认模式是**只读观测**：不重写 system prompt，不改 provider payload；默认开启的前缀
 诊断只在本扩展自己的 `before_provider_request` hook 里比较 system/developer/
@@ -69,11 +69,11 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 226–317 | `computeLiveHitRates` | `usage.go:305` |
 | 228–266 | `cacheHitDenom` / `cacheHitPct` | `usage.go:185` / `usage.go:209`（另有 `…Numbers` 数值重载 `:203` / `:216`） |
 | 320–510 | 类型、`emptySnapshot`/`emptyLiveRun`、`randomSalt`、`createInstanceState`、`clearPrefixMemory`、`resetRunState`（TPS 计时戳与 `clearTurnTiming` 已于 v0.1.0 随 TPS 功能移除） | `state.go:141` `createInstanceState`；`:156` `clearPrefixMemory`（锁内体 `:162` `…Locked`）；`:169` `resetRunState`（`:175` `…Locked`）；`state.go:129` `randomSalt`；`state.go:124`/`:126` `emptySnapshot`/`emptyLiveRun` |
-| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey`、`sheepMeat`、`formatHerdsmanStatus` | `footer.go:19` 图标常量；`extension.go:204` `isEnabled`；`format.go:71` `sheepMeat`；`format.go:79` `formatHerdsmanStatus` |
+| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey` | `footer.go:19` 图标常量；`extension.go:204` `isEnabled`；`modelKey` 的宿主等价物 `extension.go:742` `safeModelIdentity`（TS 同段的外部状态渲染助手已随该页脚段移除，Go 侧不再存在，见 CHANGELOG Breaking Changes） |
 | 535–560 | `readFooterCtx` | `state.go:201`（入参 `footerReadInput` 由 `extension.go:533` `captureFooterInput` 从 `sdk.Context` 采集） |
 | 562–571 | `refreshFooter` | `state.go:235` |
 | 573–611 | `recordTurnUsage` | `state.go:248` |
-| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:855` / `extension.go:803`；渲染体 `footer.go:161` `footerRender`，快照 `footer.go:85` `captureFooterSnapshot`（缓存键 `footer.go:43` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:781` `footerRendererHook`（宿主输入安全读取 `extension.go:825` `footerUIInputs`） |
+| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:844` / `extension.go:803`；渲染体 `footer.go:162` `footerRender`（只剩双命中率菱形、上下文占用、模型三段），快照 `footer.go:86` `captureFooterSnapshot`（缓存键 `footer.go:44` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:781` `footerRendererHook`（宿主输入安全读取 `extension.go:825` `footerUITheme`） |
 | 705–877 | 前缀类型、`emptyBudget`、`section`、`fingerprint`、`escapeForNotify`、读取与预算原语 | `prefix.go:188` `fingerprint`（`padHex8` `:219` / `padInt32Hex8` `:235`）；`:246` `escapeForNotify`；`:273` `chargeChars`；`:290` `chargeString`；`:294` `bumpNodes` |
 | 879–1037 | `hashValue`、`writeValue`、`extractPlainText`、`textToSection` | `prefix.go:320` / `:331` / `:461` / `:544` |
 | 1039–1198 | `collectRoleBag`、`detectShape`、`toolsSection`、标签扇描、extras | `prefix.go:578` / `:676` / `:711` / `:765` `scanUniqueTaggedBlock` / `:825` `extraFromSystemText` |
@@ -81,7 +81,7 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 1562–1680 | `formatSection`、`prefixStatsLine`、`showPrefix` | `prefix.go:1166` / `:1192` / `:1205` `prefixLines` |
 | 1682–2074 | `Extension()` 工厂与 **10 个事件订阅**、`/cache-stats` | `extension.go:54` `Extension`；`before_provider_request` 仅前缀诊断（`state.go:290` `observePrefixDiagnostics`，scope 采集 `extension.go:563` `captureScopeIdentity`）；`agent_end` `extension.go:215` `applyAgentEnd`；`turn_end` `extension.go:284` `applyTurnEndEvent`；命令 `extension.go:301` `handleCommand` |
 | 2060–2131 | `readSessionAggregate`、`showStats` | `extension.go:400` `sessionAggregateOf`；`extension.go:417` `statsLines` |
-| 700–810 | `computeTurnTps`、`toStamp`、`formatTps`（TPS 估算器与格式化器） | **已于 v0.1.0 移除**：TPS 页脚段、计时戳、估算器连同 `tps.go` / `tps_test.go` 整体删除；`truncateFooter` 迁至 `format.go`，`formatWindowSize` 在 `format.go:36`，`extractAndNormalizeUsage` 仍在 `usage.go:336` |
+| 700–810 | `computeTurnTps`、`toStamp`、`formatTps`（TPS 估算器与格式化器） | **已于 v0.1.0 移除**：TPS 页脚段、计时戳、估算器连同 `tps.go` / `tps_test.go` 整体删除；`truncateFooter` 迁至 `format.go:84`，`formatWindowSize` 在 `format.go:37`，`extractAndNormalizeUsage` 仍在 `usage.go:336`。此后页脚的外部扩展状态段亦随其宿主扩展退役移除：`footerRender` 不再消费 `ExtensionStatuses`，相应格式化助手与 `safeExtensionStatuses` 一并删除，`footerUIInputs` 收窄为 `footerUITheme`（旧→新映射见 CHANGELOG [Unreleased] Breaking Changes） |
 | 812–856 | `extractAndNormalizeUsage` | `usage.go:336`（回写在 `usage.go:379`） |
 
 **事件订阅数 = 10**（`grep -c OnEvent extension.go` → 10）：`before_provider_request`、
@@ -96,7 +96,7 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 
 | 原版文件 | Go 测试 |
 |---|---|
-| `test/hit-rate.mjs` §1–6、§8、§9、§10；§7 页脚格式化 | `usage_test.go`：`TestHitRateDenominatorAndPercent`、`TestAggregateHitOverTurns`、`TestNormalizeUsageOpenAIStyles`、`TestNormalizeUsageReasoningAndTotals`、`TestComputeLiveHitRates*`、`TestFormatWindowSize`、`TestFormatHerdsmanStatus` |
+| `test/hit-rate.mjs` §1–6、§8、§9、§10；§7 页脚格式化 | `usage_test.go`：`TestHitRateDenominatorAndPercent`、`TestAggregateHitOverTurns`、`TestNormalizeUsageOpenAIStyles`、`TestNormalizeUsageReasoningAndTotals`、`TestComputeLiveHitRates*`、`TestFormatWindowSize`、`TestStripProvider`（原页脚状态段格式化测试随该段移除） |
 | `test/cache-stats.mjs` 命中率/turn/页脚各段 | `lifecycle_test.go`（agent_end 记账、回填、有界报告、双 scope、reset 口径、400 列表）、`footer_test.go`（双菱形门控、watermark、dirty-check、上下文配色、段序、截断）。TPS 段随功能移除，不再翻成 Go 测试 |
 | `test/prefix-diagnostics.mjs` | `prefix_test.go`：`TestPrefixBaselineStableChangedPerShape`、`TestPrefixShapeFromStructureNotVendor`、`TestPrefixUnknownAndMissingShapes`、`TestPrefixOutputNeverLeaksContent` |
 | `test/prefix-r9-accessors.mjs`、`prefix-r9-budget.mjs`、`prefix-r9-endpoint.mjs` | `TestPrefixBudgetGuards`、`TestPrefixWalkerGuards`、`TestPrefixScopeIsolation`、`TestPrefixScopeMissingFieldsSkip`、`TestPrefixEvictionIsBounded` |
@@ -196,25 +196,25 @@ standalone module root 报错。说明：非交互模式下 `-p` 不会分发 `/
 
 | 分类 | 文件 | 行数 |
 |---|---|---|
-| 实现 | `extension.go` | 864 |
-| 实现 | `footer.go` | 230 |
+| 实现 | `extension.go` | 853 |
+| 实现 | `footer.go` | 221 |
 | 实现 | `prefix.go` | 1250 |
 | 实现 | `state.go` | 339 |
-| 实现 | `format.go` | 185 |
+| 实现 | `format.go` | 149 |
 | 实现 | `usage.go` | 470 |
 | 实现 | `values.go` | 101 |
-| **实现小计** | 7 个文件 | **3439** |
+| **实现小计** | 7 个文件 | **3383** |
 | 测试 | `concurrency_test.go` | 699 |
-| 测试 | `footer_test.go` | 241 |
+| 测试 | `footer_test.go` | 231 |
 | 测试 | `harness_test.go` | 218 |
 | 测试 | `lifecycle_test.go` | 352 |
 | 测试 | `prefix_test.go` | 967 |
 | 测试 | `format_test.go` | 89 |
-| 测试 | `usage_test.go` | 449 |
-| **测试小计** | 7 个文件 | **3015** |
-| **合计** | 14 个文件 | **6454** |
+| 测试 | `usage_test.go` | 420 |
+| **测试小计** | 7 个文件 | **2976** |
+| **合计** | 14 个文件 | **6359** |
 
-测试/实现比约 3015 / 3439 ≈ 0.88。
+测试/实现比约 2976 / 3383 ≈ 0.88。
 
 ## 遗留
 

@@ -187,12 +187,18 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
    供测试重置。这些是 TS 没有的测试面，不改变线上行为。
 9. **`/run/user/<uid>` 探测**（socket.go:63）
    TS 在 `XDG_RUNTIME_DIR` 为空时直接落 `/tmp`；Go 版在中间多探一步
-   `/run/user/<uid>/moshi-hook.sock`（systemd-user 默认位置），文件存在才用——herdr
-   pane 里拉起的 hook 子进程常拿不到 `XDG_RUNTIME_DIR`，缺这一步会让 envelope 静默丢失。
+   `/run/user/<uid>/moshi-hook.sock`（systemd-user 默认位置），文件存在才用——多路终端
+   里拉起的 hook 子进程常拿不到 `XDG_RUNTIME_DIR`，缺这一步会让 envelope 静默丢失。
    文件不存在时行为与 TS 完全一致（落 `/tmp`）。
 10. **测试专用注入缝**：`resolveTerminalContext(getenv, run)` 与 `newSender(sockPath, deliver, timeout)`
    把进程/环境/网络依赖注入化，便于无 socket 单测（TS 无对应物）。
-11. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
+12. **终端检测收敛为 hc 形状**（terminal.go:84）
+   TS 的经典 herdr 环境检测（`HERDR_ENV` / `HERDR_SESSION` 等 `HERDR_*` 系列变量）
+   已随经典 herdr 移除：Go 版只认 herdr-core（hc）变量
+   `herdrPane` 填终端 id，`herdrSession` 从 socket 路径的 `<session>.sock` 基名解析；
+   `herdrWorkspaceId` / `herdrTabId` 不再从环境读取，恒为空（label 由守护进程按 id 解析）。
+   tmux 探到 session 仍压过 hc，`ZELLIJ*` 变量与 `muxEnv` 原样保留。
+13. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
 
 ## 4. 文件布局
 
@@ -200,7 +206,7 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
 |---|---|
 | `envelope.go` | `Envelope`/`InteractivePrompt`/`Question`/`QuestionOption` 线格式 |
 | `socket.go` | `ResolveSocketPath`、`deliverEnvelope`、`Sender`（保序队列 + `Flush`）、全局 sender |
-| `terminal.go` | `TerminalContext` 探测（tmux/zellij/herdr/muxEnv）、项目名 |
+| `terminal.go` | `TerminalContext` 探测（tmux/zellij/herdr-core/muxEnv）、项目名 |
 | `text.go` | 文本清洗（markdown/截断/user_query）、`planSummary`、`newSessionID` |
 | `state.go` | `SessionState`、lineage 判定、`baseEnvelope`、`handleEvent`、`askQuestions`、`planFileOnDisk` |
 | `extension.go` | 宿主取值适配（`safeCwd` 等）、`Send`、`Extension()` 的 6 个钩子 |
@@ -221,8 +227,9 @@ go test -count=1 -race -v ./...            # 全绿，无 DATA RACE
   （含 rune 而非字节）、`plainTextClip`、`displayUserPrompt`（`<user_query>` 大小写不敏感、
   skill/image/system-reminder 剥离）、`formatUserPromptDetail`（200 rune + `You: ` 前缀）、
   `planSummary`、`firstString`、`textFromMessage`、`modelLabel`、`newSessionID`、`jsTrim`。
-- **终端上下文**：tmux（探测命令与参数、`#S\t#I` 解析、失败回落）、herdr（含压过 zellij、
-  缺 `HERDR_ENV` 时忽略 id、label 留空）、zellij（session/pane/`ZELLIJ` 单独命中）、`muxEnv`
+- **终端上下文**：tmux（探测命令与参数、`#S\t#I` 解析、失败回落）、herdr-core
+  （`HC_TERMINAL_ID`/`HC_TERMINAL_SOCKET` → `terminalKind=\"herdr\"`、session 从 socket 基名解析、
+  label 留空、tmux 优先于 hc）、zellij（session/pane/`ZELLIJ` 单独命中）、`muxEnv`
   取非空键、`tmuxSocketFromEnv`（无逗号/逗号在首位）、`projectNameFromCwd`、
   `projectNameForCwd` 优先级、进程级缓存与重置。
 - **socket**：路径优先级三档；保序投递；**同一时刻只有一个投递在跑**；`Flush` 等队列；
@@ -263,8 +270,8 @@ capture 端收到的 4 条连接（原文，仅换行折行）：
 {"type":"session.update","source":"pi","sessionId":"01a16e92-5d69-…","eventName":"SessionStart",
  "cwd":"/root/workspace/pi-extensions/go","projectName":"go","terminalKind":"herdr","muxEnv":{},
  "tmuxSession":"","tmuxWindow":"","tmuxPane":"","tmuxSocket":"","zellijSession":"","zellijPane":"",
- "herdrSession":"","herdrPane":"w37:p2D","herdrWorkspaceId":"w37","herdrWorkspace":"",
- "herdrTabId":"w37:t2D","herdrTab":"","modelName":"智能路由",
+ "herdrSession":"default","herdrPane":"t12t","herdrWorkspaceId":"","herdrWorkspace":"",
+ "herdrTabId":"","herdrTab":"","modelName":"智能路由",
  "transcriptPath":"/root/.pig-test/agent/sessions/…/2026-10-24T15-40-48-362Z_01a16e92-….jsonl",
  "requestedAt":"2026-10-24T15:40:48.366Z","contextRemaining":100}
 --- connection 2 (763 bytes) ---
@@ -286,8 +293,9 @@ capture 端收到的 4 条连接（原文，仅换行折行）：
   `task_complete`，title 为 `OK`；
 - 连接 4 是 `session_shutdown` → `session.closed` + `session_ended`，且在进程退出前送达
   （`FlushSends` 生效，否则这条会丢）；
-- `terminalKind:"herdr"` 与 `herdrPane/herdrWorkspaceId/herdrTabId` 来自当前 pane 的真实环境，
-  `muxEnv` 为空对象（本 pane 无 tern/TUIOS 变量），与 TS 的字段形态一致。
+- `terminalKind:"herdr"` 与 `herdrPane/herdrSession` 来自 hc 环境（`HC_TERMINAL_ID=t12t` +
+  `HC_TERMINAL_SOCKET=…/default.sock`）；`herdrWorkspaceId/herdrTabId` 恒为空由守护进程解析，
+  `muxEnv` 为空对象（本终端无 tern/TUIOS 变量），与 TS 的字段形态一致。
 
 capture 进程与日志在实测后已清理（`/tmp/moshi-capture/`），不留在仓库里。
 

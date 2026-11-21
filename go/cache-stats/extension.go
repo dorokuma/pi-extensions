@@ -2,8 +2,8 @@
 // Go extension SDK.
 //
 // The extension observes prompt caching: it keeps per-run and all-session
-// cache hit rates, renders an optional TUI footer (herdsman status, dual
-// hit-rate diamonds, context occupancy, model), warns once per model
+// cache hit rates, renders an optional TUI footer (dual hit-rate diamonds,
+// context occupancy, model), warns once per model
 // that answered 400, and exposes /cache-stats with enable / disable / reset /
 // prefix subcommands. It never rewrites a system prompt or a provider payload:
 // the default mode is safe observation, and by default it also compares the
@@ -802,8 +802,8 @@ func footerRendererHook(state *instanceState, ctx sdk.Context, render func(width
 // refreshFooter itself never calls it under mu either.
 func installFooter(ctx sdk.Context, state *instanceState) {
 	render := func(width int) []string {
-		theme, statuses := footerUIInputs(ctx)
-		return []string{footerRender(state, theme, statuses, width)}
+		theme := footerUITheme(ctx)
+		return []string{footerRender(state, theme, width)}
 	}
 	refresh := func(bool) { _ = footerRendererHook(state, ctx, render) }
 	state.mu.Lock()
@@ -813,17 +813,17 @@ func installFooter(ctx sdk.Context, state *instanceState) {
 	_ = footerRendererHook(state, ctx, render)
 }
 
-// footerUIInputs reads the two host-provided inputs the renderer needs: the
-// active theme (ctx.UITheme()) and the extension statuses
-// (ctx.FooterData().ExtensionStatuses()). Both reach into the SDK host handle,
-// so on a zero sdk.Context they panic on the nil host instead of answering; the
-// renderer then falls back to unstyled text and no statuses, which is exactly
-// what a host without a theme renders. Keeping the read here -- rather than
-// inline in the closure -- means the production renderer always reaches
-// footerRender, and therefore always takes instanceState.mu through
-// captureFooterSnapshot, no matter how small the ctx it was handed.
-func footerUIInputs(ctx sdk.Context) (theme themeStyler, statuses map[string]string) {
-	return uiTheme{theme: safeUITheme(ctx)}, safeExtensionStatuses(ctx)
+// footerUITheme reads the one host-provided input the renderer needs: the
+// active theme (ctx.UITheme()). It reaches into the SDK host handle, so on a
+// zero sdk.Context it panics on the nil host instead of answering; the
+// renderer then falls back to unstyled text, which is exactly what a host
+// without a theme renders. Keeping the read here -- rather than inline in the
+// closure -- means the production renderer always reaches footerRender, and
+// therefore always takes instanceState.mu through captureFooterSnapshot, no
+// matter how small the ctx it was handed. The extension-statuses input went
+// away with the retired herdsman/shepherd segment.
+func footerUITheme(ctx sdk.Context) themeStyler {
+	return uiTheme{theme: safeUITheme(ctx)}
 }
 
 // safeUITheme reads ctx.UITheme(), yielding the zero sdk.UITheme when the host
@@ -835,17 +835,6 @@ func safeUITheme(ctx sdk.Context) (value sdk.UITheme) {
 		}
 	}()
 	return ctx.UITheme()
-}
-
-// safeExtensionStatuses reads ctx.FooterData().ExtensionStatuses(), yielding no
-// statuses when the host cannot answer.
-func safeExtensionStatuses(ctx sdk.Context) (statuses map[string]string) {
-	defer func() {
-		if recover() != nil {
-			statuses = nil
-		}
-	}()
-	return ctx.FooterData().ExtensionStatuses()
 }
 
 // uninstallFooter restores the built-in footer and clears the captured footer

@@ -144,7 +144,7 @@ func TestFooterRenderConcurrentWithLifecycle(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for n := 0; n < iterations; n++ {
-				line := footerRender(state, plainTheme{}, map[string]string{"herdsman": "◆ Herdsman"}, 120)
+				line := footerRender(state, plainTheme{}, 120)
 				if line == "" {
 					t.Errorf("footerRender produced an empty line")
 					return
@@ -247,7 +247,7 @@ func TestFooterRefreshNotCalledUnderLock(t *testing.T) {
 	// footerRefresh stands in for ctx.SetFooterRenderer: the SDK renders
 	// synchronously inside the call, so the callback reads the state.
 	state.footerRefresh = func(bool) {
-		_ = footerRender(state, plainTheme{}, map[string]string{}, 120)
+		_ = footerRender(state, plainTheme{}, 120)
 	}
 
 	done := make(chan struct{})
@@ -284,7 +284,7 @@ func TestInstallFooterDoesNotDeadlock(t *testing.T) {
 			state.mu.Lock()
 			state.footerModelName = fmt.Sprintf("install-%d", i)
 			state.mu.Unlock()
-			_ = footerRender(state, plainTheme{}, map[string]string{}, 80)
+			_ = footerRender(state, plainTheme{}, 80)
 			state.mu.Lock()
 			state.footerHitCache = nil
 			state.mu.Unlock()
@@ -358,7 +358,7 @@ func TestFooterHitCacheNotWrittenAcrossReset(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		blockedRender <- footerRender(state, plainTheme{}, map[string]string{}, 120)
+		blockedRender <- footerRender(state, plainTheme{}, 120)
 	}()
 
 	<-readStarted
@@ -418,7 +418,7 @@ func TestFooterHitCacheNotWrittenAcrossReset(t *testing.T) {
 	// The next render sees the post-reset state with no live source, so it
 	// still falls back to the post-reset snapshot (25%), not the stale 50%
 	// the entries in hand would have produced.
-	line := footerRender(state, plainTheme{}, map[string]string{}, 120)
+	line := footerRender(state, plainTheme{}, 120)
 	if !strings.Contains(line, "◆ 25%") || !strings.Contains(line, "◇ n/a") {
 		t.Fatalf("the reset must clear the live hit rates in favour of the new snapshot, got %q", line)
 	}
@@ -443,7 +443,7 @@ func TestFooterHitCacheStillWrittenWithoutReset(t *testing.T) {
 	entries := []any{assistantEntry(usageMap("input", 500, "cacheRead", 500, "cacheWrite", 0))}
 	footerEntries(state, func() ([]any, bool) { return entries, true })
 
-	line := footerRender(state, plainTheme{}, map[string]string{}, 120)
+	line := footerRender(state, plainTheme{}, 120)
 	if !strings.Contains(line, "◆ 50%") {
 		t.Fatalf("footer = %q, want a live 50%% hit rate", line)
 	}

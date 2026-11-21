@@ -410,36 +410,7 @@ func TestFormatWindowSize(t *testing.T) {
 	}
 }
 
-func TestFormatHerdsmanStatus(t *testing.T) {
-	up := map[string]string{
-		"◆ Herdsman · 1 agent update":  "1 Up",
-		"◆ Herdsman · 2 agent updates": "2 Up",
-		"◆ Herdsman · 3 agent updates": "3 Up",
-		"Shepherd · 2 agent updates":   "2 Up",
-		"1 agent update":               "1 Up",
-		"2 updates":                    "2 Up",
-		"1 UP":                         "1 Up",
-		"5":                            "5 Up",
-	}
-	for input, want := range up {
-		value := input
-		requireOptionalString(t, input, formatHerdsmanStatus(&value), strPtr(want))
-	}
-	for _, input := range []string{"◆ Herdsman", "Herdsman", "◇ Herdsman · reconnecting", "Shepherd"} {
-		value := input
-		requireOptionalString(t, input, formatHerdsmanStatus(&value), strPtr("On"))
-	}
-	for _, input := range []string{"", "   "} {
-		value := input
-		requireOptionalString(t, input, formatHerdsmanStatus(&value), nil)
-	}
-	requireOptionalString(t, "undefined", formatHerdsmanStatus(nil), nil)
-}
-
-func TestFormatHerdsmanStatusRaw(t *testing.T) {
-	if got := sheepMeat("◆ Herdsman · 1 agent update"); got != "1 agent update" {
-		t.Fatalf("sheepMeat = %q", got)
-	}
+func TestStripProvider(t *testing.T) {
 	if got := stripProvider("GPT-4o (OpenAI)"); got != "GPT-4o" {
 		t.Fatalf("stripProvider = %q", got)
 	}

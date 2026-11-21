@@ -10,6 +10,19 @@
   `make build`/`make vet`/`make test` loop; run `go build/vet/test ./...`
   inside this directory manually if needed. No code change.
 
+### Removed
+
+- Classic `HERDR_*` environment probing in `resolveTerminalContext`
+  (`terminal.go`): `HERDR_ENV` / `HERDR_SESSION` / `HERDR_PANE_ID` /
+  `HERDR_WORKSPACE_ID` / `HERDR_TAB_ID` are no longer read; only the
+  herdr-core (`hc`) variables `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` produce a
+  `terminalKind="herdr"` context. `herdrWorkspaceId` / `herdrTabId` are now
+  always empty (labels resolved daemon-side).
+
+> **Note**: this module is retired (see `RETIRED_COMPONENTS` in
+> `go/Makefile`); the entry above is recorded for completeness and no new
+> version will be published.
+
 ## [0.1.0] - 2026-11-10
 
 首次正式发布。Go port of the `moshi-hooks.ts` Pi extension: normalizes Pi
