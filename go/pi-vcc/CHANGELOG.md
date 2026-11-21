@@ -22,7 +22,7 @@
 - **摘要小节构成（0.11.1 起，0.11.2 未变）**：`[Early Session Requests]`（本会话前 3 条用户
   消息）、`[Files And Changes]`（Modified/Created/Read 各最新 10 个）、`[Commits]`（最多 8 行
   去重）、`[Tracked Commands]`（按 `trackCommands` 分类）、`[User Messages]`（最新 15 条用户
-  原话）；`injected` 消息只进 brief 不进这两节。
+  原话）；`injected` 消息只进 brief，不进 `[Early Session Requests]` 与 `[User Messages]` 两节。
 - **上游 0.11.2 三项召回护栏（`2eb4e7e`）**：单条召回结果硬顶 50 KB（`RecallOutputChars`，
   `capOutput` 高代理对安全切割 + `Warning: output clipped` 头注 + `[clipped at 50 KB]` 尾注）；
   搜索摘要单行裁 300 字符窗口（`clipLine`/`snippetLineChars`）；搜索与 BM25 语料跳过
@@ -41,10 +41,10 @@
     `PIG_EXT_HOST_INFO.agentDir` → `$PI_CODING_AGENT_DIR` → `$PIG_CODING_AGENT_DIR` →
     `$PIG_HOME/agent` → `~/.pig/agent`，**绝不回退 `~/.pi`**；`SettingsPath` 另认
     `$PI_VCC_CONFIG_PATH` 显式覆盖；
-  - `globalIndexFor` 会话树异常时 `recover` 回退空表（`b287a63`），recall 不再 panic；
+  - `globalIndexFor` 会话树异常时 `recover` 回退空表（`b287a63`），`session_before_compact` 生成摘要 `#N` 索引时不再 panic；
   - 每扩展独立状态（`extstate.go` `extensionStates` 按 `*sdk.Extension` 取键）与 JS 语义适配层
-    （UTF-16 码位长度/切片、RE2 复刻 JS RegExp 语义、`toFixed` half-away-from-zero、
-    `setTimeout(0)` → `time.AfterFunc` + `recover`）。
+    （UTF-16 码位长度/切片、RE2 复刻 JS RegExp 语义、`toFixed` 经 `strconv.FormatFloat`
+    实现［IEEE-754 round-half-to-even］、`setTimeout(0)` → `time.AfterFunc` + `recover`）。
 - **上游对等测试**：与上游 `tests/recall-output-cap.test.ts` 对等的 Go 用例（BM25 排序不受
   Base64 blob 扰乱、长连写标识符可检索、600 KB 单行 expand 截断端到端），连同既有护栏测试
   与 `context_edit`/`agentDir`/`recover` 的钉住测试。
@@ -57,7 +57,7 @@
 - **未跟进的上游未合入 PR**：`#41`（postTokensEst）、`#61`、`#62`（compact_context）、`#65`、
   `#66`（summarizeBranches）均未移植；若上游后续合并，需另起同步批次。
 - **用户消息词数为 UAX#29 近似**（差异 D3）：Go 无 ICU 词典，Han 连续段按 `ceil(n/2)` 计、
-  已知仅两处短中文与一处长句与 `Intl.Segmenter` 实测分歧；词数只决定「是否满两个词」，
+  已知仅三处二字中文短回复（`走吧`/`是的`/`没事`）与一处长句与 `Intl.Segmenter` 实测分歧；词数只决定「是否满两个词」，
   不影响实质消息去留。
 - **`sortedKeys` 改排序键**：Go map 无插入序，工具参数名输出顺序与 TS `Object.keys` 不同，
   属已记录的有意偏差；完整差异清单见 `go/reports/batch-4-pi-vcc.md` §10 及模块 README。
