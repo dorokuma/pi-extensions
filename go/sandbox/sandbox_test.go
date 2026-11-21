@@ -1057,6 +1057,17 @@ func TestReviewerAgentPreset(t *testing.T) {
 		t.Fatalf("mkdir repo: %v", err)
 	}
 
+	// 确定性 claude 桩放入独立临时 PATH，确保无宿主 claude 时仍无条件实跑断言。
+	stubBin := filepath.Join(tmp, "stub-bin")
+	if err := os.MkdirAll(stubBin, 0o755); err != nil {
+		t.Fatalf("mkdir stub-bin: %v", err)
+	}
+	stubClaude := filepath.Join(stubBin, "claude")
+	if err := os.WriteFile(stubClaude, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write stub claude: %v", err)
+	}
+	t.Setenv("PATH", stubBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	policy := sandbox.ReviewerAgent(workDir)
 	t.Cleanup(func() {
 		cleanupReviewerTempDirs(policy)
@@ -1066,17 +1077,13 @@ func TestReviewerAgentPreset(t *testing.T) {
 		t.Fatalf("ReviewerAgent Validate failed: %v", err)
 	}
 	if len(policy.EntryAgents) == 0 {
-		t.Fatal("expected EntryAgents to be populated when agy/pig exist on host")
+		t.Fatal("expected EntryAgents to be populated")
 	}
 
 	// EntryAgents 白名单必须含 claude（含符号链接解析后的真实路径），
 	// 但 dispatch-agent 仍不得在列——嵌套派发刻意保持禁止（无条件断言）。
-	// claude 断言依赖宿主真实存在 claude，否则跳过。
 	if sandbox.IsEntryAgentPath(policy.EntryAgents, "dispatch-agent") {
 		t.Fatalf("dispatch-agent must stay out of EntryAgents, got %v", policy.EntryAgents)
-	}
-	if _, err := exec.LookPath("claude"); err != nil {
-		t.Skipf("claude not installed on host (LookPath: %v), skipping claude EntryAgents assertion", err)
 	}
 	if !sandbox.IsEntryAgentPath(policy.EntryAgents, "claude") {
 		t.Fatalf("expected claude in EntryAgents, got %v", policy.EntryAgents)

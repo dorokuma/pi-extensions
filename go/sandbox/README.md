@@ -105,7 +105,7 @@ PID 1 启动），在 `sandbox.Apply` 之前完成全部隔离步骤：
 
 隔离完成后 `sbx` 本体不直接 `exec` 业务命令，而是担任**轻量 PID 1 init**：派生目标命令并向它转发信号（其实际 PID 不固定为 2——`sandbox.Apply` 会先派生 helper 辅助进程；信号经 `kill(目标子进程 PID, sig)` 送达）、以 `Wait4(-1, WNOHANG)` 循环回收孤儿僵尸进程（业务进程若为 PID 1 会忽略默认未捕获信号且无人收尸）；目标子进程退出即返回其退出码/`128+信号`，PID 1 退出后内核自动清理命名空间内残余进程。**信号转发分两层口径**：CLI 外层 `sbx` 父进程仅监听并转发 `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` 共 4 种；容器内 PID-1 init 监听 `SIGCHLD`/`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH` 共 8 种——其中 `SIGCHLD` 仅用于唤醒 `Wait4` 收尸不转发，其余 7 种转发给目标子进程。
 
-同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。**退出码口径**：父进程派生子进程失败（`unshare` 不被支持/权限不足等）严格模式退 `126`，`--best-effort` 下告警回退不 unshare（跳过全部覆盖与挂载锁，绝不动宿主命名空间）；子进程内任一挂载/封锁步骤失败默认退 `1` 拒绝启动，`--best-effort` 下仅告警继续。已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `report.sock`。
+同时从环境剔除全部 `HC_` 前缀变量（保留 `HC_TERMINAL_ID`）、`GPG_AGENT_INFO`、`SSH_AUTH_SOCK`、`DBUS_SESSION_BUS_ADDRESS` 与宿主 `XDG_RUNTIME_DIR`（`--env` 显式传入同样剔除；预设注入的私有 `XDG_RUNTIME_DIR` 不受影响）。`GOROOT` 对宿主继承环境一律剔除（防宿主 toolchain module 缓存污染）；预设模式（`--preset reviewer` / `reviewer-agent`）下同时剔除 `--env GOROOT=...` 以保护预设回钉的受信根，无预设自定义模式下允许调用方通过 `--env GOROOT=...` 显式指定自定义 Go 工具树。**退出码口径**：父进程派生子进程失败（`unshare` 不被支持/权限不足等）严格模式退 `126`，`--best-effort` 下告警回退不 unshare（跳过全部覆盖与挂载锁，绝不动宿主命名空间）；子进程内任一挂载/封锁步骤失败默认退 `1` 拒绝启动，`--best-effort` 下仅告警继续。已知边界（按设计保持可达）：`/root/.herdsman/herdsman.sock`（herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr 状态上报）、goExecDir 内 `report.sock`。
 
 ## 受控发布 `scripts/deploy.sh`
 

@@ -1,7 +1,7 @@
 ---
 date: 2026-11-10
 module: go/sandbox
-status: active
+status: closed
 ---
 
 # sbx trusted-agent-homes 测试覆盖静默 SKIP 观察项（2026-11-10）
@@ -89,3 +89,9 @@ oracle 观察项，当前不阻断。后续可考虑：
 但该偏斜窗口因 dispatch-agent 先行部署已在上线前消弭，本分支合入后
 两侧口径即对齐。教训：跨仓同一校验口径变更须核对两侧部署顺序，先发
 的仓库决定偏斜窗口方向。
+
+## 终态收口（2026-11-21，fix/sbx-hygiene-and-notes）
+
+- 残余两处宿主环境依赖的 `t.Skip` 已全部消除，本笔记状态关闭：
+  - `go/sandbox/preset_test.go` `TestAppendAgyStateReadWriteMarksRootFilesOptional`：改用隔离 `t.Setenv("HOME", t.TempDir())` 构造确定性 `.gemini/antigravity-cli` 状态根夹具，不再触碰宿主真实目录，不再因宿主缺失状态根而 `t.Skip`。
+  - `go/sandbox/sandbox_test.go` `TestReviewerAgentPreset`：在临时目录写入可执行 `claude` 桩并前置 `PATH`，无条件断言 `claude` 进入 `EntryAgents`，移除 `exec.LookPath("claude")` 触发的 `t.Skipf`。

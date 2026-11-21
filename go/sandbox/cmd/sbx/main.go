@@ -193,10 +193,13 @@ func parseArgs(args []string) (cliConfig, error) {
 // Policy.Env 回钉的受信 GOROOT 根）不属于外部指针——剥离只作用于
 // cfg.Env 与宿主继承，不动 Policy.Env 注入，故受信注入不受影响。
 //
-// GOROOT 全剥离（方案 B）：宿主 os.Environ() 携带的 toolchain module
-// 缓存 GOROOT 与调用方 --env GOROOT=<伪根> 一律剔除——否则其经
-// mergeEnv 覆盖 ReadOnlyReviewer 注入的受信根，把沙盒内 go 的
-// <GOROOT>/pkg/tool 指到不可信根。
+// GOROOT 边界（按预设门控 + 宿主剥离）：宿主 os.Environ() 携带的 toolchain
+// module 缓存 GOROOT 一律经 sandboxHostStripExtraKeys 剔除；预设模式
+// （cfg.Preset != ""）下 buildPolicy 额外剔除 --env GOROOT=<伪根>，防止其
+// 经 mergeEnv 覆盖 ReadOnlyReviewer 注入的受信根（把沙盒内 go 的
+// <GOROOT>/pkg/tool 指到不可信根）。无预设自定义 CLI 模式（cfg.Preset == ""）
+// 下调用方显式构造全部白名单，无预设受信 GOROOT 可被覆盖，故允许显式
+// --env GOROOT=<自定义根> 生效。
 //
 // PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 不入本集合：仅对宿主
 // os.Environ() 经 sandboxHostStripExtraKeys 追加剔除（--env 显式声明
@@ -206,18 +209,20 @@ var sandboxEnvStripKeys = map[string]bool{
 	"SSH_AUTH_SOCK":              true,
 	"DBUS_SESSION_BUS_ADDRESS":   true,
 	"XDG_RUNTIME_DIR":            true,
-	"GOROOT":                     true,
 	"PI_SANDBOX_INTERNAL_MODE":   true,
 	"PI_SANDBOX_HELPER_CFG":      true,
 	"PI_SANDBOX_PRESET_TMP_DIRS": true,
 }
 
-// sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：宿主
-// 残留的 PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR 属外部指针——pig 包装器
-// 后置 export PIG_USE_PI_DIRS=1 会激活宿主 PI_* 目录，仅删 policy.Env 侧
-// 同名键而保留 os.Environ() 中的宿主值，会让宿主 PIG_USE_PI_DIRS=1 /
-// PI_CODING_AGENT_DIR 直接进入最终目标 env（N2）。
+// sandboxHostStripExtraKeys 是仅对宿主 os.Environ() 追加剔除的键：
+//   - GOROOT：宿主 toolchain module 缓存等残留 GOROOT 不得渗入沙盒；
+//     预设模式下另在 buildPolicy 中剔除 --env GOROOT，无预设模式允许显式 --env GOROOT。
+//   - PIG_USE_PI_DIRS / PI_CODING_AGENT_DIR：属外部指针——pig 包装器
+//     后置 export PIG_USE_PI_DIRS=1 会激活宿主 PI_* 目录，仅删 policy.Env 侧
+//     同名键而保留 os.Environ() 中的宿主值，会让宿主 PIG_USE_PI_DIRS=1 /
+//     PI_CODING_AGENT_DIR 直接进入最终目标 env（N2）。
 var sandboxHostStripExtraKeys = map[string]bool{
+	"GOROOT":              true,
 	"PIG_USE_PI_DIRS":     true,
 	"PI_CODING_AGENT_DIR": true,
 }
@@ -284,6 +289,9 @@ func buildPolicy(cfg cliConfig) (sandbox.Policy, error) {
 	// TMPDIR 重新 filepath.Join 重建私有目录身份。
 	var agentFact reviewerAgentDirFact
 	if cfg.Preset != "" {
+		// 预设模式下剥离调用方 --env GOROOT，防止覆盖预设回钉的受信 GOROOT
+		//（无预设自定义模式允许显式 --env GOROOT，宿主继承仍经 stripHostEnv 剔除）。
+		cfg.Env = removeEnvKey(cfg.Env, "GOROOT")
 		switch cfg.Preset {
 		case "reviewer", "read-only-reviewer":
 			wd := cfg.WorkDir

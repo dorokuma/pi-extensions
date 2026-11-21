@@ -247,7 +247,7 @@ type pathRuleEntry struct {
 	// 打开失败时容忍 ENOENT/ENOTDIR/EACCES。
 	optional bool
 	// transient 仅对 Policy.OptionalReadWrite 登记的瞬态状态文件生效：
-	// 打开返回 ENOENT（含悬空软链/快照枚举后被宿主删除）时安全跳过；
+	// 打开返回 ENOENT（快照枚举后被宿主删除或中间路径缺失）时安全跳过；
 	// 不授予任何额外权限，也绝不放宽普通 ReadWrite 条目的 fail-closed 语义。
 	transient bool
 }
@@ -501,7 +501,7 @@ func addPathRule(rulesetFD int, path string, access uint64, abi int, optional, t
 	if err != nil {
 		if transient && errors.Is(err, unix.ENOENT) {
 			// OptionalReadWrite 登记的瞬态状态文件（如 agy .db-shm）：
-			// 枚举快照后已被宿主删除（含悬空软链）时安全跳过，不击穿 Apply。
+			// 枚举快照后已被宿主删除或中间路径缺失时安全跳过，不击穿 Apply。
 			return nil
 		}
 		if optional && (errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.EACCES)) {

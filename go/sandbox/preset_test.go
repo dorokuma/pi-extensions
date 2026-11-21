@@ -2584,23 +2584,20 @@ func TestPreparePrivateClaudeConfigDirProjectsSymlink(t *testing.T) {
 // （授权不变）与 OptionalReadWrite（Apply 时 ENOENT 容忍）；数据子目录、
 // bin/ 软链绝不进 OptionalReadWrite——保持严格 fail-closed ENOENT 报错。
 func TestAppendAgyStateReadWriteMarksRootFilesOptional(t *testing.T) {
+	// 使用隔离 HOME 临时目录夹具构造确定性 antigravity-cli 状态根：
+	// 既不触碰宿主真实 ~/.gemini/antigravity-cli，也消除无宿主目录时的 t.Skip。
+	t.Setenv("HOME", t.TempDir())
+	stateRoot := filepath.Join(homeDir(), ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(stateRoot, 0o755); err != nil {
+		t.Fatalf("mkdir stateRoot %s: %v", stateRoot, err)
+	}
 	const fixture = "conversation_summaries.db-shm"
-	var roots []string
-	var fixturePaths []string
-	for _, dir := range agyAntigravityStateDirs() {
-		if st, err := os.Lstat(dir); err == nil && st.IsDir() {
-			roots = append(roots, dir)
-			fp := filepath.Join(dir, fixture)
-			fixturePaths = append(fixturePaths, fp)
-			if err := os.WriteFile(fp, []byte("x"), 0o600); err != nil {
-				t.Fatalf("write fixture %s: %v", fp, err)
-			}
-			t.Cleanup(func() { _ = os.Remove(fp) })
-		}
+	fp := filepath.Join(stateRoot, fixture)
+	if err := os.WriteFile(fp, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write fixture %s: %v", fp, err)
 	}
-	if len(roots) == 0 {
-		t.Skip("host has no antigravity-cli state root")
-	}
+	roots := []string{stateRoot}
+	fixturePaths := []string{fp}
 
 	var p Policy
 	appendAgyStateReadWrite(&p)
