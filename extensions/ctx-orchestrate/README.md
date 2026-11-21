@@ -47,7 +47,7 @@ settings.json**——只 `registerTool` ×1 + `pi.on("tool_result")` ×1。
 > **纳管时历史快照（非当前内容）**：下面三项 md5 / 字节数 / 行数与「`--audit` 报 `MATCH`」
 > 只描述该记录书写时点的内容（已核实等于本仓基线提交里那份 25394 字节 / 613 行的文件，
 > 亦即改前备份 `/root/.pi/agent/extensions/ctx-orchestrate.ts.bak-20261025-digest-hint`）。
-> 其后源码只改过**提示文字**：2026-10-25 把 `ctx_search_digest` 的调用说明收口为「只在
+> 其后源码只改过**提示文字**：2026-10-25 把 `ctx_search_digest` 的调用说明收口为「在
 > codemode 脚本内以 `tools.ctx_search_digest({...})` 调用」，本 README 的调用示例也改为可直接复制的具体对象；当前内容以文件
 > 本身为准。本轮按任务禁用 `install.sh` 与 `--audit`，未跑巡检，故**不得**据本节声称
 > 当前仍是 `MATCH`。

@@ -3586,3 +3586,67 @@ func TestNodeOnlyCacheStillRejectsPig(t *testing.T) {
 		t.Fatalf("total = %d, want 0: node-runtime cell must not count toward Go target set", total)
 	}
 }
+
+// TestBuildPolicyGorootBoundary 锁定 GOROOT 剥离边界：
+//   - 宿主 os.Environ() 的 GOROOT 一律经 stripHostEnv 剔除；
+//   - 无预设自定义模式（cfg.Preset == ""）允许调用方显式 --env GOROOT=...；
+//   - 预设模式（reviewer / reviewer-agent）剔除 --env GOROOT=...，防止覆盖预设受信根。
+func TestBuildPolicyGorootBoundary(t *testing.T) {
+	t.Setenv("PIG_HOME", filepath.Join(t.TempDir(), "isolated-pig"))
+	hostEnv := []string{"GOROOT=/host/toolchain/cache", "KEEP=1"}
+
+	t.Run("non_preset_allows_explicit_env_goroot", func(t *testing.T) {
+		policy, err := buildPolicy(cliConfig{
+			Env: []string{"GOROOT=/opt/custom-go", "FOO=bar"},
+		})
+		if err != nil {
+			t.Fatalf("buildPolicy failed: %v", err)
+		}
+		if got := envListValue(policy.Env, "GOROOT"); got != "/opt/custom-go" {
+			t.Fatalf("policy.Env GOROOT = %q, want /opt/custom-go", got)
+		}
+		execEnv := mergeEnv(stripHostEnv(hostEnv), policy.Env)
+		if got := envListValue(execEnv, "GOROOT"); got != "/opt/custom-go" {
+			t.Fatalf("execEnv GOROOT = %q, want /opt/custom-go", got)
+		}
+		if got := envListValue(execEnv, "KEEP"); got != "1" {
+			t.Fatalf("execEnv KEEP = %q, want 1", got)
+		}
+	})
+
+	t.Run("non_preset_strips_host_goroot", func(t *testing.T) {
+		policy, err := buildPolicy(cliConfig{
+			Env: []string{"FOO=bar"},
+		})
+		if err != nil {
+			t.Fatalf("buildPolicy failed: %v", err)
+		}
+		execEnv := mergeEnv(stripHostEnv(hostEnv), policy.Env)
+		if got := envListValue(execEnv, "GOROOT"); got != "" {
+			t.Fatalf("host GOROOT leaked into non-preset execEnv: got %q, want empty", got)
+		}
+	})
+
+	for _, preset := range []string{"reviewer", "reviewer-agent"} {
+		t.Run("preset_"+preset+"_strips_env_goroot", func(t *testing.T) {
+			workdir := t.TempDir()
+			policy, err := buildPolicy(cliConfig{
+				Preset:  preset,
+				WorkDir: workdir,
+				Env:     []string{"GOROOT=/tmp/evil"},
+				Command: []string{"/bin/true"},
+			})
+			if err != nil {
+				t.Fatalf("buildPolicy(%s) failed: %v", preset, err)
+			}
+			t.Cleanup(func() { cleanupPresetTempDirsFromPolicy(policy) })
+			if got := envListValue(policy.Env, "GOROOT"); got == "/tmp/evil" {
+				t.Fatalf("preset %s leaked --env GOROOT=/tmp/evil into policy.Env", preset)
+			}
+			execEnv := mergeEnv(stripHostEnv(hostEnv), policy.Env)
+			if got := envListValue(execEnv, "GOROOT"); got == "/tmp/evil" || got == "/host/toolchain/cache" {
+				t.Fatalf("preset %s leaked untrusted GOROOT=%q into execEnv", preset, got)
+			}
+		})
+	}
+}

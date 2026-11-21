@@ -96,7 +96,7 @@ status: active
    真能恢复送达未经证实，**只作待核形态登记，不计为已确认可恢复**。其中
    **根 ctx 取消后的投递失败不属于可恢复形态**：`close()` 先关闭监听
    （`report_relay.go:281-289`），再取消根 ctx 并关闭活动连接（`:303-309`），
-   子进程结束后中继随之关闭（`main.go:454`、`:526-527`）且无重启入口——该
+   子进程结束后中继随之关闭（`main.go:808`、`main.go:892-895`）且无重启入口——该
    场景下客户端退避后没有可恢复的对端，也不能保证状态 2 回包送达。本次实测
    现场错误串（客户端拨号成功并拿到 `delivery failed: … signal: killed`
    原因串，证明中继活到了 deliver 分支、被 kill 的是中继 fork 的 `hc send`
@@ -111,7 +111,7 @@ status: active
 
 - 首版「无持久兜底：中继每次尝试落盘 attempts/*.md 并回带路径」方案已撤销。
   **首版该项理由表述有误（中继运行在沙盒外 sbx 外层父进程，`report_relay.go:24-27`
-  注释与 `main.go:430-435` 明确父进程本身保持在 Landlock 规则集之外，父侧写盘
+  注释与 `main.go:794-808` 明确父进程本身保持在 Landlock 规则集之外，父侧写盘
   不必然等于子侧获得写权限），「给只读角色开可写路径、扩大信任边界」的论证
   站不住，已删除；结论未变。** 撤销依据改为两条事实加一条方案取舍判断：
   ① 报告**本次从子代理会话取回**——既定恢复路径是父侧一次
@@ -152,13 +152,13 @@ status: active
   现场错误串只证明进入 deliver 后失败，该形态的可恢复性**仍待核**，列入
   候选不等于已确认，见缺陷 #2）。**根 ctx 取消不列入候选**：`close()`
   关闭监听（`report_relay.go:281-289`）、取消根 ctx 并关闭活动连接
-  （`:303-309`），`main.go:454`/`:526-527` 的中继关闭无重启入口，取消
+  （`:303-309`），`main.go:808`/`:892-895` 的中继关闭无重启入口，取消
   场景下退避无可恢复对端、状态 2 回包也无法保证送达。
   **「中继不可达」本身不足以判定瞬时**：`maybeStartReportRelay()`
   存在多条早退分支（不满足启用条件、地址校验不过、找不到可信 hc、
   监听或权限设置失败等），此时中继根本不启动，沙盒内客户端在同一会话里
-  无论重试多少次都不可能出现中继，重试必然空转；而 `main.go:453` 拿到 nil relay
-  后仍在 `:496` 照常启动子进程（fail-open，`defer relay.close()` 对 nil
+  无论重试多少次都不可能出现中继，重试必然空转；而 `main.go:807` 拿到 nil relay
+  后仍在 `:855` 照常启动子进程（fail-open，`defer relay.close()` 对 nil
   无害），不可达在此是永久状态，与 ③ 的「中继存活、投递侧失败」**不是一回事，
   不可达不重试**。**突发桶耗尽量不列入短退避**——其恢复
   窗口属 refill 节奏问题（见缺陷 #1），另议；会话封顶继续保持
@@ -185,19 +185,16 @@ status: active
   `maybeStartReportRelay()` 早退分支误计为四条（实为七条），
   据此确认「候选方案不配行号级论证」这条纪律的必要性。
 
-## 协调事实（主代理实测 + 本轮复核）
+## 协调事实（主代理实测 + 2026-11-21 刷新）
 
-- 本仓存在**在制品分支** `fix/sbx-addr-and-go-hygiene`（worktree
-  `<workspace>/.wt/pi-extensions/fix-sbx-addr-and-go-hygiene`，
-  本轮复核其 `git status --porcelain` 为 18 个文件未提交），它**恰好改了同一个文件**
-  `go/sandbox/cmd/sbx/report_relay.go`：把 `reportAddrRe` 从
-  `^[A-Za-z0-9._:/-]{1,64}$` 改为 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
-  （拒绝首字符 `-`、去掉 `:` 与 `/`，防地址形态注入；该分支内位于 `:89`）。
-  **本笔记登记的后续修复若立项，必须与该分支协调**，不得假定主干行号不变。
-- 本笔记引用的行号以 main `9f7f53d`（本 worktree 基线）实际读取为准；
-  与任务书预估行号有一处偏差：`reportMaxTextBytes` 在 `:46`（非 `:45`，
-  `:45` 是 `reportMaxFrame`）；`process()` 定义在 `:354`、失败分支在 `:366`；
-  `deliver()` 在 `:407-422`（非 `:410-426`）。
+- 原在制品分支 `fix/sbx-addr-and-go-hygiene` 已合并入 `main`（merge commit `45070b3`）：
+  `go/sandbox/cmd/sbx/report_relay.go:89` 的 `reportAddrRe` 已落地为
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（拒绝首字符 `-`、去掉 `:` 与 `/`）。
+- 随后的 W10 加固合并（`fix/sbx-readonly-isolation`，merge commit `0f4b91f`）导致
+  `go/sandbox/cmd/sbx/main.go` 行号后移；上文 `main.go` 行号已刷新对齐至当前基线
+  （`runSandboxedChild` 入口约 `:794`、`maybeStartReportRelay` 在 `:807`、
+  `defer relay.close()` 在 `:808`、`cmd.Start()` 在 `:855`、wait/return 在 `:892-895`）。
+- 其余 `report_relay.go` 行号原以 main `9f7f53d` 为基线实测记录，立项修改时仍以当前源码符号为准。
 - 行为观察来自运行现场（`<install-dir>/sbx`，`sbx --version` 输出
   `0.4.0+9f7f53dcded2`，与 main `9f7f53d` 一致；二进制 mtime 2026-11-11
   10:22，但该构建来源 commit 未以独立证据链确证）；代码定位以 main
