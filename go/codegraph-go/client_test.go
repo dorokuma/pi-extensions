@@ -138,6 +138,14 @@ func TestMCPProcess(t *testing.T) {
 		default:
 			message = "unknown method"
 		}
+		if mode == "alive-close-stdin" && req.Method == "tools/list" {
+			// Close stdin BEFORE replying to tools/list so the pipe's read
+			// end is guaranteed closed before c.start() returns and the next
+			// client write runs — otherwise the write can land in the kernel
+			// pipe buffer before Close() and time out instead of hitting
+			// EPIPE (R4).
+			os.Stdin.Close()
+		}
 		fmt.Fprintln(os.Stdout, "non-json startup noise")
 		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}
 		if message != "" {
@@ -167,11 +175,6 @@ func TestMCPProcess(t *testing.T) {
 			// while the child stays alive (R4).
 			os.Stdout.Close()
 			stdoutOpen = false
-		}
-		if mode == "alive-close-stdin" && req.Method == "tools/list" {
-			// Close stdin AFTER the handshake: the next client write hits a
-			// dead pipe while the child stays alive (R4).
-			os.Stdin.Close()
 		}
 	}
 	// stdin ended (EOF or closed). alive-close-* modes keep the child
