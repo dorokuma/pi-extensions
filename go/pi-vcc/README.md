@@ -18,6 +18,7 @@
   （非 `main` 包名 + 导出 `Extension()`），PiG 为其生成 runner。
 - 本地 build/vet/test 经 `go/go.work`（含 `./pi-vcc`）解析到本地 `go/pigsdk`；PiG 加载时
   使用 staged SDK。未修改生产扩展目录或 TS 部署副本。
+- 版本与变更记录：本模块独立按 SemVer 编号（与上游版本号无对应关系），见 `CHANGELOG.md`。
 
 ## 注册面（对外契约）
 
@@ -63,7 +64,7 @@
 ### 补丁 #1 `pi-vcc-0.9.0-ctx-run`（tracked-commands）
 
 放宽 tracked-commands 的扫描门槛：主循环不再只扫 `bash` 工具，而是对**任何** tool_call
-块调用 `commandTextsOf(args)`（`trackedCommands.go:223`）抽取 shell 类命令文本，支持三种形状——
+块调用 `commandTextsOf(args)`（`trackedCommands.go:225`）抽取 shell 类命令文本，支持三种形状——
 `args.command`（string）、`args.argv`（数组，只收 string 元素后 `join(" ")`）、
 `args.commands`（数组，元素为 string 或含 string `command` 字段的对象）；无这些字段的调用不贡献文本，
 对非 shell 工具仍是 no-op。目的是让 `ctx_run`（bash 之外的执行通道）的命令也进入跨压缩记忆。
@@ -72,8 +73,8 @@
 ### 补丁 #2 `pi-vcc-0.10.0-recall-note`（`RECALL_NOTE`）
 
 在 `RECALL_NOTE` 常量尾部追加一句，提示模型每次压缩后先调 `vcc_recall` 拉回本任务的原始指令，
-原句一字未改。Go 侧 `format.go:150` `RecallNote` 逐字节等于补丁后常量；`summarize.go:436`
-`buildRecallNoteRe()` 由该常量动态生成正则、`summarize.go:451` `StripRecallNote()` 在合并前剥离旧尾注，
+原句一字未改。Go 侧 `format.go:151` `RecallNote` 逐字节等于补丁后常量；`summarize.go:568`
+`buildRecallNoteRe()` 由该常量动态生成正则、`summarize.go:583` `StripRecallNote()` 在合并前剥离旧尾注，
 故尾注不随压缩叠加。测试：`patchRecallNote_test.go`。
 
 ## 与 TS 0.11.2 的行为差异
@@ -95,24 +96,24 @@ TS 固定读 `homedir()/.pi/agent/pi-vcc-config.json`；Go 侧 `AgentDir()`（`s
 
 TS 把 `lastStats` / `lastCompactWasPiVcc` / `pendingFollowUpPrompt` / auto-continue 定时器放在
 模块作用域（一个扩展加载一个模块实例）。Go 一个子进程可服务多个扩展实例，故这些可变状态收进
-`extensionStates` 映射、按 `*sdk.Extension` 指针取用（`extstate.go:34` `extensionStates` 映射、`extstate.go:37` `stateFor`）。
-由 `extstate_test.go:17` `TestExtState_IsKeyedPerExtension` 钉住"两个 `Extension()` 不共享状态"的边界。
+`extensionStates` 映射、按 `*sdk.Extension` 指针取用（`extstate.go:39` `extensionStates` 映射、`extstate.go:42` `stateFor`）。
+由 `extstate_test.go:18` `TestExtState_IsKeyedPerExtension` 钉住"两个 `Extension()` 不共享状态"的边界。
 
 ### D3 用户消息词数（`userMessages.go`）
 
 TS 用 `new Intl.Segmenter(undefined, { granularity: "word" })` 数字，Go 无 ICU 与词典数据，
 故按 UAX#29 字符类近似：字母/数字连续段算一个词（跨撇号、数字间的 `.`/`,` 合并），每个 Han
 连续段算 `ceil(n/2)` 词，平假名/片假名一字一词。该校准表连同 node 实测值钉在
-`extract_test.go` 的 `TestUserMessageWordCount_IntlSegmenterCalibration`。已知分歧仅两处短中文
-（ICU 词典把「走吧/是的/没事」读作两个词，此处读作一个）与一处长句（ICU 多读一个词）；词数只
+`extract_test.go` 的 `TestUserMessageWordCount_IntlSegmenterCalibration`。已知分歧仅三处二字中文短回复
+（`走吧`/`是的`/`没事`，ICU 词典读作两个词，此处读作一个）与一处长句（ICU 多读一个词）；词数只
 决定「是否满两个词」，故不影响任何实质消息的去留。
 
 ### 其它偏差
 
-- **`sortedKeys`（`content.go:294`）**：TS 用 `Object.keys` 取插入序，Go map 无插入序，故改为排序键；
+- **`sortedKeys`（`content.go:296`）**：TS 用 `Object.keys` 取插入序，Go map 无插入序，故改为排序键；
   仅在 TS 顺序本身"看似未指定"的输出（工具参数名）上可见，属对有意偏差的记录。
-- **JS 语义适配层（`jslite.go:12` 等）**：字符串按 UTF-16 码位取长/切片（`jslite.go`）、
-  `toFixed(1)` 用 `math/big` 做 half-away-from-zero（`jsFixed1`）、RegExp 在 RE2 上复刻 JS 语义
+- **JS 语义适配层（`jslite.go:35` 等）**：字符串按 UTF-16 码位取长/切片（`jslite.go`）、
+  `toFixed(1)` 经标准库 `strconv.FormatFloat` 实现（`jsFixed1`，IEEE-754 round-half-to-even）、RegExp 在 RE2 上复刻 JS 语义
   （`.` 不吃行终止符、`\s` 含 Unicode 分隔符 + U+FEFF、`i` 用 Unicode simple case folding、
   `\uXXXX` 展开、JS `\b`，见 `jsregex.go`）。这些是"看起来相同"的必要成本。
 - **`setTimeout(..., 0)` → `time.AfterFunc` + `recover`**：auto-continue 的不可见续跑改由 Go 定时器
@@ -141,7 +142,5 @@ ok github.com/dorokuma/pi-extensions/go/pi-vcc
 完整竞态输出 0 DATA RACE；测试与行为差异的逐条对照见 `go/reports/batch-4-pi-vcc.md`。
 隔离加载实测（`go/bin/pig-test -e ./pi-vcc`，`PIG_HOME=/root/.pig-test`）通过，`vcc_recall`
 工具在隔离会话中被实际调用并返回真实结果（见 batch-4 报告 §8；0.11.1 同步后的复测输出原文
-与退出码见 `go/reports/batch-4b-sync-0.11.1.md`）。0.11.2 同步（`2eb4e7e`）与本轮文档/测试补齐
+与退出码见 `go/reports/batch-4b-sync-0.11.1.md`）。0.11.2 同步（`2eb4e7e`）与 `batch-4c` 文档/测试补齐
 的验证记录见 `go/reports/batch-4c-sync-0.11.2.md`。
-
-未提交、未部署。以上为 worker 验证，仍需 reviewer / verifier 独立核验。
