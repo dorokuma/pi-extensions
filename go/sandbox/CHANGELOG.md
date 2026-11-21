@@ -84,10 +84,11 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
     放行路径；`go build`/`go vet`/`go list` 等只读编译子命令经
     `bin/go` 真实直链原样可用。
 
-- **CLI 默认启用 `CLONE_NEWNS|CLONE_NEWPID` 联合命名空间隔离**：此前受限
-  子进程与父进程共享宿主挂载与 PID 命名空间；现在子进程在独立 mount ns
-  与 PID ns 内执行（覆盖挂载不传播回宿主，宿主进程在沙盒 `/proc` 下
-  不可见）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权用户且内核未放行
+- **CLI 默认启用 `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC` 联合命名空间
+  隔离**：此前受限子进程与父进程共享宿主挂载、PID 与 IPC 命名空间；
+  现在子进程在独立 mount/PID/IPC ns 内执行（覆盖挂载不传播回宿主，
+  宿主进程在沙盒 `/proc` 下不可见，SysV `shm`/`sem`/`msg` 与按命名空间
+  解析的 POSIX `mq_open`/`mq_unlink` 面同步隔离）。无 `CAP_SYS_ADMIN` 可用的环境（如非特权用户且内核未放行
   unprivileged user-ns）下 `unshare` 会失败：**父进程派生子进程失败**
   严格模式退 `126`，`--best-effort` 下告警降级回旧行为（不 unshare、
   跳过全部 socket 覆盖、不安装挂载锁）；**子进程内挂载/封锁步骤失败**
@@ -95,26 +96,38 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
 
 - **socket 白名单视图从 `/run/user/0` 扩为整个 `/run`**：此前仅覆盖
   `/run/user/0`；现在整个 `/run` 被空 tmpfs 覆盖，仅按原相对路径回绑
-  `/run/user/0/moshi-hook.sock` 与 `/run` 下的 `/etc/resolv.conf`
-  解析目标（普通文件）。沙盒内原可达的 `/run` 下其它对象——
+  `/run/user/0/moshi-hook.sock`（agy 钩子遥测，socket 回绑保持可写，
+  `connect()` 要求挂载点可写）与 `/run` 下的 `/etc/resolv.conf`
+  解析目标（DNS stub，普通文件，补只读 remount），覆盖层整体
+  remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖（终端
+  按键注入面）。覆盖路径不存在跳过；任一挂载步骤失败默认拒绝启动
+  （fail-closed），`--best-effort` 下仅告警；unshare 失败在
+  `--best-effort` 下回退不 unshare（此时跳过全部覆盖，绝不动宿主
+  命名空间）。Go 标准库只对 `Unshareflags` 路径自动置 `/` rprivate，
+  `Cloneflags` 路径不会自动执行，由 `isolateRuntimeSockets` 首步
+  private-propagation 硬前置执行 `MS_REC|MS_PRIVATE`，失败即熔断
+  全部覆盖挂载。沙盒内原可达的 `/run` 下其它对象——
   `/run/systemd/private`、`/run/docker.sock`、
   `/run/containerd/containerd.sock`、`/run/dbus/system_bus_socket`、
   `/run/user/0/herdr-core/*` 等——全部不可见，依赖它们的沙盒内代码
   将收到 `ENOENT`/`EACCES`。迁移方式：确有需求的对象只能经由新增
   白名单回绑项放行（需改码并过审查）。
 
-- **沙盒内挂载族与进程控制族系统调用一律 `EPERM`**：全部覆盖/回绑与
-  暂存清理完成后、`sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` +
-  seccomp-BPF 过滤器（支持 `linux/amd64` 与 `linux/arm64`，异构 ABI
-  直接 `KILL_PROCESS`，amd64 另封堵 x32 `__X32_SYSCALL_BIT`），
-  `mount`/`umount2`/`setns`/`unshare`/`pivot_root`/`open_tree`/
-  `move_mount`/`fsopen`/`fsconfig`/`fsmount`/`fspick`/`mount_setattr`
-  与 `chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/
-  `pidfd_getfd`/`kcmp` 共 18 个系统调用返回 `EPERM`；过滤器与 NNP 跨
-  `execve` 继承。此前沙盒内 root 可 `setns` 跳回宿主挂载命名空间、
-  `umount2` 撤销覆盖层、`chroot` 组合魔链越狱或 `ptrace`/`pidfd_getfd`
-  操纵宿主进程，这些逃逸路径均被堵死；依赖上述系统调用的沙盒内代码
-  将失败。`--best-effort` 下锁安装失败仅告警降级。
+- **沙盒内挂载族/进程控制族/capability 门控宿主全局副作用·句柄·
+  密钥环族系统调用一律 `EPERM`**：全部覆盖/回绑与暂存清理完成后、
+  `sandbox.Apply` 之前安装 `PR_SET_NO_NEW_PRIVS` + seccomp-BPF 过滤器
+  （支持 `linux/amd64` 与 `linux/arm64`，异构 ABI 直接 `KILL_PROCESS`，
+  amd64 另封堵 x32 `__X32_SYSCALL_BIT`）：12 个挂载族（`mount`/`umount2`/
+  `setns`/`unshare`/`pivot_root`/`open_tree`/`move_mount`/`fsopen`/
+  `fsconfig`/`fsmount`/`fspick`/`mount_setattr`）、6 个进程控制族
+  （`chroot`/`ptrace`/`process_vm_readv`/`process_vm_writev`/
+  `pidfd_getfd`/`kcmp`）与 27 个 capability 门控宿主全局副作用/句柄/
+  密钥环族（amd64 另有 `ioperm`/`iopl`）共 45/47 个系统调用返回
+  `EPERM`；过滤器与 NNP 跨 `execve` 继承。此前沙盒内 root 可 `setns`
+  跳回宿主挂载命名空间、`umount2` 撤销覆盖层、`chroot` 组合魔链越狱、
+  `ptrace`/`pidfd_getfd` 操纵宿主进程或 `reboot`/载模块/改时钟/`bpf`
+  施加宿主全局副作用，这些逃逸路径均被堵死；依赖上述系统调用的沙盒内
+  代码将失败。`--best-effort` 下锁安装失败仅告警降级。
 
 ### Added
 
@@ -276,28 +289,6 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
   说明退 0；其它形态退 126；中继不可用或 `PI_SANDBOX_GO_EXEC_DIR` 为空
   时 stderr 一行退 75。真 `/root/.local/bin/hc` 不进任何 Exec 白名单。
 
-- **socket 白名单视图（Linux，`CLONE_NEWNS|CLONE_NEWPID`）**：受限子
-  进程同时进入独立挂载与 PID 命名空间（Go 标准库只对 `Unshareflags`
-  路径自动置 `/` rprivate，`Cloneflags` 路径不会自动执行，由
-  `isolateRuntimeSockets` 首步 private-propagation 硬前置执行
-  `MS_REC|MS_PRIVATE`，失败即熔断全部覆盖挂载；子进程即新 PID ns
-  的 PID 1），在 `sandbox.Apply` 之前：
-  先硬校验 `os.Getpid()==1` 后挂载专属 procfs（宿主 PID 与
-  `/proc/<pid>/root` 魔链彻底不可见），随后整个 `/run` 被 tmpfs 覆盖，
-  只按原相对路径回绑白名单项——`moshi-hook.sock`（agy 钩子遥测，
-  socket 回绑保持可写，`connect()` 要求挂载点可写）与 `/run` 下的
-  `/etc/resolv.conf` 目标文件（DNS stub，补只读 remount），覆盖层整体
-  remount 为只读；`/tmp/tmux-0` 存在时被空只读 tmpfs 覆盖。覆盖路径
-  不存在跳过；任一挂载步骤失败默认拒绝启动（fail-closed），
-  `--best-effort` 下仅告警。unshare 失败在 `--best-effort` 下回退不
-  unshare（此时跳过全部覆盖，绝不动宿主命名空间）。全部挂载与清理
-  完成后安装 mount-seal seccomp 锁（见 Breaking Changes）。
-
-- **轻量 PID 1 init 收尸与信号转发**：`MountNS` 路径下 `sbx` 本体作为
-  新 PID ns 的 PID 1 不直接 `exec` 业务命令，而是派生目标命令并担任
-  init（记录目标子进程 PID、转发信号、`Wait4(-1, WNOHANG)` 收尸），
-  避免业务进程作为 PID 1 忽略默认未捕获信号与残留孤儿僵尸。
-
 - **回报中继生命周期屏障**：`serve()` 在 `mu` 临界区内判 `closing` 并
   同步 `conns` 登记 + `wg.Add`，消除 `Add`/`Wait` 竞态；非 `ErrClosed`
   的 Accept 错误（EMFILE/ENFILE 等）退避 10ms 继续循环而非永久退出；
@@ -313,6 +304,42 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
   与 `runChildFromEnv` 的 mergeEnv 基底）与 `--env` 传入值（`buildPolicy`
   同口径过滤）。预设自身注入的 `XDG_RUNTIME_DIR`（reviewer-agent 私有
   0700 目录）不属于外部指针，不受影响。
+
+- **claude `projects/` 会话转录跨会话共享（`[0.3.3]`「无跨会话状态」
+  边界的显式例外）**：`preparePrivateClaudeConfigDir` 在每会话私有的
+  `<privateTmpDir>/claude`（0700）下预置 `projects ->
+  /tmp/herdr-role-sessions/claude-projects`（0700）符号链接——沙盒内
+  claude 经 `<CLAUDE_CONFIG_DIR>/projects/<project-slug>/<uuid>.jsonl`
+  写入的会话转录跨会话汇聚于共享根（该根本就在
+  `ReviewerAgentWithEnv` 的 ReadWrite 白名单内）；根级 `.claude.json`/
+  `settings.json`/`hooks`/`mcpServers` 仍随 `privateTmpDir` 清理、每会话
+  私有。共享根与其父目录均以 `Lstat` 确认为真实目录才创建/软链，被
+  预置为符号链接或缺失时容忍降级（该次会话 `projects/` 回退为私有目录
+  内自建路径，不跟随父软链对外部目标 `MkdirAll`/`Chmod`）；
+  `/tmp/herdr-role-sessions` 进 `ReadWrite` 前同样先 `Lstat` 确认为真实
+  目录。
+
+- **`ForbiddenExecNames` 新增 `claude-pty`/`claude-code` +
+  `DefaultReviewerTools` 新增 `dispatch-report`**：claude 衍生本体形态按
+  精确名列入禁名表（裸 `claude` 不加——否则顶层 `sbx -- claude` 与
+  `EntryAgents` 放行形成自锁）；`dispatch-report` 作为只读角色回报通道
+  列入默认工具白名单。`shouldDenyExecMmap` 的 `SYS_MMAP` `fdTarget` 分支
+  补 `IsEntryAgentPath` 校验（与 `exe` 检查同口径对称）：`EntryAgents`
+  成员（agy/pig/pi/claude 及其过身份校验的软链目标）经 fd 被
+  `PROT_EXEC` 映射属合法运行期行为，不再与毒软链目标一同被拒。
+
+- **二进制收录面撤出调用方可控 `$HOME`（`c9f81bd`+`d2ced59`）**：
+  `agentLookupDirs`/`agyHookLookupDirs`/herdsman-go bin/版本化 pig
+  glob/`agyStateBin` 改经 `trustedLookupHomes()` 枚举——
+  `trustedHomeDir()`（`/etc/passwd` 解析的宿主真实 HOME，被隔离覆盖的
+  `$HOME` 下仍解析到宿主）+ 硬编码 `/root` 与 `/root/.agy-pro-home`
+  （agy 硬编码 HOME 约定），绝不读 `$HOME`/`homeDir()`（调用方可控输入
+  不作二进制收录的信任边界输入）；相对修复前枚举是超集（passwd-HOME +
+  `/root` + `.agy-pro-home`），不丢合法项。隔离 `$HOME` 下经
+  `trustedHomeDir()`（生产 `resolveEntryAgentPaths` 固定入口，测试经
+  `ResolveEntryAgentPathsForTest` 注入夹具）保留宿主受信安装根，
+  `entryAgentInstallRoots` 维持 `trustedAgentHomes()+/root` 既有口径
+  （含 `homeDir()`）不动。
 
 ### Changed
 
@@ -640,6 +667,14 @@ MINOR：自 v0.3.3 以来的核心演进——`CLONE_NEWNS` 派生升级为 `CLO
 
 ### Known Risks
 
+- **已知边界（按设计保持可达 socket）**：`/root/.herdsman/herdsman.sock`
+  （herdsman 扩展必需）、`/root/.config/herdr/herdr.sock`（老 herdr
+  状态上报）、`goExecDir` 内 `report.sock`（本版本新增回报中继监听）。
+  上述 socket 位于 `/run` 覆盖树外或属白名单回绑/中继本身，覆盖挂载
+  不改变其可达性；白名单视图收敛的是 `/run` 内 pathname `connect()`
+  直通面（`/run/user/0/herdr-core/*`、`systemd/private`、`dbus`、
+  `docker.sock`、`/tmp/tmux-0/*` 等已全部不可见），不承诺封堵白名单外
+  其它按设计放行的宿主 socket。
 - **`memfd_create`/`execveat` 与匿名 `PROT_EXEC` 旁路（Q1 决策：不改
   seccomp 黑名单，仅文档披露）**：seccomp `PROT_EXEC` 守卫只拦截带
   `PROT_EXEC` 标志的 `mmap`/`mprotect` 且以 `/proc/<pid>/fd`/`exe` 判定
