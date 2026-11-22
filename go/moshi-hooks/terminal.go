@@ -132,7 +132,7 @@ func resolveTerminalContext(getenv func(string) string, run func(string, []strin
 	// herdrPane and the session name is parsed from the socket path. The
 	// daemon resolves labels from those ids.
 	herdrSession := ""
-	herdrPane, herdrWorkspaceID, herdrTabID := "", "", ""
+	herdrPane := ""
 	hcTerminalID := getenv("HC_TERMINAL_ID")
 	if hcTerminalID != "" {
 		herdrPane = hcTerminalID
@@ -169,9 +169,9 @@ func resolveTerminalContext(getenv func(string) string, run func(string, []strin
 		ZellijPane:       zellijPane,
 		HerdrSession:     herdrSession,
 		HerdrPane:        herdrPane,
-		HerdrWorkspaceID: herdrWorkspaceID,
+		HerdrWorkspaceID: "",
 		HerdrWorkspace:   "",
-		HerdrTabID:       herdrTabID,
+		HerdrTabID:       "",
 		HerdrTab:         "",
 		MuxEnv:           muxEnv,
 	}

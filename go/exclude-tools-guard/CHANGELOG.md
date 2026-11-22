@@ -41,3 +41,6 @@ dispatch-layer tools from the visible tool set per role.
   reply must echo `id`/`address`, be `"live"` when `state` is present, carry an
   explicit `parent` key that is JSON `null`, and return `pid > 0` as
   `shell_pid` for the unchanged S3/S4 checks.
+
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.2.0...HEAD
+[0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.1.0...go/exclude-tools-guard/v0.2.0

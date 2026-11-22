@@ -69,7 +69,7 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 226–317 | `computeLiveHitRates` | `usage.go:305` |
 | 228–266 | `cacheHitDenom` / `cacheHitPct` | `usage.go:185` / `usage.go:209`（另有 `…Numbers` 数值重载 `:203` / `:216`） |
 | 320–510 | 类型、`emptySnapshot`/`emptyLiveRun`、`randomSalt`、`createInstanceState`、`clearPrefixMemory`、`resetRunState`（TPS 计时戳与 `clearTurnTiming` 已于 v0.1.0 随 TPS 功能移除） | `state.go:141` `createInstanceState`；`:156` `clearPrefixMemory`（锁内体 `:162` `…Locked`）；`:169` `resetRunState`（`:175` `…Locked`）；`state.go:129` `randomSalt`；`state.go:124`/`:126` `emptySnapshot`/`emptyLiveRun` |
-| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey` | `footer.go:19` 图标常量；`extension.go:204` `isEnabled`；`modelKey` 的宿主等价物 `extension.go:742` `safeModelIdentity`（TS 同段的外部状态渲染助手已随该页脚段移除，Go 侧不再存在，见 CHANGELOG Breaking Changes） |
+| 512–533 | `FOOTER_ICON`、`isEnabled`、`modelKey` | `footer.go:19` 图标常量；`extension.go:204` `isEnabled`；`modelKey` 的宿主等价物 `extension.go:744` `safeModelIdentity`（TS 同段的外部状态渲染助手已随该页脚段移除，Go 侧不再存在，见 CHANGELOG Breaking Changes） |
 | 535–560 | `readFooterCtx` | `state.go:201`（入参 `footerReadInput` 由 `extension.go:533` `captureFooterInput` 从 `sdk.Context` 采集） |
 | 562–571 | `refreshFooter` | `state.go:235` |
 | 573–611 | `recordTurnUsage` | `state.go:248` |
@@ -81,7 +81,7 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 1562–1680 | `formatSection`、`prefixStatsLine`、`showPrefix` | `prefix.go:1166` / `:1192` / `:1205` `prefixLines` |
 | 1682–2074 | `Extension()` 工厂与 **10 个事件订阅**、`/cache-stats` | `extension.go:54` `Extension`；`before_provider_request` 仅前缀诊断（`state.go:290` `observePrefixDiagnostics`，scope 采集 `extension.go:563` `captureScopeIdentity`）；`agent_end` `extension.go:215` `applyAgentEnd`；`turn_end` `extension.go:284` `applyTurnEndEvent`；命令 `extension.go:301` `handleCommand` |
 | 2060–2131 | `readSessionAggregate`、`showStats` | `extension.go:400` `sessionAggregateOf`；`extension.go:417` `statsLines` |
-| 700–810 | `computeTurnTps`、`toStamp`、`formatTps`（TPS 估算器与格式化器） | **已于 v0.1.0 移除**：TPS 页脚段、计时戳、估算器连同 `tps.go` / `tps_test.go` 整体删除；`truncateFooter` 迁至 `format.go:84`，`formatWindowSize` 在 `format.go:37`，`extractAndNormalizeUsage` 仍在 `usage.go:336`。此后页脚的外部扩展状态段亦随其宿主扩展退役移除：`footerRender` 不再消费 `ExtensionStatuses`，相应格式化助手与 `safeExtensionStatuses` 一并删除，`footerUIInputs` 收窄为 `footerUITheme`（旧→新映射见 CHANGELOG [Unreleased] Breaking Changes） |
+| 700–810 | `computeTurnTps`、`toStamp`、`formatTps`（TPS 估算器与格式化器） | **已于 v0.1.0 移除**：TPS 页脚段、计时戳、估算器连同 `tps.go` / `tps_test.go` 整体删除；`truncateFooter` 迁至 `format.go:84`，`formatWindowSize` 在 `format.go:37`，`extractAndNormalizeUsage` 仍在 `usage.go:336`。此后页脚的外部扩展状态段亦随其宿主扩展退役移除：`footerRender` 不再消费 `ExtensionStatuses`，相应格式化助手与 `safeExtensionStatuses` 一并删除，`footerUIInputs` 收窄为 `footerUITheme`（旧→新映射见 CHANGELOG [0.2.0] Breaking Changes） |
 | 812–856 | `extractAndNormalizeUsage` | `usage.go:336`（回写在 `usage.go:379`） |
 
 **事件订阅数 = 10**（`grep -c OnEvent extension.go` → 10）：`before_provider_request`、
@@ -118,7 +118,7 @@ $ go vet ./...
 （退出码 0）
 
 $ go test -count=3 -race -v ./...
---- PASS（77 个顶层测试 + 41 个子测试 = 118 条 RUN/PASS 执行记录，全过；连续 3 轮全绿）
+--- PASS（76 个顶层测试 + 41 个子测试 = 117 条 RUN/PASS 执行记录，全过；连续 3 轮全绿）
 PASS
 ok  	github.com/dorokuma/pi-extensions/go/cache-stats	1.792s
 （DATA RACE 计数：0）

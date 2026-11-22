@@ -8,10 +8,10 @@ import (
 )
 
 // This file ports the custom footer of cache-stats.ts (TS L512-533 and
-// L611-700 and L966-1055): the geometric icon set, the extension-status
-// segment, the live dual hit-rate segment (◆ cumulative / ◇ latest), the
-// context-usage segment with its occupancy colors, and the merged model
-// segment.
+// L611-700): the geometric icon set, the live dual hit-rate segment
+// (◆ cumulative / ◇ latest), the context-usage segment with its occupancy
+// colors, and the merged model segment. The extension-status segment went
+// away with the retired herdsman extension.
 
 // footerIcons is FOOTER_ICON: one geometric symbol family, no emoji mixin.
 // The shepherd/herdsman "●" segment went away with the retired herdsman
@@ -45,7 +45,6 @@ func hitCacheKey(epoch int, baseline *int, entries int) string {
 	return strconv.Itoa(epoch) + "|" + baselineKey(baseline) + "|" + strconv.Itoa(entries)
 }
 
-// footerRender renders the single footer line. statuses is
 // footerRenderSnapshot is one consistent read of the footer inputs. The footer
 // renderer runs on a background goroutine (surface.go:100-123), so it takes
 // this copy under instanceState.mu and then renders from the copy: building the

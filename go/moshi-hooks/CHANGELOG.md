@@ -8,7 +8,7 @@
   listed in `go/Makefile` `RETIRED_COMPONENTS`. The source stays in this tree
   and in `go/go.work` for reference but no longer participates in the default
   `make build`/`make vet`/`make test` loop; run `go build/vet/test ./...`
-  inside this directory manually if needed. No code change.
+  inside this directory manually if needed.
 
 ### Removed
 

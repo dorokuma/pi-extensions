@@ -194,6 +194,13 @@ func TestFooterSegmentOrderAndModel(t *testing.T) {
 	}
 
 	requireContains(t, line, "◆ n/a")
+	hitIndex := strings.Index(line, "◆")
+	if !(hitIndex >= 0 && hitIndex < contextIndex) {
+		t.Fatalf("hit-rate segment must come before the context segment: %q", line)
+	}
+	if strings.Contains(line, "●") {
+		t.Fatalf("the retired herdsman ● segment must not render: %q", line)
+	}
 
 	// The thinking level merges into the model segment.
 	state.footerThinking = strPtr("high")

@@ -29,7 +29,7 @@
 
       前缀按键名枚举后**逐个回查 `getenv(key)` 并要求非空**：列在环境里但值为空的键（`PIG_EXT_SOCKET_X=`）不算证明；键名按枚举原样查询，不做大小写折叠（Linux 环境变量名大小写敏感）。
     - **fused 形态（上述全部缺失）**：self 即宿主（`hostIndex = 0`）；若 self cmdline 识别不出 agent runtime → fail-closed 判子代理。
-  - **S4 无中间 agent 嵌套**：宿主进程（`hostIndex`）与 `shell_pid` 之间的所有祖先进程，其 `/proc/<pid>/cmdline` 绝不能含有 agent 运行时（`pi`、`pig`、`ctxmode`、`pi-coding-agent`、`bundle/cli.js`）。扫描范围严格限定为 `for hop := hostIndex + 1; hop < shellIndex; hop++`，跳过宿主自身。
+  - **S4 无中间 agent 嵌套**：宿主进程（`hostIndex`）与 `shell_pid` 之间的所有祖先进程，其 `/proc/<pid>/cmdline` 绝不能含有 agent 运行时（`pi`、`pig`、`ctxmode`、`claude`、`claude-code`、`claude-pty`、`pi-coding-agent`、`bundle/cli.js`、`(?:^|/)claude/versions/`）。扫描范围严格限定为 `for hop := hostIndex + 1; hop < shellIndex; hop++`，跳过宿主自身。
 - **fail-closed 处置**：任何 socket 连接失败、读取超时、JSON 解析错误、字段不匹配、宿主锚定失败或内核链断裂，均按子代理会话处置。
 - **诊断开关**：`PI_IDENTITY_DEBUG=1` 时向 stderr 输出判定理由（如 `[subagent-identity] subagent: S1: HC_TERMINAL_ID unset or empty`），不改变判定逻辑。
 
@@ -63,7 +63,7 @@
 | **读取 /proc ppid** | L131-L142 (`readProcPpid`) | `ReadProcPpid` | 按最后一个 `)` 之后切分并读取第 2 个字段，防御性处理空格与括号 |
 | **读取 /proc cmdline** | L145-L151 (`readProcCmdline`) | `ReadProcCmdline` | 以 `\0` 分隔并过滤空串，空格拼接 |
 | **进程祖先链回溯** | L154-L168 (`readAncestorChain`) | `ReadAncestorChain` | 32 跳上限，环路与终止检测（`ppid == 0 \|\| ppid == current`） |
-| **agent 运行时特征检测** | L171-L177 (`isAgentRuntimeCmdline`) | `IsAgentRuntimeCmdline` | 匹配 `pi`、`pig`、`ctxmode` 及正则 `pi-coding-agent\|bundle/cli\.js` |
+| **agent 运行时特征检测** | L171-L177 (`isAgentRuntimeCmdline`) | `IsAgentRuntimeCmdline` | 匹配 `pi`、`pig`、`ctxmode`、`claude`、`claude-code`、`claude-pty` 及正则 `pi-coding-agent\|bundle/cli\.js\|(?:^|/)claude/versions/` |
 | **负向标记检测** | L180-L189 (`subagentLaunchMarker`) | `SubagentLaunchMarker`, `LoadEffectiveArgs` | 检测 `PI_SUBAGENT=1`、`PI_ROLE` 与 argv 特征（含通过 `PIG_HARNESS_ARGV_FILE` 桥接宿主参数） |
 | **fail-closed 身份推断** | L194-L236 (`resolveAgentIdentity`, `isSubagentSession`) | `ResolveAgentIdentityWithEnv`, `ResolveAgentIdentity`, `IsSubagentSession`, `DetectSubprocessForm`, `failClosed` | 形态判据为 `DetectSubprocessForm`（`PIG_EXT_SOCKET` / `PIG_EXT_SOCKET_<NAME>` / `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`），宿主锚定为第一个 agent-runtime 祖先（subprocess）或 self（fused），S3 校验 `shellIndex > hostIndex`，S4 只扫中间进程，终端命名仅作辅助证据，S1-S4 任一失败均 fail-closed + 单次去重 warning |
 | **工具过滤纯函数** | L244-L255 (`enforceExclusions`) | `FilterActiveTools`, `EnforceToolExclusions` | 纯切片过滤保持相对顺序；无变更时不调用 `SetActiveTools`；debug 下记录打点 |

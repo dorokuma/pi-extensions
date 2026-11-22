@@ -826,7 +826,17 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 	// Merge os.Args with PIG_HARNESS_ARGV_FILE arguments if present.
 	// Fail-closed policy (M2): if PIG_HARNESS_ARGV_FILE is set but read/parse fails,
 	// resolve as subagent immediately.
-	effectiveArgs, err := LoadEffectiveArgsWithCache(env.Getenv, env.Args, env.ArgvCache)
+	//
+	// Isolation (test-fix R2): a nil env.ArgvCache must NOT fall back to the
+	// package-level defaultArgvCache — that global is shared with the host
+	// process and can already hold a --name role- marker read from a real
+	// harness PIG_HARNESS_ARGV_FILE, which would poison every mocked identity
+	// resolution. Only DefaultIdentityEnv (production) passes the global cache.
+	argvCache := env.ArgvCache
+	if argvCache == nil {
+		argvCache = &ArgvCache{}
+	}
+	effectiveArgs, err := LoadEffectiveArgsWithCache(env.Getenv, env.Args, argvCache)
 	if err != nil {
 		return true, fmt.Sprintf("argv bridge failed: %v", err)
 	}
@@ -858,8 +868,6 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 		return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s has parent=%s (subagent terminal)", termID, info.Parent))
 	}
 	shellPID = info.PID
-	// The terminal address doubles as the diagnostic label below.
-	termLabel := termID
 
 	// S3: /proc ancestry chain must contain shellPID
 	chain := ReadAncestorChain(env.PID, IdentityAncestorMaxHops, env.ReadStat, env.ReadCmdline)
@@ -875,7 +883,7 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 		}
 	}
 	if shellIndex < 0 {
-		return failClosed(fmt.Sprintf("S3: terminal %s shell_pid=%d is not in this process ancestry [%s]", termLabel, shellPID, describeAncestorChain(chain)))
+		return failClosed(fmt.Sprintf("S3: terminal %s shell_pid=%d is not in this process ancestry [%s]", termID, shellPID, describeAncestorChain(chain)))
 	}
 
 	// Host process topology determination.
@@ -943,7 +951,7 @@ func ResolveAgentIdentityWithEnv(env IdentityEnv) (bool, string) {
 		}
 	}
 
-	return false, fmt.Sprintf("S1-S4 hold: terminal=%s shell_pid=%d hop=%d", termLabel, shellPID, shellIndex)
+	return false, fmt.Sprintf("S1-S4 hold: terminal=%s shell_pid=%d hop=%d", termID, shellPID, shellIndex)
 }
 
 // ResolveAgentIdentity resolves identity using DefaultIdentityEnv.
