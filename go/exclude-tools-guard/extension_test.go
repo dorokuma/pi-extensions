@@ -1,6 +1,7 @@
 package excludetoolsguard
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -63,9 +64,11 @@ func hcTerminalSocket(t *testing.T, reply string) string {
 	return sockPath
 }
 
-// hcTerminalSocketCapture 与 hcTerminalSocket 同型，但把收到的请求体记到
-// captured 指针里（第一行 JSON），供调用方断言 terminal.get 的报文字段。
-func hcTerminalSocketCapture(t *testing.T, reply string, captured *string) string {
+// hcTerminalSocketCapture 与 hcTerminalSocket 同型，但把收到的请求体（以 \n
+// 结尾的第一行 JSON）经 capturedCh 送回调用方，供断言 terminal.get 的
+// 报文字段。channel 传递在 accept goroutine 与测试 goroutine 之间建立
+// happens-before，避免共享指针的 data race。
+func hcTerminalSocketCapture(t *testing.T, reply string, capturedCh chan<- string) string {
 	t.Helper()
 	sockPath := filepath.Join(t.TempDir(), "herdr-core.sock")
 	listener, err := net.Listen("unix", sockPath)
@@ -79,10 +82,9 @@ func hcTerminalSocketCapture(t *testing.T, reply string, captured *string) strin
 			if acceptErr != nil {
 				return
 			}
-			buffer := make([]byte, 4096)
-			n, _ := conn.Read(buffer)
-			if captured != nil {
-				*captured = string(buffer[:n])
+			line, _ := bufio.NewReader(conn).ReadString('\n')
+			if capturedCh != nil {
+				capturedCh <- line
 			}
 			if reply != "" {
 				_, _ = conn.Write([]byte(reply))
@@ -133,11 +135,17 @@ func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
 	}
 
 	t.Run("request_fields", func(t *testing.T) {
-		var captured string
-		sockPath := hcTerminalSocketCapture(t, ok, &captured)
+		capturedCh := make(chan string, 1)
+		sockPath := hcTerminalSocketCapture(t, ok, capturedCh)
 		info, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 500*time.Millisecond)
 		if !gotOK || info.Address != "t12t" || info.PID != 4321 {
 			t.Fatalf("QueryHcTerminalInfo = %+v,%v", info, gotOK)
+		}
+		var captured string
+		select {
+		case captured = <-capturedCh:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for captured terminal.get request")
 		}
 		for _, want := range []string{
 			`"method":"terminal.get"`,
@@ -166,6 +174,8 @@ func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
 			t.Fatalf("failed to create unix socket listener: %v", err)
 		}
 		t.Cleanup(func() { _ = listener.Close() })
+		done := make(chan struct{})
+		t.Cleanup(func() { close(done) })
 		go func() {
 			conn, acceptErr := listener.Accept()
 			if acceptErr != nil {
@@ -173,7 +183,8 @@ func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
 			}
 			buf := make([]byte, 4096)
 			_, _ = conn.Read(buf)
-			select {} // never reply
+			<-done // hold without replying until the subtest ends
+			_ = conn.Close()
 		}()
 		if _, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 60*time.Millisecond); gotOK {
 			t.Fatalf("silent server must time out and fail closed")

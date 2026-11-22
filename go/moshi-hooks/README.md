@@ -221,7 +221,7 @@ go vet ./...                               # EXIT 0
 go test -count=1 -race -v ./...            # 全绿，无 DATA RACE
 ```
 
-覆盖（59 个顶层测试，含 40 个子测试，合计 99 条用例，`-race` 下无 `DATA RACE`）：
+覆盖（71 个顶层测试，含 46 个子测试，合计 117 条用例，`-race` 下无 `DATA RACE`）：
 
 - **文本**：`stripMarkdown`（代码块/行内码/链接/粗斜体/标题列表/空白折叠）、`truncateText`
   （含 rune 而非字节）、`plainTextClip`、`displayUserPrompt`（`<user_query>` 大小写不敏感、

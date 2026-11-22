@@ -103,7 +103,7 @@ func TestResolveTerminalContextHc(t *testing.T) {
 	}
 }
 
-// tmux 探到 session 时压过 hc 终端：terminalKind 保持 tmux，herdr 字段留空。
+// tmux 探到 session 时压过 hc 终端：terminalKind 保持 tmux，HerdrPane 仍独立保留。
 func TestResolveTerminalContextTmuxBeatsHc(t *testing.T) {
 	context := resolveTerminalContext(envFunc(map[string]string{
 		"TMUX":           "/tmp/tmux-0/default,4242,0",

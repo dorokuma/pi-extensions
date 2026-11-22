@@ -73,7 +73,7 @@ TS 行号对 `cache-stats.ts`（2110 行）；Go 行号用 `grep -n '^func '` �
 | 535–560 | `readFooterCtx` | `state.go:201`（入参 `footerReadInput` 由 `extension.go:533` `captureFooterInput` 从 `sdk.Context` 采集） |
 | 562–571 | `refreshFooter` | `state.go:235` |
 | 573–611 | `recordTurnUsage` | `state.go:248` |
-| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:844` / `extension.go:803`；渲染体 `footer.go:162` `footerRender`（只剩双命中率菱形、上下文占用、模型三段），快照 `footer.go:86` `captureFooterSnapshot`（缓存键 `footer.go:44` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:781` `footerRendererHook`（宿主输入安全读取 `extension.go:825` `footerUITheme`） |
+| 613–703 | `uninstallFooter` / `installFooter`（含 `render()` 与 dirty-check 缓存） | `extension.go:844` / `extension.go:803`；渲染体 `footer.go:161` `footerRender`（只剩双命中率菱形、上下文占用、模型三段），快照 `footer.go:85` `captureFooterSnapshot`（缓存键 `footer.go:44` `hitCacheKey`）；`SetFooterRenderer` 注入钩 `extension.go:781` `footerRendererHook`（宿主输入安全读取 `extension.go:825` `footerUITheme`） |
 | 705–877 | 前缀类型、`emptyBudget`、`section`、`fingerprint`、`escapeForNotify`、读取与预算原语 | `prefix.go:188` `fingerprint`（`padHex8` `:219` / `padInt32Hex8` `:235`）；`:246` `escapeForNotify`；`:273` `chargeChars`；`:290` `chargeString`；`:294` `bumpNodes` |
 | 879–1037 | `hashValue`、`writeValue`、`extractPlainText`、`textToSection` | `prefix.go:320` / `:331` / `:461` / `:544` |
 | 1039–1198 | `collectRoleBag`、`detectShape`、`toolsSection`、标签扇描、extras | `prefix.go:578` / `:676` / `:711` / `:765` `scanUniqueTaggedBlock` / `:825` `extraFromSystemText` |
@@ -197,24 +197,24 @@ standalone module root 报错。说明：非交互模式下 `-p` 不会分发 `/
 | 分类 | 文件 | 行数 |
 |---|---|---|
 | 实现 | `extension.go` | 853 |
-| 实现 | `footer.go` | 221 |
+| 实现 | `footer.go` | 220 |
 | 实现 | `prefix.go` | 1250 |
 | 实现 | `state.go` | 339 |
 | 实现 | `format.go` | 149 |
 | 实现 | `usage.go` | 470 |
 | 实现 | `values.go` | 101 |
-| **实现小计** | 7 个文件 | **3383** |
+| **实现小计** | 7 个文件 | **3382** |
 | 测试 | `concurrency_test.go` | 699 |
-| 测试 | `footer_test.go` | 231 |
+| 测试 | `footer_test.go` | 238 |
 | 测试 | `harness_test.go` | 218 |
 | 测试 | `lifecycle_test.go` | 352 |
 | 测试 | `prefix_test.go` | 967 |
 | 测试 | `format_test.go` | 89 |
 | 测试 | `usage_test.go` | 420 |
-| **测试小计** | 7 个文件 | **2976** |
-| **合计** | 14 个文件 | **6359** |
+| **测试小计** | 7 个文件 | **2983** |
+| **合计** | 14 个文件 | **6365** |
 
-测试/实现比约 2976 / 3383 ≈ 0.88。
+测试/实现比约 2983 / 3382 ≈ 0.88。
 
 ## 遗留
 

@@ -9,8 +9,10 @@
 - Claude Code / `claude-pty` runtime recognition in `IsAgentRuntimeCmdline`
   (`1ec41d7`): `reAgentRuntime` now also matches `(?:^|/)claude/versions/` and
   the argv0 basenames `claude`, `claude-code` and `claude-pty` count as agent
-  runtimes, so a Claude-family host between host and terminal shell is caught
-  by S4 and fused-form S3 instead of being silently trusted.
+  runtimes. In the subprocess form S3 can anchor a Claude host as `hostIndex`,
+  and a Claude runtime sitting between host and terminal shell is caught by
+  S4; in the fused form S3 recognizes a Claude-family self as a valid agent
+  runtime host instead of rejecting it as an unknown runtime.
 
 ### Breaking Changes
 
