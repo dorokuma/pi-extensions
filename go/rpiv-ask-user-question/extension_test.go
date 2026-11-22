@@ -619,7 +619,7 @@ func writeWireFrame(w io.Writer, msg map[string]any) error {
 // follows go/ctxmode/test_helpers_test.go's sdkHost.
 func TestAnswerDispatchVerdictRidesTheDispatchContext(t *testing.T) {
 	t.Setenv("PIG_EXT_SOCKET", "")
-	// A temp HOME keeps the extension's LoadConfig deterministic: the sandbox's
+	// A temp HOME keeps the extension's LoadConfig deterministic: the host's
 	// config store must not leak into the run.
 	t.Setenv("HOME", t.TempDir())
 

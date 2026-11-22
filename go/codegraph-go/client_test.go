@@ -478,7 +478,7 @@ func TestStderrRingAndDiagnostics(t *testing.T) {
 	}
 }
 
-// The sandbox-refusal shape from production: the daemon exits while the
+// The permission-refusal shape from production: the daemon exits while the
 // client waits on initialize. The tool error must carry phase, exit code,
 // workdir and a bounded, sanitized stderr tail instead of a bare
 // "disconnected" or a start-timeout. The process identity is captured via

@@ -24,6 +24,5 @@ use (
 	./pigsdk
 	./pigsdk-regress
 	./rpiv-ask-user-question
-	./sandbox
 	./verifier-expect-fail
 )

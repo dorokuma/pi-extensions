@@ -30,7 +30,7 @@
 
 | 模块（go.mod） | 首个正式 tag |
 |----------------|--------------|
-| `github.com/dorokuma/pi-extensions/go/sandbox` | `go/sandbox/v0.1.0` |
+| `github.com/dorokuma/pi-extensions/go/cache-stats` | `go/cache-stats/v0.1.0` |
 | 其他 `go/<name>` 模块 | `go/<name>/vX.Y.Z` |
 
 约定：
@@ -43,8 +43,8 @@
 消费者引用示例：
 
 ```bash
-go get github.com/dorokuma/pi-extensions/go/sandbox@v0.1.0
-# 对应 git tag: go/sandbox/v0.1.0
+go get github.com/dorokuma/pi-extensions/go/cache-stats@v0.1.0
+# 对应 git tag: go/cache-stats/v0.1.0
 ```
 
 ## CHANGELOG 格式
@@ -65,12 +65,12 @@ go get github.com/dorokuma/pi-extensions/go/sandbox@v0.1.0
 
 ## 发布流程清单
 
-对某一 Go 模块（以 `go/sandbox` 为例）执行正式发布时，按序完成：
+对某一 Go 模块（以 `go/cache-stats` 为例）执行正式发布时，按序完成：
 
 1. **测试全绿**：在模块目录执行 `gofmt -l`、`go vet ./...`、`go test -race ./...`（每步独立重定向到日志并检查 `rc=0`；测试输出不得经管道截断）。
 2. **更新 CHANGELOG**：将 `[Unreleased]` 整理为 `[X.Y.Z] - 日期`，写清 Added/Fixed/Breaking/Known Risks。
 3. **注入版本并提交**：命令行工具用 `-ldflags "-X main.version=X.Y.Z"` 注入；源码中的默认值可为 `dev`。将 VERSIONING/CHANGELOG/代码变更提交到 `main`（一个逻辑清晰的 commit）。
-4. **打 annotated tag**：`git tag -a go/sandbox/vX.Y.Z -m "..."`。
+4. **打 annotated tag**：`git tag -a go/cache-stats/vX.Y.Z -m "..."`。
 5. **推送**：先 `git fetch`；确认 `origin/main` 是本地 `main` 的祖先后，普通推送 `main` 与该 tag。**绝不 `--force`**；不推送无关分支或 `archive/*` tag。
 6. **安装**：将二进制安装到约定路径（默认 `/root/.local/bin/<cmd>`）；若已有现役文件，先备份为 `.<cmd>.bak-YYYYMMDD-<version>`。
 7. **冒烟**：至少执行 `--version` 与一条代表性格命令，确认退出码与关键输出。
