@@ -140,7 +140,7 @@ func TestToolRendererCompactRow(t *testing.T) {
 // TestToolRendererCtxRunSummary covers the one-line summary for ctx_run args.
 func TestToolRendererCtxRunSummary(t *testing.T) {
 	r, _ := modalRuntime(t)
-	args := map[string]any{"action": "execute", "command": "herdr pane read w3N:p1 --lines 40"}
+	args := map[string]any{"action": "execute", "command": "hc terminals list"}
 	lines := r.toolRenderLines("ctx_run", args, sdk.ToolRenderContext{
 		ToolCallID:   "ctx-1",
 		ArgsComplete: true,
@@ -152,7 +152,7 @@ func TestToolRendererCtxRunSummary(t *testing.T) {
 	if !strings.Contains(joined, "ctx_run") {
 		t.Errorf("row = %q, want tool name", joined)
 	}
-	if !strings.Contains(joined, "herdr pane read") {
+	if !strings.Contains(joined, "hc terminals list") {
 		t.Errorf("row = %q, want command summary", joined)
 	}
 	if strings.Contains(joined, "ctx_run ...") || strings.HasSuffix(strings.TrimSpace(joined), "...") {

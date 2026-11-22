@@ -3,7 +3,6 @@ package excludetoolsguard
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -39,498 +37,6 @@ func (m *mockToolManager) SetActiveTools(tools []string) {
 	m.activeTools = tools
 }
 
-// 1. Identity Resolution Tests with Real Unix Domain Socket Fake Server
-func TestQueryPaneShellPid_RealUnixSocket(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "fake-herdr.sock")
-
-	listener, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Fatalf("failed to create unix socket listener: %v", err)
-	}
-
-	type serverAction func(conn net.Conn)
-
-	var (
-		mu            sync.RWMutex
-		currentAction serverAction
-		wg            sync.WaitGroup
-	)
-
-	setAction := func(act serverAction) {
-		mu.Lock()
-		currentAction = act
-		mu.Unlock()
-	}
-	getAction := func() serverAction {
-		mu.RLock()
-		defer mu.RUnlock()
-		return currentAction
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			wg.Add(1)
-			go func(c net.Conn) {
-				defer wg.Done()
-				defer c.Close()
-				act := getAction()
-				if act != nil {
-					act(c)
-				}
-			}(conn)
-		}
-	}()
-
-	defer func() {
-		_ = listener.Close()
-		wg.Wait()
-	}()
-
-	t.Run("MainAgent_Success", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			reader := bufio.NewReader(c)
-			line, readErr := reader.ReadString('\n')
-			if readErr != nil {
-				return
-			}
-			var req struct {
-				ID     string         `json:"id"`
-				Method string         `json:"method"`
-				Params map[string]any `json:"params"`
-			}
-			_ = json.Unmarshal([]byte(line), &req)
-			if req.ID == "pi-identity" && req.Method == "pane.process_info" && req.Params["pane_id"] == "herdr:tab1:p1" {
-				resp := `{"id":"pi-identity","result":{"process_info":{"pane_id":"herdr:tab1:p1","shell_pid":4242}}}` + "\n"
-				_, _ = c.Write([]byte(resp))
-			}
-		})
-
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if !ok || pid != 4242 {
-			t.Errorf("expected (4242, true), got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_MismatchedPaneId", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			resp := `{"id":"pi-identity","result":{"process_info":{"pane_id":"herdr:tab1:other","shell_pid":4242}}}` + "\n"
-			_, _ = c.Write([]byte(resp))
-		})
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for mismatched pane_id, got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_HalfClosedConnection", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			// Close connection immediately without writing any bytes (half-closed / peer hangup)
-			_ = c.Close()
-		})
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for half-closed connection, got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_StringShellPid", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			// shell_pid as string should be strictly rejected (only JSON number accepted)
-			resp := `{"id":"pi-identity","result":{"process_info":{"pane_id":"herdr:tab1:p1","shell_pid":"4242"}}}` + "\n"
-			_, _ = c.Write([]byte(resp))
-		})
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for string shell_pid, got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_InvalidShellPid", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			resp := `{"id":"pi-identity","result":{"process_info":{"pane_id":"herdr:tab1:p1","shell_pid":-5}}}` + "\n"
-			_, _ = c.Write([]byte(resp))
-		})
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for negative shell_pid, got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_GarbageJSON", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			_, _ = c.Write([]byte("{this is not valid json\n"))
-		})
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 500*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for garbage json, got (%d, %v)", pid, ok)
-		}
-	})
-
-	t.Run("Subagent_HangTimeout", func(t *testing.T) {
-		setAction(func(c net.Conn) {
-			// Sleep longer than query timeout (50ms)
-			time.Sleep(200 * time.Millisecond)
-		})
-		start := time.Now()
-		pid, ok := QueryPaneShellPid(sockPath, "herdr:tab1:p1", 50*time.Millisecond)
-		elapsed := time.Since(start)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) on timeout, got (%d, %v)", pid, ok)
-		}
-		if elapsed > 150*time.Millisecond {
-			t.Errorf("timeout did not terminate promptly: took %v", elapsed)
-		}
-	})
-
-	t.Run("Subagent_SocketNotExist", func(t *testing.T) {
-		nonExistentPath := filepath.Join(tmpDir, "does-not-exist.sock")
-		pid, ok := QueryPaneShellPid(nonExistentPath, "herdr:tab1:p1", 100*time.Millisecond)
-		if ok || pid != 0 {
-			t.Errorf("expected (0, false) for non-existent socket, got (%d, %v)", pid, ok)
-		}
-	})
-}
-
-// 2. Identity Resolution Fail-Closed Logic (Markers & S1-S4)
-func TestResolveAgentIdentityWithEnv(t *testing.T) {
-	baseEnv := func() IdentityEnv {
-		return IdentityEnv{
-			Getenv: func(k string) string {
-				if k == "HERDR_PANE_ID" {
-					return "herdr:tab1:p1"
-				}
-				return ""
-			},
-			Args:       []string{"pi"},
-			PID:        100,
-			SocketPath: "/tmp/fake.sock",
-			Timeout:    time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
-				return 4242, true
-			},
-			ReadStat: func(pid int) (int, bool) {
-				if pid == 100 {
-					return 4242, true
-				}
-				if pid == 4242 {
-					return 1, true
-				}
-				return 0, false
-			},
-			ReadCmdline: func(pid int) string {
-				if pid == 100 {
-					return "pi"
-				}
-				if pid == 4242 {
-					return "/bin/bash"
-				}
-				return ""
-			},
-		}
-	}
-
-	t.Run("MainAgent_AllS1ToS4Hold", func(t *testing.T) {
-		env := baseEnv()
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if isSub {
-			t.Errorf("expected main agent (isSub=false), got true: %s", reason)
-		}
-		if !strings.Contains(reason, "S1-S4 hold: pane=herdr:tab1:p1 shell_pid=4242 hop=1") {
-			t.Errorf("unexpected reason format: %s", reason)
-		}
-	})
-
-	t.Run("NegativeMarkers", func(t *testing.T) {
-		markers := []struct {
-			name   string
-			mutate func(e *IdentityEnv)
-			marker string
-		}{
-			{
-				name: "PI_SUBAGENT=1",
-				mutate: func(e *IdentityEnv) {
-					origGet := e.Getenv
-					e.Getenv = func(k string) string {
-						if k == "PI_SUBAGENT" {
-							return "1"
-						}
-						return origGet(k)
-					}
-				},
-				marker: "launch marker: PI_SUBAGENT=1",
-			},
-			{
-				name: "PI_ROLE=worker",
-				mutate: func(e *IdentityEnv) {
-					origGet := e.Getenv
-					e.Getenv = func(k string) string {
-						if k == "PI_ROLE" {
-							return "worker"
-						}
-						return origGet(k)
-					}
-				},
-				marker: "launch marker: PI_ROLE is set",
-			},
-			{
-				name: "argv --name role-",
-				mutate: func(e *IdentityEnv) {
-					e.Args = []string{"pi", "--name", "role-researcher"}
-				},
-				marker: "launch marker: argv has --name role-",
-			},
-			{
-				name: "argv /tmp/herdr-role-sessions",
-				mutate: func(e *IdentityEnv) {
-					e.Args = []string{"pi", "/tmp/herdr-role-sessions/sess-1"}
-				},
-				marker: "launch marker: argv has /tmp/herdr-role-sessions",
-			},
-			{
-				name: "argv /tmp/dispatch-",
-				mutate: func(e *IdentityEnv) {
-					e.Args = []string{"pi", "/tmp/dispatch-task.json"}
-				},
-				marker: "launch marker: argv has /tmp/dispatch-",
-			},
-		}
-
-		for _, tc := range markers {
-			t.Run(tc.name, func(t *testing.T) {
-				env := baseEnv()
-				tc.mutate(&env)
-				isSub, reason := ResolveAgentIdentityWithEnv(env)
-				if !isSub {
-					t.Errorf("expected subagent for %s, got false", tc.name)
-				}
-				if !strings.Contains(reason, tc.marker) {
-					t.Errorf("expected reason to contain %q, got %q", tc.marker, reason)
-				}
-			})
-		}
-	})
-
-	// S1 只要求 pane id 非空（它是 herdr 查询的查找键）；pane 命名不构成判据。
-	t.Run("S1_PaneIdUnset_FailsClosed", func(t *testing.T) {
-		envEmpty := baseEnv()
-		envEmpty.Getenv = func(k string) string { return "" }
-		isSub, reason := ResolveAgentIdentityWithEnv(envEmpty)
-		if !isSub || !strings.Contains(reason, "S1: HERDR_PANE_ID unset or empty") {
-			t.Errorf("expected S1 unset error, got isSub=%v, reason=%s", isSub, reason)
-		}
-	})
-
-	// pane 命名不再作判据：非 ":p1" 后缀的 pane id 本身绝不导致子代理判定，
-	// 它只作为辅助证据出现在 reason 里。
-	t.Run("S1_PaneNamingIsNotACriterion", func(t *testing.T) {
-		envNotP1 := baseEnv()
-		envNotP1.Getenv = func(k string) string {
-			if k == "HERDR_PANE_ID" {
-				return "herdr:tab1:p2"
-			}
-			return ""
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(envNotP1)
-		if isSub {
-			t.Errorf("pane naming must not be an identity criterion, got subagent: %s", reason)
-		}
-		if !strings.Contains(reason, "pane=herdr:tab1:p2") {
-			t.Errorf("expected pane id recorded as auxiliary evidence, got: %s", reason)
-		}
-	})
-
-	t.Run("S2_SocketFailure", func(t *testing.T) {
-		env := baseEnv()
-		env.QuerySocket = func(sock, pane string, to time.Duration) (int, bool) {
-			return 0, false
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if !isSub || !strings.Contains(reason, "S2: herdr pane query for herdr:tab1:p1 failed") {
-			t.Errorf("expected S2 failure, got isSub=%v, reason=%s", isSub, reason)
-		}
-	})
-
-	t.Run("S3_AncestryMissingShellPid", func(t *testing.T) {
-		env := baseEnv()
-		// ancestry chain does not contain 4242
-		env.ReadStat = func(pid int) (int, bool) {
-			if pid == 100 {
-				return 9999, true
-			}
-			if pid == 9999 {
-				return 1, true
-			}
-			return 0, false
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if !isSub || !strings.Contains(reason, "S3: pane herdr:tab1:p1 shell_pid=4242 is not in this process ancestry") {
-			t.Errorf("expected S3 ancestry missing shell_pid, got isSub=%v, reason=%s", isSub, reason)
-		}
-	})
-
-	t.Run("S3_AncestryChainEmpty", func(t *testing.T) {
-		env := baseEnv()
-		env.ReadStat = func(pid int) (int, bool) {
-			return 0, false
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if !isSub || !strings.Contains(reason, "S3: /proc ancestry for this process is unreadable") {
-			t.Errorf("expected S3 ancestry unreadable, got isSub=%v, reason=%s", isSub, reason)
-		}
-	})
-
-	// M1 正向实证 ①：真实的 subprocess 拓扑（扩展是 pi 宿主的子进程） -> 判定为主代理（main agent）
-	t.Run("SubprocessTopology_PiHost_MainAgent", func(t *testing.T) {
-		env := baseEnv()
-		// 拓扑：100 (exclude-tools-guard subprocess) -> 200 (pi 宿主) -> 4242 (pane shell)
-		env.PID = 100
-		env.Getenv = func(k string) string {
-			switch k {
-			case "HERDR_PANE_ID":
-				return "herdr:tab1:p1"
-			case "PIG_EXT_SOCKET":
-				return "/tmp/pig-ext-sock.sock"
-			default:
-				return ""
-			}
-		}
-		env.ReadStat = func(pid int) (int, bool) {
-			if pid == 100 {
-				return 200, true
-			}
-			if pid == 200 {
-				return 4242, true
-			}
-			if pid == 4242 {
-				return 1, true
-			}
-			return 0, false
-		}
-		env.ReadCmdline = func(pid int) string {
-			if pid == 100 {
-				return "/root/workspace/pi-extensions/go/bin/exclude-tools-guard"
-			}
-			if pid == 200 {
-				return "pi -p hello"
-			}
-			if pid == 4242 {
-				return "/bin/bash"
-			}
-			return ""
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if isSub {
-			t.Errorf("expected main agent (isSub=false) for pi host subprocess topology, got isSub=true, reason=%s", reason)
-		}
-		if !strings.Contains(reason, "S1-S4 hold: pane=herdr:tab1:p1 shell_pid=4242 hop=2") {
-			t.Errorf("unexpected reason format: %s", reason)
-		}
-	})
-
-	// M1 正向实证：将来迁移到 pig 宿主的 subprocess 拓扑 -> 判定为主代理（main agent）
-	t.Run("SubprocessTopology_PigHost_MainAgent", func(t *testing.T) {
-		env := baseEnv()
-		// 拓扑：100 (exclude-tools-guard subprocess) -> 200 (pig 宿主) -> 4242 (pane shell)
-		env.PID = 100
-		env.Getenv = func(k string) string {
-			switch k {
-			case "HERDR_PANE_ID":
-				return "herdr:tab1:p1"
-			case "PIG_EXT_SOCKET":
-				return "/tmp/pig-ext-sock.sock"
-			default:
-				return ""
-			}
-		}
-		env.ReadStat = func(pid int) (int, bool) {
-			if pid == 100 {
-				return 200, true
-			}
-			if pid == 200 {
-				return 4242, true
-			}
-			if pid == 4242 {
-				return 1, true
-			}
-			return 0, false
-		}
-		env.ReadCmdline = func(pid int) string {
-			if pid == 100 {
-				return "/root/workspace/pi-extensions/go/bin/exclude-tools-guard"
-			}
-			if pid == 200 {
-				return "pig -p hello"
-			}
-			if pid == 4242 {
-				return "/bin/bash"
-			}
-			return ""
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if isSub {
-			t.Errorf("expected main agent (isSub=false) for pig host subprocess topology, got isSub=true, reason=%s", reason)
-		}
-	})
-
-	// M1 反向实证 ②：宿主与 pane shell 之间夹了 agent 运行时 -> 判定为子代理（subagent）
-	t.Run("SubprocessTopology_AgentRuntimeBetweenHostAndShell_Subagent", func(t *testing.T) {
-		env := baseEnv()
-		// 拓扑：100 (exclude-tools-guard subprocess) -> 200 (pi 宿主) -> 300 (中间 agent 运行时) -> 4242 (pane shell)
-		env.PID = 100
-		env.Getenv = func(k string) string {
-			switch k {
-			case "HERDR_PANE_ID":
-				return "herdr:tab1:p1"
-			case "PIG_EXT_SOCKET":
-				return "/tmp/pig-ext-sock.sock"
-			default:
-				return ""
-			}
-		}
-		env.ReadStat = func(pid int) (int, bool) {
-			if pid == 100 {
-				return 200, true
-			}
-			if pid == 200 {
-				return 300, true
-			}
-			if pid == 300 {
-				return 4242, true
-			}
-			if pid == 4242 {
-				return 1, true
-			}
-			return 0, false
-		}
-		env.ReadCmdline = func(pid int) string {
-			if pid == 100 {
-				return "/root/workspace/pi-extensions/go/bin/exclude-tools-guard"
-			}
-			if pid == 200 {
-				return "pi -p hello"
-			}
-			if pid == 300 {
-				return "pi-coding-agent subagent-worker"
-			}
-			if pid == 4242 {
-				return "/bin/bash"
-			}
-			return ""
-		}
-		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if !isSub || !strings.Contains(reason, "S4: agent runtime ancestor pid=300") {
-			t.Errorf("expected S4 agent runtime rejection, got isSub=%v, reason=%s", isSub, reason)
-		}
-	})
-}
-
 // hcTerminalSocket starts a unix socket server that replies with reply for
 // every connection and returns its path.
 func hcTerminalSocket(t *testing.T, reply string) string {
@@ -549,6 +55,37 @@ func hcTerminalSocket(t *testing.T, reply string) string {
 			}
 			buffer := make([]byte, 4096)
 			_, _ = conn.Read(buffer)
+			if reply != "" {
+				_, _ = conn.Write([]byte(reply))
+			}
+			_ = conn.Close()
+		}
+	}()
+	return sockPath
+}
+
+// hcTerminalSocketCapture 与 hcTerminalSocket 同型，但把收到的请求体（以 \n
+// 结尾的第一行 JSON）经 capturedCh 送回调用方，供断言 terminal.get 的
+// 报文字段。channel 传递在 accept goroutine 与测试 goroutine 之间建立
+// happens-before，避免共享指针的 data race。
+func hcTerminalSocketCapture(t *testing.T, reply string, capturedCh chan<- string) string {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "herdr-core.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create unix socket listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			line, _ := bufio.NewReader(conn).ReadString('\n')
+			if capturedCh != nil {
+				capturedCh <- line
+			}
 			if reply != "" {
 				_, _ = conn.Write([]byte(reply))
 			}
@@ -579,6 +116,13 @@ func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
 		{"non_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":5,"state":"live","pid":4321}}`, false, ""},
 		{"result_null", `{"id":"pi-identity","result":null}`, false, ""},
 		{"wrong_request_id", `{"id":"other","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`, false, ""},
+		{"address_mismatch", `{"id":"pi-identity","result":{"address":"t99t","parent":null,"state":"live","pid":4321}}`, false, ""},
+		{"missing_pid", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live"}}`, false, ""},
+		{"pid_string", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":"4321"}}`, false, ""},
+		{"pid_zero", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":0}}`, false, ""},
+		{"pid_negative", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":-7}}`, false, ""},
+		{"pid_float", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":4321.5}}`, false, ""},
+		{"invalid_json_reply", `not-json`, false, ""},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -589,10 +133,118 @@ func TestQueryHcTerminalInfo_HcSocket(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("request_fields", func(t *testing.T) {
+		capturedCh := make(chan string, 1)
+		sockPath := hcTerminalSocketCapture(t, ok, capturedCh)
+		info, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 500*time.Millisecond)
+		if !gotOK || info.Address != "t12t" || info.PID != 4321 {
+			t.Fatalf("QueryHcTerminalInfo = %+v,%v", info, gotOK)
+		}
+		var captured string
+		select {
+		case captured = <-capturedCh:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for captured terminal.get request")
+		}
+		for _, want := range []string{
+			`"method":"terminal.get"`,
+			`"terminal":"t12t"`,
+			`"caller":"t12t"`,
+			`"id":"pi-identity"`,
+			`"jsonrpc":"2.0"`,
+		} {
+			if !strings.Contains(captured, want) {
+				t.Fatalf("terminal.get request missing %s, got: %s", want, captured)
+			}
+		}
+	})
+
+	t.Run("socket_missing", func(t *testing.T) {
+		if _, gotOK := QueryHcTerminalInfo(filepath.Join(t.TempDir(), "no.sock"), "t12t", 100*time.Millisecond); gotOK {
+			t.Fatalf("missing socket must fail closed")
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		// 服务端 accept 后不回，读取必须撞 deadline 并 fail closed。
+		sockPath := filepath.Join(t.TempDir(), "herdr-core.sock")
+		listener, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("failed to create unix socket listener: %v", err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		done := make(chan struct{})
+		t.Cleanup(func() { close(done) })
+		go func() {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			buf := make([]byte, 4096)
+			_, _ = conn.Read(buf)
+			<-done // hold without replying until the subtest ends
+			_ = conn.Close()
+		}()
+		if _, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 60*time.Millisecond); gotOK {
+			t.Fatalf("silent server must time out and fail closed")
+		}
+	})
+
+	t.Run("half_closed_eof", func(t *testing.T) {
+		// 服务端半关闭（写 EOF、不回数据）：ReadBytes 拿到 0 字节 + EOF，
+		// 与空 reply 等价，必须 fail closed 而非 panic。
+		sockPath := filepath.Join(t.TempDir(), "herdr-core.sock")
+		listener, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("failed to create unix socket listener: %v", err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			buf := make([]byte, 4096)
+			_, _ = conn.Read(buf)
+			_ = conn.(*net.UnixConn).CloseWrite()
+			_ = conn.Close()
+		}()
+		if _, gotOK := QueryHcTerminalInfo(sockPath, "t12t", 500*time.Millisecond); gotOK {
+			t.Fatalf("half-closed EOF must fail closed")
+		}
+	})
 }
 
-// 2b. herdr-core (hc) 身份形状回归：HERDR_PANE_ID 缺位且导出 HC_TERMINAL_ID 时，
-// terminal.get 的 parent=null 顶层记录等价于老 herdr 的主窗格正证明。
+// 2b-0. SubagentLaunchMarker 环境负向标记：PI_SUBAGENT=1 与 PI_ROLE 非空
+// 必须立刻判子代理，不进入 S1-S4 进程拓扑。
+func TestSubagentLaunchMarkerEnvMarkers(t *testing.T) {
+	base := func(k string) string { return "" }
+	if marker, hit := SubagentLaunchMarker(base, []string{"pig"}); hit {
+		t.Fatalf("clean env must not hit a marker, got %q", marker)
+	}
+	withPI_SUBAGENT := func(k string) string {
+		if k == "PI_SUBAGENT" {
+			return "1"
+		}
+		return ""
+	}
+	if marker, hit := SubagentLaunchMarker(withPI_SUBAGENT, []string{"pig"}); !hit || marker != "PI_SUBAGENT=1" {
+		t.Fatalf("PI_SUBAGENT=1 must hit, got marker=%q hit=%v", marker, hit)
+	}
+	withPI_ROLE := func(k string) string {
+		if k == "PI_ROLE" {
+			return "verifier"
+		}
+		return ""
+	}
+	if marker, hit := SubagentLaunchMarker(withPI_ROLE, []string{"pig"}); !hit || marker != "PI_ROLE is set" {
+		t.Fatalf("PI_ROLE must hit, got marker=%q hit=%v", marker, hit)
+	}
+}
+
+// 2b. herdr-core (hc) 身份形状回归：导出 HC_TERMINAL_ID 时，
+// terminal.get 的 parent=null 顶层记录证明主代理身份。
 func TestResolveAgentIdentity_HcTerminal(t *testing.T) {
 	// 拓扑：100 (扩展 subprocess) -> 200 (pi 宿主) -> 4242 (hc 终端 shell)
 	hcEnv := func(info HcTerminalInfo, ok bool) IdentityEnv {
@@ -609,11 +261,14 @@ func TestResolveAgentIdentity_HcTerminal(t *testing.T) {
 			Environ: func() []string {
 				return []string{"HC_TERMINAL_ID=t12t", "PIG_EXT_SOCKET=/tmp/pig-ext-sock.sock"}
 			},
-			Args:        []string{"exclude-tools-guard"},
-			PID:         100,
-			SocketPath:  "/tmp/fake.sock",
-			Timeout:     time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) { return 0, false },
+			// Args/ArgvCache isolate this env from the process-wide
+			// defaultArgvCache: a prior LoadEffectiveArgs call that read a
+			// harness PIG_HARNESS_ARGV_FILE must never leak markers into the
+			// mocked identity resolutions below.
+			Args:      []string{"pig"},
+			PID:       100,
+			Timeout:   time.Second,
+			ArgvCache: &ArgvCache{},
 			QueryHcSocket: func(sock, termID string, to time.Duration) (HcTerminalInfo, bool) {
 				if sock != HcSocketFile && !strings.HasPrefix(sock, "/tmp/") {
 					t.Fatalf("hc socket path %q must be the hard-coded default or an injected test path", sock)
@@ -676,11 +331,69 @@ func TestResolveAgentIdentity_HcTerminal(t *testing.T) {
 			t.Fatalf("expected S3 ancestry denial, got isSub=%v, reason=%s", isSub, reason)
 		}
 	})
+
+	t.Run("InvalidTerminalIDFormat_Denied", func(t *testing.T) {
+		// HC_TERMINAL_ID 不匹配 ^t[0-9a-z]+$ 时 S1 拒于格式校验，hc 查询不应被调用。
+		env := hcEnv(HcTerminalInfo{Address: "t12t", PID: 4242}, true)
+		env.Getenv = func(k string) string {
+			if k == "HC_TERMINAL_ID" {
+				return "pane-0"
+			}
+			if k == "PIG_EXT_SOCKET" {
+				return "/tmp/pig-ext-sock.sock"
+			}
+			return ""
+		}
+		queryCalled := false
+		env.QueryHcSocket = func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+			queryCalled = true
+			return HcTerminalInfo{Address: id, PID: 4242}, true
+		}
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if !isSub || !strings.Contains(reason, "S1: HC_TERMINAL_ID=pane-0 is not a terminal address") {
+			t.Fatalf("expected S1 format denial, got isSub=%v, reason=%s", isSub, reason)
+		}
+		if queryCalled {
+			t.Fatalf("hc query must not run when HC_TERMINAL_ID fails the format check")
+		}
+	})
+
+	t.Run("EmptyAncestryChain_Denied", func(t *testing.T) {
+		// /proc 祖先链完全不可读时 len(chain)==0，S3 fail-closed。
+		env := hcEnv(HcTerminalInfo{Address: "t12t", PID: 4242}, true)
+		env.ReadStat = func(pid int) (int, bool) { return 0, false }
+		env.ReadCmdline = func(pid int) string { return "" }
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if !isSub || !strings.Contains(reason, "S3: /proc ancestry for this process is unreadable") {
+			t.Fatalf("expected S3 empty-chain denial, got isSub=%v, reason=%s", isSub, reason)
+		}
+	})
+
+	t.Run("PigHostTopology_MainAgent", func(t *testing.T) {
+		// 宿主进程也可以是 pig（不仅是 pi）：subprocess 形态下 pig cmdline
+		// 同样被 IsAgentRuntimeCmdline 识别为 agent runtime 宿主。
+		env := hcEnv(HcTerminalInfo{Address: "t12t", PID: 4242}, true)
+		env.ReadCmdline = func(pid int) string {
+			switch pid {
+			case 100:
+				return "/opt/ext/exclude-tools-guard"
+			case 200:
+				return "pig"
+			case 4242:
+				return "/bin/bash"
+			}
+			return ""
+		}
+		isSub, reason := ResolveAgentIdentityWithEnv(env)
+		if isSub || !strings.Contains(reason, "S1-S4 hold") {
+			t.Fatalf("pig host must resolve as main agent, got isSub=%v, reason=%s", isSub, reason)
+		}
+	})
 }
 
 // 2a. 身份判据重构回归（oracle2 反例 A/B + 三条已决落地）
-//   - pane 命名不构成判据；PIG_EXT_SOCKET 为主判别式；hostIndex = 第一个 agent-runtime 祖先；
-//   - 找不到祖先 / fused 自身无法识别 / herdr 查询失败一律 fail-closed 判子代理。
+//   - 终端命名不构成判据；PIG_EXT_SOCKET 为主判别式；hostIndex = 第一个 agent-runtime 祖先；
+//   - 找不到祖先 / fused 自身无法识别 / hc 查询失败一律 fail-closed 判子代理。
 func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 	writeArgvFile := func(name, content string) string {
 		path := filepath.Join(t.TempDir(), name)
@@ -690,20 +403,20 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		return path
 	}
 
-	// subprocessEnv 构造 subprocess 形态（PIG_EXT_SOCKET 非空）的判定环境。
-	subprocessEnv := func(paneID string) IdentityEnv {
+	// subprocessEnv 构造 subprocess 形态（PIG_EXT_SOCKET 非空）的判定环境，
+	// herdr-core (hc) 身份形状：HC_TERMINAL_ID + 顶层 terminal.get 记录。
+	subprocessEnv := func(termID string) IdentityEnv {
 		envMap := map[string]string{
-			"HERDR_PANE_ID":  paneID,
+			"HC_TERMINAL_ID": termID,
 			"PIG_EXT_SOCKET": "/tmp/pig-ext-sock.sock",
 		}
 		return IdentityEnv{
-			Getenv:     func(k string) string { return envMap[k] },
-			Args:       []string{"/root/workspace/pi-extensions/go/bin/exclude-tools-guard"},
-			PID:        100,
-			SocketPath: "/tmp/fake.sock",
-			Timeout:    time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
-				return 4242, true
+			Getenv:  func(k string) string { return envMap[k] },
+			Args:    []string{"/root/workspace/pi-extensions/go/bin/exclude-tools-guard"},
+			PID:     100,
+			Timeout: time.Second,
+			QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+				return HcTerminalInfo{Address: id, PID: 4242}, true
 			},
 			ArgvCache: &ArgvCache{},
 		}
@@ -713,9 +426,9 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 
 	// 用例 1：子代理宿主。subprocess 拓扑下宿主自身 cmdline 带 --name role-reviewer
 	// （经 PIG_HARNESS_ARGV_FILE 桥接，因为 subprocess 的 os.Args 只有二进制路径）-> 判 subagent。
-	// 取代原来依赖 ":p1"  pane 命名的旧用例。
+	// 取代原来依赖 ":p1" 终端命名的旧用例。
 	t.Run("SubagentHost_ArgvMarker_Subagent", func(t *testing.T) {
-		env := subprocessEnv("herdr:tab1:p1")
+		env := subprocessEnv("t12t")
 		argvPath := writeArgvFile("role-reviewer.json", `["pi","--name","role-reviewer","-p","review"]`)
 		origGet := env.Getenv
 		env.Getenv = func(k string) string {
@@ -724,7 +437,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 			}
 			return origGet(k)
 		}
-		// 拓扑：100 (扩展子进程) -> 200 (role-reviewer 宿主) -> 4242 (pane shell)
+		// 拓扑：100 (扩展子进程) -> 200 (role-reviewer 宿主) -> 4242 (终端 shell)
 		env.ReadStat = func(pid int) (int, bool) {
 			switch pid {
 			case 100:
@@ -757,7 +470,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 	// 用例 2：隔层 spawn（oracle2 反例 A 回归）。ext(100)->sh(200)->pi(300)->bash(4242)
 	// hostIndex 取第一个 agent-runtime 祖先（pi@300），S4 扫描区间为空 -> 判 main。
 	t.Run("GappedSpawn_IntermediateShell_MainAgent", func(t *testing.T) {
-		env := subprocessEnv("herdr:tab1:p1")
+		env := subprocessEnv("t12t")
 		env.ReadStat = func(pid int) (int, bool) {
 			switch pid {
 			case 100:
@@ -789,7 +502,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		if isSub {
 			t.Errorf("expected main agent for gapped spawn topology, got subagent: %s", reason)
 		}
-		if !strings.Contains(reason, "S1-S4 hold: pane=herdr:tab1:p1 shell_pid=4242 hop=3") {
+		if !strings.Contains(reason, "S1-S4 hold: terminal=t12t shell_pid=4242 hop=3") {
 			t.Errorf("unexpected reason format: %s", reason)
 		}
 	})
@@ -798,10 +511,10 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 	// PIG_EXT_SOCKET 未设 + self 为 "node /x/index.js" -> fail-closed 判 subagent。
 	// 旧代码的 "|| len(chain) >= 2" 旁路会误把父进程当宿主从而放行。
 	t.Run("FusedUnrecognizedSelfCmdline_Subagent", func(t *testing.T) {
-		env := subprocessEnv("herdr:tab1:p1")
+		env := subprocessEnv("t12t")
 		env.Getenv = func(k string) string {
-			if k == "HERDR_PANE_ID" {
-				return "herdr:tab1:p1"
+			if k == "HC_TERMINAL_ID" {
+				return "t12t"
 			}
 			return ""
 		}
@@ -832,7 +545,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 
 	// 用例 4：subprocess 拓扑但链上找不到 agent-runtime 祖先 -> fail-closed 判 subagent。
 	t.Run("NoAgentRuntimeAncestor_Subagent", func(t *testing.T) {
-		env := subprocessEnv("herdr:tab1:p1")
+		env := subprocessEnv("t12t")
 		env.ReadStat = func(pid int) (int, bool) {
 			switch pid {
 			case 100:
@@ -864,7 +577,7 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 
 	// 用例 5：同进程第二次调用仍判 subagent（argv 进程内缓存；变量按打包单元共享而保留可读）。
 	t.Run("ConsecutiveCalls_Subagent_ArgvCache", func(t *testing.T) {
-		env := subprocessEnv("herdr:tab1:p1")
+		env := subprocessEnv("t12t")
 		argvPath := writeArgvFile("consecutive-subprocess.json", `["pi","--name","role-reviewer-consecutive","-p","review"]`)
 		origGet := env.Getenv
 		// PIG_HARNESS_ARGV_FILE 保留在环境：packed cell 内的兄弟扩展也要读它，
@@ -914,10 +627,10 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		}
 	})
 
-	// 用例 6：pane 名不再作判据。HERDR_PANE_ID=w32:p23（非 :p1）+ 其余条件都像主代理
-	// （宿主是 pi、无负向标记、herdr 查询成功）-> 判 main。
-	t.Run("PaneNamingNotCriterion_MainAgent", func(t *testing.T) {
-		env := subprocessEnv("w32:p23")
+	// 用例 6：终端命名不再作判据。HC_TERMINAL_ID=t23t（任意合法终端地址）+ 其余条件都像主代理
+	// （宿主是 pi、无负向标记、terminal.get 成功）-> 判 main。
+	t.Run("TerminalNamingNotCriterion_MainAgent", func(t *testing.T) {
+		env := subprocessEnv("t23t")
 		env.ReadStat = func(pid int) (int, bool) {
 			switch pid {
 			case 100:
@@ -943,10 +656,10 @@ func TestResolveAgentIdentity_IdentityCriteriaRefactor(t *testing.T) {
 		isSub, reason := ResolveAgentIdentityWithEnv(env)
 		t.Logf("isSubagent=%v reason=%s", isSub, reason)
 		if isSub {
-			t.Errorf("expected main agent (pane naming is not a criterion), got subagent: %s", reason)
+			t.Errorf("expected main agent (terminal naming is not a criterion), got subagent: %s", reason)
 		}
-		if !strings.Contains(reason, "pane=w32:p23") {
-			t.Errorf("expected pane id as auxiliary evidence, got: %s", reason)
+		if !strings.Contains(reason, "terminal=t23t") {
+			t.Errorf("expected terminal id in reason, got: %s", reason)
 		}
 	})
 }
@@ -966,7 +679,7 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 	// packedCellEnv 只放真实迁移键名，不做伪造：没有 PIG_EXT_SOCKET，有成员 sock 键 +
 	// PIG_EXT_PACKED_CELL + PIG_EXT_ACTIVE_MEMBERS。
 	packedCellEnv := func(envMap map[string]string) IdentityEnv {
-		envMap["HERDR_PANE_ID"] = "herdr:tab1:p1"
+		envMap["HC_TERMINAL_ID"] = "t12t"
 		return IdentityEnv{
 			Getenv: func(k string) string { return envMap[k] },
 			Args:   []string{packedRunner},
@@ -979,16 +692,15 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 				}
 				return entries
 			},
-			SocketPath: "/tmp/fake.sock",
-			Timeout:    time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
-				return 4242, true
+			Timeout: time.Second,
+			QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+				return HcTerminalInfo{Address: id, PID: 4242}, true
 			},
 			ArgvCache: &ArgvCache{},
 		}
 	}
 
-	// topology 把 pids 依次绑成祖先链（pids[0]=self，最后一个是 pane shell）。
+	// topology 把 pids 依次绑成祖先链（pids[0]=self，最后一个是终端 shell）。
 	setTopology := func(env *IdentityEnv, pids []int, cmdlines map[int]string) {
 		env.ReadStat = func(pid int) (int, bool) {
 			for i, p := range pids {
@@ -1006,7 +718,7 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 	}
 
 	// 用例 1（阻断修复的主证据）：只注入真实成员键 PIG_EXT_SOCKET_EXCLUDE_TOOLS_GUARD、
-	// 不设 PIG_EXT_SOCKET；配「宿主是 pi、父进程是 pane shell」拓扑 -> 必须走 subprocess 分支并判 main。
+	// 不设 PIG_EXT_SOCKET；配「宿主是 pi、父进程是终端 shell」拓扑 -> 必须走 subprocess 分支并判 main。
 	t.Run("PackedCell_RealMemberKey_MainAgent", func(t *testing.T) {
 		env := packedCellEnv(map[string]string{
 			memberSocketKey: "/run/x.sock",
@@ -1024,13 +736,13 @@ func TestResolveAgentIdentity_PackedCellForm(t *testing.T) {
 		if isSub {
 			t.Errorf("packed-go cell member must be recognised as subprocess form -> main, got subagent: %s", reason)
 		}
-		if !strings.Contains(reason, "S1-S4 hold: pane=herdr:tab1:p1 shell_pid=4242 hop=2") {
+		if !strings.Contains(reason, "S1-S4 hold: terminal=t12t shell_pid=4242 hop=2") {
 			t.Errorf("unexpected reason format: %s", reason)
 		}
 	})
 
 	// 用例 2：完整的 packed-cell 形态（成员键 + PIG_EXT_PACKED_CELL + PIG_EXT_ACTIVE_MEMBERS），
-	// 但宿主与 pane shell 之间夹了 agent runtime -> 必须仍判 subagent（形态识别放宽不削弱 S4）。
+	// 但宿主与终端 shell 之间夹了 agent runtime -> 必须仍判 subagent（形态识别放宽不削弱 S4）。
 	t.Run("PackedCell_AgentRuntimeBetweenHostAndShell_Subagent", func(t *testing.T) {
 		env := packedCellEnv(map[string]string{
 			memberSocketKey:          "/run/x.sock",
@@ -1104,20 +816,19 @@ func TestResolveAgentIdentity_FailClosedBranches_WarnOnce(t *testing.T) {
 		return IdentityEnv{
 			Getenv: func(k string) string {
 				switch k {
-				case "HERDR_PANE_ID":
-					return "herdr:tab1:p1"
+				case "HC_TERMINAL_ID":
+					return "t12t"
 				case "PIG_EXT_SOCKET":
 					return "/tmp/pig-ext-sock.sock"
 				}
 				return ""
 			},
-			Args:       []string{"pi"},
-			PID:        100,
-			Environ:    func() []string { return nil },
-			SocketPath: "/tmp/fake.sock",
-			Timeout:    time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
-				return 4242, true
+			Args:    []string{"pig"},
+			PID:     100,
+			Environ: func() []string { return nil },
+			Timeout: time.Second,
+			QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+				return HcTerminalInfo{Address: id, PID: 4242}, true
 			},
 			ReadStat: func(pid int) (int, bool) {
 				switch pid {
@@ -1166,11 +877,11 @@ func TestResolveAgentIdentity_FailClosedBranches_WarnOnce(t *testing.T) {
 		wantBranch string
 	}{
 		{
-			name: "S1_PaneIdUnset",
+			name: "S1_TerminalIdUnset",
 			mutate: func(e *IdentityEnv) {
 				e.Getenv = func(string) string { return "" }
 			},
-			wantBranch: "S1: HERDR_PANE_ID unset or empty",
+			wantBranch: "S1: HC_TERMINAL_ID unset or empty",
 		},
 		{
 			name: "S3_NoAgentRuntimeAncestor",
@@ -1255,8 +966,90 @@ func TestResolveAgentIdentity_FailClosedBranches_WarnOnce(t *testing.T) {
 	}
 }
 
-// 2d. herdr 查询失败/超时：fail-closed 判子代理 + 只记一条日志（sync.Once 去重）。
-func TestResolveAgentIdentity_HerdrQueryFailure_WarnsOnce(t *testing.T) {
+// 2c-2. 包级 defaultArgvCache 隔离回归：宿主 pig 把 PIG_HARNESS_ARGV_FILE
+// 指到带 --name role- 的 argv 文件时，一次真实的 LoadEffectiveArgs 会把该文件
+// 写进进程级缓存；后面所有「模拟 env（ArgvCache=nil）」的判定都必须用自己的
+// 独立 ArgvCache / 干净 Args，绝不能经由 defaultArgvCache 串入宿主 argv。
+func TestResolveAgentIdentity_DefaultArgvCacheIsolation(t *testing.T) {
+	argvPath := filepath.Join(t.TempDir(), "harness-argv.json")
+	if err := os.WriteFile(argvPath, []byte(`["--name","role-verifier-sim"]`), 0o600); err != nil {
+		t.Fatalf("failed to write harness argv file: %v", err)
+	}
+
+	// 预热并污染 defaultArgvCache，模拟「先跑了一条读真实宿主 argv 文件的判定」。
+	ResetDefaultArgvCache()
+	t.Cleanup(ResetDefaultArgvCache)
+	warmGetenv := func(k string) string {
+		if k == "PIG_HARNESS_ARGV_FILE" {
+			return argvPath
+		}
+		return ""
+	}
+	warmArgs, err := LoadEffectiveArgs(warmGetenv, []string{"pig"})
+	if err != nil {
+		t.Fatalf("warm-up LoadEffectiveArgs failed: %v", err)
+	}
+	if marker, hit := SubagentLaunchMarker(warmGetenv, warmArgs); !hit || !strings.Contains(marker, "--name role-") {
+		t.Fatalf("warm-up must prime defaultArgvCache with the role marker, got marker=%q hit=%v", marker, hit)
+	}
+	if cached, ok := defaultArgvCache.Get(); !ok || len(cached) == 0 {
+		t.Fatalf("defaultArgvCache must be populated after warm-up, got %v,%v", cached, ok)
+	}
+
+	// 模拟 env：ArgvCache=nil（走 defaultArgvCache 回退）但 Args 显式为干净 argv。
+	// 隔离修复后的语义：env.ArgvCache == nil 时不得复用 defaultArgvCache，
+	// 只能 merge 该 env 自己的 argv 文件；本 env 未设 PIG_HARNESS_ARGV_FILE，
+	// 因此不受宿主 role- marker 污染。
+	env := IdentityEnv{
+		Getenv: func(k string) string {
+			switch k {
+			case "HC_TERMINAL_ID":
+				return "t12t"
+			case "PIG_EXT_SOCKET":
+				return "/tmp/pig-ext-sock.sock"
+			}
+			return ""
+		},
+		Args:    []string{"pig"},
+		PID:     100,
+		Timeout: time.Second,
+		QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+			return HcTerminalInfo{Address: id, PID: 4242}, true
+		},
+		ReadStat: func(pid int) (int, bool) {
+			switch pid {
+			case 100:
+				return 200, true
+			case 200:
+				return 4242, true
+			case 4242:
+				return 1, true
+			}
+			return 0, false
+		},
+		ReadCmdline: func(pid int) string {
+			switch pid {
+			case 100:
+				return "/opt/ext/exclude-tools-guard"
+			case 200:
+				return "pig"
+			case 4242:
+				return "/bin/bash"
+			}
+			return ""
+		},
+	}
+	isSub, reason := ResolveAgentIdentityWithEnv(env)
+	if isSub {
+		t.Fatalf("mocked env must not inherit the host role marker via defaultArgvCache, got isSub=%v reason=%s", isSub, reason)
+	}
+	if !strings.Contains(reason, "S1-S4 hold") {
+		t.Fatalf("unexpected reason: %s", reason)
+	}
+}
+
+// 2d. hc 查询失败/超时：fail-closed 判子代理 + 只记一条日志（sync.Once 去重）。
+func TestResolveAgentIdentity_HcQueryFailure_WarnsOnce(t *testing.T) {
 	ResetIdentityWarnOnce()
 
 	origStderr := os.Stderr
@@ -1268,20 +1061,19 @@ func TestResolveAgentIdentity_HerdrQueryFailure_WarnsOnce(t *testing.T) {
 
 	env := IdentityEnv{
 		Getenv: func(k string) string {
-			if k == "HERDR_PANE_ID" {
-				return "herdr:tab1:p1"
+			if k == "HC_TERMINAL_ID" {
+				return "t12t"
 			}
 			return ""
 		},
-		Args:       []string{"pi"},
-		PID:        100,
-		SocketPath: "/tmp/fake.sock",
-		Timeout:    1500 * time.Millisecond,
-		QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
+		Args:    []string{"pig"},
+		PID:     100,
+		Timeout: 1500 * time.Millisecond,
+		QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
 			if to != 1500*time.Millisecond {
 				t.Errorf("expected the 1500ms budget to be preserved, got %v", to)
 			}
-			return 0, false
+			return HcTerminalInfo{}, false
 		},
 		ReadStat: func(pid int) (int, bool) {
 			if pid == 100 {
@@ -1300,7 +1092,7 @@ func TestResolveAgentIdentity_HerdrQueryFailure_WarnsOnce(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		isSub, reason := ResolveAgentIdentityWithEnv(env)
-		if !isSub || !strings.Contains(reason, "S2: herdr pane query for herdr:tab1:p1 failed") {
+		if !isSub || !strings.Contains(reason, "S2: hc terminal.get for t12t failed") {
 			t.Fatalf("call#%d expected fail-closed subagent, got isSub=%v, reason=%s", i+1, isSub, reason)
 		}
 	}
@@ -1311,7 +1103,7 @@ func TestResolveAgentIdentity_HerdrQueryFailure_WarnsOnce(t *testing.T) {
 	_ = r.Close()
 
 	outputStr := string(out)
-	if !strings.Contains(outputStr, "[subagent-identity] warning: identity not verified, fail-closed to subagent: S2: herdr pane query for herdr:tab1:p1 failed") {
+	if !strings.Contains(outputStr, "[subagent-identity] warning: identity not verified, fail-closed to subagent: S2: hc terminal.get for t12t failed") {
 		t.Errorf("expected one warning line naming the S2 branch, got: %q", outputStr)
 	}
 	if count := strings.Count(outputStr, "warning: identity not verified"); count != 1 {
@@ -1333,7 +1125,7 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 
 	makeEnvWithArgvFile := func(filePath string, baseArgs []string) IdentityEnv {
 		envMap := map[string]string{
-			"HERDR_PANE_ID": "herdr:tab1:p1",
+			"HC_TERMINAL_ID": "t12t",
 		}
 		if filePath != "" {
 			envMap["PIG_HARNESS_ARGV_FILE"] = filePath
@@ -1342,12 +1134,11 @@ func TestHostArgvFile_PIG_HARNESS_ARGV_FILE(t *testing.T) {
 			Getenv: func(k string) string {
 				return envMap[k]
 			},
-			Args:       baseArgs,
-			PID:        100,
-			SocketPath: "/tmp/fake.sock",
-			Timeout:    time.Second,
-			QuerySocket: func(sock, pane string, to time.Duration) (int, bool) {
-				return 4242, true
+			Args:    baseArgs,
+			PID:     100,
+			Timeout: time.Second,
+			QueryHcSocket: func(sock, id string, to time.Duration) (HcTerminalInfo, bool) {
+				return HcTerminalInfo{Address: id, PID: 4242}, true
 			},
 			ReadStat: func(pid int) (int, bool) {
 				if pid == 100 {
@@ -1808,6 +1599,8 @@ func TestIsAgentRuntimeCmdline(t *testing.T) {
 	}{
 		{"/usr/local/bin/pi -p hello", true},
 		{"pi", true},
+		{"pig", true},
+		{"/root/.local/bin/pig --mode json", true},
 		{"/bin/ctxmode list", true},
 		{"ctxmode", true},
 		{"node /root/workspace/packages/pi-coding-agent/index.js", true},

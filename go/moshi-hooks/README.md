@@ -28,7 +28,7 @@ PiG 的 moshi-hook 生命周期钩子扩展。它把 Pi 的会话事件归一化
 | **严格保序**：单 worker 串行投递，避免"解决事件"先于"请求事件"到达 | `Sender`（socket.go:120）`run`（socket.go:145） |
 | `FlushSends(timeout)`：等待队列排空或超时 | socket.go:182 / socket.go:232 |
 | `session_shutdown` 传 1000ms | `ShutdownFlushTimeout`（socket.go:23）+ extension.go:172 注册处 |
-| 终端上下文进程级解析一次（含测试重置） | `TerminalContextForProcess`（terminal.go:164）/ `ResetTerminalContextForTest`（terminal.go:176） |
+| 终端上下文进程级解析一次（含测试重置） | `TerminalContextForProcess`（terminal.go:188）/ `ResetTerminalContextForTest`（terminal.go:200） |
 | 子代理（lineage 子会话）不进收件箱；header 判定按路径缓存 | `sessionIsChild` / `transcriptHeaderIsChild`（state.go） |
 | transcriptPath 四级回退链（见下） | `resolveTranscriptPath`（state.go） |
 | stop 去重：完成态下 5s 内同签名只发一次 | `recordTaskCompletion`（state.go:106） |
@@ -53,13 +53,13 @@ JSON 名逐字照抄 TS 属性名（`herdrWorkspaceId`、`herdrTabId`、`toolUse
 | L62-91 | `deliverEnvelope` | socket.go:70 |
 | L93-106 | `flushSends` | socket.go:182、socket.go:232 |
 | L108-123 | `interface TerminalContext` | terminal.go:26 |
-| L125-127 | `muxEnvKeys` | terminal.go:47（`MuxEnvKeys`） |
-| L129-136 | `runForOutput` | terminal.go:74 |
-| L138-142 | `tmuxSocketFromEnv` | terminal.go:60 |
-| L144-200 | `resolveTerminalContext` | terminal.go:84 |
-| L202 | `const terminalContext`（进程级缓存） | terminal.go:164 |
-| L204-209 | `projectNameFromCwd` | terminal.go:185 |
-| L211-213 | `projectNameForCwd` | terminal.go:199 |
+| L125-127 | `muxEnvKeys` | terminal.go:49（`MuxEnvKeys`） |
+| L129-136 | `runForOutput` | terminal.go:98 |
+| L138-142 | `tmuxSocketFromEnv` | terminal.go:68 |
+| L144-200 | `resolveTerminalContext` | terminal.go:108 |
+| L202 | `const terminalContext`（进程级缓存） | terminal.go:188 |
+| L204-209 | `projectNameFromCwd` | terminal.go:209 |
+| L211-213 | `projectNameForCwd` | terminal.go:223 |
 | L215-220 | `firstString` | text.go:77 |
 | L222-236 | `textFromContent` | text.go:87 |
 | L238-246 | `textFromMessage` | text.go:118 |
@@ -178,21 +178,27 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
    Go 的 `\s` 只有 ASCII。为与 JS 正则逐字节一致，所有 `\s` 位置都替换为 ECMA-262
    WhiteSpace + LineTerminator 全集（`jsSpaceClass`），`trim` 亦用同一集合（`jsTrim`）。
    唯一残留差异：Go regexp 是 RE2，无逆向引用——TS 的 9 条正则都不含逆向引用，pattern 等价。
-7. **`muxEnv` 键序**（terminal.go:45）
+7. **`muxEnv` 键序**（terminal.go:49）
    TS 按环境注入顺序写对象，Go 的 `map[string]string` 序列化按键名字典序。守护进程按键取值，
    语义无关；字段始终存在（`{}` 而非省略或 `null`）。
-8. **进程级状态**（state.go:38、socket.go:211、terminal.go:157）
+8. **进程级状态**（state.go:38、socket.go:211、terminal.go:180）
    TS 用模块级 `const`/`Map`；Go 用互斥保护的包级状态（事件可能并发到达），并额外提供
    `ResetSessionsForTest`/`SetSenderForTest`/`ResetSenderForTest`/`ResetTerminalContextForTest`
    供测试重置。这些是 TS 没有的测试面，不改变线上行为。
 9. **`/run/user/<uid>` 探测**（socket.go:63）
    TS 在 `XDG_RUNTIME_DIR` 为空时直接落 `/tmp`；Go 版在中间多探一步
-   `/run/user/<uid>/moshi-hook.sock`（systemd-user 默认位置），文件存在才用——herdr
-   pane 里拉起的 hook 子进程常拿不到 `XDG_RUNTIME_DIR`，缺这一步会让 envelope 静默丢失。
+   `/run/user/<uid>/moshi-hook.sock`（systemd-user 默认位置），文件存在才用——多路终端
+   里拉起的 hook 子进程常拿不到 `XDG_RUNTIME_DIR`，缺这一步会让 envelope 静默丢失。
    文件不存在时行为与 TS 完全一致（落 `/tmp`）。
 10. **测试专用注入缝**：`resolveTerminalContext(getenv, run)` 与 `newSender(sockPath, deliver, timeout)`
    把进程/环境/网络依赖注入化，便于无 socket 单测（TS 无对应物）。
-11. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
+11. **终端检测收敛为 hc 形状**（terminal.go:108）
+   TS 的经典 herdr 环境检测（`HERDR_ENV` / `HERDR_SESSION` 等 `HERDR_*` 系列变量）
+   已随经典 herdr 移除：Go 版只认 herdr-core（hc）变量
+   `herdrPane` 填终端 id，`herdrSession` 从 socket 路径的 `<session>.sock` 基名解析；
+   `herdrWorkspaceId` / `herdrTabId` 不再从环境读取，恒为空（label 由守护进程按 id 解析）。
+   tmux 探到 session 仍压过 hc，`ZELLIJ*` 变量与 `muxEnv` 原样保留。
+12. **未移植**：无。TS 里被引用但未调用的 `helperBinary` 常量照留（extension.go:24）。
 
 ## 4. 文件布局
 
@@ -200,7 +206,7 @@ sessions root 解析（`pigSessionsRoot`）与 PiG node shim
 |---|---|
 | `envelope.go` | `Envelope`/`InteractivePrompt`/`Question`/`QuestionOption` 线格式 |
 | `socket.go` | `ResolveSocketPath`、`deliverEnvelope`、`Sender`（保序队列 + `Flush`）、全局 sender |
-| `terminal.go` | `TerminalContext` 探测（tmux/zellij/herdr/muxEnv）、项目名 |
+| `terminal.go` | `TerminalContext` 探测（tmux/zellij/herdr-core/muxEnv）、项目名 |
 | `text.go` | 文本清洗（markdown/截断/user_query）、`planSummary`、`newSessionID` |
 | `state.go` | `SessionState`、lineage 判定、`baseEnvelope`、`handleEvent`、`askQuestions`、`planFileOnDisk` |
 | `extension.go` | 宿主取值适配（`safeCwd` 等）、`Send`、`Extension()` 的 6 个钩子 |
@@ -215,14 +221,15 @@ go vet ./...                               # EXIT 0
 go test -count=1 -race -v ./...            # 全绿，无 DATA RACE
 ```
 
-覆盖（59 个顶层测试，含 40 个子测试，合计 99 条用例，`-race` 下无 `DATA RACE`）：
+覆盖（71 个顶层测试，含 46 个子测试，合计 117 条用例，`-race` 下无 `DATA RACE`）：
 
 - **文本**：`stripMarkdown`（代码块/行内码/链接/粗斜体/标题列表/空白折叠）、`truncateText`
   （含 rune 而非字节）、`plainTextClip`、`displayUserPrompt`（`<user_query>` 大小写不敏感、
   skill/image/system-reminder 剥离）、`formatUserPromptDetail`（200 rune + `You: ` 前缀）、
   `planSummary`、`firstString`、`textFromMessage`、`modelLabel`、`newSessionID`、`jsTrim`。
-- **终端上下文**：tmux（探测命令与参数、`#S\t#I` 解析、失败回落）、herdr（含压过 zellij、
-  缺 `HERDR_ENV` 时忽略 id、label 留空）、zellij（session/pane/`ZELLIJ` 单独命中）、`muxEnv`
+- **终端上下文**：tmux（探测命令与参数、`#S\t#I` 解析、失败回落）、herdr-core
+  （`HC_TERMINAL_ID`/`HC_TERMINAL_SOCKET` → `terminalKind=\"herdr\"`、session 从 socket 基名解析、
+  label 留空、tmux 优先于 hc）、zellij（session/pane/`ZELLIJ` 单独命中）、`muxEnv`
   取非空键、`tmuxSocketFromEnv`（无逗号/逗号在首位）、`projectNameFromCwd`、
   `projectNameForCwd` 优先级、进程级缓存与重置。
 - **socket**：路径优先级三档；保序投递；**同一时刻只有一个投递在跑**；`Flush` 等队列；
@@ -263,8 +270,8 @@ capture 端收到的 4 条连接（原文，仅换行折行）：
 {"type":"session.update","source":"pi","sessionId":"01a16e92-5d69-…","eventName":"SessionStart",
  "cwd":"/root/workspace/pi-extensions/go","projectName":"go","terminalKind":"herdr","muxEnv":{},
  "tmuxSession":"","tmuxWindow":"","tmuxPane":"","tmuxSocket":"","zellijSession":"","zellijPane":"",
- "herdrSession":"","herdrPane":"w37:p2D","herdrWorkspaceId":"w37","herdrWorkspace":"",
- "herdrTabId":"w37:t2D","herdrTab":"","modelName":"智能路由",
+ "herdrSession":"default","herdrPane":"t12t","herdrWorkspaceId":"","herdrWorkspace":"",
+ "herdrTabId":"","herdrTab":"","modelName":"智能路由",
  "transcriptPath":"/root/.pig-test/agent/sessions/…/2026-10-24T15-40-48-362Z_01a16e92-….jsonl",
  "requestedAt":"2026-10-24T15:40:48.366Z","contextRemaining":100}
 --- connection 2 (763 bytes) ---
@@ -286,8 +293,9 @@ capture 端收到的 4 条连接（原文，仅换行折行）：
   `task_complete`，title 为 `OK`；
 - 连接 4 是 `session_shutdown` → `session.closed` + `session_ended`，且在进程退出前送达
   （`FlushSends` 生效，否则这条会丢）；
-- `terminalKind:"herdr"` 与 `herdrPane/herdrWorkspaceId/herdrTabId` 来自当前 pane 的真实环境，
-  `muxEnv` 为空对象（本 pane 无 tern/TUIOS 变量），与 TS 的字段形态一致。
+- `terminalKind:"herdr"` 与 `herdrPane/herdrSession` 来自 hc 环境（`HC_TERMINAL_ID=t12t` +
+  `HC_TERMINAL_SOCKET=…/default.sock`）；`herdrWorkspaceId/herdrTabId` 恒为空由守护进程解析，
+  `muxEnv` 为空对象（本终端无 tern/TUIOS 变量），与 TS 的字段形态一致。
 
 capture 进程与日志在实测后已清理（`/tmp/moshi-capture/`），不留在仓库里。
 

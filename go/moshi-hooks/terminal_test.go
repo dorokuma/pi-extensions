@@ -66,42 +66,8 @@ func TestResolveTerminalContextTmuxProbeFailure(t *testing.T) {
 	}
 }
 
-func TestResolveTerminalContextHerdr(t *testing.T) {
-	context := resolveTerminalContext(envFunc(map[string]string{
-		"HERDR_ENV":           "1",
-		"HERDR_SESSION":       "main",
-		"HERDR_PANE_ID":       "pane-1",
-		"HERDR_WORKSPACE_ID":  "ws-9",
-		"HERDR_TAB_ID":        "tab-4",
-		"ZELLIJ_SESSION_NAME": "zellij-should-lose",
-	}), runFunc("", nil))
-
-	if context.TerminalKind != "herdr" {
-		t.Fatalf("TerminalKind = %q, want herdr (herdr wins over zellij)", context.TerminalKind)
-	}
-	if context.HerdrSession != "main" || context.HerdrPane != "pane-1" ||
-		context.HerdrWorkspaceID != "ws-9" || context.HerdrTabID != "tab-4" {
-		t.Fatalf("herdr ids = %+v", context)
-	}
-	// Labels are resolved daemon-side, so both stay empty.
-	if context.HerdrWorkspace != "" || context.HerdrTab != "" {
-		t.Fatalf("herdr labels = %q/%q, want empty", context.HerdrWorkspace, context.HerdrTab)
-	}
-}
-
-func TestResolveTerminalContextIgnoresHerdrIdsWithoutEnv(t *testing.T) {
-	context := resolveTerminalContext(envFunc(map[string]string{
-		"HERDR_PANE_ID": "pane-1",
-	}), runFunc("", nil))
-
-	if context.HerdrPane != "" || context.TerminalKind != "" {
-		t.Fatalf("herdr without HERDR_ENV = %+v, want empty", context)
-	}
-}
-
-// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET instead of the
-// HERDR_* variables; a pig session inside a hc terminal must still report a
-// herdr-shaped identity.
+// herdr-core (hc) stamps HC_TERMINAL_ID / HC_TERMINAL_SOCKET; a pig session
+// inside a hc terminal reports a herdr-shaped identity.
 func TestResolveTerminalContextHc(t *testing.T) {
 	context := resolveTerminalContext(envFunc(map[string]string{
 		"HC_TERMINAL_ID":     "t12t",
@@ -134,6 +100,61 @@ func TestResolveTerminalContextHc(t *testing.T) {
 	}), runFunc("", nil))
 	if noSession.HerdrSession != "" || noSession.TerminalKind != "herdr" {
 		t.Fatalf("hc without session socket = %+v, want empty session + herdr kind", noSession)
+	}
+}
+
+// tmux 探到 session 时压过 hc 终端：terminalKind 保持 tmux，HerdrPane 仍独立保留。
+func TestResolveTerminalContextTmuxBeatsHc(t *testing.T) {
+	context := resolveTerminalContext(envFunc(map[string]string{
+		"TMUX":           "/tmp/tmux-0/default,4242,0",
+		"TMUX_PANE":      "%7",
+		"HC_TERMINAL_ID": "t12t",
+		"ZELLIJ":         "0",
+	}), runFunc("work\t1\n", nil))
+	if context.TerminalKind != "tmux" {
+		t.Fatalf("TerminalKind = %q, want tmux (tmux > hc > zellij)", context.TerminalKind)
+	}
+	// herdrPane 仍由 HC_TERMINAL_ID 填入（上下文字段独立收集，不随 kind 清零），
+	// 但 muxEnv 仍携带 hc 变量、tmux 字段完整。
+	if context.HerdrPane != "t12t" {
+		t.Fatalf("HerdrPane = %q, want t12t (field fill is independent of kind)", context.HerdrPane)
+	}
+	if context.TmuxSession != "work" || context.TmuxPane != "%7" {
+		t.Fatalf("tmux fields = %q/%q, want work/%%7", context.TmuxSession, context.TmuxPane)
+	}
+}
+
+// hc 变量缺位时 zellij 仍兜底：hc > zellij 的优先级只对 hc 命中生效。
+func TestResolveTerminalContextHcBeatsZellij(t *testing.T) {
+	context := resolveTerminalContext(envFunc(map[string]string{
+		"HC_TERMINAL_ID": "t12t",
+		"ZELLIJ":         "0",
+	}), runFunc("", nil))
+	if context.TerminalKind != "herdr" {
+		t.Fatalf("TerminalKind = %q, want herdr (hc > zellij)", context.TerminalKind)
+	}
+}
+
+// 经典 HERDR_* 变量不再被读取：HERDR_ENV/HERDR_PANE_ID/HERDR_SESSION 在
+// 没有 HC_TERMINAL_ID 的情况下不产生 herdr 上下文，Herdr* 字段恒为空。
+func TestResolveTerminalContextIgnoresLegacyHerdr(t *testing.T) {
+	context := resolveTerminalContext(envFunc(map[string]string{
+		"HERDR_ENV":          "1",
+		"HERDR_PANE_ID":      "42",
+		"HERDR_SESSION":      "legacy",
+		"HERDR_WORKSPACE_ID": "ws-9",
+		"HERDR_TAB_ID":       "tab-3",
+	}), runFunc("", nil))
+	if context.TerminalKind != "" {
+		t.Fatalf("TerminalKind = %q, want empty (legacy HERDR_* ignored)", context.TerminalKind)
+	}
+	if context.HerdrPane != "" || context.HerdrSession != "" ||
+		context.HerdrWorkspaceID != "" || context.HerdrWorkspace != "" ||
+		context.HerdrTabID != "" || context.HerdrTab != "" {
+		t.Fatalf("Herdr fields must all be empty, got %+v", context)
+	}
+	if len(context.MuxEnv) != 0 {
+		t.Fatalf("MuxEnv must not pick up HERDR_* keys, got %v", context.MuxEnv)
 	}
 }
 

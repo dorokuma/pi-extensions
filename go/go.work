@@ -10,7 +10,6 @@ use (
 	./ctx-orchestrate
 	./ctxmode
 	./exclude-tools-guard
-	./herdr-agent-state
 	./herdsman
 	./jev-gate
 	./jev-gate/cmd/jev-mcp

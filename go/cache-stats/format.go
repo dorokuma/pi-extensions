@@ -10,9 +10,10 @@ import (
 )
 
 // This file ports the pure formatting helpers of cache-stats.ts:
-// formatWindowSize, formatHerdsmanStatus (with sheepMeat and stripProvider),
-// contextSegment, truncateFooter and the ECMAScript Number::toString(10)
-// renderer jsNumberString (TS L432-533 and L861-868).
+// formatWindowSize, contextSegment, truncateFooter and the ECMAScript
+// Number::toString(10) renderer jsNumberString (TS L432-533 and L861-868).
+// The shepherd/herdsman status segment (sheepMeat / formatHerdsmanStatus)
+// went away with the retired herdsman extension.
 
 // themeStyler is the slice of Pi's Theme the footer uses: fg(token, text)
 // colors text with the named token. The SDK's sdk.UITheme satisfies it through
@@ -54,43 +55,6 @@ func formatWindowSize(size float64) string {
 	// Round at integer-tenth granularity so binary float drift cannot drop a
 	// value a full tenth; a trailing ".0" vanishes on its own.
 	return jsNumberString(math.Round(size/100_000)/10) + "M"
-}
-
-var (
-	// sheepPrefix strips the leading footer marker of the shepherd/herdsman
-	// status.
-	sheepPrefix = regexp.MustCompile(`^\s*[◆◇●▲■▸]?\s*(?:(?:Shepherd|Herdsman)(?:\s*[·•|｜]\s*)?)`)
-	// herdsmanCount matches the returned-results forms.
-	herdsmanCount = regexp.MustCompile(`(?i)(\d+)\s*(?:agent\s*)?(?:updates?|completed|done|UP)\b`)
-	// herdsmanBare matches a status that is only a count.
-	herdsmanBare = regexp.MustCompile(`^(\d+)$`)
-)
-
-// sheepMeat strips the leading footer marker from the shepherd/herdsman
-// extension status. TS: sheepMeat (L436-438).
-func sheepMeat(s string) string {
-	return strings.TrimSpace(sheepPrefix.ReplaceAllString(s, ""))
-}
-
-// formatHerdsmanStatus formats the shepherd/herdsman status for the footer:
-// "[count] Up" when agents returned results, "On" when running without
-// results, and nil when not loaded or not running. TS: formatHerdsmanStatus
-// (L446-458).
-func formatHerdsmanStatus(s *string) *string {
-	if s == nil || strings.TrimSpace(*s) == "" {
-		return nil
-	}
-	meat := sheepMeat(*s)
-	if match := herdsmanCount.FindStringSubmatch(meat); match != nil {
-		value := match[1] + " Up"
-		return &value
-	}
-	if match := herdsmanBare.FindStringSubmatch(meat); match != nil {
-		value := match[1] + " Up"
-		return &value
-	}
-	value := "On"
-	return &value
 }
 
 var providerSuffix = regexp.MustCompile(` \([^)]*\)$`)
