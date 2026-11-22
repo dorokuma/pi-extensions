@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" width="72" height="72" role="img" aria-label="pi-extensions logo">
+  <defs>
+    <linearGradient id="pg-light" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d97706"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="64" height="64" rx="14" fill="#f6f8fa"/>
+  <g fill="url(#pg-light)">
+    <rect x="14" y="14" width="20" height="20" rx="5"/>
+    <rect x="38" y="14" width="20" height="20" rx="5" opacity="0.75"/>
+    <rect x="14" y="38" width="20" height="20" rx="5" opacity="0.5"/>
+    <circle cx="48" cy="48" r="10"/>
+  </g>
+</svg>
