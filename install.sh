@@ -21,8 +21,8 @@
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
 #   install.sh --dest-dir <DIR> ...   # 覆盖目标目录；默认 $PI_EXT_DEST_DIR 或 ~/.pig/agent/extensions
 #
-# 部署保护（zero-node / 原生 Go 接管；详见 README『原生 Go 扩展共存保护』与
-# 『zero-node 无原生 Go 兜底保护』）：
+# 部署保护（zero-node / 原生 Go 接管；详见 federated/README.md『原生 Go 扩展共存保护』
+# 与『zero-node 无原生 Go 兜底保护』）：
 #   - 目标存在同名目录（含软链）且含 go.mod → 原生 Go 接管：跳过 TS 安装/级联并自愈残留 .ts。
 #   - zero-node 宿主机（无 node 且无原生 Go 目录）上，对真实 pig 扩展目录（默认目录或
 #     经 realpath -m 规范化后等于 $HOME/.pig/agent/extensions 或 registry .defaultDestDir
