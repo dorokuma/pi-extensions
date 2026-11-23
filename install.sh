@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # install.sh — 联邦式 Pi 扩展分发中枢的统一安装/巡检入口。
 #
-# 数据源：federated/registry.json（10 个扩展的类别与绝对权威路径）。本仓是 6 个
+# 数据源：federated/registry.json——10 个托管 TS 条目（含 destFile：6 hosted +
+# 3 federated + 1 external herdr-agent-state）+ 14 个真实加载入口（13 个 native
+# Go 扩展目录 + 1 个 external moshi-hooks.ts），共 25 个登记项。本仓是 6 个
 # 「hosted」内生扩展的唯一权威源，逐字节同步到部署目录；对 3 个「federated」外生
 # 扩展只以子进程级联调用其宿主仓的 install.sh（源留在宿主仓，改动回宿主仓走既有
-# 流程）；对 1 个「external」项 herdr-agent-state.ts 只读巡检、本仓绝不写它。
+# 流程）；对 2 个「external」项（herdr-agent-state.ts / moshi-hooks.ts）只读巡检、
+# 本仓绝不写它们；14 个「native」项由 pig 直接加载 <destDir>/<name>/go.mod，本仓
+# 不做 TS 安装。
 #
 # 契约与样板 /root/workspace/codegraph-go/integrations/pi/install.sh 对齐：
 #   - set -euo pipefail；command -v md5sum 预检（缺失即显式 FAILED，绝不静默）。
@@ -14,8 +18,8 @@
 #   - 实质改动后提示 Pi 需 /reload 或新会话才生效。
 #
 # 用法：
-#   install.sh --list                 # 列出 10 个扩展：名称/类别/权威源/目标/当前状态
-#   install.sh --audit                # 只读巡检全机 10 个：md5/权限/外生脚本/herdr 只读态 + dest 差集告警
+#   install.sh --list                 # 列出全部 25 个登记项：名称/类别/权威源/目标/当前状态
+#   install.sh --audit                # 只读巡检全机 25 个登记项：md5/权限/外生脚本/herdr 只读态/native go.mod + dest 差集告警
 #   install.sh --dry-run <names...>   # 只演练，不写任何文件
 #   install.sh <names...>             # 安装指定扩展（hosted 直拷；federated 级联宿主 install.sh）
 #   install.sh --all                  # 安装全部 hosted+federated（绝不写 herdr-agent-state.ts）
@@ -54,8 +58,8 @@ usage() {
 install.sh — 联邦式 Pi 扩展统一安装/巡检入口
 
 Usage:
-  install.sh --list                list 10 extensions (name/category/authority/target/status)
-  install.sh --audit               read-only inspect all 10 (md5/perms/upstream scripts/herdr) + warn on unregistered dest-dir entries
+  install.sh --list                list all entries (name/category/authority/target/status)
+  install.sh --audit               read-only inspect all (md5/perms/upstream scripts/herdr+moshi/native Go) + warn on unregistered dest-dir entries
   install.sh --dry-run <names...>  rehearse only; write nothing
   install.sh <names...>            install named extensions (hosted copy | federated cascade)
   install.sh --all                 install all hosted+federated (never writes herdr-agent-state.ts)
@@ -90,10 +94,14 @@ md5_of() {
 }
 
 # ---- 注册表读取助手 ----
+# name 全局唯一（native 同名冲突条目用 -go/-ext 后缀区分）；native 条目的部署目录名
+# 由 .destName 给出（=pig 扩展目录下的目录名，默认即 .name 去掉 -go/-ext 后缀前的部分，
+# 明确以字段为准）。regq/all_names 语义不变。
 extension_exists() { jq -e --arg n "$1" '.extensions[] | select(.name==$n)' "$REGISTRY" >/dev/null 2>&1; }
 regq() { jq -r --arg n "$1" ".extensions[] | select(.name==\$n) | ${2} // \"\"" "$REGISTRY"; }
 all_names() { jq -r '.extensions[].name' "$REGISTRY"; }
-all_dest_files() { jq -r '.extensions[].destFile // empty' "$REGISTRY"; }
+# 已登记部署条目名集合：TS 条目按 .destFile，native 条目按 .destName。
+all_registered_dest_names() { jq -r '.extensions[] | (.destFile // .destName // empty)' "$REGISTRY"; }
 is_registered_dest_file() { # $1=basename  $2=newline-joined registered destFiles
   local target="$1" list="$2" item
   while IFS= read -r item; do
@@ -118,10 +126,10 @@ installable_names() {
   nw_joined="$(printf '%s\n' "${NEVERWRITE[@]}")"
   jq -r --arg nw "$nw_joined" '
     ($nw | split("\n") | map(select(length > 0))) as $deny
-    | .extensions[]
-    | select((.category // "hosted") != "external")
-    | select((.destFile // "") as $df | ($deny | index($df)) == null)
-    | .name
+    | [.extensions[]
+      | select((.category // "hosted") == "hosted" or (.category // "") == "federated")
+      | select((.destFile // "") as $df | ($deny | index($df)) == null)
+      | .name] | unique[]
   ' "$REGISTRY"
 }
 
@@ -144,6 +152,18 @@ refuse_if_neverwrite() { # $1=destFile
 native_go_ext_dir() { # $1=dest file path  → stdout: native dir | rc 1
   local native_dir="${1%.ts}"
   if [ "$native_dir" != "$1" ] && [ -d "$native_dir" ] && [ -f "$native_dir/go.mod" ]; then
+    printf '%s' "$native_dir"
+    return 0
+  fi
+  return 1
+}
+
+# category=native 的条目：部署目录名由 .destName 给出，检测 <destDir>/<destName>/go.mod 是否在位。
+# 返回目录路径（在位）或 rc 1（不在位/无 go.mod）。
+native_go_dir_by_name() { # $1=dest_dir $2=destName → stdout: native dir | rc 1
+  local ddir="$1" dname="$2"
+  local native_dir="$ddir/$dname"
+  if [ -d "$native_dir" ] && [ -f "$native_dir/go.mod" ]; then
     printf '%s' "$native_dir"
     return 0
   fi
@@ -253,13 +273,20 @@ status_of() { # $1=name  $2=dest_dir
   local name="$1" ddir="$2" cat src dest smd5="" dmd5="(none)" perms="(n/a)" status="" native_dir=""
   cat="$(regq "$name" '.category')"
   src="$(regq "$name" '.authority.sourcePath // ""')"
-  dest="$ddir/$(regq "$name" '.destFile')"
+  local dest_file; dest_file="$(regq "$name" '.destFile // ""')"
+  if [ "$cat" = "native" ]; then
+    dest="$ddir/$(regq "$name" '(.destName // .name)')"   # native 条目 dest 指向部署目录 <ddir>/<destName>
+  else
+    dest="$ddir/$dest_file"
+  fi
   local ext_exist="present"
   if [ "$cat" = "federated" ]; then
     local script; script="$(regq "$name" '.authority.installScript // ""')"
     if [ -z "$script" ] || [ ! -e "$script" ]; then ext_exist="missing"; fi
   fi
-  if [ "$cat" != "external" ]; then
+  if [ "$cat" = "native" ]; then
+    native_dir="$(native_go_dir_by_name "$ddir" "$(regq "$name" '(.destName // .name)')")" || native_dir=""
+  elif [ "$cat" != "external" ]; then
     native_dir="$(native_go_ext_dir "$dest")" || native_dir=""
   fi
   if [ -n "$src" ] && [ ! -L "$src" ] && [ -f "$src" ] && md5_of "$src" >/dev/null 2>&1; then
@@ -279,6 +306,15 @@ status_of() { # $1=name  $2=dest_dir
       status="read-only (herdr-managed; non-regular entry, content check skipped)"
     else
       status="absent (herdr-managed)"
+    fi
+  elif [ "$cat" = "native" ]; then
+    # native（PiG 原生 Go）：name 即部署目录名，检测 <dest>/<name>/go.mod 在位性
+    if [ -n "$native_dir" ]; then
+      status="native Go active ($native_dir)"
+    elif [ -d "$dest" ]; then
+      status="DRIFT (directory exists but missing go.mod: $dest)"
+    else
+      status="absent (native Go extension not deployed)"
     fi
   elif [ -n "$native_dir" ]; then
     # 原生 Go 扩展共存：无 .ts = 正常接管；旁挂残留 .ts（即使 md5 相同）= 危险漂移。
@@ -346,7 +382,7 @@ audit_unregistered_dest() { # $1=dest_dir
     echo "unregistered entries in dest-dir ($ddir): none (dest-dir does not exist)"
     return 0
   fi
-  reg_files="$(all_dest_files)"
+  reg_files="$(all_registered_dest_names)"
   local top_entries=()
   local nullglob_was=0 dotglob_was=0
   shopt -q nullglob && nullglob_was=1
@@ -543,13 +579,15 @@ audit_unregistered_dest() { # $1=dest_dir
 
 # ---- hosted 安装（逐字节、md5 幂等）----
 install_hosted() { # $1=name
-  local name="$1" src dest smd5 native_dir
+  local name="$1" src dest smd5 native_dir dest_file
   src="$(regq "$name" '.authority.sourcePath // ""')"
   [ -n "$src" ] || fail "hosted extension '$name' has no authority.sourcePath in registry"
   [ -f "$src" ] || fail "source not found: $src"
-  dest="$DEST_DIR/$(regq "$name" '.destFile')"
+  dest_file="$(regq "$name" '.destFile // ""')"
+  [ -n "$dest_file" ] || fail "hosted extension '$name' has no .destFile in registry"
+  dest="$DEST_DIR/$dest_file"
   validate_target_file "$dest"
-  refuse_if_neverwrite "$(regq "$name" '.destFile')"
+  refuse_if_neverwrite "$dest_file"
   # 原生 Go 扩展共存保护：同名目录含 go.mod 即由原生实现接管，跳过 TS 安装并自愈残留 .ts。
   if native_dir="$(native_go_ext_dir "$dest")"; then
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -610,12 +648,14 @@ install_hosted() { # $1=name
 
 # ---- federated 安装（级联宿主仓 install.sh；缺失/失败都容忍并记 WARN）----
 install_federated() { # $1=name
-  local name="$1" script envname dest out rc native_dir
+  local name="$1" script envname dest out rc native_dir dest_file
   script="$(regq "$name" '.authority.installScript // ""')"
   envname="$(regq "$name" '.authority.installDestEnv // ""')"
-  dest="$DEST_DIR/$(regq "$name" '.destFile')"
+  dest_file="$(regq "$name" '.destFile // ""')"
+  [ -n "$dest_file" ] || fail "federated extension '$name' has no .destFile in registry"
+  dest="$DEST_DIR/$dest_file"
   validate_target_file "$dest"
-  refuse_if_neverwrite "$(regq "$name" '.destFile')"
+  refuse_if_neverwrite "$dest_file"
   # 原生 Go 扩展共存保护：命中即跳过上游级联（不注入 PI_EXT_DEST/PI_CTXMODE_EXT），
   # 残留 .ts 自愈清除；也避免已迁原生 Go、旧 TS 仓退役的扩展误报 upstream missing。
   if native_dir="$(native_go_ext_dir "$dest")"; then
@@ -696,12 +736,16 @@ case "$MODE" in
       cat="$(regq "$nm" '.category')"
       kind="$(regq "$nm" '.authority.kind // ""')"
       src="$(regq "$nm" '.authority.sourcePath // ""')"
-      [ -z "$src" ] && src="(herdr binary — out of band)"
-      dest="$DEST_DIR/$(regq "$nm" '.destFile')"
+      [ -z "$src" ] && src="(out of band — external tool)"
+      if [ "$cat" = "native" ]; then
+        dest="$DEST_DIR/$(regq "$nm" '(.destName // .name)')"
+      else
+        dest="$DEST_DIR/$(regq "$nm" '.destFile')"
+      fi
       st="$(status_of "$nm" "$DEST_DIR")"; st="${st%%$'\t'*}"
       printf '%-17s %-9s %-15s %-44s %s [%s]\n' "$nm" "$cat" "$kind" "$src" "$dest" "$st"
     done < <(all_names)
-    echo "note: herdr-agent-state.ts is external — never written by this repo (read-only)."
+    echo "note: herdr-agent-state.ts + moshi-hooks.ts are external — never written by this repo (read-only); native Go extensions are deployed by PiG (install.sh only audits)."
     exit 0
     ;;
 
@@ -732,7 +776,10 @@ case "$MODE" in
         fi
       fi
       if [ "$cat" = "external" ]; then
-        echo "    └─ external/herdr-managed: READ-ONLY — this repo will never modify it; governed by the herdr binary"
+        echo "    └─ external/out-of-band managed: READ-ONLY — this repo will never modify it"
+      fi
+      if [ "$cat" = "native" ]; then
+        echo "    └─ native PiG Go extension: deployed by PiG (go.mod dir); install.sh only audits, never installs TS"
       fi
     done < <(all_names)
     echo "-------------------------------------------------------------------------------------------------------------------------------"
@@ -757,6 +804,9 @@ case "$MODE" in
       cat="$(regq "$nm" '.category')"
       if [ "$cat" = "external" ]; then
         fail "refusing to install external/herdr-managed extension: $nm — this repo NEVER writes it; reconcile via the herdr binary"
+      fi
+      if [ "$cat" = "native" ]; then
+        fail "refusing to install native Go extension: $nm — native PiG extensions are loaded by PiG from <destDir>/<destName>/go.mod, not installed as TypeScript by this script"
       fi
       if [ "$cat" = "federated" ]; then install_federated "$nm"; else install_hosted "$nm"; fi
     done

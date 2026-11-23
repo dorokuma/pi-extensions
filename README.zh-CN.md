@@ -53,6 +53,7 @@
 | 扩展 | 栈 | 说明 |
 |---|---|---|
 | **herdr-agent-state** | TS | 由 `herdr` 二进制托管；本仓只对其做只读巡检，**绝不写它**。 |
+| **moshi-hooks** | TS | `moshi-hooks.ts` 由外部 `moshi-hook` 工具生成（见其头注 `Auto-generated`），服务 moshi 守护进程；本仓只读巡检、**绝不写它**。注意与本仓已退役的 `go/moshi-hooks` 是两个不同实现。 |
 
 ### PiG 原生与社区移植（Go 模块，无 TS 对应）
 
@@ -68,6 +69,8 @@
 | **verifier-expect-fail** | 零第三方依赖的独立 CLI 断言工具（非 PiG 扩展）：机械四条件输出断言，专用于预期失败的回归探针。 |
 
 已退役组件（`herdsman`、`moshi-hooks`、`pi-context-pruning`）源码保留在 `go/` 中备查，但默认不再参与构建与部署。`go/pigsdk` 是 staged PiG SDK 的仓内镜像；`go/pigsdk-regress` 存放其回归测试。
+
+> **部署现状提示**：真实 PiG 扩展目录 `~/.pig/agent/extensions` 当前加载 **14 个入口**——13 个原生 Go 模块目录（每个是含 `go.mod` 的独立加载单元；`auto-continue` 未部署）加外部 `moshi-hooks.ts`。`federated/registry.json` 现已全部登记：13 个 native 目录入 `category="native"`（按 `destName` 键）、`moshi-hooks` 入 `category="external"`，`--audit` 未登记差集为空。`auto-continue` 与 `magpie-image` 均为「在册未部署」：前者意图未核不擅自启用，后者按设计需显式安装。
 
 ## 快速开始
 
@@ -127,7 +130,8 @@ go/                    # 原生 Go 工作区：go.work 列 22 个 module——�
   go/pigsdk-regress/   # 经导出 API 驱动的 SDK 回归测试
   go/examples/hello/   # 最小 PiG 扩展示例（冒烟用）——独立 module，不在 go.work 中
 extensions/<name>/     # Hosted TS 扩展——唯一权威源，安装时逐字节同步
-federated/registry.json# 唯一数据源：10 个扩展的类别与权威路径
+federated/registry.json# 唯一数据源：10 个托管 TS 条目 + 14 个真实加载入口
+                       #（13 个 native Go 目录 + 1 个 external moshi-hooks.ts）
 install.sh             # 统一安装 / 演练 / 巡检入口
 tests/install.test.sh  # install.sh 的回归测试
 archive/               # 归档的历史桥接（不参与安装）
@@ -139,11 +143,12 @@ VERSIONING.md          # SemVer + 多模块 tag 规范
 <details>
 <summary><b>联邦分发与巡检模式</b></summary>
 
-三个类别，一份清单（`federated/registry.json`）：
+三个托管 TS 类别外加 `native`/`external` 真实入口登记，一份清单（`federated/registry.json`）：
 
 - **hosted（内生）**——源码在本仓；`install.sh` 逐字节同步（md5 幂等，一致则 `unchanged`）。
 - **federated（外生）**——源码留在各宿主仓；`install.sh` 级联调用宿主仓自己的 `install.sh`。
-- **external（外部）**——`herdr-agent-state.ts` 由 `herdr` 二进制托管；只读巡检，本仓任何东西都**绝不写它**。
+- **external（外部）**——`herdr-agent-state.ts`（herdr 二进制）与 `moshi-hooks.ts`（外部 moshi-hook 工具）带外托管；只读巡检，本仓任何东西都**绝不写它**。
+- **native（原生 Go）**——14 个 PiG 原生 Go 模块（13 个已部署目录 + 1 个 `auto-continue-go` 在册未部署），pig 经 `<destDir>/<destName>/go.mod` 加载；`install.sh` 不做 TS 安装，只巡检 `go.mod` 在位性。
 
 `--audit` 做一次只读扫描：全部已登记条目的 md5 与权限检查、部署目录未登记条目差集、原生 Go 接管时的 `NATIVE`/`DRIFT` 状态标注，以及 `WARN` 汇总——退出码保持 `0`。
 

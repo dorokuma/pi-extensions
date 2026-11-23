@@ -1,5 +1,5 @@
 {
-  "_comment": "联邦式 Pi 扩展注册表：全机 10 个扩展的类别与绝对权威路径。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=本仓外二进制(herdr)托管、只读巡检、绝不写。原 TS 桥扩展已归档至 archive/（归档 tag 见仓内 tag 列表），不再属托管扩展。",
+  "_comment": "联邦式 Pi 扩展注册表：本仓托管的 10 个 TS 扩展条目 + 真实加载入口 14 项（13 个原生 Go 扩展目录 + 1 个外部 moshi-hooks.ts）。install.sh 以此为唯一数据源驱动 --list/--all/--audit/级联。类别口径：hosted=本仓托管源、直接逐字节同步 TS；federated=源留宿主仓、本仓仅级联调用其 install.sh；external=带外托管（herdr/moshi-hook 外部工具生成）、只读巡检、绝不写；native=PiG 原生 Go 扩展（pig 直接加载 <destDir>/<name> 目录中的 go.mod，本仓源在 go/<name>；entryKind=go-module 无 destFile，install.sh 不做 TS 安装只读巡检）。原 TS 桥扩展已归档至 archive/（归档 tag 见仓内 tag 列表），不再属托管扩展。",
   "schemaVersion": 1,
   "defaultDestDir": "/root/.pig/agent/extensions",
   "settingsJson": "/root/.pig/agent/settings.json",
@@ -13,13 +13,15 @@
       "managed": "this-repo",
       "destFile": "auto-continue.ts",
       "targetPath": "/root/.pig/agent/extensions/auto-continue.ts",
+      "deployedAs": "auto-continue-go",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/auto-continue/src/auto-continue.ts",
         "hostRepo": null,
         "installScript": null,
         "installDestEnv": null
-      }
+      },
+      "note": "registry 在册但部署目录无 auto-continue.ts；部署侧 auto-continue/ 为原生 Go 目录接管（见 auto-continue-go 条目）。意图未核，按既定红线不擅自启用 TS 版本"
     },
     {
       "name": "no-tables",
@@ -27,6 +29,7 @@
       "managed": "this-repo",
       "destFile": "no-tables.ts",
       "targetPath": "/root/.pig/agent/extensions/no-tables.ts",
+      "deployedAs": "no-tables-go",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/no-tables/src/no-tables.ts",
@@ -41,6 +44,7 @@
       "managed": "this-repo",
       "destFile": "ctx-orchestrate.ts",
       "targetPath": "/root/.pig/agent/extensions/ctx-orchestrate.ts",
+      "deployedAs": "ctx-orchestrate-go",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/ctx-orchestrate/src/ctx-orchestrate.ts",
@@ -55,6 +59,7 @@
       "managed": "this-repo",
       "destFile": "jev-gate.ts",
       "targetPath": "/root/.pig/agent/extensions/jev-gate.ts",
+      "deployedAs": "jev-gate-go",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/jev-gate/src/jev-gate.ts",
@@ -69,6 +74,7 @@
       "managed": "this-repo",
       "destFile": "exclude-tools-guard.ts",
       "targetPath": "/root/.pig/agent/extensions/exclude-tools-guard.ts",
+      "deployedAs": "exclude-tools-guard-go",
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/exclude-tools-guard/src/exclude-tools-guard.ts",
@@ -83,13 +89,15 @@
       "managed": "this-repo",
       "destFile": "magpie-image.ts",
       "targetPath": "/root/.pig/agent/extensions/magpie-image.ts",
+      "deployedAs": null,
       "authority": {
         "kind": "in-repo",
         "sourcePath": "/root/workspace/pi-extensions/extensions/magpie-image/src/magpie-image.ts",
         "hostRepo": null,
         "installScript": null,
         "installDestEnv": null
-      }
+      },
+      "note": "registry 在册、明确未部署（非 bug）；需 bash install.sh magpie-image 才安装 TS 版本"
     },
     {
       "name": "codegraph-go",
@@ -97,6 +105,7 @@
       "managed": "upstream-repo",
       "destFile": "codegraph-go.ts",
       "targetPath": "/root/.pig/agent/extensions/codegraph-go.ts",
+      "deployedAs": "codegraph-go-ext",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/codegraph-go/integrations/pi/codegraph-go.ts",
@@ -111,6 +120,7 @@
       "managed": "upstream-repo",
       "destFile": "ctxmode.ts",
       "targetPath": "/root/.pig/agent/extensions/ctxmode.ts",
+      "deployedAs": "ctxmode-ext",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/ctxmode/integrations/pi/ctxmode.ts",
@@ -125,6 +135,7 @@
       "managed": "upstream-repo",
       "destFile": "cache-stats.ts",
       "targetPath": "/root/.pig/agent/extensions/cache-stats.ts",
+      "deployedAs": "cache-stats",
       "authority": {
         "kind": "host-repo-cascade",
         "sourcePath": "/root/workspace/pi-cache-stats/extensions/cache-stats.ts",
@@ -148,6 +159,246 @@
       },
       "readOnly": true,
       "note": "由 herdr 二进制托管/重装；本仓任何路径都绝不写它，仅在 --audit 只读巡检（md5/权限/头注）"
+    },
+    {
+      "name": "moshi-hooks",
+      "category": "external",
+      "managed": "moshi-hook-tool",
+      "destFile": "moshi-hooks.ts",
+      "targetPath": "/root/.pig/agent/extensions/moshi-hooks.ts",
+      "authority": {
+        "kind": "out-of-band-external",
+        "sourcePath": null,
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "readOnly": true,
+      "note": "真实入口：/root/.pig/agent/extensions/moshi-hooks.ts，由外部 moshi-hook 工具生成（头注 Auto-generated by moshi-hook），服务外部 moshi 守护进程；本仓只读巡检、绝不写。注意：与本仓 go/moshi-hooks（已退役归档，未部署）是两个不同实现，勿混淆"
+    },
+    {
+      "name": "auto-continue-go",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "auto-continue",
+      "targetPath": "/root/.pig/agent/extensions/auto-continue",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/auto-continue",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（同名目录含 go.mod 被 pig 直接加载）；hosted auto-continue（TS）的原生 Go 实现，当前部署的 auto-continue 入口即此"
+    },
+    {
+      "name": "cache-stats",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "cache-stats",
+      "targetPath": "/root/.pig/agent/extensions/cache-stats",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/cache-stats",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；federated pi-cache-stats 的原生 Go 移植。install.sh 不做 TS 安装，仅只读巡检"
+    },
+    {
+      "name": "codegraph-go-ext",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "codegraph-go",
+      "targetPath": "/root/.pig/agent/extensions/codegraph-go",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/codegraph-go",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；federated codegraph-go（TS 桥）的原生 Go 实现。name 用 codegraph-go-ext 避免与 federated 条目重名，部署目录名为 codegraph-go"
+    },
+    {
+      "name": "ctxmode-ext",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "ctxmode",
+      "targetPath": "/root/.pig/agent/extensions/ctxmode",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/ctxmode",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；federated ctxmode（TS 桥）的原生 Go 实现"
+    },
+    {
+      "name": "ctx-orchestrate-go",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "ctx-orchestrate",
+      "targetPath": "/root/.pig/agent/extensions/ctx-orchestrate",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/ctx-orchestrate",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；hosted ctx-orchestrate（TS）的原生 Go 实现"
+    },
+    {
+      "name": "exclude-tools-guard-go",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "exclude-tools-guard",
+      "targetPath": "/root/.pig/agent/extensions/exclude-tools-guard",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/exclude-tools-guard",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；hosted exclude-tools-guard（TS）的原生 Go 实现"
+    },
+    {
+      "name": "jev-gate-go",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "jev-gate",
+      "targetPath": "/root/.pig/agent/extensions/jev-gate",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/jev-gate",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；hosted jev-gate（TS）的原生 Go 实现"
+    },
+    {
+      "name": "no-tables-go",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "no-tables",
+      "targetPath": "/root/.pig/agent/extensions/no-tables",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/no-tables",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展；hosted no-tables（TS）的原生 Go 实现"
+    },
+    {
+      "name": "pi-emphasis",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "pi-emphasis",
+      "targetPath": "/root/.pig/agent/extensions/pi-emphasis",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/pi-emphasis",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
+    },
+    {
+      "name": "pi-env",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "pi-env",
+      "targetPath": "/root/.pig/agent/extensions/pi-env",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/pi-env",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
+    },
+    {
+      "name": "pi-my-compact-ui",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "pi-my-compact-ui",
+      "targetPath": "/root/.pig/agent/extensions/pi-my-compact-ui",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/pi-my-compact-ui",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
+    },
+    {
+      "name": "pi-tinyfish",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "pi-tinyfish",
+      "targetPath": "/root/.pig/agent/extensions/pi-tinyfish",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/pi-tinyfish",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
+    },
+    {
+      "name": "pi-vcc",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "pi-vcc",
+      "targetPath": "/root/.pig/agent/extensions/pi-vcc",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/pi-vcc",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
+    },
+    {
+      "name": "rpiv-ask-user-question",
+      "category": "native",
+      "managed": "pig-native",
+      "entryKind": "go-module",
+      "destName": "rpiv-ask-user-question",
+      "targetPath": "/root/.pig/agent/extensions/rpiv-ask-user-question",
+      "authority": {
+        "kind": "in-repo",
+        "sourcePath": "/root/workspace/pi-extensions/go/rpiv-ask-user-question",
+        "hostRepo": null,
+        "installScript": null,
+        "installDestEnv": null
+      },
+      "note": "PiG 原生 Go 扩展（无对应 TS 条目，Go-only）"
     }
   ]
 }
