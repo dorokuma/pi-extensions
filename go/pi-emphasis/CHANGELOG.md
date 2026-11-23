@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-24
+
 ### Fixed
 
 - 标题行内 `[[Word]]` 现渲染为胶囊：此前 `Decorate` 的 heading 分支只给标题词加图标，

@@ -12,7 +12,7 @@
 - **模块**：`github.com/dorokuma/pi-extensions/go/pi-emphasis`，包名 `emphasis`
   （`package emphasis`，无 `package main`、无 `init()`；`init` 级初始化仅用于
   构建只读查找表 `toneWords`/`known`）。
-- **版本**：`const Version = "0.1.0"`，遵循 `../../VERSIONING.md`。
+- **版本**：`const Version = "0.1.1"`，遵循 `../../VERSIONING.md`。
 
 ## 功能概览
 

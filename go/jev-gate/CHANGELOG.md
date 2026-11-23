@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
 ### Added
 
 - `identity.go`: extend `forbiddenExecutableBases` with `claude` /
