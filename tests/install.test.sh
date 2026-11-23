@@ -266,6 +266,8 @@ assert_file_exists "$T9/herdr-agent-state.ts" "NEVERWRITE file intact"
 # 第 1 道防线补充：external 条目在 --all 枚举中本就不出现（installable_names 类别剔除）。
 out="$(bash "$INSTALL" --dry-run --all --dest-dir "$T9" 2>&1)"
 assert_not_contains "$out" "herdr-agent-state" "NEVERWRITE --all dry-run no external entry"
+# 同口径补充：native 条目也不进 --all 安装枚举（installable_names 仅取 hosted/federated）。
+assert_not_contains "$out" "auto-continue-go" "--all dry-run no native entry"
 
 # NEVERWRITE 第 2/3 道防线隔离回归：把 herdr-agent-state 的 category 篡改为 hosted
 # 并指向一个假源文件——绕过第 1 道防线（external 类别剔除）后，--all 枚举仍被第 2 道

@@ -6,9 +6,10 @@
 
 ## 数据源：`federated/registry.json`
 
-`registry.json` 是 install.sh 的**唯一数据源**，登记全部 10 个扩展的类别
+`registry.json` 是 install.sh 的**唯一数据源**，登记本仓托管的 10 个 TS 扩展条目
 （`.extensions[].category`）、权威路径（`.authority`）、部署文件名（`.destFile`），
-以及三项全局字段：
+以及 14 个真实加载入口（13 个 `category=native` 的 PiG 原生 Go 扩展 + 1 个
+`category=external` 的 `moshi-hooks.ts`），另含三项全局字段：
 
 - `defaultDestDir` — 真实 pig 扩展部署目录锚点（`~/.pig/agent/extensions`），
   zero-node 保护的第二锚点（见下文）。
@@ -19,18 +20,24 @@
 预检要求：`md5sum`、`jq`、`realpath` 必须在 PATH（缺失即显式 FAILED），
 registry 必须存在且为合法 JSON。
 
-## 三类扩展
+## 四类条目
 
 | 类别 | 权威源 | install.sh 行为 |
 |---|---|---|
 | **hosted**（6 个） | 本仓 `extensions/<name>/src/` | 逐字节直拷部署目录：`md5` 幂等（同则 `unchanged`、不动 mtime），父目录 `mkdir -p`，`install -m 644` |
 | **federated**（3 个） | 各自宿主仓 | 以子进程级联调用宿主仓 `install.sh`：`env <installDestEnv>=<dest> bash <installScript>`；上游脚本缺失或失败只记 WARN 不中止 |
-| **external**（1 个） | herdr 二进制（带外） | `herdr-agent-state.ts` 只读巡检，任何路径（含 `--all`）绝不写 |
+| **external**（2 个） | 带外托管 | `herdr-agent-state.ts`（herdr 二进制托管）与 `moshi-hooks.ts`（外部 moshi-hook 工具生成）只读巡检，任何路径绝不写 |
+| **native**（14 个） | 本仓 `go/<name>` | PiG 原生 Go 扩展：pig 直接加载 `<destDir>/<destName>/go.mod` 目录；install.sh 不做 TS 安装，仅 `--list`/`--audit` 按 `destName` 检测目录 `go.mod` 在位性（`native Go active`/`absent`/`DRIFT`） |
 
 hosted：auto-continue / no-tables / ctx-orchestrate / jev-gate /
 exclude-tools-guard / magpie-image（registry 在册，默认未部署，需显式安装）。
 federated：codegraph-go / ctxmode / pi-cache-stats（注意其 `destFile` 为
-`cache-stats.ts`，与 `name` 异名）。external：herdr-agent-state。
+`cache-stats.ts`，与 `name` 异名）。external：herdr-agent-state / moshi-hooks。
+native：cache-stats / codegraph-go-ext / ctxmode-ext / ctx-orchestrate-go /
+exclude-tools-guard-go / jev-gate-go / no-tables-go / auto-continue-go /
+pi-emphasis / pi-env / pi-my-compact-ui / pi-tinyfish / pi-vcc /
+rpiv-ask-user-question（`destName` 为部署目录名，其中 13 个在部署目录有位、
+`auto-continue-go` 登记为源存在但未部署）。
 
 目标目录解析顺序：CLI `--dest-dir` > `$PI_EXT_DEST_DIR` > `$HOME/.pig/agent/extensions`。
 DEST 非绝对路径、或目标已存在目录 → 显式 FAILED、非零退出、消息走 stderr。
@@ -92,13 +99,14 @@ DEST 非绝对路径、或目标已存在目录 → 显式 FAILED、非零退出
 `--audit` **严格只读**：不写任何文件、删除任何条目或调用上游安装脚本，退出码
 保持 `0`（所有差集/缺失/漂移一律走 WARN 输出而非非零退出）。巡检内容：
 
-- **10 个注册条目逐项状态**：md5（源与部署副本比对）、权限（`stat -c '%a'`）、
-  `MATCH` / `MISMATCH` / `NATIVE` / `----` 判定；external 项只读态标注
-  `read-only (herdr-managed)` 并附 `READ-ONLY` 说明；federated 项附上游
-  `install.sh` 存在性行。
+- **全部注册条目逐项状态**（TS 条目：md5 源与部署副本比对、权限、`MATCH`/`MISMATCH`/
+  `NATIVE`/`----` 判定；external 项只读态标注 `read-only (herdr-managed)`；
+  native 项按 `destName` 检测部署目录 `go.mod`，报 `NATIVE — native Go active` /
+  `MISMATCH — absent/DRIFT`）；federated 项附上游 `install.sh` 存在性行。
 - **dest 目录差集告警**（`audit_unregistered_dest`）：
-  - 顶层枚举与 registry `.destFile`（非 `.name`）做差集——兼容 name/destFile
-    异名条目（如 `pi-cache-stats` → `cache-stats.ts`）；
+  - 顶层枚举与已登记条目名集合（TS `.destFile` ∪ native `.destName`）做差集——兼容
+    name/destFile 异名条目（如 `pi-cache-stats` → `cache-stats.ts`）与 native 条目
+    目录名（如 `codegraph-go-ext` → `codegraph-go`）；
   - 递归扫描子目录（`find -P -mindepth 2`，无限深度，不跟随符号链接、不进入
     符号链接目录），大小写不敏感收集嵌套 `.ts`；非 `.ts` 嵌套文件只进汇总计数；
   - `find`/`sort` 缺失或遍历报错时显式打印 `INCOMPLETE` WARN（说明可能少报），
