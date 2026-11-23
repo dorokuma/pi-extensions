@@ -9,7 +9,7 @@ import (
 )
 
 // Version is the Go port's release, per ../../VERSIONING.md.
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 // Extension is the factory a generated PiG runner calls (upstream's default
 // emphasis(pi) export). It wires the same three hooks:
