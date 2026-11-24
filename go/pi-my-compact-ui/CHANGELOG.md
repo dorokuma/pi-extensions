@@ -16,8 +16,7 @@ rail + 自旋帧 + 等待提示 + header 计数），历史思考重挂 assistan
 
 ### Added
 
-- 完整移植 TS 权威源（`/root/.pi/agent/npm/node_modules/pi-my-compact-ui/dist/extension.ts`，
-  2453 行）的工具组生命周期：顺序即语义的 `entries`、最近开放组吸收新条目、
+- 完整移植 TS 权威源 `pi-my-compact-ui` 的工具组生命周期：顺序即语义的 `entries`、最近开放组吸收新条目、
   真实文本到达即 seal、历史思考锚点重挂与幻影 padding 剥离、cache miss 折叠、
   有界动画 tick 与 `session_shutdown` 停止、配置读取失败静默回退默认值。
 

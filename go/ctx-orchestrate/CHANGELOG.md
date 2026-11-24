@@ -25,9 +25,10 @@ codemode 回传治理钩子，外加 Go 版独有的 codemode 沙盒嵌套调用
     大小写折叠可能绕过已批准 action）一律 fail-closed 阻断；`ctx_stats`
     的 input 非对象或携带任何非空 `action` 字段同样 fail-closed；
   - 嵌套调用 panic 亦 fail-closed（与 `tool_result` 钩子的 fail-open 相反）。
-- **`models.*` 窄护栏**：顶层 codemode 调用的 `input.code` 命中字面
-  `models.<method>(`（classify / generateImages / getModelsOfType /
-  getAvailableOfType / getModelOfType）即阻断——这些 QuickJS 全局绕过
+- **`models.*` 窄护栏**：顶层 codemode 调用的 `input.code` 匹配五个
+  `models.<method>` 名称（classify / generateImages / getModelsOfType /
+  getAvailableOfType / getModelOfType）即阻断（允许点号两侧空白，不要求
+  紧跟 `(`，亦覆盖直接方法引用）——这些 QuickJS 全局绕过
   `tool_call` 事件无法逐次拦截，该护栏是窄反滥用栏而非对抗边界；
   `CTX_ORCH_ALLOW_SANDBOX_MODELS=1` 可放开。
 - **实例独占分层调用预算（`CallBudgetTracker`）**：一级嵌套调用上限
