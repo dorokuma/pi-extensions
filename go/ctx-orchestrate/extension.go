@@ -123,29 +123,49 @@ func searchDigestOutputSchema() sdk.Schema {
 	}
 }
 
-// handleToolResult is the tool_result hook. It never fails the host: a panic or
-// an unexpected payload leaves the result untouched, as the TS hook returning
-// undefined does.
-func handleToolResult(_ sdk.Context, data map[string]any) (result any, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			diagLog(fmt.Sprintf("tool_result hook failed (ignored): %v", recovered))
-			result, err = nil, nil
-		}
-	}()
-	return CapCodemodeResult(data), nil
+// handleToolResult returns the tool_result hook bound to the per-instance
+// budget. It never fails the host: a panic or an unexpected payload leaves
+// the result untouched, as the TS hook returning undefined does.
+//
+// Before any governance it unconditionally releases the top-level codemode /
+// ctx_search_digest call's budget slot (a finished call frees its root),
+// independent of GovernEnabled: CTX_ORCH_GOVERN=0 turns off the cap, not the
+// guard bookkeeping.
+func handleToolResult(budget *CallBudgetTracker) sdk.EventFunc {
+	return func(_ sdk.Context, data map[string]any) (result any, err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				diagLog(fmt.Sprintf("tool_result hook failed (ignored): %v", recovered))
+				result, err = nil, nil
+			}
+		}()
+		releaseTopLevelRoot(budget, data)
+		return CapCodemodeResult(data), nil
+	}
 }
+
+// searchDigestDescription is the tool's model-facing description. The
+// trailing [codemode-guard:v1] is the interlock capability marker
+// exclude-tools-guard requires before it leaves codemode active: a
+// same-named tool without it (an old Go build or the TS port) is not proof
+// the nested-call guard is loaded.
+const searchDigestDescription = "Run several ctx_fs rg searches concurrently, dedupe hits and aggregate them per file → " +
+	"{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary}. Read-only. [codemode-guard:v1]"
 
 // Extension constructs and returns the ctx-orchestrate extension instance for PiG.
 func Extension() *sdk.Extension {
 	e := sdk.New("ctx-orchestrate")
 
+	// budget is exclusive to this extension instance: a packed-cell /reload
+	// or a second session instantiates Extension() again and must never
+	// share counters with a previous generation.
+	budget := NewCallBudgetTracker()
+
 	readOnly := true
 	e.RegisterTool(sdk.ToolDefinition{
-		Name:  "ctx_search_digest",
-		Label: "CTX Search Digest",
-		Description: "Run several ctx_fs rg searches concurrently, dedupe hits and aggregate them per file → " +
-			"{patterns, files:[{path,hits:[{line,excerpt,patterns}]}], summary}. Read-only.",
+		Name:          "ctx_search_digest",
+		Label:         "CTX Search Digest",
+		Description:   searchDigestDescription,
 		PromptSnippet: "Multi-pattern search aggregated per file",
 		PromptGuidelines: []string{
 			"Use tools.ctx_search_digest({...}) inside codemode for several patterns at once instead of one rg call per pattern.",
@@ -162,7 +182,27 @@ func Extension() *sdk.Extension {
 		},
 	})
 
-	e.OnToolResult(handleToolResult)
+	e.OnToolResult(handleToolResult(budget))
+	e.OnEvent(sdk.EventToolCall, func(ctx sdk.Context, data map[string]any) (any, error) {
+		return handleToolCall(budget, data)
+	})
+	// tool_execution_end is the second release path: a tool_result may never
+	// arrive for an aborted/interrupted call, so a finished top-level
+	// codemode / ctx_search_digest releases here as well (idempotent).
+	e.OnEvent(sdk.EventToolExecutionEnd, func(_ sdk.Context, data map[string]any) (any, error) {
+		releaseTopLevelRoot(budget, data)
+		return nil, nil
+	})
+	// agent_end clears every leftover root slot of the turn (upstream
+	// session_loadout.go does the same for its own counters).
+	e.OnEvent(sdk.EventAgentEnd, func(_ sdk.Context, _ map[string]any) (any, error) {
+		budget.Clear()
+		return nil, nil
+	})
+	e.OnSessionStart(func(_ sdk.Context, _ map[string]any) (any, error) {
+		diagLog(fmt.Sprintf("guard=readonly-whitelist(max_calls=%d/%d)", MaxNestedCalls(), MaxTotalNestedCalls()))
+		return nil, nil
+	})
 
 	diagLog(fmt.Sprintf(
 		"registered ctx_search_digest (exposure=codemode, namespace=%s) and codemode text cap governance (cap=%d, enabled=%t)",

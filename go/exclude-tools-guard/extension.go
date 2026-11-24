@@ -154,6 +154,37 @@ func FilterActiveTools(currentActive []string, isSubagent bool) ([]string, bool)
 type ToolManager interface {
 	GetActiveTools() ([]string, error)
 	SetActiveTools([]string)
+	// GetAllTools lists the session registry (sdk.Context.GetAllTools); the
+	// codemode interlock uses it to prove the ctx-orchestrate guard is loaded.
+	GetAllTools() ([]sdk.ToolInfo, error)
+}
+
+// codemodeGuardWarnOnce deduplicates the single warning emitted when codemode
+// is active but the ctx-orchestrate guard (ctx_search_digest) is not.
+var codemodeGuardWarnOnce sync.Once
+
+// reportCodemodeGuardMissing emits exactly one warning line per process for a
+// stripped codemode (the sandbox whitelist guard is absent: ctx-orchestrate
+// unloaded or its tool unregistered, so codemode must not stay callable).
+func reportCodemodeGuardMissing(detail string) {
+	codemodeGuardWarnOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "[subagent-identity] warning: ctx-orchestrate guard missing, fail-closed stripped codemode from active tools (%s)\n", detail)
+	})
+}
+
+// ResetCodemodeGuardWarnOnce resets codemodeGuardWarnOnce for testing purposes.
+func ResetCodemodeGuardWarnOnce() {
+	codemodeGuardWarnOnce = sync.Once{}
+}
+
+// hasTool reports whether the filtered set still contains name.
+func hasTool(tools []string, name string) bool {
+	for _, tool := range tools {
+		if tool == name {
+			return true
+		}
+	}
+	return false
 }
 
 // EnforceToolExclusions retrieves current active tools from ctx, filters them,
@@ -161,6 +192,22 @@ type ToolManager interface {
 // "No change means SetActiveTools is not called."
 // If GetActiveTools fails, it does NOT pretend filtering succeeded, logs a diagnostic
 // to stderr when PI_IDENTITY_DEBUG=1, and returns the error without panicking.
+//
+// Codemode interlock: an active "codemode" without the ctx-orchestrate nested
+// guard (ctx_search_digest registered) can reach arbitrary tools from the
+// sandbox. When the filtered set still carries "codemode", GetAllTools is
+// called -- once per evaluation, only in that case -- to check for a
+// guard-capable "ctx_search_digest"; an error or a missing entry strips
+// "codemode" too, and SetActiveTools still runs with the regular exclusions
+// applied (a guard probe failure never skips the base exclusion set).
+//
+// Guard capability marker: only the Go ctx-orchestrate build at or after the
+// codemode-guard v1 contract stamps "[codemode-guard:v1]" into the tool's
+// Description. The check refuses two look-alikes that would fail open:
+//   - a TypeScript port (SourceInfo.Path ending in ".ts", any case, after
+//     trimming space): the TS implementation carries no nested-call guard;
+//   - a pre-marker Go build or an unrelated same-named tool: no marker in
+//     the Description means no interlock contract.
 func EnforceToolExclusions(ctx ToolManager, isSubagent bool) (bool, error) {
 	currentActive, err := ctx.GetActiveTools()
 	if err != nil {
@@ -170,6 +217,42 @@ func EnforceToolExclusions(ctx ToolManager, isSubagent bool) (bool, error) {
 		return isSubagent, err
 	}
 	filtered, changed := FilterActiveTools(currentActive, isSubagent)
+	if hasTool(filtered, "codemode") {
+		guardPresent := false
+		allTools, allErr := ctx.GetAllTools()
+		if allErr == nil {
+			for _, info := range allTools {
+				if info.Name != "ctx_search_digest" {
+					continue
+				}
+				if strings.HasSuffix(strings.ToLower(strings.TrimSpace(info.SourceInfo.Path)), ".ts") {
+					// A TypeScript port carries no guard: not a credential.
+					continue
+				}
+				if !strings.Contains(info.Description, "[codemode-guard:v1]") {
+					// A pre-v1 Go build or an unrelated same-named tool.
+					continue
+				}
+				guardPresent = true
+				break
+			}
+		}
+		if allErr != nil || !guardPresent {
+			detail := "ctx_search_digest not registered"
+			if allErr != nil {
+				detail = fmt.Sprintf("GetAllTools failed: %v", allErr)
+			}
+			reportCodemodeGuardMissing(detail)
+			stripped := make([]string, 0, len(filtered))
+			for _, tool := range filtered {
+				if tool != "codemode" {
+					stripped = append(stripped, tool)
+				}
+			}
+			filtered = stripped
+			changed = true
+		}
+	}
 	if changed {
 		ctx.SetActiveTools(filtered)
 		if os.Getenv("PI_IDENTITY_DEBUG") == "1" {
