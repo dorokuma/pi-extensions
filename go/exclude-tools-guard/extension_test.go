@@ -22,6 +22,9 @@ import (
 type mockToolManager struct {
 	activeTools []string
 	getErr      error
+	allTools    []sdk.ToolInfo
+	allErr      error
+	allCalls    int
 	setCalls    [][]string
 }
 
@@ -35,6 +38,14 @@ func (m *mockToolManager) GetActiveTools() ([]string, error) {
 func (m *mockToolManager) SetActiveTools(tools []string) {
 	m.setCalls = append(m.setCalls, tools)
 	m.activeTools = tools
+}
+
+func (m *mockToolManager) GetAllTools() ([]sdk.ToolInfo, error) {
+	m.allCalls++
+	if m.allErr != nil {
+		return nil, m.allErr
+	}
+	return m.allTools, nil
 }
 
 // hcTerminalSocket starts a unix socket server that replies with reply for
@@ -1471,6 +1482,76 @@ func TestEnforceToolExclusions_SetterCalls(t *testing.T) {
 		stderrOut := buf.String()
 		if !strings.Contains(stderrOut, "[subagent-identity] warning: GetActiveTools failed:") {
 			t.Errorf("expected stderr diagnostic, got: %q", stderrOut)
+		}
+	})
+}
+
+// 4b. EnforceToolExclusions codemode interlock tests: an active codemode is
+// stripped whenever the ctx-orchestrate guard (ctx_search_digest) is missing
+// or the probe fails -- and the regular exclusion set is never skipped.
+func TestEnforceToolExclusions_CodemodeInterlock(t *testing.T) {
+	guardTools := []sdk.ToolInfo{{Name: "ctx_search_digest"}, {Name: "codemode"}}
+
+	t.Run("GuardPresent_KeepsCodemode", func(t *testing.T) {
+		ResetCodemodeGuardWarnOnce()
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "codemode", "bash"},
+			allTools:    guardTools,
+		}
+		if _, err := EnforceToolExclusions(mgr, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if mgr.allCalls != 1 {
+			t.Errorf("GetAllTools calls = %d, want 1 (codemode active)", mgr.allCalls)
+		}
+		if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], []string{"read", "codemode"}) {
+			t.Errorf("expected SetActiveTools([read codemode]), got %v", mgr.setCalls)
+		}
+	})
+
+	t.Run("NoCodemode_SkipsGetAllTools", func(t *testing.T) {
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "edit", "bash"},
+			allErr:      errors.New("probe must never fire"),
+		}
+		if _, err := EnforceToolExclusions(mgr, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if mgr.allCalls != 0 {
+			t.Errorf("GetAllTools must not run without an active codemode, calls = %d", mgr.allCalls)
+		}
+		if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], []string{"read", "edit"}) {
+			t.Errorf("expected SetActiveTools([read edit]), got %v", mgr.setCalls)
+		}
+	})
+
+	t.Run("GuardMissing_StripsCodemode_AndBaseExclusionsStillApply", func(t *testing.T) {
+		ResetCodemodeGuardWarnOnce()
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "codemode", "bash", "jev_check"},
+			allTools:    []sdk.ToolInfo{{Name: "codemode"}}, // no ctx_search_digest
+		}
+		if _, err := EnforceToolExclusions(mgr, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"read"}
+		if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], want) {
+			t.Errorf("expected SetActiveTools(%v) (codemode + base exclusions stripped), got %v", want, mgr.setCalls)
+		}
+	})
+
+	t.Run("GetAllToolsError_StillAppliesRegularExclusions", func(t *testing.T) {
+		ResetCodemodeGuardWarnOnce()
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "codemode", "grep"},
+			allErr:      errors.New("host unreachable"),
+		}
+		if _, err := EnforceToolExclusions(mgr, false); err != nil {
+			t.Fatalf("GetAllTools failure must not abort enforcement, got error: %v", err)
+		}
+		want := []string{"read"}
+		if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], want) {
+			t.Errorf("expected SetActiveTools(%v) on probe failure, got %v", want, mgr.setCalls)
 		}
 	})
 }

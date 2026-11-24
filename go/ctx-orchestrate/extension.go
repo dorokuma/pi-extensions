@@ -126,6 +126,10 @@ func searchDigestOutputSchema() sdk.Schema {
 // handleToolResult is the tool_result hook. It never fails the host: a panic or
 // an unexpected payload leaves the result untouched, as the TS hook returning
 // undefined does.
+//
+// Before any governance it unconditionally releases the codemode call's budget
+// slot (a finished top-level codemode frees its root), independent of
+// GovernEnabled: CTX_ORCH_GOVERN=0 turns off the cap, not the guard bookkeeping.
 func handleToolResult(_ sdk.Context, data map[string]any) (result any, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -133,6 +137,13 @@ func handleToolResult(_ sdk.Context, data map[string]any) (result any, err error
 			result, err = nil, nil
 		}
 	}()
+	if name, _ := data["toolName"].(string); name == "codemode" {
+		if parent, ok := data["parentToolCallId"].(string); !ok || parent == "" {
+			if id, _ := data["toolCallId"].(string); id != "" {
+				guardBudget.Release(id)
+			}
+		}
+	}
 	return CapCodemodeResult(data), nil
 }
 
@@ -163,6 +174,11 @@ func Extension() *sdk.Extension {
 	})
 
 	e.OnToolResult(handleToolResult)
+	e.OnEvent(sdk.EventToolCall, handleToolCall)
+	e.OnSessionStart(func(_ sdk.Context, _ map[string]any) (any, error) {
+		diagLog(fmt.Sprintf("guard=readonly-whitelist(max_calls=%d/%d)", MaxNestedCalls(), MaxTotalNestedCalls()))
+		return nil, nil
+	})
 
 	diagLog(fmt.Sprintf(
 		"registered ctx_search_digest (exposure=codemode, namespace=%s) and codemode text cap governance (cap=%d, enabled=%t)",

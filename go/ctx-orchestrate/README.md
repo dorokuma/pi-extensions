@@ -4,6 +4,8 @@ PiG 扩展组件，移植 `pi-extensions/extensions/ctx-orchestrate/src/ctx-orch
 （部署件 `/root/.pi/agent/extensions/ctx-orchestrate.ts`，md5 `0e33386a7178868cbefe31969f08720b`）。
 只移植精简后版本：`ctx_search_digest` 组合工具 + codemode 3000 字回传治理钩子 + 注册诊断日志。
 **不包含**已在本分支 `de148fc` 删除的 `ctx_symbol_read` / `ctx_test_digest`。
+另含 Go 版独有守卫（TS 版没有对应物）：`tool_call` 正面只读白名单 + 分层嵌套调用预算
+（`guard.go`，见下「codemode 沙盒嵌套守卫」）。
 
 ## 目录
 
@@ -13,6 +15,7 @@ PiG 扩展组件，移植 `pi-extensions/extensions/ctx-orchestrate/src/ctx-orch
 | `extension.go` | `func Extension() *sdk.Extension`：命名空间、工具注册、`tool_result` 钩子挂载、注册诊断 |
 | `digest.go` | `ctx_search_digest`：rg 输出解析、限并发嵌套调用、跨模式去重、按文件聚合、摘要与结构化结果 |
 | `govern.go` | 治理钩子 `CapCodemodeResult`、`TextCap` / `GovernEnabled`、环境变量读取 |
+| `guard.go` | `tool_call` 钩子 `handleToolCall`：正面只读白名单、`models.*` 护栏、`CallBudgetTracker` 分层预算 |
 | `text.go` | JavaScript 语义助手：UTF-16 长度与安全截断、`oneLine`、`clampInt`、`optStr` |
 | `diag.go` | TUI-safe 诊断日志（默认写文件，`CTX_ORCH_DEBUG=1` 才写 stderr） |
 | `*_test.go` | 对照测试（94 个 PASS = 41 顶层 + 53 子测试；全部用假 rg，不跑外部二进制）。`diag_test.go` 专测诊断路径解析与 PIG_HOME 隔离 |
@@ -42,6 +45,39 @@ PiG 扩展组件，移植 `pi-extensions/extensions/ctx-orchestrate/src/ctx-orch
 | `:475` `capCodemodeResult` | `govern.go:110` `CapCodemodeResult`（导出，同 TS `export`） |
 | `:556` `installGovernanceHook` | `extension.go:128` `handleToolResult` + `extension.go:163` `e.OnToolResult` |
 | `:572` `export default function (pi)` | `extension.go:139` `Extension()` |
+
+## codemode 沙盒嵌套守卫（Go 版独有，`guard.go`）
+
+挂载 `e.OnEvent(sdk.EventToolCall, handleToolCall)`。SDK 在 `pigsdk/extension.go:1630` 已把
+handler 返回值自动包成 `{"_pigToolCallResult": result}`，因此 handler **直接**返回
+`map[string]any{"block": true, "reason": "..."}`（放行返回 `nil, nil`）——手包一层会让宿主
+解出 `Block=false` 静默 fail-open。
+
+- **顶层调用**（`parentToolCallId` 不存在 / `nil` / `""`）：除 `codemode` 外 100% 放行；
+  `codemode` 放行前对 `input.code` 跑窄护栏正则
+  `\bmodels\s*\.\s*(classify|generateImages|getModelsOfType|getAvailableOfType|getModelOfType)\b`
+  （`CTX_ORCH_ALLOW_SANDBOX_MODELS=1` 可跳过），命中则阻断；通过后把 `toolCallId` 登记为
+  `CallBudgetTracker` 的精确 `rootID`。`parentToolCallId` 存在但非 `string` 视为畸形载荷，
+  fail-closed 阻断。注意 `models.*` 是 QuickJS 全局、不走 `tool_call`，本护栏只挡字面调用，
+  属防误调定位而非对抗级物理封死（物理禁用是上游 PiG `Options.DisableModels` 待办）。
+- **嵌套调用**（`parentToolCallId != ""`）：先过白名单、不命中不耗预算；panic 恢复为
+  fail-closed 阻断（区别于 `handleToolResult` 的 fail-open）。白名单 6 工具：
+  `ctx_fs`（`ls/glob/stat/rg/resolve/related`）、`ctx_git`（`status/diff/log`）、
+  `ctx_stats`（不得带非空 `action`）、`ctx_kb`（仅 `search/stats/doctor`）、
+  `codegraph`（仅 `explore/search/files/node/callers/callees/impact/status/affected/communities/search_facts`，
+  严格拒绝 `store_fact`）、`ctx_search_digest`。4 个动作工具统一
+  `strings.ToLower(strings.TrimSpace(action))`，并拒绝任何 `k != "action" && EqualFold(k,"action")`
+  的重复键（防 JSON 大小写折叠绕过）。其余一切工具（`ctx_run`/`ctx_bg`/`ctx_report`/`jev_check`/
+  `ask_user_question`/`vcc_recall`/`read`/`edit`/`write`/`bash` 及未来新增）默认拒绝。
+- **分层预算 `CallBudgetTracker`**（单 `sync.Mutex` 原子扣减 + 128 槽环形淘汰）：
+  嵌套 id 形如 `<callerID>/<n>`。精确匹配 `parentToolCallId == rootID` 计一级+总数；
+  最长 `rootID+"/"` 前缀匹配（`ctx_search_digest` 内部二跳 `ctx_fs`）仅计总数；
+  未命中再从右向左剥离 `/<数字>` 尾段回退。一级上限 `CTX_ORCH_MAX_NESTED_CALLS`
+  （默认 16，范围 1–64），总上限 `CTX_ORCH_MAX_TOTAL_NESTED_CALLS`（默认 64，范围 16–256）。
+  PiG 自带 `NestedCallLimits.MaxCalls=256` 只截审计记录不拦执行，本预算是唯一物理上限。
+- **槽位回收**：`handleToolResult` 入口无条件按 `toolName=="codemode" && parentToolCallId==""`
+  调 `guardBudget.Release(toolCallId)`，独立于 `GovernEnabled()`（`CTX_ORCH_GOVERN=0` 不泄槽）。
+- **自检日志**：`OnSessionStart` 打 `guard=readonly-whitelist(max_calls=16/64)`。
 
 ## 行为对齐要点
 

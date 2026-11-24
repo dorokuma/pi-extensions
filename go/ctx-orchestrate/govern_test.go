@@ -62,7 +62,7 @@ func TestCapCodemodeResultCapsOversizedReply(t *testing.T) {
 	for _, want := range []string{
 		"[…ctx-orchestrate 治理] codemode 回传 3500 字符超过硬顶 3000",
 		"丢弃约 680 字符", // 3500 - (3000-180)
-		"完整输出已存至 /tmp/out/full.txt，用 read 精确取片段（无需重跑）。",
+		"完整输出已存至 /tmp/out/full.txt，请在顶层用直连 read 精确取片段（沙盒内 read 不可用，无需重跑）。",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("marker missing %q in:\n%s", want, text)
@@ -93,7 +93,7 @@ func TestCapCodemodeResultMarkerWithoutFullOutputPath(t *testing.T) {
 		t.Fatal("4000 characters must be governed")
 	}
 	text := contentText(t, result["content"])
-	if !strings.Contains(text, "请在脚本内自己收敛：只回摘要/计数/关键路径，需要全文就写入文件后用 read 精确取片段。") {
+	if !strings.Contains(text, "请在脚本内自己收敛：只回摘要/计数/关键路径；确需全文请把中间结果写入工作区文件后在顶层用直连 read 精确取片段（沙盒内 read 不可用）。") {
 		t.Fatalf("fallback marker missing:\n%s", text)
 	}
 	if strings.Contains(text, "完整输出已存至") {

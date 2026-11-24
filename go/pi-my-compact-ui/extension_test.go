@@ -2182,3 +2182,107 @@ func tuiStrip(s string) string {
 	}
 	return b.String()
 }
+
+// Test a nested codemode call's tool_execution events never enter the ported
+// tree (bug regression): the host mounts no card for a `parentToolCallId` call
+// (`<parent id>/<n>`), so recording it would add a phantom entry whose id
+// passes hostCardForCallID and steals the group's display rights from the
+// outer codemode card, hiding the whole tool tree. The events must be dropped
+// on entry -- the outer call keeps its start time, duration and component.
+func TestNestedToolExecutionEventsAreDropped(t *testing.T) {
+	r, _, tui := startedRuntime(t)
+	r.setClock(func() int64 { return 1_000 })
+	r.handleMessageStart(map[string]any{
+		"message": map[string]any{"role": "assistant", "content": []any{}},
+	})
+
+	// The outer codemode call streams and starts (parentToolCallId absent).
+	assistant := map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"type": "toolCall", "id": "call-1", "name": "codemode", "arguments": map[string]any{"code": "tools.ctx_fs({action:'ls'})"}},
+	}}
+	r.handleMessageUpdate(map[string]any{
+		"message":               assistant,
+		"assistantMessageEvent": map[string]any{"type": "toolcall_start", "contentIndex": float64(0)},
+	})
+	r.handleToolExecutionStart(map[string]any{"toolCallId": "call-1", "toolName": "codemode", "args": map[string]any{"code": "1"}})
+	r.mu.Lock()
+	group := r.lastActiveGroup
+	var outerComp *toolComponent
+	if group != nil {
+		for _, entry := range group.entries {
+			if entry.kind == "tool" {
+				outerComp = entry.tool
+			}
+		}
+	}
+	r.mu.Unlock()
+	if outerComp == nil {
+		t.Fatal("the outer codemode call mounted no component")
+	}
+
+	// The sandbox's nested ctx_fs call broadcasts tool_execution_start/end with
+	// parentToolCallId set and id "call-1/1". Neither event may touch the tree.
+	rendersBefore := tui.renderCount()
+	r.handleToolExecutionStart(map[string]any{
+		"toolCallId":       "call-1/1",
+		"toolName":         "ctx_fs",
+		"args":             map[string]any{"action": "ls"},
+		"parentToolCallId": "call-1",
+	})
+	r.handleToolExecutionEnd(map[string]any{
+		"toolCallId":       "call-1/1",
+		"parentToolCallId": "call-1",
+		"result":           map[string]any{"content": []any{map[string]any{"type": "text", "text": "nested-out"}}},
+	})
+
+	r.mu.Lock()
+	_, nestedStarted := r.toolStarts["call-1/1"]
+	_, nestedDuration := r.toolDurations["call-1/1"]
+	nestedComp := r.findGroupedToolByIDLocked("call-1/1")
+	entries := 0
+	children := 0
+	if group != nil {
+		entries = len(group.entries)
+		children = len(group.children)
+	}
+	display := (*toolComponent)(nil)
+	if group != nil {
+		display = group.displayToolLocked()
+	}
+	r.mu.Unlock()
+	if nestedStarted || nestedDuration {
+		t.Errorf("nested call left timing state: started=%v duration=%v, want none", nestedStarted, nestedDuration)
+	}
+	if nestedComp != nil {
+		t.Error("the nested call mounted a component; it must never enter the tree")
+	}
+	if entries != 1 || children != 1 {
+		t.Errorf("group entries=%d children=%d, want 1 and 1 (only the outer codemode)", entries, children)
+	}
+	if display != outerComp {
+		t.Errorf("display tool = %v, want the outer codemode component (the cardless nested id stole the card)", display)
+	}
+	if tui.renderCount() != rendersBefore {
+		t.Errorf("nested events requested %d renders, want 0", tui.renderCount()-rendersBefore)
+	}
+
+	// The outer codemode finish is unaffected: its duration and result apply.
+	r.setClock(func() int64 { return 3_500 })
+	r.handleToolExecutionEnd(map[string]any{
+		"toolCallId": "call-1",
+		"result":     map[string]any{"content": []any{map[string]any{"type": "text", "text": "outer-out"}}},
+	})
+	r.mu.Lock()
+	duration, timed := r.toolDurations["call-1"]
+	var resultText string
+	if outerComp.result != nil && len(outerComp.result.content) > 0 {
+		resultText = outerComp.result.content[0].text
+	}
+	r.mu.Unlock()
+	if !timed || duration != 2.5 {
+		t.Errorf("outer codemode duration = %v (timed=%v), want 2.5s", duration, timed)
+	}
+	if resultText != "outer-out" {
+		t.Errorf("outer codemode result = %q, want the applied output", resultText)
+	}
+}

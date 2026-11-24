@@ -176,9 +176,11 @@ func CapCodemodeResult(event map[string]any) map[string]any {
 	}
 	marker := fmt.Sprintf("[…ctx-orchestrate 治理] codemode 回传 %d 字符超过硬顶 %d，已物理截断（丢弃约 %d 字符）。", total, cap, dropped)
 	if fullOutputPath != "" {
-		marker += fmt.Sprintf("完整输出已存至 %s，用 read 精确取片段（无需重跑）。", fullOutputPath)
+		// The sandbox whitelist no longer lets a script read the spool file:
+		// the model must leave codemode and read it through a top-level call.
+		marker += fmt.Sprintf("完整输出已存至 %s，请在顶层用直连 read 精确取片段（沙盒内 read 不可用，无需重跑）。", fullOutputPath)
 	} else {
-		marker += "请在脚本内自己收敛：只回摘要/计数/关键路径，需要全文就写入文件后用 read 精确取片段。"
+		marker += "请在脚本内自己收敛：只回摘要/计数/关键路径；确需全文请把中间结果写入工作区文件后在顶层用直连 read 精确取片段（沙盒内 read 不可用）。"
 	}
 
 	lastText := -1

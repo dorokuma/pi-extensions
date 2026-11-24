@@ -681,6 +681,12 @@ func (r *runtimeState) setAgentWorkPhase(phase *string) {
 
 // handleToolExecutionStart is tool_execution_start (L2299-2307).
 func (r *runtimeState) handleToolExecutionStart(data map[string]any) {
+	// A codemode sandbox's nested call (parentToolCallId set, id `<parent>/<n>`)
+	// has no host card: recording it would add a cardless entry that steals the
+	// group's display rights from the outer codemode card and hides the tree.
+	if asString(data["parentToolCallId"]) != "" {
+		return
+	}
 	id := asString(data["toolCallId"])
 	// nowMs takes the lock itself, so read the clock before entering it.
 	now := r.nowMs()
@@ -705,6 +711,11 @@ func (r *runtimeState) handleToolExecutionStart(data map[string]any) {
 
 // handleToolExecutionEnd is tool_execution_end (L2308-2325).
 func (r *runtimeState) handleToolExecutionEnd(data map[string]any) {
+	// Nested-call events are dropped like in handleToolExecutionStart: they
+	// have no start state, no component and no host card to stamp.
+	if asString(data["parentToolCallId"]) != "" {
+		return
+	}
 	id := asString(data["toolCallId"])
 	// nowMs takes the lock itself, so read the clock before entering it.
 	end := r.nowMs()
