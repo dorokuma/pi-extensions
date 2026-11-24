@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Added
+
+- **codemode 互锁守卫（`EnforceToolExclusions`）**：过滤后的激活工具集仍含
+  `codemode` 时，每次评估调用一次 `GetAllTools` 探测嵌套调用守卫，通过
+  三项校验才保留 `codemode`，任一不满足即剥离：
+  - 注册了名为 `ctx_search_digest` 的工具；
+  - 其 `SourceInfo.Path`（去空白、大小写不敏感）不以 `.ts` 结尾——TS 移植版
+    无嵌套调用守卫，不算凭据；
+  - 其 `Description` 携带能力标记 `[codemode-guard:v1]`——无标记的旧版
+    Go 构建或同名无关工具无互锁契约。
+- **探测失败 fail-closed**：`GetAllTools` 报错或守卫缺失时，经
+  `reportCodemodeGuardMissing` 打点并把 `codemode` 从过滤集剥离；剥离路径
+  仍照常执行 `SetActiveTools`——守卫探测失败绝不跳过基础排除集。
+
 ## [0.2.0] - 2026-11-22
 
 ### Added
@@ -44,5 +60,6 @@ dispatch-layer tools from the visible tool set per role.
   explicit `parent` key that is JSON `null`, and return `pid > 0` as
   `shell_pid` for the unchanged S3/S4 checks.
 
-[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.2.0...HEAD
+[Unreleased]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.3.0...HEAD
+[0.3.0]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.2.0...go/exclude-tools-guard/v0.3.0
 [0.2.0]: https://github.com/dorokuma/pi-extensions/compare/go/exclude-tools-guard/v0.1.0...go/exclude-tools-guard/v0.2.0
