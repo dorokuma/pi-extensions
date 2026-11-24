@@ -191,6 +191,12 @@ type budgetCounters struct {
 	direct int
 	// total counts every nested call under the root (direct + second hop).
 	total int
+	// totalOnly marks a root registered by a top-level ctx_search_digest
+	// call: its own ctx_fs fan-out arrives as first-level nested calls
+	// under its toolCallId -- the same quota shape as the second hop of a
+	// codemode -> ctx_search_digest -- so only the total cap applies and
+	// direct is never touched.
+	totalOnly bool
 }
 
 // CallBudgetTracker counts nested calls per codemode root. One mutex makes
@@ -229,11 +235,24 @@ func (t *CallBudgetTracker) effectiveCaps() (maxNest, maxTot int) {
 	return maxNest, maxTot
 }
 
-// Register records a top-level codemode call as a budget root. A reused
-// toolCallId resets that root's counters without re-queueing it (its FIFO
-// position is kept); a fresh id is appended, evicting the oldest entry
-// first when the queue is full.
+// Register records a top-level codemode call as a budget root, bound by
+// both the first-level and the total cap.
 func (t *CallBudgetTracker) Register(rootID string) {
+	t.register(rootID, false)
+}
+
+// RegisterTotalOnly records a top-level ctx_search_digest call as a
+// total-only budget root: its ctx_fs fan-out debits only the total cap,
+// matching the codemode -> ctx_search_digest second-hop quota.
+func (t *CallBudgetTracker) RegisterTotalOnly(rootID string) {
+	t.register(rootID, true)
+}
+
+// register records rootID as a budget root. A reused toolCallId resets
+// that root's counters without re-queueing it (its FIFO position is
+// kept); a fresh id is appended, evicting the oldest entry first when
+// the queue is full.
+func (t *CallBudgetTracker) register(rootID string, totalOnly bool) {
 	if rootID == "" {
 		return
 	}
@@ -247,7 +266,7 @@ func (t *CallBudgetTracker) Register(rootID string) {
 		}
 		t.ring = append(t.ring, rootID)
 	}
-	t.roots[rootID] = &budgetCounters{}
+	t.roots[rootID] = &budgetCounters{totalOnly: totalOnly}
 }
 
 // Release drops the root's slot when the top-level codemode call finishes.
@@ -294,10 +313,11 @@ func isNumericSegments(suffix string) bool {
 }
 
 // debit spends one nested call for parentID: an exact registered-root match
-// counts first-level + total, and a `rootID + "/" + <numeric segments>`
-// match counts only the total (second hop). Anything else fails closed as
-// an unknown parent. It returns the block reason when the root is unknown
-// or a cap is exceeded, "" otherwise.
+// counts first-level + total (the first-level leg only when the root is not
+// total-only), and a `rootID + "/" + <numeric segments>` match counts only
+// the total (second hop). Anything else fails closed as an unknown parent.
+// It returns the block reason when the root is unknown or a cap is
+// exceeded, "" otherwise.
 func (t *CallBudgetTracker) debit(parentID string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -309,17 +329,17 @@ func (t *CallBudgetTracker) debit(parentID string) string {
 	maxNest, maxTot := t.effectiveCaps()
 	nextTotal := counters.total + 1
 	nextDirect := counters.direct
-	if direct {
+	if direct && !counters.totalOnly {
 		nextDirect++
 	}
-	if direct && nextDirect > maxNest {
+	if direct && !counters.totalOnly && nextDirect > maxNest {
 		return fmt.Sprintf("[ctx-orchestrate] 单脚本一级嵌套调用已达上限 %d（CTX_ORCH_MAX_NESTED_CALLS）：请拆分脚本或减少 ctx_search_digest 的 patterns 数量；确需更多调用请改在顶层直连。", maxNest)
 	}
 	if nextTotal > maxTot {
 		return fmt.Sprintf("[ctx-orchestrate] 同一 codemode 根的嵌套调用总数已达上限 %d（CTX_ORCH_MAX_TOTAL_NESTED_CALLS，含 ctx_search_digest 二级 ctx_fs 扇出）：请拆分脚本或减少 patterns 数量。", maxTot)
 	}
 	counters.total = nextTotal
-	if direct {
+	if direct && !counters.totalOnly {
 		counters.direct = nextDirect
 	}
 	return ""
@@ -394,8 +414,9 @@ func handleToolCall(budget *CallBudgetTracker, data map[string]any) (result any,
 // but codemode and ctx_search_digest passes 100% untouched. For codemode it
 // runs the models.* rail and, on allow, registers the call id as a budget
 // root so its nested calls have a ledger to count against. A top-level
-// ctx_search_digest is registered too: its own ctx_fs fan-out arrives as
-// nested calls under its toolCallId and needs the same ledger.
+// ctx_search_digest is registered as a total-only root: its own ctx_fs
+// fan-out arrives as first-level nested calls under its toolCallId, the
+// same quota shape as a codemode script's second hop.
 func handleTopLevelToolCall(budget *CallBudgetTracker, data map[string]any) (any, error) {
 	toolName, _ := data["toolName"].(string)
 	if toolName != "codemode" && toolName != "ctx_search_digest" {
@@ -411,7 +432,11 @@ func handleTopLevelToolCall(budget *CallBudgetTracker, data map[string]any) (any
 		}
 	}
 	toolCallID, _ := data["toolCallId"].(string)
-	budget.Register(toolCallID)
+	if toolName == "ctx_search_digest" {
+		budget.RegisterTotalOnly(toolCallID)
+	} else {
+		budget.Register(toolCallID)
+	}
 	return nil, nil
 }
 

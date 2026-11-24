@@ -291,12 +291,15 @@ func TestNestedCtxStatsFailsClosed(t *testing.T) {
 	}
 }
 
-// TestTopLevelSearchDigestRegistersRoot (oracle S-3): a direct ctx_search_digest
-// call registers its toolCallId as a budget root, so its own ctx_fs fan-out
-// arrives as a nested call that passes and is counted.
+// TestTopLevelSearchDigestRegistersRoot (oracle S-3): a direct
+// ctx_search_digest call registers its toolCallId as a total-only budget
+// root, so its own ctx_fs fan-out arrives as first-level nested calls
+// under the real PiG wire protocol (parentToolCallId == the digest's
+// toolCallId, toolCallId == <root>/<n>) and is bounded only by the total
+// cap -- the same quota shape as a codemode second hop.
 func TestTopLevelSearchDigestRegistersRoot(t *testing.T) {
 	cleanEnv(t)
-	resetBudget(t, 8, 8)
+	resetBudget(t, 2, 6)
 
 	data := map[string]any{
 		"toolName":   "ctx_search_digest",
@@ -306,15 +309,35 @@ func TestTopLevelSearchDigestRegistersRoot(t *testing.T) {
 	if reason := blocked(t, data); reason != "" {
 		t.Fatalf("top-level ctx_search_digest must pass untouched, got %q", reason)
 	}
-	// Its second hop is a registered root's child: allowed and accounted.
-	if reason := blocked(t, nestedData("sd-1/1", "ctx_fs", map[string]any{"action": "rg", "pattern": "foo"})); reason != "" {
-		t.Fatalf("second hop under the digest root must pass, got %q", reason)
+	// The digest's own ctx_fs calls arrive with parentToolCallId "sd-1"
+	// (first-level under the real wire protocol) but count only against the
+	// total cap: six calls pass, crossing maxNest=2.
+	for i := 0; i < 6; i++ {
+		data := map[string]any{
+			"parentToolCallId": "sd-1",
+			"toolName":         "ctx_fs",
+			"toolCallId":       fmt.Sprintf("sd-1/%d", i+1),
+			"input":            map[string]any{"action": "rg", "pattern": "foo"},
+		}
+		if reason := blocked(t, data); reason != "" {
+			t.Fatalf("digest fan-out call %d must pass, got %q", i+1, reason)
+		}
+	}
+	// The seventh call hits the total cap.
+	data = map[string]any{
+		"parentToolCallId": "sd-1",
+		"toolName":         "ctx_fs",
+		"toolCallId":       "sd-1/7",
+		"input":            map[string]any{"action": "rg", "pattern": "foo"},
+	}
+	if reason := blocked(t, data); reason == "" || !strings.Contains(reason, "上限") {
+		t.Fatalf("digest fan-out call 7 must hit the total cap, got %q", reason)
 	}
 	guardTestBudget.mu.Lock()
-	total := guardTestBudget.roots["sd-1"].total
+	counters := guardTestBudget.roots["sd-1"]
 	guardTestBudget.mu.Unlock()
-	if total != 1 {
-		t.Fatalf("digest second hop total = %d, want 1", total)
+	if counters.total != 6 || counters.direct != 0 {
+		t.Fatalf("digest root ledger = {total:%d direct:%d}, want {total:6 direct:0}", counters.total, counters.direct)
 	}
 }
 
@@ -372,6 +395,12 @@ func TestBudgetNumericSuffixFallback(t *testing.T) {
 	if reason := blocked(t, nestedData("root/2/4", "ctx_fs", map[string]any{"action": "ls"})); reason != "" {
 		t.Fatalf("a numeric two-hop id under a registered root must pass, got %q", reason)
 	}
+	guardTestBudget.mu.Lock()
+	counters := guardTestBudget.roots["root"]
+	guardTestBudget.mu.Unlock()
+	if counters.total != 1 || counters.direct != 0 {
+		t.Fatalf("numeric two-hop ledger = {total:%d direct:%d}, want {total:1 direct:0}", counters.total, counters.direct)
+	}
 	// An id that shares the string prefix but is not under root/ stays blocked.
 	if reason := blocked(t, nestedData("rootx", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
 		t.Error("an id merely sharing the prefix must not match")
@@ -387,6 +416,13 @@ func TestBudgetNumericSuffixFallback(t *testing.T) {
 	// An unknown parent fails closed.
 	if reason := blocked(t, nestedData("unknown", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
 		t.Error("an unregistered parent must fail closed")
+	}
+	// Rejected ids never touched the ledger: the count stays {1, 0}.
+	guardTestBudget.mu.Lock()
+	counters = guardTestBudget.roots["root"]
+	guardTestBudget.mu.Unlock()
+	if counters.total != 1 || counters.direct != 0 {
+		t.Fatalf("rejected ids must not debit: ledger = {total:%d direct:%d}, want {total:1 direct:0}", counters.total, counters.direct)
 	}
 }
 
