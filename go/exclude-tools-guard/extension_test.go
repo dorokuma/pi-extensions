@@ -1490,7 +1490,7 @@ func TestEnforceToolExclusions_SetterCalls(t *testing.T) {
 // stripped whenever the ctx-orchestrate guard (ctx_search_digest) is missing
 // or the probe fails -- and the regular exclusion set is never skipped.
 func TestEnforceToolExclusions_CodemodeInterlock(t *testing.T) {
-	guardTools := []sdk.ToolInfo{{Name: "ctx_search_digest"}, {Name: "codemode"}}
+	guardTools := []sdk.ToolInfo{{Name: "ctx_search_digest", Description: "composite search [codemode-guard:v1]"}, {Name: "codemode"}}
 
 	t.Run("GuardPresent_KeepsCodemode", func(t *testing.T) {
 		ResetCodemodeGuardWarnOnce()
@@ -1552,6 +1552,93 @@ func TestEnforceToolExclusions_CodemodeInterlock(t *testing.T) {
 		want := []string{"read"}
 		if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], want) {
 			t.Errorf("expected SetActiveTools(%v) on probe failure, got %v", want, mgr.setCalls)
+		}
+	})
+
+	// Adversarial credentials (oracle M-1): a same-named tool is not proof of
+	// the guard unless it is a non-TypeScript source carrying the
+	// [codemode-guard:v1] capability marker.
+	stripped := []struct {
+		name  string
+		tools []sdk.ToolInfo
+	}{
+		{
+			name: "TypeScriptPort_StripsCodemode",
+			tools: []sdk.ToolInfo{{
+				Name:        "ctx_search_digest",
+				Description: "composite search [codemode-guard:v1]",
+				SourceInfo:  sdk.SourceInfo{Path: "/root/.pig/agent/extensions/ctx-orchestrate.ts"},
+			}},
+		},
+		{
+			name:  "NoMarker_PreV1GoBuild_StripsCodemode",
+			tools: []sdk.ToolInfo{{Name: "ctx_search_digest", Description: "composite search, read-only"}},
+		},
+		{
+			name: "MarkerOnDifferentCasingTsPath_StillStripped",
+			tools: []sdk.ToolInfo{{
+				Name:        "ctx_search_digest",
+				Description: "[codemode-guard:v1]",
+				SourceInfo:  sdk.SourceInfo{Path: " /opt/ext/CTX-ORCHESTRATE.TS "},
+			}},
+		},
+	}
+	for _, tc := range stripped {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetCodemodeGuardWarnOnce()
+			mgr := &mockToolManager{
+				activeTools: []string{"read", "codemode"},
+				allTools:    append(append([]sdk.ToolInfo{}, tc.tools...), sdk.ToolInfo{Name: "codemode"}),
+			}
+			if _, err := EnforceToolExclusions(mgr, false); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(mgr.setCalls) != 1 || !reflect.DeepEqual(mgr.setCalls[0], []string{"read"}) {
+				t.Errorf("expected SetActiveTools([read]) (codemode stripped), got %v", mgr.setCalls)
+			}
+		})
+	}
+
+	t.Run("MarkerNonTsSource_KeepsCodemode", func(t *testing.T) {
+		ResetCodemodeGuardWarnOnce()
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "codemode"},
+			allTools: []sdk.ToolInfo{
+				{
+					Name:        "ctx_search_digest",
+					Description: "composite search [codemode-guard:v1]",
+					SourceInfo:  sdk.SourceInfo{Path: "/root/.pig/agent/extensions/ctx-orchestrate"},
+				},
+				{Name: "codemode"},
+			},
+		}
+		if _, err := EnforceToolExclusions(mgr, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(mgr.setCalls) != 0 {
+			t.Errorf("a guard-capable tool must keep the active set unchanged, got SetActiveTools %v", mgr.setCalls)
+		}
+	})
+
+	t.Run("MarkerBesideTsLookalike_KeepsCodemode", func(t *testing.T) {
+		ResetCodemodeGuardWarnOnce()
+		mgr := &mockToolManager{
+			activeTools: []string{"read", "codemode"},
+			allTools: []sdk.ToolInfo{
+				{
+					Name:        "ctx_search_digest",
+					Description: "[codemode-guard:v1]",
+					SourceInfo:  sdk.SourceInfo{Path: "/ext/ctx-orchestrate.ts"},
+				},
+				{Name: "ctx_search_digest", Description: "guard v1 [codemode-guard:v1]"},
+				{Name: "codemode"},
+			},
+		}
+		if _, err := EnforceToolExclusions(mgr, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(mgr.setCalls) != 0 {
+			t.Errorf("a later valid credential must satisfy the interlock, got SetActiveTools %v", mgr.setCalls)
 		}
 	})
 }

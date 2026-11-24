@@ -2,6 +2,7 @@ package ctxorchestrate
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,15 @@ func TestToolDefinitionShape(t *testing.T) {
 		if _, ok := hitProperties[name]; !ok {
 			t.Fatalf("file member %q missing", name)
 		}
+	}
+}
+
+// TestSearchDigestCarriesGuardMarker pins the codemode interlock credential
+// (oracle M-1): exclude-tools-guard only accepts a ctx_search_digest whose
+// Description carries the [codemode-guard:v1] capability marker, so dropping
+// or renaming it must fail this test before it fails open in production.
+func TestSearchDigestCarriesGuardMarker(t *testing.T) {
+	if !strings.Contains(searchDigestDescription, "[codemode-guard:v1]") {
+		t.Fatalf("ctx_search_digest Description must carry [codemode-guard:v1], got %q", searchDigestDescription)
 	}
 }

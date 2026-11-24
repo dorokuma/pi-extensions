@@ -196,10 +196,18 @@ func hasTool(tools []string, name string) bool {
 // Codemode interlock: an active "codemode" without the ctx-orchestrate nested
 // guard (ctx_search_digest registered) can reach arbitrary tools from the
 // sandbox. When the filtered set still carries "codemode", GetAllTools is
-// called -- once per evaluation, only in that case -- to check for
-// "ctx_search_digest"; an error or a missing entry strips "codemode" too,
-// and SetActiveTools still runs with the regular exclusions applied (a guard
-// probe failure never skips the base exclusion set).
+// called -- once per evaluation, only in that case -- to check for a
+// guard-capable "ctx_search_digest"; an error or a missing entry strips
+// "codemode" too, and SetActiveTools still runs with the regular exclusions
+// applied (a guard probe failure never skips the base exclusion set).
+//
+// Guard capability marker: only the Go ctx-orchestrate build at or after the
+// codemode-guard v1 contract stamps "[codemode-guard:v1]" into the tool's
+// Description. The check refuses two look-alikes that would fail open:
+//   - a TypeScript port (SourceInfo.Path ending in ".ts", any case, after
+//     trimming space): the TS implementation carries no nested-call guard;
+//   - a pre-marker Go build or an unrelated same-named tool: no marker in
+//     the Description means no interlock contract.
 func EnforceToolExclusions(ctx ToolManager, isSubagent bool) (bool, error) {
 	currentActive, err := ctx.GetActiveTools()
 	if err != nil {
@@ -214,10 +222,19 @@ func EnforceToolExclusions(ctx ToolManager, isSubagent bool) (bool, error) {
 		allTools, allErr := ctx.GetAllTools()
 		if allErr == nil {
 			for _, info := range allTools {
-				if info.Name == "ctx_search_digest" {
-					guardPresent = true
-					break
+				if info.Name != "ctx_search_digest" {
+					continue
 				}
+				if strings.HasSuffix(strings.ToLower(strings.TrimSpace(info.SourceInfo.Path)), ".ts") {
+					// A TypeScript port carries no guard: not a credential.
+					continue
+				}
+				if !strings.Contains(info.Description, "[codemode-guard:v1]") {
+					// A pre-v1 Go build or an unrelated same-named tool.
+					continue
+				}
+				guardPresent = true
+				break
 			}
 		}
 		if allErr != nil || !guardPresent {

@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
 
 // Codemode nested-call guard: a tool_call hook that confines every call a
@@ -130,12 +128,22 @@ func checkNestedWhitelist(toolName string, data map[string]any) string {
 		}
 		return ""
 	case "ctx_stats":
-		// ctx_stats takes no action: any non-empty action value is malformed.
-		input, _ := data["input"].(map[string]any)
-		if input != nil {
-			if action, present := input["action"]; present {
-				if text, isString := action.(string); !isString || strings.TrimSpace(text) != "" {
-					return "[ctx-orchestrate] codemode 沙盒仅允许只读白名单工具，已阻断 ctx_stats（不接受 action 字段）；请改在顶层直连调用。"
+		// ctx_stats takes no action. A present input must be a map (anything
+		// else fails closed), and every key is checked: a non-empty/non-nil
+		// "action" value is malformed, and any case-variant duplicate key
+		// ("Action", "ACTION", ...) is blocked outright -- the same JSON
+		// case-folding bypass the action-routed tools refuse.
+		rawInput, exists := data["input"]
+		if exists && rawInput != nil {
+			input, isMap := rawInput.(map[string]any)
+			if !isMap {
+				return "[ctx-orchestrate] codemode 沙盒仅允许只读白名单工具，已阻断 ctx_stats（input 非对象，fail-closed）；请改在顶层直连调用。"
+			}
+			for key, value := range input {
+				if strings.EqualFold(key, "action") {
+					if key != "action" || (value != nil && value != "") {
+						return "[ctx-orchestrate] codemode 沙盒仅允许只读白名单工具，已阻断 ctx_stats（不接受 action 字段）；请改在顶层直连调用。"
+					}
 				}
 			}
 		}
@@ -186,56 +194,60 @@ type budgetCounters struct {
 }
 
 // CallBudgetTracker counts nested calls per codemode root. One mutex makes
-// lookup + increment + ring eviction atomic (the QuickJS fan-out enters the
-// hook concurrently through Promise.all); the ring bounds memory to
+// lookup + increment + FIFO eviction atomic (the QuickJS fan-out enters the
+// hook concurrently through Promise.all); the queue bounds memory to
 // budgetRingSize live roots and is enough for any realistic session.
 type CallBudgetTracker struct {
-	mu      sync.Mutex
-	roots   map[string]*budgetCounters
-	ring    []string
-	next    int
+	mu    sync.Mutex
+	roots map[string]*budgetCounters
+	// ring is the registration queue, oldest first (FIFO). Register appends
+	// and a full queue evicts ring[0]; there is no LIFO reuse slot.
+	ring []string
+	// maxNest/maxTot are test overrides: >0 fixes the cap, 0 (the
+	// NewCallBudgetTracker default) re-reads the env at every debit so
+	// pi-env-injected settings apply even when the tracker outlives init().
 	maxNest int
 	maxTot  int
 }
 
-// NewCallBudgetTracker builds a tracker with the env-adjusted caps.
+// NewCallBudgetTracker builds a tracker that reads the env caps live.
 func NewCallBudgetTracker() *CallBudgetTracker {
-	return &CallBudgetTracker{
-		roots:   make(map[string]*budgetCounters),
-		maxNest: MaxNestedCalls(),
-		maxTot:  MaxTotalNestedCalls(),
+	return &CallBudgetTracker{roots: make(map[string]*budgetCounters)}
+}
+
+// effectiveCaps resolves the caps for one debit: a positive test override
+// wins, otherwise the env is re-read so CTX_ORCH_MAX_NESTED_CALLS /
+// CTX_ORCH_MAX_TOTAL_NESTED_CALLS injected after construction still apply.
+func (t *CallBudgetTracker) effectiveCaps() (maxNest, maxTot int) {
+	maxNest, maxTot = t.maxNest, t.maxTot
+	if maxNest <= 0 {
+		maxNest = MaxNestedCalls()
 	}
+	if maxTot <= 0 {
+		maxTot = MaxTotalNestedCalls()
+	}
+	return maxNest, maxTot
 }
 
 // Register records a top-level codemode call as a budget root. A reused
-// toolCallId resets that root's counters.
+// toolCallId resets that root's counters without re-queueing it (its FIFO
+// position is kept); a fresh id is appended, evicting the oldest entry
+// first when the queue is full.
 func (t *CallBudgetTracker) Register(rootID string) {
 	if rootID == "" {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.trackLocked(rootID)
-	t.roots[rootID] = &budgetCounters{}
-}
-
-// trackLocked returns the slot of rootID, evicting the oldest entry when the
-// ring is full. The caller holds t.mu.
-func (t *CallBudgetTracker) trackLocked(rootID string) *budgetCounters {
-	if counters, ok := t.roots[rootID]; ok {
-		return counters
-	}
-	if len(t.ring) < budgetRingSize {
+	if _, ok := t.roots[rootID]; !ok {
+		if len(t.ring) >= budgetRingSize {
+			evicted := t.ring[0]
+			delete(t.roots, evicted)
+			t.ring = t.ring[1:]
+		}
 		t.ring = append(t.ring, rootID)
-	} else {
-		evicted := t.ring[t.next]
-		delete(t.roots, evicted)
-		t.ring[t.next] = rootID
-		t.next = (t.next + 1) % budgetRingSize
 	}
-	counters := &budgetCounters{}
-	t.roots[rootID] = counters
-	return counters
+	t.roots[rootID] = &budgetCounters{}
 }
 
 // Release drops the root's slot when the top-level codemode call finishes.
@@ -248,41 +260,44 @@ func (t *CallBudgetTracker) Release(rootID string) {
 	for i, id := range t.ring {
 		if id == rootID {
 			t.ring = append(t.ring[:i], t.ring[i+1:]...)
-			if t.next > i {
-				t.next--
-			}
 			return
 		}
 	}
 }
 
-// stripNumericSuffix peels trailing `/<number>` segments off a nested id,
-// right to left, to recover the registered root the way nested_tool_calls.go
-// builds ids (`<callerID>/<n>`, and `<rootID>/<n>` for a second hop).
-func stripNumericSuffix(parentID string) string {
-	for {
-		slash := strings.LastIndex(parentID, "/")
-		if slash <= 0 {
-			return parentID
+// Clear drops every registered root (agent_end: the turn's codemode calls
+// are over, so any leftover slot would leak into the next turn).
+func (t *CallBudgetTracker) Clear() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.roots = make(map[string]*budgetCounters)
+	t.ring = nil
+}
+
+// isNumericSegments reports whether suffix is one or more `/<ASCII digits>`
+// segments -- the only shape nested_tool_calls.go appends to a root id.
+func isNumericSegments(suffix string) bool {
+	if !strings.HasPrefix(suffix, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(suffix[1:], "/") {
+		if segment == "" {
+			return false
 		}
-		tail := parentID[slash+1:]
-		if tail == "" {
-			return parentID
-		}
-		for _, r := range tail {
-			if r < '0' || r > '9' {
-				return parentID
+		for i := 0; i < len(segment); i++ {
+			if segment[i] < '0' || segment[i] > '9' {
+				return false
 			}
 		}
-		parentID = parentID[:slash]
 	}
+	return true
 }
 
 // debit spends one nested call for parentID: an exact registered-root match
-// counts first-level + total, a `rootID + "/"` prefix match counts only the
-// total (second hop), and an unregistered parent falls back to peeling
-// `/<number>` tails until a registered root is found. It returns the block
-// reason when the root is unknown or a cap is exceeded, "" otherwise.
+// counts first-level + total, and a `rootID + "/" + <numeric segments>`
+// match counts only the total (second hop). Anything else fails closed as
+// an unknown parent. It returns the block reason when the root is unknown
+// or a cap is exceeded, "" otherwise.
 func (t *CallBudgetTracker) debit(parentID string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -291,16 +306,17 @@ func (t *CallBudgetTracker) debit(parentID string) string {
 		return fmt.Sprintf("[ctx-orchestrate] 嵌套调用 parent=%q 未匹配任何已登记的 codemode 根调用，fail-closed 阻断；请改在顶层直连调用。", parentID)
 	}
 	counters := t.roots[rootID]
+	maxNest, maxTot := t.effectiveCaps()
 	nextTotal := counters.total + 1
 	nextDirect := counters.direct
 	if direct {
 		nextDirect++
 	}
-	if direct && nextDirect > t.maxNest {
-		return fmt.Sprintf("[ctx-orchestrate] 单脚本一级嵌套调用已达上限 %d（CTX_ORCH_MAX_NESTED_CALLS）：请拆分脚本或减少 ctx_search_digest 的 patterns 数量；确需更多调用请改在顶层直连。", t.maxNest)
+	if direct && nextDirect > maxNest {
+		return fmt.Sprintf("[ctx-orchestrate] 单脚本一级嵌套调用已达上限 %d（CTX_ORCH_MAX_NESTED_CALLS）：请拆分脚本或减少 ctx_search_digest 的 patterns 数量；确需更多调用请改在顶层直连。", maxNest)
 	}
-	if nextTotal > t.maxTot {
-		return fmt.Sprintf("[ctx-orchestrate] 同一 codemode 根的嵌套调用总数已达上限 %d（CTX_ORCH_MAX_TOTAL_NESTED_CALLS，含 ctx_search_digest 二级 ctx_fs 扇出）：请拆分脚本或减少 patterns 数量。", t.maxTot)
+	if nextTotal > maxTot {
+		return fmt.Sprintf("[ctx-orchestrate] 同一 codemode 根的嵌套调用总数已达上限 %d（CTX_ORCH_MAX_TOTAL_NESTED_CALLS，含 ctx_search_digest 二级 ctx_fs 扇出）：请拆分脚本或减少 patterns 数量。", maxTot)
 	}
 	counters.total = nextTotal
 	if direct {
@@ -311,48 +327,44 @@ func (t *CallBudgetTracker) debit(parentID string) string {
 
 // matchLocked finds the registered root of a nested parent id. Exact
 // parentID == rootID wins (a first-level call); otherwise the longest
-// `rootID + "/"` prefix wins (a second hop), and only then is the `/<number>`
-// tail peel tried. The caller holds t.mu.
+// registered root whose `root + "/"` prefix leads parentID wins, but only
+// when the remaining suffix is one or more `/<ASCII digits>` segments --
+// the sole shape PiG's nested_tool_calls.go generates, so `root/abc` never
+// counts against root. The caller holds t.mu.
 func (t *CallBudgetTracker) matchLocked(parentID string) (rootID string, direct bool) {
 	if _, ok := t.roots[parentID]; ok {
 		return parentID, true
 	}
 	best := ""
 	for id := range t.roots {
-		if strings.HasPrefix(parentID, id+"/") && len(id) > len(best) {
+		if len(id) > len(best) && strings.HasPrefix(parentID, id+"/") && isNumericSegments(parentID[len(id):]) {
 			best = id
 		}
 	}
 	if best != "" {
 		return best, false
 	}
-	if peeled := stripNumericSuffix(parentID); peeled != parentID {
-		if _, ok := t.roots[peeled]; ok {
-			return peeled, false
-		}
-	}
 	return "", false
 }
-
-// guardBudget is the session-wide tracker. The extension process is one
-// connection per session, so a single instance is the whole surface.
-var guardBudget = NewCallBudgetTracker()
 
 // handleToolCall is the tool_call hook (sdk.EventToolCall). The SDK wraps
 // the return value itself, so a block is map[string]any{"block": true,
 // "reason": ...} -- never a hand-rolled _pigToolCallResult envelope.
 //
-// Top-level calls (parentToolCallId absent, nil or ""): only a codemode call
-// is inspected, for the models.* rail; every other tool returns nil untouched.
+// Top-level calls (parentToolCallId absent, nil or ""): only codemode and
+// ctx_search_digest are inspected; every other tool returns nil untouched.
 // A present-but-non-string parentToolCallId is a malformed payload and fails
 // closed. Nested calls run the whitelist first (a rejected call must not burn
 // budget) and then the layered budget. A panic on the nested path fails
 // closed, unlike handleToolResult which fails open.
-func handleToolCall(_ sdk.Context, data map[string]any) (result any, err error) {
+//
+// budget is the per-extension-instance tracker (created in Extension()), so
+// a packed-cell /reload or a second session never shares counters.
+func handleToolCall(budget *CallBudgetTracker, data map[string]any) (result any, err error) {
 	rawParent, present := data["parentToolCallId"]
 	parentID, isString := rawParent.(string)
 	if !present || rawParent == nil || (isString && parentID == "") {
-		return handleTopLevelToolCall(data)
+		return handleTopLevelToolCall(budget, data)
 	}
 	if !isString {
 		diagLog(fmt.Sprintf("tool_call guard: malformed parentToolCallId %T, fail-closed", rawParent))
@@ -371,23 +383,25 @@ func handleToolCall(_ sdk.Context, data map[string]any) (result any, err error) 
 		diagLog(fmt.Sprintf("tool_call guard blocked %s: whitelist", toolName))
 		return map[string]any{"block": true, "reason": reason}, nil
 	}
-	if reason := guardBudget.debit(parentID); reason != "" {
+	if reason := budget.debit(parentID); reason != "" {
 		diagLog(fmt.Sprintf("tool_call guard blocked %s (parent=%s): budget", toolName, parentID))
 		return map[string]any{"block": true, "reason": reason}, nil
 	}
 	return nil, nil
 }
 
-// handleTopLevelToolCall is the parentToolCallId-empty branch: every tool but
-// codemode passes 100% untouched. For codemode it runs the models.* rail and,
-// on allow, registers the call id as a budget root so its nested calls have a
-// ledger to count against.
-func handleTopLevelToolCall(data map[string]any) (any, error) {
+// handleTopLevelToolCall is the parentToolCallId-empty branch: every tool
+// but codemode and ctx_search_digest passes 100% untouched. For codemode it
+// runs the models.* rail and, on allow, registers the call id as a budget
+// root so its nested calls have a ledger to count against. A top-level
+// ctx_search_digest is registered too: its own ctx_fs fan-out arrives as
+// nested calls under its toolCallId and needs the same ledger.
+func handleTopLevelToolCall(budget *CallBudgetTracker, data map[string]any) (any, error) {
 	toolName, _ := data["toolName"].(string)
-	if toolName != "codemode" {
+	if toolName != "codemode" && toolName != "ctx_search_digest" {
 		return nil, nil
 	}
-	if !envFlag("CTX_ORCH_ALLOW_SANDBOX_MODELS", false) {
+	if toolName == "codemode" && !envFlag("CTX_ORCH_ALLOW_SANDBOX_MODELS", false) {
 		input, _ := data["input"].(map[string]any)
 		code, _ := input["code"].(string)
 		if code != "" && sandboxModelsPattern.MatchString(code) {
@@ -397,6 +411,23 @@ func handleTopLevelToolCall(data map[string]any) (any, error) {
 		}
 	}
 	toolCallID, _ := data["toolCallId"].(string)
-	guardBudget.Register(toolCallID)
+	budget.Register(toolCallID)
 	return nil, nil
+}
+
+// releaseTopLevelRoot frees the budget slot of a finished top-level codemode
+// or ctx_search_digest call (parentToolCallId absent/empty). It is shared by
+// the tool_result hook and the tool_execution_end event so an aborted or
+// interrupted call cannot leak its slot; Release is idempotent.
+func releaseTopLevelRoot(budget *CallBudgetTracker, data map[string]any) {
+	toolName, _ := data["toolName"].(string)
+	if toolName != "codemode" && toolName != "ctx_search_digest" {
+		return
+	}
+	if parent, ok := data["parentToolCallId"].(string); ok && parent != "" {
+		return
+	}
+	if id, _ := data["toolCallId"].(string); id != "" {
+		budget.Release(id)
+	}
 }

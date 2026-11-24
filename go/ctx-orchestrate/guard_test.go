@@ -3,6 +3,8 @@ package ctxorchestrate
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
@@ -17,10 +19,11 @@ var noCtx = sdk.Context{}
 // _pigToolCallResult envelope (the SDK adds that itself).
 
 // blocked extracts the block reason handleToolCall returns for data, or ""
-// when the call is allowed (result nil or no "block": true).
+// when the call is allowed (result nil or no "block": true). The tracker
+// under test is guardTestBudget; resetBudget or setBudget installs it.
 func blocked(t *testing.T, data map[string]any) string {
 	t.Helper()
-	result, err := handleToolCall(noCtx, data)
+	result, err := handleToolCall(guardTestBudget, data)
 	t.Helper()
 	if err != nil {
 		t.Fatalf("handleToolCall error = %v", err)
@@ -54,16 +57,29 @@ func nestedData(parent, tool string, input map[string]any) map[string]any {
 	return data
 }
 
-// resetBudget swaps the shared tracker for a fresh one sized by caps.
+// guardTestBudget is the tracker every helper in this file exercises; tests
+// install their own with resetBudget / setBudget (restored by Cleanup).
+var guardTestBudget = NewCallBudgetTracker()
+
+// resetBudget installs a fresh tracker with fixed test caps (>0 overrides
+// the env), restored by t.Cleanup.
 func resetBudget(t *testing.T, direct, total int) {
 	t.Helper()
-	old := guardBudget
-	t.Cleanup(func() { guardBudget = old })
-	guardBudget = &CallBudgetTracker{
+	old := guardTestBudget
+	t.Cleanup(func() { guardTestBudget = old })
+	guardTestBudget = &CallBudgetTracker{
 		roots:   make(map[string]*budgetCounters),
 		maxNest: direct,
 		maxTot:  total,
 	}
+}
+
+// setBudget installs tracker, restored by t.Cleanup.
+func setBudget(t *testing.T, tracker *CallBudgetTracker) {
+	t.Helper()
+	old := guardTestBudget
+	t.Cleanup(func() { guardTestBudget = old })
+	guardTestBudget = tracker
 }
 
 func TestToolCallTopLevelPassesOtherTools(t *testing.T) {
@@ -135,7 +151,7 @@ func TestToolCallModelsRail(t *testing.T) {
 func TestNestedWhitelistMatrix(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 64, 256)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	allow := []struct {
 		name  string
@@ -166,7 +182,7 @@ func TestNestedWhitelistMatrix(t *testing.T) {
 func TestNestedWhitelistRejects(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 64, 256)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	cases := []struct {
 		name  string
@@ -219,7 +235,7 @@ func TestNestedWhitelistRejects(t *testing.T) {
 func TestNestedActionCaseVariantFailsClosed(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 64, 256)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	for _, tool := range []string{"ctx_fs", "ctx_git", "ctx_kb", "codegraph"} {
 		data := nestedData("root", tool, map[string]any{"action": "ls", "Action": "store_fact"})
@@ -232,10 +248,80 @@ func TestNestedActionCaseVariantFailsClosed(t *testing.T) {
 	}
 }
 
+// TestNestedCtxStatsFailsClosed pins the whole fail-closed surface of the
+// ctx_stats branch: a present non-map input, a case-variant action key, and
+// every non-empty/non-nil action value are blocked outright.
+func TestNestedCtxStatsFailsClosed(t *testing.T) {
+	cleanEnv(t)
+	resetBudget(t, 64, 256)
+	guardTestBudget.Register("root")
+
+	cases := []struct {
+		name  string
+		input any
+	}{
+		{"string input", "json"},
+		{"number input", float64(1)},
+		{"array input", []any{"json"}},
+		{"bool action", map[string]any{"action": true}},
+		{"number action", map[string]any{"action": float64(1)}},
+		{"case variant only", map[string]any{"Action": "json"}},
+		{"empty case variant", map[string]any{"ACTION": ""}},
+		{"nil case variant", map[string]any{"Action": nil}},
+		{"variant beside empty action", map[string]any{"action": "", "Action": ""}},
+		{"whitespace action", map[string]any{"action": "   "}},
+	}
+	for _, tc := range cases {
+		data := nestedData("root", "ctx_stats", nil)
+		data["input"] = tc.input
+		if reason := blocked(t, data); reason == "" {
+			t.Errorf("ctx_stats with %s must fail closed", tc.name)
+		}
+	}
+
+	// A map input with an empty-string or nil literal "action" (and no case
+	// variant) stays allowed, as before.
+	for _, input := range []map[string]any{
+		{"action": ""},
+		{"action": nil},
+	} {
+		if reason := blocked(t, nestedData("root", "ctx_stats", input)); reason != "" {
+			t.Errorf("ctx_stats with benign action input %v must pass, got %q", input, reason)
+		}
+	}
+}
+
+// TestTopLevelSearchDigestRegistersRoot (oracle S-3): a direct ctx_search_digest
+// call registers its toolCallId as a budget root, so its own ctx_fs fan-out
+// arrives as a nested call that passes and is counted.
+func TestTopLevelSearchDigestRegistersRoot(t *testing.T) {
+	cleanEnv(t)
+	resetBudget(t, 8, 8)
+
+	data := map[string]any{
+		"toolName":   "ctx_search_digest",
+		"toolCallId": "sd-1",
+		"input":      map[string]any{"patterns": []any{"foo"}},
+	}
+	if reason := blocked(t, data); reason != "" {
+		t.Fatalf("top-level ctx_search_digest must pass untouched, got %q", reason)
+	}
+	// Its second hop is a registered root's child: allowed and accounted.
+	if reason := blocked(t, nestedData("sd-1/1", "ctx_fs", map[string]any{"action": "rg", "pattern": "foo"})); reason != "" {
+		t.Fatalf("second hop under the digest root must pass, got %q", reason)
+	}
+	guardTestBudget.mu.Lock()
+	total := guardTestBudget.roots["sd-1"].total
+	guardTestBudget.mu.Unlock()
+	if total != 1 {
+		t.Fatalf("digest second hop total = %d, want 1", total)
+	}
+}
+
 func TestBudgetFirstLevelCap(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 3, 10)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	for i := 0; i < 3; i++ {
 		if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason != "" {
@@ -251,7 +337,7 @@ func TestBudgetFirstLevelCap(t *testing.T) {
 func TestBudgetSecondHopCountsOnlyTotal(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 2, 4)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	// Two direct calls fill the first-level cap.
 	for i := 0; i < 2; i++ {
@@ -279,22 +365,24 @@ func TestBudgetSecondHopCountsOnlyTotal(t *testing.T) {
 func TestBudgetNumericSuffixFallback(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 8, 8)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
-	// A deeper-nested id peels trailing /<number> segments to find the root.
-	data := nestedData("root/2/4", "ctx_fs", map[string]any{"action": "ls"})
-	if reason := blocked(t, data); reason != "" {
-		t.Fatalf("nested id under a registered root must pass via suffix peel, got %q", reason)
+	// A deeper-nested id matches the root when every trailing segment is
+	// `/<ASCII digits>` and counts toward the total only.
+	if reason := blocked(t, nestedData("root/2/4", "ctx_fs", map[string]any{"action": "ls"})); reason != "" {
+		t.Fatalf("a numeric two-hop id under a registered root must pass, got %q", reason)
 	}
 	// An id that shares the string prefix but is not under root/ stays blocked.
 	if reason := blocked(t, nestedData("rootx", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
 		t.Error("an id merely sharing the prefix must not match")
 	}
-	// A non-numeric tail is never peeled: it stays a prefix match instead
-	// (parent "root/abc" is a child of the registered root, so it counts
-	// toward the total only).
-	if reason := blocked(t, nestedData("root/abc", "ctx_fs", map[string]any{"action": "ls"})); reason != "" {
-		t.Errorf("a non-numeric suffix is a second-hop prefix match, must pass: %q", reason)
+	// A non-numeric suffix is not a PiG nested id: fail closed, never counted.
+	if reason := blocked(t, nestedData("root/abc", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
+		t.Error("root/abc is not a nested id and must fail closed")
+	}
+	// Mixed numeric/non-numeric tails are rejected too.
+	if reason := blocked(t, nestedData("root/2/abc", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
+		t.Error("root/2/abc is not a nested id and must fail closed")
 	}
 	// An unknown parent fails closed.
 	if reason := blocked(t, nestedData("unknown", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
@@ -304,20 +392,28 @@ func TestBudgetNumericSuffixFallback(t *testing.T) {
 
 func TestBudgetLongestPrefixWins(t *testing.T) {
 	cleanEnv(t)
-	resetBudget(t, 8, 8)
-	// Two registered roots in a prefix relationship: the longer one must win.
-	guardBudget.Register("root")
-	guardBudget.Register("root/9")
+	resetBudget(t, 1, 1)
+	// Two registered roots in a prefix relationship: the longer one must win,
+	// and the debit must land on root/9's ledger, not root's.
+	guardTestBudget.Register("root")
+	guardTestBudget.Register("root/9")
 	if reason := blocked(t, nestedData("root/9/1", "ctx_fs", map[string]any{"action": "ls"})); reason != "" {
 		t.Fatalf("longest-prefix match must find root/9, got %q", reason)
 	}
-	t.Cleanup(func() { guardBudget.Release("root"); guardBudget.Release("root/9") })
+	// root/9's total is now spent (maxTot=1): a further call under it blocks.
+	if reason := blocked(t, nestedData("root/9", "ctx_fs", map[string]any{"action": "ls"})); reason == "" {
+		t.Fatal("root/9's budget must be spent by the longer-prefix debit")
+	}
+	// The debit never touched root's ledger: its first-level call still passes.
+	if reason := blocked(t, nestedData("root", "ctx_fs", map[string]any{"action": "ls"})); reason != "" {
+		t.Fatalf("root's ledger must be untouched by the root/9 debit, got %q", reason)
+	}
 }
 
 func TestBudgetRejectedCallDoesNotConsume(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 1, 2)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	// Whitelist rejections burn no budget: the single first-level slot must
 	// still be there for a legitimate call.
@@ -334,7 +430,7 @@ func TestBudgetRejectedCallDoesNotConsume(t *testing.T) {
 func TestBudgetRelease(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 1, 1)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 	if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason != "" {
 		t.Fatalf("first call must pass, got %q", reason)
 	}
@@ -342,8 +438,8 @@ func TestBudgetRelease(t *testing.T) {
 		t.Fatal("the second call must hit the cap")
 	}
 	// A finished codemode call frees the slot for the next one.
-	guardBudget.Release("root")
-	guardBudget.Register("root-2")
+	guardTestBudget.Release("root")
+	guardTestBudget.Register("root-2")
 	if reason := blocked(t, nestedData("root-2", "ctx_stats", nil)); reason != "" {
 		t.Fatalf("a fresh root must pass after release, got %q", reason)
 	}
@@ -356,12 +452,12 @@ func TestBudgetRelease(t *testing.T) {
 func TestHandleToolResultReleasesBudget(t *testing.T) {
 	cleanEnv(t)
 	resetBudget(t, 1, 1)
-	guardBudget.Register("root")
+	guardTestBudget.Register("root")
 
 	// A top-level codemode tool_result releases the root even with
 	// CTX_ORCH_GOVERN=0 (the release is independent of the cap).
 	t.Setenv("CTX_ORCH_GOVERN", "0")
-	if _, err := handleToolResult(noCtx, map[string]any{
+	if _, err := handleToolResult(guardTestBudget)(noCtx, map[string]any{
 		"toolName": "codemode", "toolCallId": "root",
 		"content": []any{textBlock("ok")},
 	}); err != nil {
@@ -372,8 +468,8 @@ func TestHandleToolResultReleasesBudget(t *testing.T) {
 	}
 	// A nested result never releases (parentToolCallId set).
 	resetBudget(t, 1, 1)
-	guardBudget.Register("root")
-	if _, err := handleToolResult(noCtx, map[string]any{
+	guardTestBudget.Register("root")
+	if _, err := handleToolResult(guardTestBudget)(noCtx, map[string]any{
 		"toolName": "ctx_fs", "toolCallId": "root/1", "parentToolCallId": "root",
 		"content": []any{textBlock("ok")},
 	}); err != nil {
@@ -442,5 +538,202 @@ func TestGuardRingEviction(t *testing.T) {
 	// The newest roots still have a ledger.
 	if reason := tracker.debit(fmt.Sprintf("root-%d", budgetRingSize+4)); reason != "" {
 		t.Fatalf("a live root must pass, got %q", reason)
+	}
+}
+
+// TestGuardFIFONoLIFOEviction is the oracle probe for the LIFO mis-eviction
+// (S-1): with a released middle slot, two new roots must append FIFO and
+// evict the oldest entry -- a LIFO tracker would reuse the freed slot and
+// kick the freshly-registered live root instead.
+func TestGuardFIFONoLIFOEviction(t *testing.T) {
+	tracker := &CallBudgetTracker{roots: make(map[string]*budgetCounters), maxNest: 4, maxTot: 8}
+	// Fill the queue to 255 so the last registration r-255 is the freshest.
+	for i := 0; i < budgetRingSize+127; i++ {
+		tracker.Register(fmt.Sprintf("r-%d", i))
+	}
+	// Free a middle slot, then register two fresh roots: the freed slot takes
+	// live-a, and live-b evicts the oldest live root r-128 (strict FIFO).
+	tracker.Release("r-127")
+	tracker.Register("live-a")
+	tracker.Register("live-b")
+	if reason := tracker.debit("r-128"); reason == "" {
+		t.Error("r-128 must be evicted (oldest FIFO entry), but still debits")
+	}
+	// The next-oldest root keeps its ledger until the queue fills again.
+	if reason := tracker.debit("r-129"); reason != "" {
+		t.Errorf("r-129 must still be live, got %q", reason)
+	}
+	// A LIFO tracker would have evicted live-a instead; it must still debit.
+	if reason := tracker.debit("live-a"); reason != "" {
+		t.Errorf("live-a must keep its ledger (FIFO eviction), got %q", reason)
+	}
+	if reason := tracker.debit("live-b"); reason != "" {
+		t.Errorf("live-b must keep its ledger, got %q", reason)
+	}
+	tracker.mu.Lock()
+	live := len(tracker.roots)
+	tracker.mu.Unlock()
+	if live != budgetRingSize {
+		t.Fatalf("tracker holds %d roots, want %d", live, budgetRingSize)
+	}
+}
+
+// TestBudgetDynamicCapsAfterConstruction (oracle S-2): a tracker built by
+// NewCallBudgetTracker reads the env caps at every debit, so
+// CTX_ORCH_MAX_NESTED_CALLS injected after construction (pi-env settings)
+// applies immediately.
+func TestBudgetDynamicCapsAfterConstruction(t *testing.T) {
+	cleanEnv(t)
+	setBudget(t, NewCallBudgetTracker()) // no fixed caps: live env reads
+	guardTestBudget.Register("root")
+
+	// The env arrives after construction, as pi-env injects settings.json.
+	t.Setenv("CTX_ORCH_MAX_NESTED_CALLS", "2")
+	for i := 0; i < 2; i++ {
+		if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason != "" {
+			t.Fatalf("call %d within the late-injected cap must pass, got %q", i+1, reason)
+		}
+	}
+	if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason == "" {
+		t.Fatal("the third call must hit the cap injected after construction")
+	}
+}
+
+// TestToolExecutionEndReleasesRoot (oracle S-4): the tool_execution_end path
+// frees the slot of a top-level codemode / ctx_search_digest call that never
+// produced a tool_result (abort/interrupt); a nested end event never does.
+func TestToolExecutionEndReleasesRoot(t *testing.T) {
+	cleanEnv(t)
+	resetBudget(t, 1, 1)
+	guardTestBudget.Register("root")
+
+	// A nested tool_execution_end must not release.
+	releaseTopLevelRoot(guardTestBudget, map[string]any{
+		"toolName": "ctx_fs", "toolCallId": "root/1", "parentToolCallId": "root",
+	})
+	if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason != "" {
+		t.Fatalf("a nested execution end must not release, got %q", reason)
+	}
+
+	// A top-level codemode tool_execution_end releases even without a result.
+	releaseTopLevelRoot(guardTestBudget, map[string]any{
+		"toolName": "codemode", "toolCallId": "root",
+	})
+	if reason := blocked(t, nestedData("root", "ctx_stats", nil)); reason == "" {
+		t.Fatal("the execution-end release must drop the root's ledger")
+	}
+
+	// A top-level ctx_search_digest releases the same way.
+	guardTestBudget.Register("sd-1")
+	releaseTopLevelRoot(guardTestBudget, map[string]any{
+		"toolName": "ctx_search_digest", "toolCallId": "sd-1",
+	})
+	if reason := blocked(t, nestedData("sd-1", "ctx_fs", map[string]any{"action": "rg"})); reason == "" {
+		t.Fatal("ctx_search_digest execution end must release its root")
+	}
+}
+
+// TestAgentEndClearsBudget (oracle S-4): agent_end drops every leftover root
+// so an aborted turn cannot leak slots into the next one.
+func TestAgentEndClearsBudget(t *testing.T) {
+	cleanEnv(t)
+	resetBudget(t, 8, 8)
+	guardTestBudget.Register("root-1")
+	guardTestBudget.Register("root-2")
+	guardTestBudget.Clear()
+	for _, root := range []string{"root-1", "root-2"} {
+		if reason := blocked(t, nestedData(root, "ctx_stats", nil)); reason == "" {
+			t.Errorf("a root cleared at agent_end must fail closed: %s", root)
+		}
+	}
+	guardTestBudget.mu.Lock()
+	live := len(guardTestBudget.roots)
+	queue := len(guardTestBudget.ring)
+	guardTestBudget.mu.Unlock()
+	if live != 0 || queue != 0 {
+		t.Fatalf("Clear must empty both roots (%d) and the queue (%d)", live, queue)
+	}
+}
+
+// TestCallBudgetTracker_Concurrent (oracle S-5): concurrent Register / debit /
+// Release / Clear must be race-free under -race; afterwards, concurrent
+// debits against fixed roots must never admit more than the caps and every
+// admitted call must land on the ledger.
+func TestCallBudgetTracker_Concurrent(t *testing.T) {
+	cleanEnv(t)
+	tracker := &CallBudgetTracker{roots: make(map[string]*budgetCounters), maxNest: 8, maxTot: 32}
+
+	// Phase 1: lifecycle churn purely to provoke races.
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			root := fmt.Sprintf("root-%d", n%8)
+			tracker.Register(root)
+			_ = tracker.debit(root)
+			tracker.Release(root)
+			if n%16 == 0 {
+				tracker.Clear()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Phase 2: fixed roots, concurrent debits. An admitted call must be
+	// reflected in the ledger exactly once, and no ledger may exceed a cap.
+	const roots = 4
+	for i := 0; i < roots; i++ {
+		tracker.Register(fmt.Sprintf("c-%d", i))
+	}
+	var admitted [roots]atomic.Int64
+	for i := 0; i < 128; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			r := n % roots
+			root := fmt.Sprintf("c-%d", r)
+			if reason := tracker.debit(root); reason == "" {
+				admitted[r].Add(1)
+			}
+			// A deeper nested id of the same root shares the ledger.
+			if reason := tracker.debit(root + "/7"); reason == "" {
+				admitted[r].Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	for i := 0; i < roots; i++ {
+		id := fmt.Sprintf("c-%d", i)
+		counters, ok := tracker.roots[id]
+		if !ok {
+			t.Fatalf("fixed root %s lost from the ledger", id)
+		}
+		if got := admitted[i].Load(); int64(counters.total) != got {
+			t.Fatalf("%s admitted %d calls but ledger total %d (lost update)", id, got, counters.total)
+		}
+		if counters.total > tracker.maxTot {
+			t.Fatalf("%s total %d exceeds the total cap %d", id, counters.total, tracker.maxTot)
+		}
+		if counters.direct > tracker.maxNest {
+			t.Fatalf("%s direct %d exceeds the first-level cap %d", id, counters.direct, tracker.maxNest)
+		}
+	}
+	// Structural invariant: the FIFO queue and the ledger never diverge.
+	if len(tracker.ring) != len(tracker.roots) {
+		t.Fatalf("ring holds %d ids but roots has %d", len(tracker.ring), len(tracker.roots))
+	}
+	seen := make(map[string]bool, len(tracker.ring))
+	for _, id := range tracker.ring {
+		if seen[id] {
+			t.Fatalf("%s queued twice", id)
+		}
+		seen[id] = true
+		if _, ok := tracker.roots[id]; !ok {
+			t.Fatalf("%s queued but has no ledger", id)
+		}
 	}
 }
