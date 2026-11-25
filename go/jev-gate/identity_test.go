@@ -11,9 +11,10 @@ import (
 )
 
 // identityFixture builds an IdentityEnv over a synthetic process chain. chain[0]
-// is this process; QuerySocket returns shellPID (0 means "query failed"). Argv
-// and Env may be injected per hop; when Argv is empty resolveIdentity derives
-// it from Cmdline via splitCmdlineTokens.
+// is this process; the mocked herdr-core terminal.get answers shellPID inside a
+// live top-level record (0 means "query failed"). Argv and Env may be injected
+// per hop; when Argv is empty resolveIdentity derives it from Cmdline via
+// splitCmdlineTokens.
 func identityFixture(env map[string]string, chain []AncestorProcess, shellPID int) IdentityEnv {
 	values := make(map[string]string, len(env))
 	for key, value := range env {
@@ -40,15 +41,16 @@ func identityFixture(env map[string]string, chain []AncestorProcess, shellPID in
 	return IdentityEnv{
 		Getenv:      func(name string) string { return values[name] },
 		PID:         chain[0].PID,
-		SocketPath:  "/tmp/identity-fixture.sock",
 		Timeout:     50 * time.Millisecond,
 		ReadStat:    func(pid int) (int, bool) { ppid, ok := ppids[pid]; return ppid, ok },
 		ReadCmdline: func(pid int) string { return cmdlines[pid] },
 		ReadArgv:    func(pid int) []string { return argvs[pid] },
 		ReadEnviron: func(pid int) map[string]string { return envs[pid] },
 		Environ:     func() []string { return environ },
-		QuerySocket: func(string, string, time.Duration) (int, bool) { return shellPID, shellPID > 0 },
-		ArgvCache:   &ArgvCache{},
+		QueryHcSocket: func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
+			return HcTerminalInfo{Address: termID, PID: shellPID}, shellPID > 0
+		},
+		ArgvCache: &ArgvCache{},
 	}
 }
 
@@ -98,7 +100,7 @@ func TestPromptArgsNotMarkers(t *testing.T) {
 		{"pi", "-i", "please review /tmp/herdr-role-sessions/s1"},
 		{"pi", "-p=work on /tmp/dispatch-task.md"},
 	} {
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 200)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 200)
 		environment.Args = args
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if isSubagent {
@@ -114,40 +116,40 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 		{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi --print"},
 		{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 	}
-	t.Run("S1_missing_pane", func(t *testing.T) {
+	t.Run("S1_missing_terminal_id", func(t *testing.T) {
 		environment := identityFixture(map[string]string{"PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
-		if !isSubagent || !strings.HasPrefix(reason, "S1: HERDR_PANE_ID") {
+		if !isSubagent || !strings.HasPrefix(reason, "S1: HC_TERMINAL_ID unset or empty") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
-	t.Run("S1_pane_without_p1_suffix_rejected", func(t *testing.T) {
-		// The ":p1" suffix is a necessary condition of S1: a non-p1 pane id is
-		// rejected before the herdr socket is even queried.
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w32:p23", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 300)
+	t.Run("S1_non_address_terminal_id_rejected", func(t *testing.T) {
+		// A terminal id that does not match ^t[0-9a-z]+$ is rejected before
+		// the hc socket is even queried.
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "w32:p23", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
-		if !isSubagent || !strings.Contains(reason, `is not a main pane (no ":p1" suffix)`) {
+		if !isSubagent || !strings.Contains(reason, "is not a terminal address (no ^t[0-9a-z]+$ match)") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
-	t.Run("S1_forged_p1_suffix_still_needs_S2", func(t *testing.T) {
-		// HERDR_PANE_ID=forged:p1 passes the suffix check but fails the herdr
-		// socket query (shellPID=0 here): the pane id alone is never enough.
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "forged:p1", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 0)
+	t.Run("S1_forged_terminal_id_still_needs_S2", func(t *testing.T) {
+		// HC_TERMINAL_ID=t12t passes the shape check but fails the hc
+		// terminal.get query (shellPID=0 here): the id alone is never enough.
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 0)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.HasPrefix(reason, "S2:") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
 	t.Run("S2_query_failed", func(t *testing.T) {
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 0)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 0)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.HasPrefix(reason, "S2:") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
 	t.Run("S3_not_in_ancestry", func(t *testing.T) {
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 999)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 999)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "is not in this process ancestry") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -158,7 +160,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 100, PPID: 300, Cmdline: "/opt/ext/jev-gate"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "no agent-runtime ancestor") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -173,7 +175,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 250, PPID: 300, Cmdline: ""},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "empty or unreadable cmdline") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -186,7 +188,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 250, PPID: 300, Cmdline: "/usr/local/bin/ctxmode run"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.HasPrefix(reason, "S4: agent runtime ancestor pid=250") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -200,7 +202,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.HasPrefix(reason, "S4: agent runtime ancestor pid=200") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -213,7 +215,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi", Env: map[string]string{"CTXMODE_ROLE": "worker"}},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S4: ancestor pid=200") || !strings.Contains(reason, "CTXMODE_ROLE") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -227,21 +229,21 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S4: subagent CLI flag in ancestor pid=150") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
 	t.Run("main_subprocess", func(t *testing.T) {
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, subprocess, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
 	t.Run("packed_cell_member_is_subprocess_form", func(t *testing.T) {
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET_JEV_GATE": "/tmp/x"}, subprocess, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET_JEV_GATE": "/tmp/x"}, subprocess, 300)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -252,7 +254,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 100, PPID: 200, Cmdline: "/usr/local/bin/pig"},
 			{PID: 200, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 200)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 200)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -263,7 +265,7 @@ func TestResolveAgentIdentityProofChain(t *testing.T) {
 			{PID: 100, PPID: 200, Cmdline: "/usr/bin/mytool --serve"},
 			{PID: 200, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 200)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 200)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "fused form but self pid=100") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -280,7 +282,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -292,7 +294,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "node /root/.gemini/antigravity-cli/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -304,7 +306,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -316,7 +318,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "forged:p1"}, chain, 0)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 0)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.HasPrefix(reason, "S2:") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -328,7 +330,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "forged:p1"}, chain, 999)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 999)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "is not in this process ancestry") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -340,7 +342,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy --agent worker"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S4: subagent CLI flag in ancestor pid=200") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -352,7 +354,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy", Env: map[string]string{"CTXMODE_ROLE": "worker"}},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "CTXMODE_ROLE") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -365,7 +367,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S4: subagent CLI flag") && !strings.Contains(reason, "nested second host") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -378,7 +380,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "nested second host runtime") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -391,7 +393,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "agent/tool runtime ancestor pid=150") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -413,7 +415,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 				{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 				{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 			}
-			environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+			environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 			isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 			if !isSubagent {
 				t.Fatalf("claude ancestor %q must be rejected, reason=%q", cmd, reason)
@@ -432,7 +434,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "unexpected intermediate ancestor pid=150") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -448,7 +450,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/bin/bash -c agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "unexpected intermediate ancestor pid=200") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -460,7 +462,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/bin/bash -c pi"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "unexpected intermediate ancestor pid=200") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -472,7 +474,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 150, PPID: 300, Cmdline: ""},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "empty or unreadable cmdline") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -486,7 +488,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy -i \"work on /tmp/dispatch-x.md\""},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -499,7 +501,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "env -u FOO /usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -512,7 +514,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "env FOO=1 /usr/local/bin/ctxmode run"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "agent/tool runtime ancestor pid=200") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
@@ -528,7 +530,7 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 				Argv: []string{"/usr/local/bin/agy", "--name role-x"}},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 		if isSubagent {
 			t.Fatalf("single-token '--name role-x' is not the marker: isSubagent=%v reason=%q", isSubagent, reason)
@@ -571,7 +573,7 @@ func TestEnvArgv0Masking(t *testing.T) {
 					{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/pi"},
 					{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 				}
-				environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
+				environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t", "PIG_EXT_SOCKET": "/tmp/x"}, chain, 300)
 				isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 				if !isSubagent || !strings.Contains(reason, "S4") {
 					t.Fatalf("isSubagent=%v reason=%q, want S4 rejection", isSubagent, reason)
@@ -588,7 +590,7 @@ func TestEnvArgv0Masking(t *testing.T) {
 					{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 					{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 				}
-				environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, chain, 300)
+				environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
 				isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
 				if !isSubagent || !strings.Contains(reason, "S4") {
 					t.Fatalf("isSubagent=%v reason=%q, want S4 rejection", isSubagent, reason)
@@ -775,7 +777,7 @@ func TestPromptArgStrippingFlagBoundary(t *testing.T) {
 
 // TestResolveAgentIdentityUnreadableAncestry pins the unreadable /proc branch.
 func TestResolveAgentIdentityUnreadableAncestry(t *testing.T) {
-	environment := identityFixture(map[string]string{"HERDR_PANE_ID": "w1:p1"}, []AncestorProcess{{PID: 100, PPID: 1, Cmdline: "pi"}}, 300)
+	environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, []AncestorProcess{{PID: 100, PPID: 1, Cmdline: "pi"}}, 300)
 	environment.ReadStat = func(int) (int, bool) { return 0, false }
 	isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 	if !isSubagent || !strings.Contains(reason, "ancestry for this process is unreadable") {
@@ -854,7 +856,7 @@ func TestLoadEffectiveArgs(t *testing.T) {
 		environment := identityFixture(map[string]string{"PIG_HARNESS_ARGV_FILE": path},
 			[]AncestorProcess{{PID: 100, PPID: 1, Cmdline: "pi"}}, 100)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
-		if !isSubagent || !strings.HasPrefix(reason, "S1: HERDR_PANE_ID") {
+		if !isSubagent || !strings.HasPrefix(reason, "S1: HC_TERMINAL_ID unset or empty") {
 			t.Fatalf("clean argv cannot elevate to main: isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
@@ -972,7 +974,7 @@ func TestLoadEffectiveArgsConcurrent(t *testing.T) {
 // connection and returns its path.
 func paneSocket(t *testing.T, reply string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "herdr.sock")
+	path := filepath.Join(t.TempDir(), "hc.sock")
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
@@ -993,66 +995,6 @@ func paneSocket(t *testing.T, reply string) string {
 		}
 	}()
 	return path
-}
-
-// TestQueryPaneShellPid covers the socket protocol branches.
-func TestQueryPaneShellPid(t *testing.T) {
-	ok := `{"id":"pi-identity","result":{"process_info":{"pane_id":"w1:p1","shell_pid":4321}}}`
-	cases := []struct {
-		name    string
-		reply   string
-		paneID  string
-		wantPID int
-		wantOK  bool
-	}{
-		{"ok", ok, "w1:p1", 4321, true},
-		{"pane_mismatch", ok, "w1:p2", 0, false},
-		{"wrong_request_id", `{"id":"other","result":{"process_info":{"pane_id":"w1:p1","shell_pid":7}}}`, "w1:p1", 0, false},
-		{"zero_pid", `{"id":"pi-identity","result":{"process_info":{"pane_id":"w1:p1","shell_pid":0}}}`, "w1:p1", 0, false},
-		{"fractional_pid", `{"id":"pi-identity","result":{"process_info":{"pane_id":"w1:p1","shell_pid":4.5}}}`, "w1:p1", 0, false},
-		{"bad_json", `not json`, "w1:p1", 0, false},
-		{"empty_reply", "", "w1:p1", 0, false},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			path := paneSocket(t, testCase.reply)
-			pid, ok := queryPaneShellPid(path, testCase.paneID, time.Second)
-			if ok != testCase.wantOK || pid != testCase.wantPID {
-				t.Fatalf("queryPaneShellPid = %d,%v want %d,%v", pid, ok, testCase.wantPID, testCase.wantOK)
-			}
-		})
-	}
-
-	t.Run("no_socket", func(t *testing.T) {
-		if _, ok := queryPaneShellPid(filepath.Join(t.TempDir(), "absent.sock"), "w1:p1", 50*time.Millisecond); ok {
-			t.Fatal("a missing socket must fail closed")
-		}
-	})
-}
-
-// TestQueryPaneShellPidTimeout pins the bounded query budget.
-func TestQueryPaneShellPidTimeout(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "herdr.sock")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("listen unix: %v", err)
-	}
-	defer listener.Close()
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		time.Sleep(2 * time.Second)
-		_ = conn.Close()
-	}()
-	start := time.Now()
-	if _, ok := queryPaneShellPid(path, "w1:p1", 40*time.Millisecond); ok {
-		t.Fatal("a silent server must fail closed")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("query took %s, the budget must bound it", elapsed)
-	}
 }
 
 // TestQueryHcTerminalInfo covers the terminal.get JSON-RPC 2.0 wire shape
@@ -1088,11 +1030,42 @@ func TestQueryHcTerminalInfo(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("no_socket", func(t *testing.T) {
+		if _, ok := queryHcTerminalInfo(filepath.Join(t.TempDir(), "absent.sock"), "t12t", 50*time.Millisecond); ok {
+			t.Fatal("a missing socket must fail closed")
+		}
+	})
+
+	t.Run("timeout_bounded", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "hc.sock")
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("listen unix: %v", err)
+		}
+		defer listener.Close()
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			time.Sleep(2 * time.Second)
+			_ = conn.Close()
+		}()
+		start := time.Now()
+		if _, ok := queryHcTerminalInfo(path, "t12t", 40*time.Millisecond); ok {
+			t.Fatal("a silent server must fail closed")
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("query took %s, the budget must bound it", elapsed)
+		}
+	})
 }
 
-// TestResolveHcTerminalIdentity walks the herdr-core S1/S2 shape: with
-// HERDR_PANE_ID absent and HC_TERMINAL_ID exported, terminal.get's
-// parent=null record is the hc analogue of the :p1 main pane.
+// TestResolveHcTerminalIdentity walks the herdr-core S1/S2 shape:
+// terminal.get's parent=null record is the only positive proof of a
+// top-level terminal. (hc-only since v0.4.0: the classic herdr.sock /
+// HERDR_PANE_ID branch was removed.)
 func TestResolveHcTerminalIdentity(t *testing.T) {
 	chain := []AncestorProcess{
 		{PID: 100, PPID: 200, Cmdline: "/opt/ext/jev-gate"},
@@ -1126,7 +1099,7 @@ func TestResolveHcTerminalIdentity(t *testing.T) {
 	})
 	t.Run("parent_set_is_subagent_terminal", func(t *testing.T) {
 		// `hc run --bg` children always carry the parent address; a non-null
-		// parent fails closed at S1 like a non-:p1 pane.
+		// parent fails closed at S1.
 		environment := hcFixture(HcTerminalInfo{Address: "t12t", Parent: "t9t", PID: 300}, true)
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S1: HC_TERMINAL_ID=t12t has parent=t9t (subagent terminal)") {

@@ -27,33 +27,45 @@ import net from "node:net";
 // jev_check 出现在工具表、windhub/jev-latest 可解析。根因是「判主代理」只依赖单个可被环境赋值
 // 伪造的变量。
 //
+// 2026-11-25 hc-only 迁移：经典 herdr（herdr.sock / HERDR_PANE_ID / pane.process_info）分支随
+// herdr 退役整体移除，herdr-core（hc）成为唯一的 S1/S2 正证明路径，与
+// go/exclude-tools-guard v0.2.0 及 go/jev-gate v0.4.0 的共享身份核心对齐。
+//
 // 新判据：主代理需要下列正向证据全部成立；任一条缺位、无法确证、查询失败或超时，一律判子代理。
-//   S1 HERDR_PANE_ID 非空且以 ":p1" 结尾。来源＝环境变量，因此只作必要条件，单独伪造它无法通过
-//      S2/S3（这正是旧判据的漏洞所在）。
-//   S2 向运行中的 herdr server 查询该 pane，回执必须 pane_id 一致且 shell_pid > 0。来源＝herdr
-//      server 的运行态；socket 路径写死常量而不读 HERDR_SOCKET_PATH，否则又引入一个可伪造的环境变量。
-//   S3 本进程的 /proc 祖先链必须包含 S2 回执的 shell_pid。来源＝内核进程表：祖先关系由内核维护，
-//      环境赋值伪造不了；setsid/daemonize 只会让链条断掉（→ 子代理），不会凭空接到别的 pane 的 shell 上。
+//   S1 HC_TERMINAL_ID 非空且匹配 ^t[0-9a-z]+$（hc 终端地址形状，如 "t12t"）。来源＝环境变量，
+//      因此只作必要条件，单独伪造它无法通过 S2/S3。
+//   S2 向运行中的 herdr-core server 发 JSON-RPC 2.0 terminal.get 查询该终端，回执必须 id 回环、
+//      result 为对象、address 回环、state 存在时必须为 "live"、parent 键必须存在且为 JSON 字面
+//      null（顶层主终端；`hc run --bg` 的子代理终端必带父地址——parent 缺失/""/非字符串、
+//      非 "live" 的 state 一律 fail-closed）、pid 为正整数。来源＝hc server 的运行态；
+//      socket 路径写死常量而不读 HC_TERMINAL_SOCKET，否则又引入一个可伪造的环境变量。
+//   S3 本进程的 /proc 祖先链必须包含 S2 回执的 pid（作为 shell_pid）。来源＝内核进程表：祖先关系
+//      由内核维护，环境赋值伪造不了；setsid/daemonize 只会让链条断掉（→ 子代理），不会凭空接到
+//      别的终端的 shell 上。
 //   S4 从本进程到 shell_pid 之间的祖先里不得出现其他 agent 运行时（pi / ctxmode）。来源＝内核进程表
-//      ＋ /proc/<pid>/cmdline：主代理的 pi 由 pane shell 直接拉起，任何「pi 里再起 pi」都必然留下
+//      ＋ /proc/<pid>/cmdline：主代理的 pi 由终端 shell 直接拉起，任何「pi 里再起 pi」都必然留下
 //      agent 祖先，环境变量无法隐藏它。
-//   残余面（已知、本次不覆盖）：能改 pane 内容物的旁路仍可绕——例如把另一个 pi 塞进 p1 的 shell 里
-//   执行，进程树看起来就是 shell 直接拉起。彻底封死需要 herdr 在 pane 启动时注入不可继承的凭据。
+//   残余面（已知、本次不覆盖）：能改终端内容物的旁路仍可绕——例如把另一个 pi 塞进顶层终端的 shell 里
+//   执行，进程树看起来就是 shell 直接拉起。彻底封死需要 herdr-core 在终端启动时注入不可继承的凭据。
 //
 // 负向标记（命中即子代理；这些信号只能把结论推向子代理，不存在「伪造放行」的方向）：
 //   PI_SUBAGENT=1 / PI_ROLE 非空 / argv 含 "--name role-"、"/tmp/herdr-role-sessions"、"/tmp/dispatch-"。
 //
 // 诊断：PI_IDENTITY_DEBUG=1 只控制是否把判定理由打到 stderr，不参与判定。
 
-/** herdr server 的 unix socket（常量写死：HERDR_SOCKET_PATH 可被环境赋值伪造，故不采用）。 */
-const HERDR_SOCKET_FILE = "/root/.config/herdr/herdr.sock"
+/** herdr-core server 的 unix socket（常量写死：HC_TERMINAL_SOCKET 可被环境赋值伪造，故不采用）。 */
+const HC_SOCKET_FILE = "/run/user/0/herdr-core/default.sock"
 /** 单次 socket 查询超时（毫秒）；超时按子代理处置。 */
 const IDENTITY_QUERY_TIMEOUT_MS = 1500
 /** /proc 祖先链回溯上限（防御异常/环状 stat）。 */
 const IDENTITY_ANCESTOR_MAX_HOPS = 32
+/** hc 终端地址形状（如 "t12t"）；socket 参数绝不由它派生。 */
+const HC_TERMINAL_ID_PATTERN = /^t[0-9a-z]+$/u
 
-interface PaneProcessInfo {
-  shellPid: number
+interface HcTerminalInfo {
+  pid: number
+  /** null = 顶层终端（parent 为 JSON null）；非空字符串 = `hc run --bg` 子代理终端的父地址。 */
+  parent: string | null
 }
 
 interface AncestorProcess {
@@ -63,15 +75,16 @@ interface AncestorProcess {
 }
 
 /**
- * 经 herdr server socket 查询 pane 的 shell_pid。
- * 任何失败（连接/超时/非 JSON/回执不符/pane 不存在）返回 null —— 调用方按子代理处置。
+ * 经 herdr-core server socket 查询终端记录（JSON-RPC 2.0 terminal.get）。
+ * 任何失败（连接/超时/非 JSON/回执 id 不符/result 非对象/address 不符/state 存在但非 "live"/
+ * parent 键缺失或为空串或类型不符/pid 非正整数）返回 null —— 调用方按子代理处置。
  */
-function queryPaneShellPid(paneId: string, timeoutMs: number = IDENTITY_QUERY_TIMEOUT_MS): Promise<PaneProcessInfo | null> {
+function queryHcTerminalInfo(termId: string, timeoutMs: number = IDENTITY_QUERY_TIMEOUT_MS): Promise<HcTerminalInfo | null> {
   return new Promise((resolve) => {
     let settled = false
     let socket: ReturnType<typeof net.connect> | undefined
     let timer: ReturnType<typeof setTimeout> | undefined
-    const finish = (value: PaneProcessInfo | null): void => {
+    const finish = (value: HcTerminalInfo | null): void => {
       if (settled) return
       settled = true
       if (timer !== undefined) clearTimeout(timer)
@@ -85,27 +98,56 @@ function queryPaneShellPid(paneId: string, timeoutMs: number = IDENTITY_QUERY_TI
       resolve(value)
     }
     const handleReply = (text: string): void => {
-      let reply: { id?: unknown; result?: { process_info?: { pane_id?: unknown; shell_pid?: unknown } } }
+      let reply: { id?: unknown; result?: unknown }
       try {
         reply = JSON.parse(text) as typeof reply
       } catch {
         finish(null)
         return
       }
-      const info = reply?.result?.process_info
-      const shellPid = Number(info?.shell_pid)
-      if (reply?.id === "pi-identity" && info?.pane_id === paneId && Number.isInteger(shellPid) && shellPid > 0) {
-        finish({ shellPid })
+      if (reply?.id !== "pi-identity" || typeof reply?.result !== "object" || reply.result === null || Array.isArray(reply.result)) {
+        finish(null)
+        return
+      }
+      const record = reply.result as Record<string, unknown>
+      if (record.address !== termId) {
+        finish(null)
+        return
+      }
+      // state 在线上可选；存在时必须为 "live"，否则不能证明一个存活终端。
+      if ("state" in record && record.state !== "live") {
+        finish(null)
+        return
+      }
+      // parent 键必须存在：JSON null = 顶层终端；非空字符串 = 父地址（子代理终端）；
+      // 缺失、空串或其它类型都无法证明顶层形态，整条记录 fail-closed。
+      if (!("parent" in record)) {
+        finish(null)
+        return
+      }
+      const rawParent = record.parent
+      let parent: string | null
+      if (rawParent === null) {
+        parent = null
+      } else if (typeof rawParent === "string" && rawParent !== "") {
+        parent = rawParent
       } else {
         finish(null)
+        return
       }
+      const pid = Number(record.pid)
+      if (!Number.isInteger(pid) || pid <= 0) {
+        finish(null)
+        return
+      }
+      finish({ pid, parent })
     }
-    socket = net.connect(HERDR_SOCKET_FILE)
+    socket = net.connect(HC_SOCKET_FILE)
     timer = setTimeout(() => finish(null), timeoutMs)
     let buffer = ""
     socket.on("connect", () => {
       try {
-        socket?.write(`${JSON.stringify({ id: "pi-identity", method: "pane.process_info", params: { pane_id: paneId } })}\n`)
+        socket?.write(`${JSON.stringify({ id: "pi-identity", jsonrpc: "2.0", method: "terminal.get", params: { caller: termId, terminal: termId } })}\n`)
       } catch {
         finish(null)
       }
@@ -195,23 +237,26 @@ async function resolveAgentIdentity(): Promise<{ isSubagent: boolean; reason: st
   const marker = subagentLaunchMarker()
   if (marker) return { isSubagent: true, reason: `launch marker: ${marker}` }
 
-  const paneId = (process.env.HERDR_PANE_ID ?? "").trim()
-  if (!paneId) return { isSubagent: true, reason: "S1: HERDR_PANE_ID unset or empty" }
-  if (!paneId.endsWith(":p1")) {
-    return { isSubagent: true, reason: `S1: HERDR_PANE_ID=${paneId} is not a main pane (no ":p1" suffix)` }
+  const termId = (process.env.HC_TERMINAL_ID ?? "").trim()
+  if (!termId) return { isSubagent: true, reason: "S1: HC_TERMINAL_ID unset or empty" }
+  if (!HC_TERMINAL_ID_PATTERN.test(termId)) {
+    return { isSubagent: true, reason: `S1: HC_TERMINAL_ID=${termId} is not a terminal address (no ^t[0-9a-z]+$ match)` }
   }
 
-  const pane = await queryPaneShellPid(paneId)
-  if (!pane) return { isSubagent: true, reason: `S2: herdr pane query for ${paneId} failed, timed out or mismatched` }
+  const terminal = await queryHcTerminalInfo(termId)
+  if (!terminal) return { isSubagent: true, reason: `S2: hc terminal.get for ${termId} failed, timed out or mismatched` }
+  if (terminal.parent !== null) {
+    return { isSubagent: true, reason: `S1: HC_TERMINAL_ID=${termId} has parent=${terminal.parent} (subagent terminal)` }
+  }
 
   const chain = readAncestorChain(process.pid, IDENTITY_ANCESTOR_MAX_HOPS)
   if (chain.length === 0) return { isSubagent: true, reason: "S3: /proc ancestry for this process is unreadable" }
-  const index = chain.findIndex((entry) => entry.pid === pane.shellPid)
+  const index = chain.findIndex((entry) => entry.pid === terminal.pid)
   if (index < 0) {
     const seen = chain.map((entry) => `${entry.pid}${entry.cmdline ? `(${entry.cmdline.slice(0, 40)})` : ""}`).join(" <- ")
     return {
       isSubagent: true,
-      reason: `S3: pane ${paneId} shell_pid=${pane.shellPid} is not in this process ancestry [${seen}]`,
+      reason: `S3: terminal ${termId} shell_pid=${terminal.pid} is not in this process ancestry [${seen}]`,
     }
   }
   for (let hop = 1; hop < index; hop++) {
@@ -219,11 +264,11 @@ async function resolveAgentIdentity(): Promise<{ isSubagent: boolean; reason: st
     if (isAgentRuntimeCmdline(ancestor.cmdline)) {
       return {
         isSubagent: true,
-        reason: `S4: agent runtime ancestor pid=${ancestor.pid} "${ancestor.cmdline.slice(0, 60)}" between this process and pane shell`,
+        reason: `S4: agent runtime ancestor pid=${ancestor.pid} "${ancestor.cmdline.slice(0, 60)}" between this process and terminal shell`,
       }
     }
   }
-  return { isSubagent: false, reason: `S1-S4 hold: pane=${paneId} shell_pid=${pane.shellPid} hop=${index}` }
+  return { isSubagent: false, reason: `S1-S4 hold: terminal=${termId} shell_pid=${terminal.pid} hop=${index}` }
 }
 
 /** 本会话是否子代理。fail-closed：无法确证为主代理时一律 true。 */

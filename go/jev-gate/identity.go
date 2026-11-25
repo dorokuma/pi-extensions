@@ -9,29 +9,22 @@ package jevgate
 // penetration, one-layer host cap). README.md lists where they differ.
 //
 // A session is the main agent only when every positive proof holds; any proof
-// that is missing, unverifiable, failed or timed out resolves as subagent:
-//   S1: HERDR_PANE_ID is non-empty AND ends with ":p1" — the herdr lookup key
-//       plus the necessary main-pane condition a subagent pane cannot claim
-//       (its pane id never carries the :p1 suffix).
-//   S2: the running herdr server answers the pane query with a matching
-//       shell_pid > 0. The socket path is a hard-coded constant, never read
-//       from HERDR_SOCKET_PATH, which would be one more forgeable variable.
-//
-//   Under herdr-core (hc) — where HERDR_PANE_ID is absent and HC_TERMINAL_ID
-//   is exported instead — S1/S2 take the hc shape while S3/S4 run unchanged
-//   on the resolved pid:
-//     S1: HC_TERMINAL_ID is non-empty AND matches ^t[0-9a-z]+$.
-//     S2: the hc server answers terminal.get with a record whose address
-//         echoes the terminal id, whose parent is null — the top-level-
-//         terminal analogue of :p1, since a subagent spawned via
-//         `hc run --bg` always carries its parent's address — and whose
-//         pid > 0 becomes the shell_pid. The socket path is again a
-//         hard-coded constant, never read from HC_TERMINAL_SOCKET.
+// that is missing, unverifiable, failed or timed out resolves as subagent.
+// The classic herdr branch (herdr.sock / HERDR_PANE_ID) was removed with the
+// herdr retirement: herdr-core (hc) is the only positive-proof path, aligned
+// with go/exclude-tools-guard v0.2.0+:
+//   S1: HC_TERMINAL_ID is non-empty AND matches ^t[0-9a-z]+$.
+//   S2: the hc server answers terminal.get with a record whose address
+//       echoes the terminal id, whose parent is null — the top-level
+//       terminal, since a subagent spawned via `hc run --bg` always
+//       carries its parent's address — whose state is "live" when present,
+//       and whose pid > 0 becomes the shell_pid. The socket path is a
+//       hard-coded constant, never read from HC_TERMINAL_SOCKET.
 //   S3: the shell_pid is a strict ancestor of this process, and every
 //       ancestor's /proc cmdline is readable — an empty argv is fail-closed,
 //       it can never sneak past the S4 scans.
 //   S4: no negative launch marker (env or argv) and no second agent/tool
-//       runtime sits on the ancestry between this process and the pane
+//       runtime sits on the ancestry between this process and the terminal
 //       shell, except — extension mode only — the one resolved host.
 //
 // Negative launch markers can only push the verdict toward subagent (there is
@@ -54,9 +47,9 @@ package jevgate
 //     fail-closed, mirroring jev-mcp.mjs.
 //
 // Residual surface (known, not covered here): anything that can put another
-// process into pane p1's shell makes the tree look like "shell starts an
-// agent directly". Closing that needs herdr to inject a non-inheritable
-// credential at pane start.
+// process into a top-level terminal's shell makes the tree look like "shell
+// starts an agent directly". Closing that needs herdr-core to inject a
+// non-inheritable credential at terminal start.
 
 import (
 	"bufio"
@@ -73,8 +66,6 @@ import (
 )
 
 const (
-	// herdrSocketFile is the herdr server socket; hard-coded on purpose.
-	herdrSocketFile = "/root/.config/herdr/herdr.sock"
 	// HcSocketFile is the herdr-core server socket; hard-coded on purpose.
 	// HC_TERMINAL_SOCKET is deliberately never read: it would be one more
 	// forgeable variable. Tests may inject a path via IdentityEnv.HcSocketPath.
@@ -110,80 +101,9 @@ type AncestorProcess struct {
 	Env map[string]string
 }
 
-// queryPaneShellPid asks the herdr server for a pane's shell pid. Any failure
-// (connect, timeout, non-JSON, mismatched reply, missing pane) is (0, false).
-func queryPaneShellPid(socketPath, paneID string, timeout time.Duration) (int, bool) {
-
-	deadline := time.Now().Add(timeout)
-	dialTimeout := time.Until(deadline)
-	if dialTimeout <= 0 {
-		return 0, false
-	}
-	conn, err := net.DialTimeout("unix", socketPath, dialTimeout)
-	if err != nil {
-		return 0, false
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(deadline)
-
-	request, err := json.Marshal(map[string]any{
-		"id":     "pi-identity",
-		"method": "pane.process_info",
-		"params": map[string]any{"pane_id": paneID},
-	})
-	if err != nil {
-		return 0, false
-	}
-	request = append(request, '\n')
-	if _, err := conn.Write(request); err != nil {
-		return 0, false
-	}
-
-	reader := bufio.NewReader(io.LimitReader(conn, 1048576))
-	line, err := reader.ReadBytes('\n')
-	if err != nil && len(line) == 0 {
-		return 0, false
-	}
-	var reply struct {
-		ID     string `json:"id"`
-		Result struct {
-			ProcessInfo struct {
-				PaneID   any `json:"pane_id"`
-				ShellPID any `json:"shell_pid"`
-			} `json:"process_info"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(line, &reply); err != nil {
-		return 0, false
-	}
-	if reply.ID != "pi-identity" {
-		return 0, false
-	}
-	repliedPane, ok := reply.Result.ProcessInfo.PaneID.(string)
-	if !ok || repliedPane != paneID {
-		return 0, false
-	}
-	var shellPID int
-	switch value := reply.Result.ProcessInfo.ShellPID.(type) {
-	case float64:
-		shellPID = int(value)
-		if float64(shellPID) != value {
-			return 0, false
-		}
-	case int:
-		shellPID = value
-	default:
-		return 0, false
-	}
-	if shellPID <= 0 {
-		return 0, false
-	}
-	return shellPID, true
-}
-
 // HcTerminalInfo is the herdr-core terminal record S2 needs: the terminal's
-// own address, its parent address ("" = JSON null = top-level terminal, the
-// hc analogue of herdr's :p1 main pane), and its shell pid.
+// own address, its parent address ("" = JSON null = top-level terminal), and
+// its shell pid.
 type HcTerminalInfo struct {
 	Address string
 	Parent  string
@@ -1444,7 +1364,6 @@ type IdentityEnv struct {
 	Getenv      func(string) string
 	Args        []string
 	PID         int
-	SocketPath  string
 	Timeout     time.Duration
 	ReadStat    func(int) (int, bool)
 	ReadCmdline func(int) string
@@ -1455,15 +1374,13 @@ type IdentityEnv struct {
 	ReadEnviron func(int) map[string]string
 	// Environ enumerates the environment for the PIG_EXT_SOCKET_<NAME> keys,
 	// whose names are not known in advance.
-	Environ     func() []string
-	QuerySocket func(socketPath, paneID string, timeout time.Duration) (int, bool)
+	Environ func() []string
 	// HcSocketPath overrides the herdr-core socket for tests; the production
 	// value is the hard-coded HcSocketFile, never HC_TERMINAL_SOCKET.
 	HcSocketPath string
-	// QueryHcSocket is the herdr-core terminal.get query. It is a separate
-	// field from QuerySocket because the hc record also carries the parent
-	// address — the top-level check QuerySocket's (pid, ok) shape cannot
-	// express.
+	// QueryHcSocket is the herdr-core terminal.get query; the hc record also
+	// carries the parent address, the top-level check a plain (pid, ok)
+	// answer cannot express.
 	QueryHcSocket func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool)
 	ArgvCache     *ArgvCache
 }
@@ -1474,14 +1391,12 @@ func defaultIdentityEnv() IdentityEnv {
 		Getenv:        os.Getenv,
 		Args:          os.Args,
 		PID:           os.Getpid(),
-		SocketPath:    herdrSocketFile,
 		Timeout:       identityQueryTimeout,
 		ReadStat:      readProcPpid,
 		ReadCmdline:   readProcCmdline,
 		ReadArgv:      readProcArgv,
 		ReadEnviron:   readProcEnviron,
 		Environ:       os.Environ,
-		QuerySocket:   queryPaneShellPid,
 		HcSocketPath:  HcSocketFile,
 		QueryHcSocket: queryHcTerminalInfo,
 		ArgvCache:     defaultArgvCache,
@@ -1580,9 +1495,6 @@ func fillIdentityDefaults(env *IdentityEnv) {
 	if env.Environ == nil {
 		env.Environ = os.Environ
 	}
-	if env.QuerySocket == nil {
-		env.QuerySocket = queryPaneShellPid
-	}
 	if env.HcSocketPath == "" {
 		env.HcSocketPath = HcSocketFile
 	}
@@ -1591,9 +1503,6 @@ func fillIdentityDefaults(env *IdentityEnv) {
 	}
 	if env.Timeout <= 0 {
 		env.Timeout = identityQueryTimeout
-	}
-	if env.SocketPath == "" {
-		env.SocketPath = herdrSocketFile
 	}
 }
 
@@ -1611,52 +1520,31 @@ func resolveIdentity(env IdentityEnv, mcpMode bool) (bool, string) {
 		return true, "launch marker: " + marker
 	}
 
-	// S1/S2 come in two shapes. With HERDR_PANE_ID set, the herdr shape: the
-	// pane id is both the herdr lookup key and a necessary condition — a main
-	// agent's pane id always ends with ":p1"; anything else cannot be the
-	// main pane and is rejected before the socket query. Under herdr-core
-	// (HERDR_PANE_ID absent, HC_TERMINAL_ID exported), the hc shape: the
-	// terminal id is the hc lookup key, terminal.get must return a live
-	// top-level record (a "state" present but not "live" fails; parent
-	// must be the JSON literal null — the hc analogue of the :p1 main
-	// pane, since a `hc run --bg` subagent always carries its parent's
-	// address) and its pid becomes the shell_pid S3/S4 run against.
-	var shellPID int
-	paneID := strings.TrimSpace(env.Getenv("HERDR_PANE_ID"))
-	if paneID == "" {
-		termID := strings.TrimSpace(env.Getenv("HC_TERMINAL_ID"))
-		if termID == "" {
-			return failClosed("S1: HERDR_PANE_ID unset or empty")
-		}
-		if !hcTerminalIDPattern.MatchString(termID) {
-			return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s is not a terminal address (no ^t[0-9a-z]+$ match)", termID))
-		}
-		info, ok := env.QueryHcSocket(env.HcSocketPath, termID, env.Timeout)
-		if !ok || info.Address != termID || info.PID <= 0 {
-			return failClosed(fmt.Sprintf("S2: hc terminal.get for %s failed, timed out or mismatched", termID))
-		}
-		if info.Parent != "" {
-			return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s has parent=%s (subagent terminal)", termID, info.Parent))
-		}
-		shellPID = info.PID
-		// Reuse paneID as the diagnostic label below; the value is the
-		// terminal address.
-		paneID = termID
-	} else {
-		if !strings.HasSuffix(paneID, ":p1") {
-			return failClosed(fmt.Sprintf("S1: HERDR_PANE_ID=%s is not a main pane (no \":p1\" suffix)", paneID))
-		}
-
-		// S2: ask the running herdr server.
-		pid, ok := env.QuerySocket(env.SocketPath, paneID, env.Timeout)
-		if !ok || pid <= 0 {
-			return failClosed(fmt.Sprintf("S2: herdr pane query for %s failed, timed out or mismatched", paneID))
-		}
-		shellPID = pid
+	// S1/S2 (hc shape): HC_TERMINAL_ID must match ^t[0-9a-z]+$ and
+	// terminal.get must return a live top-level record — a "state" present
+	// but not "live" fails; parent must be the JSON literal null, since a
+	// `hc run --bg` subagent terminal always carries its parent's address —
+	// plus a matching address and a positive pid that becomes the shell_pid
+	// S3/S4 run against.
+	termID := strings.TrimSpace(env.Getenv("HC_TERMINAL_ID"))
+	if termID == "" {
+		return failClosed("S1: HC_TERMINAL_ID unset or empty")
 	}
+	if !hcTerminalIDPattern.MatchString(termID) {
+		return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s is not a terminal address (no ^t[0-9a-z]+$ match)", termID))
+	}
+	info, ok := env.QueryHcSocket(env.HcSocketPath, termID, env.Timeout)
+	if !ok || info.Address != termID || info.PID <= 0 {
+		return failClosed(fmt.Sprintf("S2: hc terminal.get for %s failed, timed out or mismatched", termID))
+	}
+	if info.Parent != "" {
+		return failClosed(fmt.Sprintf("S1: HC_TERMINAL_ID=%s has parent=%s (subagent terminal)", termID, info.Parent))
+	}
+	shellPID := info.PID
 
-	// S3: the pane shell must be in this ancestry, and every hop's argv must be
-	// readable — an empty cmdline fails closed, it must not slip past S4.
+	// S3: the terminal shell must be in this ancestry, and every hop's argv
+	// must be readable — an empty cmdline fails closed, it must not slip
+	// past S4.
 	chain := readAncestorChain(env.PID, identityAncestorMaxHops, env.ReadStat, env.ReadCmdline, env.ReadArgv, env.ReadEnviron)
 	if len(chain) == 0 {
 		return failClosed("S3: /proc ancestry for this process is unreadable")
@@ -1674,7 +1562,7 @@ func resolveIdentity(env IdentityEnv, mcpMode bool) (bool, string) {
 		}
 	}
 	if shellIndex < 0 {
-		return failClosed(fmt.Sprintf("S3: pane %s shell_pid=%d is not in this process ancestry [%s]", paneID, shellPID, describeAncestorChain(chain)))
+		return failClosed(fmt.Sprintf("S3: terminal %s shell_pid=%d is not in this process ancestry [%s]", termID, shellPID, describeAncestorChain(chain)))
 	}
 	for hop := 0; hop <= shellIndex; hop++ {
 		entry := chain[hop]
@@ -1712,16 +1600,16 @@ func resolveIdentity(env IdentityEnv, mcpMode bool) (bool, string) {
 	}
 
 	if mcpMode {
-		return resolveMCPHostTopology(chain, shellIndex, paneID, shellPID)
+		return resolveMCPHostTopology(chain, shellIndex, termID, shellPID)
 	}
-	return resolveExtensionHostTopology(env, chain, shellIndex, paneID, shellPID)
+	return resolveExtensionHostTopology(env, chain, shellIndex, termID, shellPID)
 }
 
 // resolveMCPHostTopology is the MCP-mode S4: between jev-mcp and the pane
 // shell, at most one host layer (agy/antigravity or pi/pig) is allowed and
 // every other hop must be that host. Forbidden tool runtimes, a second host
 // layer, or any unknown intermediate fail closed (jev-mcp.mjs behaviour).
-func resolveMCPHostTopology(chain []AncestorProcess, shellIndex int, paneID string, shellPID int) (bool, string) {
+func resolveMCPHostTopology(chain []AncestorProcess, shellIndex int, termID string, shellPID int) (bool, string) {
 	hostLayers := 0
 	for hop := 1; hop < shellIndex; hop++ {
 		entry := chain[hop]
@@ -1733,16 +1621,16 @@ func resolveMCPHostTopology(chain []AncestorProcess, shellIndex int, paneID stri
 		if isAgyTokens(tokens) || isPiPigTokens(tokens) {
 			hostLayers++
 			if hostLayers > 1 {
-				return failClosed(fmt.Sprintf("S4: nested second host runtime ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+				return failClosed(fmt.Sprintf("S4: nested second host runtime ancestor pid=%d %q between this process and terminal shell", entry.PID, cmd))
 			}
 			continue
 		}
 		if isForbiddenTokens(tokens) {
-			return failClosed(fmt.Sprintf("S4: agent/tool runtime ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+			return failClosed(fmt.Sprintf("S4: agent/tool runtime ancestor pid=%d %q between this process and terminal shell", entry.PID, cmd))
 		}
-		return failClosed(fmt.Sprintf("S4: unexpected intermediate ancestor pid=%d %q between this process and pane shell", entry.PID, cmd))
+		return failClosed(fmt.Sprintf("S4: unexpected intermediate ancestor pid=%d %q between this process and terminal shell", entry.PID, cmd))
 	}
-	return false, fmt.Sprintf("S1-S4 hold: pane=%s shell_pid=%d hop=%d host_layers=%d", paneID, shellPID, shellIndex, hostLayers)
+	return false, fmt.Sprintf("S1-S4 hold: terminal=%s shell_pid=%d hop=%d host_layers=%d", termID, shellPID, shellIndex, hostLayers)
 }
 
 // isPiPigTokens reports whether tokens run pi or pig (directly or
@@ -1814,7 +1702,7 @@ func isPiPigOrAgentRuntimeToken(token string) bool {
 // host is the first pi/pig ancestor below the pane shell (subprocess form) or
 // self (fused form), and no other agent/tool runtime may sit between hop 0
 // and the shell except the host itself.
-func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shellIndex int, paneID string, shellPID int) (bool, string) {
+func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shellIndex int, termID string, shellPID int) (bool, string) {
 	subprocessForm, subprocessProof := detectSubprocessForm(env.Getenv, env.Environ)
 	hostIndex := -1
 	if subprocessForm {
@@ -1827,7 +1715,7 @@ func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shel
 			}
 		}
 		if hostIndex < 0 {
-			return failClosed(fmt.Sprintf("S3: no agent-runtime ancestor for subprocess pid=%d below pane shell pid=%d (form: %s) [%s]",
+			return failClosed(fmt.Sprintf("S3: no agent-runtime ancestor for subprocess pid=%d below terminal shell pid=%d (form: %s) [%s]",
 				chain[0].PID, shellPID, subprocessProof, describeAncestorChain(chain)))
 		}
 	} else {
@@ -1838,11 +1726,11 @@ func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shel
 		hostIndex = 0
 	}
 	if shellIndex < hostIndex {
-		return failClosed(fmt.Sprintf("S3: pane shell_pid=%d at hop=%d is below host pid=%d at hop=%d (shell is a descendant of this process's host)",
+		return failClosed(fmt.Sprintf("S3: terminal shell_pid=%d at hop=%d is below host pid=%d at hop=%d (shell is a descendant of this process's host)",
 			shellPID, shellIndex, chain[hostIndex].PID, hostIndex))
 	}
 	if shellIndex == hostIndex {
-		return failClosed(fmt.Sprintf("S3: pane shell_pid=%d at hop=%d is the same process as host pid=%d (expected a strict ancestor, got self)",
+		return failClosed(fmt.Sprintf("S3: terminal shell_pid=%d at hop=%d is the same process as host pid=%d (expected a strict ancestor, got self)",
 			shellPID, shellIndex, chain[hostIndex].PID))
 	}
 
@@ -1860,11 +1748,11 @@ func resolveExtensionHostTopology(env IdentityEnv, chain []AncestorProcess, shel
 			if len(cmd) > 60 {
 				cmd = cmd[:60]
 			}
-			return failClosed(fmt.Sprintf("S4: agent runtime ancestor pid=%d %q between host and pane shell", entry.PID, cmd))
+			return failClosed(fmt.Sprintf("S4: agent runtime ancestor pid=%d %q between host and terminal shell", entry.PID, cmd))
 		}
 	}
 
-	return false, fmt.Sprintf("S1-S4 hold: pane=%s shell_pid=%d hop=%d", paneID, shellPID, shellIndex)
+	return false, fmt.Sprintf("S1-S4 hold: terminal=%s shell_pid=%d hop=%d", termID, shellPID, shellIndex)
 }
 
 // resolveAgentIdentityWithEnv resolves against the given environment in
