@@ -1248,11 +1248,31 @@ func TestResolveHcTerminalIdentity(t *testing.T) {
 		// HC_TERMINAL_SOCKET is an attacker-injectable variable: even when
 		// exported (pointing at a would-be attacker socket), the dial target
 		// must stay the hard-coded HcSocketFile. This pins the never-read contract.
-		environment := hcFixture(HcTerminalInfo{Address: "t12t", PID: 300}, true)
+		//
+		// Assertion 1: even with the variable exported into the real process
+		// environment (os.Getenv visible), the production wiring
+		// defaultIdentityEnv() must hard-code HcSocketFile — a regression that
+		// reads os.Getenv("HC_TERMINAL_SOCKET") inside defaultIdentityEnv
+		// fails here instead of slipping through green.
 		t.Setenv("HC_TERMINAL_SOCKET", "/tmp/attacker.sock")
+		if got := defaultIdentityEnv().HcSocketPath; got != HcSocketFile {
+			t.Fatalf("defaultIdentityEnv().HcSocketPath = %q, want the hard-coded %q even with HC_TERMINAL_SOCKET exported", got, HcSocketFile)
+		}
+		// Assertion 2: inject HC_TERMINAL_SOCKET into the fixture environment
+		// itself so both env.Getenv and env.Environ expose the attacker path —
+		// a regression that reads env.Getenv("HC_TERMINAL_SOCKET") inside
+		// fillIdentityDefaults/resolveIdentity fails here instead of staying blind.
+		environment := identityFixture(map[string]string{
+			"HC_TERMINAL_ID":     "t12t",
+			"HC_TERMINAL_SOCKET": "/tmp/attacker.sock",
+			"PIG_EXT_SOCKET":     "/tmp/x",
+		}, chain, 0)
 		environment.QueryHcSocket = func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
 			if socketPath != HcSocketFile {
-				t.Fatalf("dial target %q must be the hard-coded HcSocketFile even with HC_TERMINAL_SOCKET exported", socketPath)
+				t.Fatalf("dial target %q must be the hard-coded HcSocketFile even with HC_TERMINAL_SOCKET in env.Getenv/Environ", socketPath)
+			}
+			if termID != "t12t" {
+				t.Fatalf("hc query went out for %q, want t12t", termID)
 			}
 			return HcTerminalInfo{Address: "t12t", PID: 300}, true
 		}

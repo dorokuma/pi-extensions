@@ -32,7 +32,7 @@ Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go �
 | `classify.go` | 257 | `models.classify()` 的 `typesafe-system-one` 实现（PiG 缺口绕法，见下）+ 回传前用同一套 `validateAnswer` 校验答案结构 |
 | `identity.go` | 1803 | `SUBAGENT-IDENTITY` 块（S1–S4 fail-closed、`PIG_HARNESS_ARGV_FILE` 桥接的进程级临界区、真实 herdr-core socket 查询、/proc 祖先链、GNU env 选项模型） |
 | `extension.go` | 357 | `executeCheck`、参数 schema、`providerConfig`、`toolDefinition`、`Extension()` 工厂 |
-| `gate_test.go` / `key_test.go` / `jev_test.go` / `extension_test.go` / `identity_test.go` / `classify_test.go` | 529 / 143 / 369 / 586 / 1289 / 318 | 见「测试」 |
+| `gate_test.go` / `key_test.go` / `jev_test.go` / `extension_test.go` / `identity_test.go` / `classify_test.go` | 529 / 143 / 369 / 586 / 1309 / 318 | 见「测试」 |
 | `go.mod` | 8 | 独立嵌套 module（PiG 只按 `go.mod` 识别扩展单元）；含一条 `replace ../exclude-tools-guard`，仅供 `extension_test.go` 末尾的 packed-cell 跨扩展回归测试 |
 
 `go/go.work` 仅新增一行 `./jev-gate`。
@@ -74,15 +74,15 @@ TS 行号随块内增行漂移，下表身份段行号以块内函数名区为�
 | `522-528` | `triage3` | `gate.go:347-360` |
 | `530-628` | `verdictFor` | `gate.go:410-547`（`Verdict` `gate.go:403-407`、`toolResult` `gate.go:550-557`） |
 | `630-699` | `executeCheck` | `extension.go:99-223`（`ExecuteCheck` / `executeCheck` / `failedResult` / `errorResult`） |
-| `701-702` | `BUILTIN_CLASSIFIER_PROVIDER = "typesafe"` | `gate.go:31` |
+| `737-741` | `BUILTIN_CLASSIFIER_PROVIDER = "typesafe"`（含上方注释块，常量本体在 `741`） | `gate.go:31` |
 | `743-745` | `SUBAGENT-IDENTITY-BEGIN` 块头 | `identity.go` 顶部块说明 |
 | `782-788` | `HC_SOCKET_FILE` / `IDENTITY_QUERY_TIMEOUT_MS` / `IDENTITY_ANCESTOR_MAX_HOPS` / `HC_TERMINAL_ID_PATTERN` | `identity.go` 常量区（`HcSocketFile` / `identityQueryTimeout` / `identityAncestorMaxHops` / `hcTerminalIDPattern`） |
-| `807-898` | `queryHcTerminalInfo` | `identity.go:122-226`（`queryHcTerminalInfo`，JSON-RPC 2.0 `terminal.get`，同一 wire 形状） |
-| `900-921` | `readProcPpid` / `readProcCmdline` | `identity.go:229-250`（`readProcPpid`）、`identity.go:268-272`（`readProcCmdline`；`readProcArgv` `252-266` 同段） |
-| `923-938` | `readAncestorChain` | `identity.go:294-330`（`readAncestorChain`） |
+| `807-897` | `queryHcTerminalInfo` | `identity.go:122-221`（`queryHcTerminalInfo`，JSON-RPC 2.0 `terminal.get`，同一 wire 形状） |
+| `900-920` | `readProcPpid` / `readProcCmdline` | `identity.go:229-248`（`readProcPpid`）、`identity.go:268-270`（`readProcCmdline`；`readProcArgv` `252-265` 同段） |
+| `923-937` | `readAncestorChain` | `identity.go:294-321`（`readAncestorChain`） |
 | `940-947` | `isAgentRuntimeCmdline` | `identity.go`（token 家族判定，见 `executableTokenOf` `identity.go:1003` 起） |
-| `949-961` | `subagentLaunchMarker` | `identity.go:1200-1218`（`subagentLaunchMarker`） |
-| `963-1000` | `resolveAgentIdentity` | `identity.go:1514-1611`（`resolveIdentity` 共享主体）+ `identity.go:1762-1766`（`resolveAgentIdentityWithEnv`） |
+| `949-957` | `subagentLaunchMarker` | `identity.go:1200-1215`（`subagentLaunchMarker`） |
+| `963-999` | `resolveAgentIdentity` | `identity.go:1514-1608`（`resolveIdentity` 共享主体）+ `identity.go:1762-1764`（`resolveAgentIdentityWithEnv`） |
 | `1002-1008` | `isSubagentSession` | `identity.go:1793-1803`（`IsSubagentSession` 导出入口） |
 | `1011-1092` | `export default async function (pi)`：子代理早退 + `registerProvider` + `registerTool` | `extension.go:323-357`（`Extension` / `newExtension`）、`extension.go:270-290`（provider config）、`extension.go:293-316`（tool definition）、`extension.go:236-266`（schema） |
 

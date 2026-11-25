@@ -58,17 +58,17 @@
 
 | 行为模块 | TS 原版 (`exclude-tools-guard.ts`) | Go 移植版 (`exclude-tools-guard/extension.go`) | 说明 |
 |---|---|---|---|
-| **常量定义** | L49-L53, L240-L242 | `HcSocketFile`, `IdentityQueryTimeout`, `IdentityAncestorMaxHops`, `excludedTools`, `subagentExcludedTools`, `ExcludedTools()`, `SubagentExcludedTools()` | 常量与内部过滤集合及只读访问函数（Go 侧只剩 herdr-core `HcSocketFile`；`HerdrSocketFile` 已随经典 herdr 分支删除） |
-| **查询终端运行态** | L82-L173 (`queryHcTerminalInfo`，2026-11-25 hc-only 迁移后行号) | `QueryHcTerminalInfo` | 双端均为 herdr-core `terminal.get`（JSON-RPC 2.0，校验 `address`/`state`/`parent:null`/严格整数 `pid`），经典 `pane.process_info` 查询已随 herdr 退役移除；从函数入口起算硬上限 1500ms 总预算，标准库 `net.DialTimeout`，1MB 缓冲截断与 JSON 验证，fail-closed |
-| **读取 /proc ppid** | L131-L142 (`readProcPpid`) | `ReadProcPpid` | 按最后一个 `)` 之后切分并读取第 2 个字段，防御性处理空格与括号 |
-| **读取 /proc cmdline** | L145-L151 (`readProcCmdline`) | `ReadProcCmdline` | 以 `\0` 分隔并过滤空串，空格拼接 |
-| **进程祖先链回溯** | L154-L168 (`readAncestorChain`) | `ReadAncestorChain` | 32 跳上限，环路与终止检测（`ppid == 0 \|\| ppid == current`） |
-| **agent 运行时特征检测** | L171-L177 (`isAgentRuntimeCmdline`) | `IsAgentRuntimeCmdline` | 匹配 `pi`、`pig`、`ctxmode`、`claude`、`claude-code`、`claude-pty` 及正则 `pi-coding-agent\|bundle/cli\.js\|(?:^|/)claude/versions/` |
-| **负向标记检测** | L180-L189 (`subagentLaunchMarker`) | `SubagentLaunchMarker`, `LoadEffectiveArgs` | 检测 `PI_SUBAGENT=1`、`PI_ROLE` 与 argv 特征（含通过 `PIG_HARNESS_ARGV_FILE` 桥接宿主参数） |
-| **fail-closed 身份推断** | L194-L236 (`resolveAgentIdentity`, `isSubagentSession`) | `ResolveAgentIdentityWithEnv`, `ResolveAgentIdentity`, `IsSubagentSession`, `DetectSubprocessForm`, `failClosed` | 形态判据为 `DetectSubprocessForm`（`PIG_EXT_SOCKET` / `PIG_EXT_SOCKET_<NAME>` / `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`），宿主锚定为第一个 agent-runtime 祖先（subprocess）或 self（fused），S3 校验 `shellIndex > hostIndex`，S4 只扫中间进程，终端命名仅作辅助证据，S1-S4 任一失败均 fail-closed + 单次去重 warning |
-| **工具过滤纯函数** | L244-L255 (`enforceExclusions`) | `FilterActiveTools`, `EnforceToolExclusions` | 纯切片过滤保持相对顺序；无变更时不调用 `SetActiveTools`；debug 下记录打点 |
-| **提示词清理** | L266-L277 (before_agent_start) | `StripAddendumBlock`, `CleanPromptOptions`, `DeleteAddendumSection` | 清空 `appendSystemPrompt` + 删除 `sections` 里的 `addendum` section + 两段式剥离 `forceSystemPrompt` 中的 `<addendum>` 块，含非字符串防护。**与 TS 加固版的行为差**：TS 加固版只清 `appendSystemPrompt`、不删 `sections["addendum"]`，Go 版多做了这一步（PiG 会用 custom section 覆盖并重包 `<addendum>`，只清 `appendSystemPrompt` 会被重新叠回） |
-| **扩展工厂与事件接线** | L239, L258-L278 | `Extension` | 导出 `func Extension() *sdk.Extension`，挂载 `session_start` 与 `before_agent_start`，首错去重 warning |
+| **常量定义** | L57-L63, L287-L289 | `HcSocketFile`, `IdentityQueryTimeout`, `IdentityAncestorMaxHops`, `excludedTools`, `subagentExcludedTools`, `ExcludedTools()`, `SubagentExcludedTools()` | 常量与内部过滤集合及只读访问函数（Go 侧只剩 herdr-core `HcSocketFile`；`HerdrSocketFile` 已随经典 herdr 分支删除） |
+| **查询终端运行态** | L82-L172 (`queryHcTerminalInfo`) | `QueryHcTerminalInfo` | 双端均为 herdr-core `terminal.get`（JSON-RPC 2.0，校验 `address`/`state`/`parent:null`/严格整数 `pid`），经典 `pane.process_info` 查询已随 herdr 退役移除；从函数入口起算硬上限 1500ms 总预算，标准库 `net.DialTimeout`，1MB 缓冲截断与 JSON 验证，fail-closed |
+| **读取 /proc ppid** | L175-L186 (`readProcPpid`) | `ReadProcPpid` | 按最后一个 `)` 之后切分并读取第 2 个字段，防御性处理空格与括号 |
+| **读取 /proc cmdline** | L189-L195 (`readProcCmdline`) | `ReadProcCmdline` | 以 `\0` 分隔并过滤空串，空格拼接 |
+| **进程祖先链回溯** | L198-L212 (`readAncestorChain`) | `ReadAncestorChain` | 32 跳上限，环路与终止检测（`ppid == 0 \|\| ppid == current`） |
+| **agent 运行时特征检测** | L215-L221 (`isAgentRuntimeCmdline`) | `IsAgentRuntimeCmdline` | 匹配 `pi`、`pig`、`ctxmode`、`claude`、`claude-code`、`claude-pty` 及正则 `pi-coding-agent\|bundle/cli\.js\|(?:^|/)claude/versions/` |
+| **负向标记检测** | L224-L232 (`subagentLaunchMarker`) | `SubagentLaunchMarker`, `LoadEffectiveArgs` | 检测 `PI_SUBAGENT=1`、`PI_ROLE` 与 argv 特征（含通过 `PIG_HARNESS_ARGV_FILE` 桥接宿主参数） |
+| **fail-closed 身份推断** | L238-L283 (`resolveAgentIdentity`, `isSubagentSession`) | `ResolveAgentIdentityWithEnv`, `ResolveAgentIdentity`, `IsSubagentSession`, `DetectSubprocessForm`, `failClosed` | 形态判据为 `DetectSubprocessForm`（`PIG_EXT_SOCKET` / `PIG_EXT_SOCKET_<NAME>` / `PIG_EXT_PACKED_CELL` / `PIG_EXT_ACTIVE_MEMBERS`），宿主锚定为第一个 agent-runtime 祖先（subprocess）或 self（fused），S3 校验 `shellIndex > hostIndex`，S4 只扫中间进程，终端命名仅作辅助证据，S1-S4 任一失败均 fail-closed + 单次去重 warning |
+| **工具过滤纯函数** | L291-L302 (`enforceExclusions`) | `FilterActiveTools`, `EnforceToolExclusions` | 纯切片过滤保持相对顺序；无变更时不调用 `SetActiveTools`；debug 下记录打点 |
+| **提示词清理** | L310-L325 (before_agent_start) | `StripAddendumBlock`, `CleanPromptOptions`, `DeleteAddendumSection` | 清空 `appendSystemPrompt` + 删除 `sections` 里的 `addendum` section + 两段式剥离 `forceSystemPrompt` 中的 `<addendum>` 块，含非字符串防护。**与 TS 加固版的行为差**：TS 加固版只清 `appendSystemPrompt`、不删 `sections["addendum"]`，Go 版多做了这一步（PiG 会用 custom section 覆盖并重包 `<addendum>`，只清 `appendSystemPrompt` 会被重新叠回） |
+| **扩展工厂与事件接线** | L286, L305-L326 | `Extension` | 导出 `func Extension() *sdk.Extension`，挂载 `session_start` 与 `before_agent_start`，首错去重 warning |
 
 ---
 
@@ -89,17 +89,17 @@
    - **Fail-closed 防御策略**：若 `PIG_HARNESS_ARGV_FILE` 环境变量存在但文件缺失或包含坏 JSON，立即 fail-closed 判定为子代理（防止攻击者通过篡改环境变量屏蔽 `--name role-` 等负向标记）；仅当该环境变量完全未设置时，才安全退化为仅使用 `os.Args`。
    - **packed cell 共享保留（MF-2 语义反转）**：`PIG_HARNESS_ARGV_FILE` 在读取后**刻意保留、不 unset**——同一 packed cell 内的兄弟扩展共享进程环境，单个扩展 unset 会致盲后续解析身份的兄弟（如在 EventSessionStart 时机）。该变量只是额外的负向标记来源：它只能把判据推向 subagent，永远无法把会话抬升为 main。（历史：此前按 TS `delete process.env.PIG_HARNESS_ARGV_FILE` 对齐做 unset，packed-cell 回归证明会破坏兄弟读取，已反转。）
    - **进程内 argv 缓存（M2 回归修复）**：`ResolveAgentIdentityWithEnv` 每个 turn 都会调用身份判定；缓存只在变量已读成功后生效，保证宿主清理变量（置空/未设）后，后续 turn 仍能复用已桥接的 argv。缓存只区分三种情形：① env 未设且无缓存 → 合法回落 `os.Args`，**不写入缓存**（避免把合法回落误当成缓存事实）；② env 已设且解析成功 → 缓存结果，供变量消失后的 turn 复用；③ env 已设但读/解析失败 → 返回错误并 fail-closed 判子代理，**不缓存失败**，因此每次调用都会重新判定，不会把一次故障永久固化成「永远子代理」。注意：**变量非空时总是重新读文件、不走缓存**——宿主把变量重指到另一路径时会按新路径读取，重指到坏路径会按 ③ 报错，而非复用旧缓存。
-3. **`pid` 类型解析与严格校验**：
-   - TS 原版使用 `Number(info?.shell_pid)`，对于 JSON 字符串形式（如 `"4242"`）会宽松转换为数字并通过验证。
-   - Go 移植版严格遵循 JSON-RPC 类型规范，只认 JSON number（float64 整数或 int），对字符串形式的 pid 一律拒绝（fail-closed 判子代理）。
+3. **`pid` 类型解析与严格校验**（历史差异——自 2026-11-25 起 TS 侧已对齐为严格 JSON number pid，本条仅为迁移前的历史记录，现双端语义一致）：
+   - 迁移前 TS 原版使用 `Number(info?.shell_pid)`，对于 JSON 字符串形式（如 `"4242"`）会宽松转换为数字并通过验证。
+   - Go 移植版严格遵循 JSON-RPC 类型规范，只认 JSON number（float64 整数或 int），对字符串形式的 pid 一律拒绝（fail-closed 判子代理）。现 TS 侧同为严格 `typeof record.pid !== "number"` 校验，双端行为一致。
 4. **`ReadProcPpid` 字段切分差异**：
    - TS 原版使用 `stat.slice(close + 2).trim().split(/\s+/u)` 从 `)` 后切分。
    - Go 移植版采用 `strings.TrimSpace(stat[closeIdx+1:])` 配合 `strings.Fields(rest)`，更具防御性地容忍括号后多空格或换行等格式畸变。
 5. **`forceSystemPrompt` 非字符串分支防护**：
    - TS 原版直接对 `forceSystemPrompt` 调用 `replaceAll`，若上游传入非字符串可能触发异常。
    - Go 移植版在 `CleanPromptOptions` 中对 `forceSystemPrompt` 进行显式字符串类型断言（`isStr`），非字符串时安全忽略，不 panic。
-6. **平台支持与通信协议（仅 Linux/macOS）**：
-   - TS 原版写死 Linux 路径 `/root/.config/herdr/herdr.sock`；Go 移植版的终端查询已整体切换到 herdr-core `default.sock`（见上），经典 herdr socket 分支已删除。
+6. **平台支持与通信协议（仅 Linux/macOS）**（历史差异——自 2026-11-25 起 TS 侧已迁移至 herdr-core `default.sock`，本条仅为迁移前的历史记录，现双端路径一致）：
+   - 迁移前 TS 原版写死 Linux 路径 `/root/.config/herdr/herdr.sock`；Go 移植版的终端查询已整体切换到 herdr-core `default.sock`（见上），经典 herdr socket 分支已删除。现 TS 侧同样写死 `/run/user/0/herdr-core/default.sock`，双端一致。
    - Go 早期移植保留的 `HerdrNamedPipeWindows` / `network="npipe"` 属死代码（Go 标准库 `net` 原生不支持 `npipe` 协议，在 Windows 运行时会导致拨号错误）。已彻底移除 Windows npipe 死代码，终端查询仅支持 Unix domain socket（Linux/macOS）。
 7. **错误处理、告警去重与已知 fail-open 面**：
    - TS 原版在 handler 中静默忽略异常。
