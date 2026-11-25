@@ -119,7 +119,7 @@ func TestIdentityResolverIsSharedCore(t *testing.T) {
 			key, _, _ := strings.Cut(name, "=")
 			switch {
 			case strings.HasPrefix(key, "PIG_EXT_"), key == "CTXMODE_ROLE",
-				key == "PI_SUBAGENT", key == "PI_ROLE", key == "HERDR_PANE_ID",
+				key == "PI_SUBAGENT", key == "PI_ROLE",
 				key == "HC_TERMINAL_ID",
 				key == "PIG_HARNESS_ARGV_FILE":
 				t.Setenv(key, "")
@@ -145,25 +145,25 @@ func TestIdentityResolverIsSharedCore(t *testing.T) {
 			t.Fatalf("shared resolver must deny CTXMODE_ROLE: %v %q", isSubagent, reason)
 		}
 	})
-	t.Run("non_p1_pane_is_denied_before_socket", func(t *testing.T) {
+	t.Run("non_address_terminal_id_denied_before_socket", func(t *testing.T) {
 		clearIdentityInputs(t)
-		t.Setenv("HERDR_PANE_ID", "w66:p8")
+		t.Setenv("HC_TERMINAL_ID", "w66;p8")
 		if tools := toolsListTools(t, 42); len(tools) != 0 {
-			t.Fatalf("non-p1 pane request must be denied before the socket, tools=%v", tools)
+			t.Fatalf("non-address terminal request must be denied before the socket, tools=%v", tools)
 		}
 		isSubagent, reason := jevgate.ResolveMCPAgentIdentity()
-		if !isSubagent || !strings.Contains(reason, `no ":p1" suffix`) {
-			t.Fatalf("shared resolver must require :p1: %v %q", isSubagent, reason)
+		if !isSubagent || !strings.Contains(reason, "is not a terminal address") {
+			t.Fatalf("shared resolver must require the terminal address shape: %v %q", isSubagent, reason)
 		}
 	})
-	t.Run("missing_pane_is_denied", func(t *testing.T) {
+	t.Run("missing_terminal_id_is_denied", func(t *testing.T) {
 		clearIdentityInputs(t)
 		if tools := toolsListTools(t, 43); len(tools) != 0 {
-			t.Fatalf("missing-pane request must be denied, tools=%v", tools)
+			t.Fatalf("missing-terminal request must be denied, tools=%v", tools)
 		}
 		isSubagent, reason := jevgate.ResolveMCPAgentIdentity()
-		if !isSubagent || !strings.HasPrefix(reason, "S1: HERDR_PANE_ID") {
-			t.Fatalf("shared resolver must require HERDR_PANE_ID: %v %q", isSubagent, reason)
+		if !isSubagent || !strings.HasPrefix(reason, "S1: HC_TERMINAL_ID unset or empty") {
+			t.Fatalf("shared resolver must require HC_TERMINAL_ID: %v %q", isSubagent, reason)
 		}
 	})
 }
@@ -183,19 +183,20 @@ func TestMCPIdentityEnvChains(t *testing.T) {
 		return jevgate.IdentityEnv{
 			Getenv:      func(string) string { return "" },
 			PID:         chain[0].PID,
-			SocketPath:  "/tmp/fake.sock",
 			Timeout:     50 * time.Millisecond,
 			ReadStat:    func(pid int) (int, bool) { ppid, ok := ppids[pid]; return ppid, ok },
 			ReadCmdline: func(pid int) string { return cmdlines[pid] },
 			Environ:     func() []string { return nil },
-			QuerySocket: func(string, string, time.Duration) (int, bool) { return shellPID, shellPID > 0 },
-			ArgvCache:   &jevgate.ArgvCache{},
+			QueryHcSocket: func(socketPath, termID string, timeout time.Duration) (jevgate.HcTerminalInfo, bool) {
+				return jevgate.HcTerminalInfo{Address: termID, PID: shellPID}, shellPID > 0
+			},
+			ArgvCache: &jevgate.ArgvCache{},
 		}
 	}
-	envWithPane := func(env jevgate.IdentityEnv) jevgate.IdentityEnv {
+	envWithTerminal := func(env jevgate.IdentityEnv) jevgate.IdentityEnv {
 		env.Getenv = func(name string) string {
-			if name == "HERDR_PANE_ID" {
-				return "w1:p1"
+			if name == "HC_TERMINAL_ID" {
+				return "t12t"
 			}
 			return ""
 		}
@@ -208,20 +209,20 @@ func TestMCPIdentityEnvChains(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithPane(fixture(chain, 300)))
+		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithTerminal(fixture(chain, 300)))
 		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})
-	t.Run("forged_pane_id_denied_without_ancestor_match", func(t *testing.T) {
+	t.Run("forged_terminal_id_denied_without_ancestor_match", func(t *testing.T) {
 		chain := []jevgate.AncestorProcess{
 			{PID: 100, PPID: 200, Cmdline: "jev-mcp"},
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
 		// The socket answers a shell_pid that is NOT in this ancestry: the
-		// forged pane id cannot satisfy S3.
-		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithPane(fixture(chain, 4242)))
+		// forged terminal id cannot satisfy S3.
+		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithTerminal(fixture(chain, 4242)))
 		if !isSubagent || !strings.Contains(reason, "is not in this process ancestry") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
@@ -232,7 +233,7 @@ func TestMCPIdentityEnvChains(t *testing.T) {
 			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy --agent worker"},
 			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
 		}
-		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithPane(fixture(chain, 300)))
+		isSubagent, reason := jevgate.ResolveMCPAgentIdentityWithEnv(envWithTerminal(fixture(chain, 300)))
 		if !isSubagent || !strings.Contains(reason, "S4:") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
@@ -275,7 +276,7 @@ func TestToolsListGate(t *testing.T) {
 		}
 	})
 	t.Run("subagent_gets_empty_list", func(t *testing.T) {
-		stubIdentity(t, true, "S1: HERDR_PANE_ID unset or empty")
+		stubIdentity(t, true, "S1: HC_TERMINAL_ID unset or empty")
 		schemaDir := stubSchemaDirs(t)
 		reply := dispatchOne(t, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 		result, _ := reply["result"].(map[string]any)
@@ -495,7 +496,7 @@ func TestSchemaFilesWrittenBeforeToolsListResponse(t *testing.T) {
 		t.Fatal("tools/list produced no response")
 	}
 	// The denied branch still writes nothing and gets an empty list.
-	stubIdentity(t, true, "S1: HERDR_PANE_ID unset or empty")
+	stubIdentity(t, true, "S1: HC_TERMINAL_ID unset or empty")
 	deniedDir := stubSchemaDirs(t)
 	spy.onWrite = func() {
 		if entries, err := os.ReadDir(deniedDir); err == nil && len(entries) != 0 {

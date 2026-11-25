@@ -504,7 +504,7 @@ func packedCellArgvFixture(t *testing.T, marker string) (string, string) {
 		switch {
 		case strings.HasPrefix(name, "PIG_EXT_"):
 			t.Setenv(name, "")
-		case name == "CTXMODE_ROLE" || name == "PI_SUBAGENT" || name == "PI_ROLE" || name == "HERDR_PANE_ID":
+		case name == "CTXMODE_ROLE" || name == "PI_SUBAGENT" || name == "PI_ROLE" || name == "HC_TERMINAL_ID":
 			t.Setenv(name, "")
 		}
 	}

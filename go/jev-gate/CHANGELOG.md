@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-25
+
+### Breaking Changes
+
+- **Removed the classic herdr identity branch** (`herdr.sock` /
+  `HERDR_PANE_ID`); the hc (`HC_TERMINAL_ID` + `terminal.get`) shape is now
+  the only S1/S2 positive-proof path — aligned with
+  `go/exclude-tools-guard` v0.2.0+, shared by the extension and
+  `cmd/jev-mcp` (`identity.go`).
+  - Removed: `herdrSocketFile` constant, `queryPaneShellPid`, the
+    `IdentityEnv.SocketPath` / `IdentityEnv.QuerySocket` injection fields and
+    the `HERDR_PANE_ID` lookup branch in `resolveIdentity`.
+  - New behavior: S1 requires `HC_TERMINAL_ID` to match `^t[0-9a-z]+$` and
+    the `terminal.get` record to be live (when `state` is present), top-level
+    (parent is JSON null) and carry a positive pid; every failure resolves
+    fail-closed to subagent (`sync.Once` warning dedup unchanged).
+  - The same hc-only migration landed in the TS authority sources:
+    the byte-identical `SUBAGENT-IDENTITY` blocks of
+    `extensions/jev-gate/src/jev-gate.ts` and
+    `extensions/exclude-tools-guard/src/exclude-tools-guard.ts` now query
+    `/run/user/0/herdr-core/default.sock` with JSON-RPC 2.0 `terminal.get`
+    instead of the classic `pane.process_info` herdr query.
+  - Migration: sessions relying on classic `HERDR_*` pane identity now
+    resolve as subagent; run inside a herdr-core (`hc`) terminal or accept
+    the subagent tool set.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

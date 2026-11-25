@@ -2,11 +2,13 @@
 
 Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go 移植。
 
-- 权威源（TS）：`extensions/jev-gate/src/jev-gate.ts`，1005 行 / 48880 字节，md5
-  `f4ff427bb51b6fa378fcfd356b81fa99`。该 TS 文件是**历史部署快照的权威源**：部署目录
+- 权威源（TS）：`extensions/jev-gate/src/jev-gate.ts`（1092 行 / 53292 字节，md5
+  `90ffa34f0b7a985e39c61913a20a3a1e`，2026-11-25 hc-only 迁移 + R2 严格整数加固后；紧邻基线
+  `e1c4ef5` 为 1045 行 / 50720 字节 / md5 `49fb44454f2c47c93a809bafe29f9a89`；更早的 v4.2 部署快照
+  为 1005 行 / 48840 字节 / md5 `f4ff427bb51b6fa378fcfd356b81fa99`，均见 git 历史）。该 TS 文件是**历史部署快照的权威源**：部署目录
   `/root/.pi/agent/extensions/` 下的 `jev-gate.ts` 及 8 个 `.bak-*` 备份只读冻结；运行态默认
   部署目录已随 `registry.json` 迁至 `/root/.pig/agent/extensions`，由本仓 `bash install.sh jev-gate`
-  依 md5 幂等同步。
+  依 md5 幂等同步。本次 hc-only 迁移按任务纪律**未运行 `install.sh`**，部署副本需主代理后续另行同步。
 - **现行部署链路是 Go 扩展 + MCP 服务器**：`extensions/jev-gate/src/jev-gate.ts` 编译部署为
   Go 扩展（本目录 `go/jev-gate`，module `github.com/dorokuma/pi-extensions/go/jev-gate`，Go 1.26，
   仅依赖标准库 + `github.com/MichaelKinsy/PiG/extensions/sdk`，本地经 `go/go.work` 解析到
@@ -28,16 +30,18 @@ Jev / Clef（**System One 分类器，非 LLM**）门禁与巡检扩展的 Go �
 | `key.go` | 214 | 凭据三步解析（环境 → `settings.json` → 本地网关令牌）、`IsLocalGatewayURL`（回环判定，含 IPv4-mapped / translated IPv6） |
 | `jev.go` | 316 | `POST {base}/systemone`、响应解包（顶层 / `result` / 双层 `result.result`）、`validateAnswers` / `validateAnswer` fail-closed、截断、有界响应读取（4 MiB）、usage 归一 |
 | `classify.go` | 257 | `models.classify()` 的 `typesafe-system-one` 实现（PiG 缺口绕法，见下）+ 回传前用同一套 `validateAnswer` 校验答案结构 |
-| `identity.go` | 1523 | `SUBAGENT-IDENTITY` 块（S1–S4 fail-closed、`PIG_HARNESS_ARGV_FILE` 桥接的进程级临界区、真实 herdr socket 查询、/proc 祖先链、GNU env 选项模型） |
+| `identity.go` | 1803 | `SUBAGENT-IDENTITY` 块（S1–S4 fail-closed、`PIG_HARNESS_ARGV_FILE` 桥接的进程级临界区、真实 herdr-core socket 查询、/proc 祖先链、GNU env 选项模型） |
 | `extension.go` | 357 | `executeCheck`、参数 schema、`providerConfig`、`toolDefinition`、`Extension()` 工厂 |
-| `gate_test.go` / `key_test.go` / `jev_test.go` / `extension_test.go` / `identity_test.go` / `classify_test.go` | 529 / 143 / 369 / 586 / 991 / 318 | 见「测试」 |
+| `gate_test.go` / `key_test.go` / `jev_test.go` / `extension_test.go` / `identity_test.go` / `classify_test.go` | 529 / 143 / 369 / 586 / 1309 / 318 | 见「测试」 |
 | `go.mod` | 8 | 独立嵌套 module（PiG 只按 `go.mod` 识别扩展单元）；含一条 `replace ../exclude-tools-guard`，仅供 `extension_test.go` 末尾的 packed-cell 跨扩展回归测试 |
 
 `go/go.work` 仅新增一行 `./jev-gate`。
 
 ## TS → Go 行号对照
 
-TS 行号取自 `extensions/jev-gate/src/jev-gate.ts`（1005 行）；Go 行号取自本目录现行文件。
+TS 行号取自 `extensions/jev-gate/src/jev-gate.ts`；Go 行号取自本目录现行文件。
+注：TS 侧的 `SUBAGENT-IDENTITY` 块于 2026-11-25 迁移至 hc-only（herdr-core `terminal.get`），
+TS 行号随块内增行漂移，下表身份段行号以块内函数名区为准、不再逐行钉死；此前行号见 git 历史。
 
 | TS | 内容 | Go |
 |---|---|---|
@@ -70,17 +74,17 @@ TS 行号取自 `extensions/jev-gate/src/jev-gate.ts`（1005 行）；Go 行号�
 | `522-528` | `triage3` | `gate.go:347-360` |
 | `530-628` | `verdictFor` | `gate.go:410-547`（`Verdict` `gate.go:403-407`、`toolResult` `gate.go:550-557`） |
 | `630-699` | `executeCheck` | `extension.go:99-223`（`ExecuteCheck` / `executeCheck` / `failedResult` / `errorResult`） |
-| `701-702` | `BUILTIN_CLASSIFIER_PROVIDER = "typesafe"` | `gate.go:31` |
-| `704-706` | `SUBAGENT-IDENTITY-BEGIN` 块头 | `identity.go:2-31`（块说明） |
-| `734-738` | `HERDR_SOCKET_FILE` / `IDENTITY_QUERY_TIMEOUT_MS` / `IDENTITY_ANCESTOR_MAX_HOPS` | `identity.go:47-64` |
-| `754-814` | `queryPaneShellPid` | `identity.go:75-141` |
-| `816-837` | `readProcPpid` / `readProcCmdline` | `identity.go:144-179` |
-| `839-854` | `readAncestorChain` | `identity.go:182-202` |
-| `856-863` | `isAgentRuntimeCmdline` | `identity.go:208-221`（+ `agentRuntimePattern` `identity.go:204`） |
-| `865-877` | `subagentLaunchMarker` | `identity.go:343-361` |
-| `879-913` | `resolveAgentIdentity` | `identity.go:466-572`（`resolveAgentIdentityWithEnv`） |
-| `915-921` | `isSubagentSession` | `identity.go:581-591` |
-| `924-1005` | `export default async function (pi)`：子代理早退 + `registerProvider` + `registerTool` | `extension.go:323-357`（`Extension` / `newExtension`）、`extension.go:270-290`（provider config）、`extension.go:293-316`（tool definition）、`extension.go:236-266`（schema） |
+| `737-741` | `BUILTIN_CLASSIFIER_PROVIDER = "typesafe"`（含上方注释块，常量本体在 `741`） | `gate.go:31` |
+| `743-745` | `SUBAGENT-IDENTITY-BEGIN` 块头 | `identity.go` 顶部块说明 |
+| `782-788` | `HC_SOCKET_FILE` / `IDENTITY_QUERY_TIMEOUT_MS` / `IDENTITY_ANCESTOR_MAX_HOPS` / `HC_TERMINAL_ID_PATTERN` | `identity.go` 常量区（`HcSocketFile` / `identityQueryTimeout` / `identityAncestorMaxHops` / `hcTerminalIDPattern`） |
+| `807-897` | `queryHcTerminalInfo` | `identity.go:122-221`（`queryHcTerminalInfo`，JSON-RPC 2.0 `terminal.get`，同一 wire 形状） |
+| `900-920` | `readProcPpid` / `readProcCmdline` | `identity.go:229-248`（`readProcPpid`）、`identity.go:268-270`（`readProcCmdline`；`readProcArgv` `252-265` 同段） |
+| `923-937` | `readAncestorChain` | `identity.go:294-321`（`readAncestorChain`） |
+| `940-947` | `isAgentRuntimeCmdline` | `identity.go`（token 家族判定，见 `executableTokenOf` `identity.go:1003` 起） |
+| `949-957` | `subagentLaunchMarker` | `identity.go:1200-1215`（`subagentLaunchMarker`） |
+| `963-999` | `resolveAgentIdentity` | `identity.go:1514-1608`（`resolveIdentity` 共享主体）+ `identity.go:1762-1764`（`resolveAgentIdentityWithEnv`） |
+| `1002-1008` | `isSubagentSession` | `identity.go:1793-1803`（`IsSubagentSession` 导出入口） |
+| `1011-1092` | `export default async function (pi)`：子代理早退 + `registerProvider` + `registerTool` | `extension.go:323-357`（`Extension` / `newExtension`）、`extension.go:270-290`（provider config）、`extension.go:293-316`（tool definition）、`extension.go:236-266`（schema） |
 
 TS 侧无对应的 Go 加固：有界响应读取 `jev.go:43-52`（含常量/哨兵为 `33-52`）、分类器答案结构校验 `classify.go:164-186`（含辅助函数 `questionMember` / `criteriaLabels` 为 `158-218`）、argv 桥进程级临界区 `identity.go:282-323`（含注释为 `275-323`）。
 
@@ -88,14 +92,15 @@ TS 侧无对应的 Go 加固：有界响应读取 `jev.go:43-52`（含常量/哨
 
 `identity.go` 是扩展（`ResolveAgentIdentity`）与 `cmd/jev-mcp`（`ResolveMCPAgentIdentity`）**共用**
 的 fail-closed 判据：负向启动标记（env + argv，prompt 参数剥离——与 PiG `args.go` 的 `-p/--print`
-消费规则一致：@file 不吞、`-` 开头不吞、`---` 开头吞）、S1 的 `:p1` pane 要求、S2 herdr
-socket 查询、S3/S4 祖先链证明。另有 **herdr-core（`hc`）正证明分支**：`HERDR_PANE_ID` 为空且
-`HC_TERMINAL_ID` 匹配 `^t[0-9a-z]+$` 时，S1/S2 改走 `hc` 形状——连接写死的
+消费规则一致：@file 不吞、`-` 开头不吞、`---` 开头吞）、S1/S2 的 hc 正证明、S3/S4 祖先链证明。
+**自 v0.4.0（2026-11-25）起 herdr-core（`hc`）是唯一的 S1/S2 正证明路径**（经典 herdr
+`herdr.sock` / `HERDR_PANE_ID` / `pane.process_info` 分支随 herdr 退役整体移除，与
+`go/exclude-tools-guard` v0.2.0+ 对齐）：`HC_TERMINAL_ID` 必须匹配 `^t[0-9a-z]+$`，连接写死的
 `/run/user/0/herdr-core/default.sock`（不读 `HC_TERMINAL_SOCKET`）发 JSON-RPC 2.0
 `terminal.get`，回执必须 `id` 回环、`address` 回环、`state` 存在时必须为 `"live"`、
 `parent` 键必须存在且为 JSON 字面 `null`（顶层主终端；`hc run --bg` 的子代理终端必带父
 地址，`parent` 缺失/`""`/非字符串、非 `"live"` 的 `state` 一律 fail-closed）、`pid > 0`
-后作为 `shell_pid` 供 S3 严格祖先链与 S4 继续证明；MCP 模式允许 jev-mcp 与 pane shell 之间至多一层宿主
+后作为 `shell_pid` 供 S3 严格祖先链与 S4 继续证明；MCP 模式允许 jev-mcp 与终端 shell 之间至多一层宿主
 （agy/antigravity 或 pi/pig），其余 hop 一律 fail-closed。解释器脚本提取
 （`isAgyTokens` / `isPiPigTokens`）与 `checkExecutableTokens` 共用同一张 flag 表：`--` 与
 `-m`/`--module` 取下一个 token 判定，`inlineTextFlags`（`-e`/`--eval`/`-c`/`--command`/
@@ -111,11 +116,10 @@ packed cell 兄弟进程共享该文件。
 ## 与 TS 的行为差异（逐条）
 
 1. **子代理身份判定（SUBAGENT-IDENTITY）采用家族已审 Go 语义**，与 TS 块有差异；
-   **本扩展与 `go/exclude-tools-guard` 的判据已分叉**：exclude-tools-guard 的 Go 身份判据仍是
-   旧家族实现（不强制 `:p1` 等），**未随本分支同步新共享核心**，本轮只如实记录、不扩大范围
-   去同步它（packed-cell 测试只校验两扩展都能读到共享 argv 桥，不校验判据一致）：
-   - S1 要求 `HERDR_PANE_ID` 非空**且**以 `:p1` 结尾（主 pane 的必要条件，先于 socket 查询判
-     决；伪造 `xxx:p1` 仍须过 S2/S3/S4）。TS 侧同样把非 `:p1` pane 判子代理，此处与 TS 方向一致。
+   **自 v0.4.0（2026-11-25）起 Go 扩展、`cmd/jev-mcp` 与两份 TS 权威源的判据重新对齐为同一
+   hc-only 口径**（此前分叉期的记录见 git 历史）：
+   - S1/S2 只有 hc 形状：`HC_TERMINAL_ID` 匹配 `^t[0-9a-z]+$` 且 `terminal.get` 回执为存活顶层
+     记录（parent 为 JSON null）——伪造终端 id 仍须过 S2/S3/S4，与 TS 方向一致。
    - 宿主锚点由「固定 hop」改为「自身向上第一个 agent-runtime 祖先」（子进程形态）或「自身」
      （融合形态），并新增 `PIG_HARNESS_ARGV_FILE` + `ArgvCache` 桥接（PiG 的 Go 扩展子进程
      argv 为空，负向标记必须从该文件读，读失败即 fail-closed）。
@@ -125,11 +129,9 @@ packed cell 兄弟进程共享该文件。
    - 未确证时用 `sync.Once` 打一行 stderr 警告（PiG 会丢弃扩展 stderr，见 D56，属尽力信号）。
    - S2 的 1500ms 预算与「不重试、不延长」纪律保持不变；socket 路径仍是硬编码常量。
    - **残余面**：若子代理未携带任何负向标记
-     （`PI_SUBAGENT` / `PI_ROLE` / 三条 argv 标记都不可见），且 pane 名恰好以 `:p1` 结尾
-     （伪造或复用），但进程链
-     形态看起来就是「pane shell 直接起 agent」（宿主是 pi、pane shell 是宿主的严格祖先（含父进程）、无中间 agent
-     runtime），S1–S4 会全部成立而被判 main，子代理分支的摘工具/清 addendum 不会发生；现网证据见
-     `go/exclude-tools-guard/README.md`（`herdr agent start --kind pi` 不注入负向标记）。
+     （`PI_SUBAGENT` / `PI_ROLE` / 三条 argv 标记都不可见），且进程链形态看起来就是「顶层终端
+     shell 直接起 agent」（宿主是 pi、终端 shell 是宿主的严格祖先（含父进程）、无中间 agent
+     runtime），S1–S4 会全部成立而被判 main，子代理分支的摘工具/清 addendum 不会发生。
 2. **`models.classify()` 的 provider 注册方式不同（PiG 缺口，见下节）**：TS 只注册模型、依赖
    pi-ai 内置 transport；Go 版额外注册 `classifiers["typesafe-system-one"]` 回调，协议与
    `ai.ClassifyTypesafeSystemOne` 对齐（URL `<baseUrl>/systemone`、body `{model,state,questions}`）。
@@ -267,9 +269,9 @@ packed cell 兄弟进程共享该文件。
 
 全部测试零外网、零生产路径：`httptest.Server` 模拟 `/v1/systemone`（含 200 三种包裹形态、429/500、
 畸形 JSON、`null`、数组、空 answers、缺键、非法概率、超时、调用方取消、截断、usage 别名、请求形状），
-临时 Unix socket 模拟 herdr `shell_pid`（含 pane 不匹配、坏 JSON、零 pid、小数 pid、无 socket、静默超时），
+临时 Unix socket 模拟 herdr-core `terminal.get`（含 parent 各形态、坏 JSON、错 id、无 socket、静默超时），
 `/proc` 合成祖先链覆盖 S1–S4 与负向标记、`PIG_HARNESS_ARGV_FILE` 桥接（成功/缺文件/坏 JSON/marker），
-以及 `go.work` 下的并发安全（`-race`）。**不触碰**生产 `/root/.pi`、生产 herdr socket 与本地 Magpie：
+以及 `go.work` 下的并发安全（`-race`）。**不触碰**生产 `/root/.pi`、生产 herdr-core socket 与本地 Magpie：
 
 ```
 $ gofmt -l .                     # 无输出
@@ -293,7 +295,7 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
 | HTTP 契约 | `TestCallJevAcceptedEnvelopes`（3 形态）、`TestCallJevUsageAliases`（6 例）、`TestCallJevRequestShape`、`TestCallJevFailures`（10 例）、`TestCallJevRateLimitedBody`、`TestCallJevTimeout`、`TestCallJevCallerCancellation`、`TestCallJevMissingCredential`、`TestCallJevTruncatesPayload`、`TestOversizedResponseBodyFailsClosed`（>4 MiB 响应体：`Call` / `classifyWith` 两路均 fail-closed） |
 | 响应校验 | `TestUnwrapSystemOneBody`（6 例）、`TestValidateAnswers`（含 score 档位越界、未知题型 fail-closed） |
 | 工具/注册 | `TestExecuteCheckInvalidTask` / `…EmptyPayload` / `…ContractLintRole` / `…Success` / `…SummaryKeepsEveryVerdictLine` / `…ContractLintSuccess` / `…Truncation` / `…HTTPError` / `…RequestBodyIsSmall`、`TestJevCheckSchema`、`TestToolDefinition`、`TestProviderConfig`、`TestNewExtensionBranches` |
-| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（10 子例：S1/S2/S3×2/S4/主代理/打包单元/融合/融合未知/pane 非 `:p1`）、`TestQueryPaneShellPid`（临时 unix socket 协议分支：回执错 id、pane 不符、零/小数 pid、坏 JSON、空应答、无 socket）、`TestQueryHcTerminalInfo`（hc `terminal.get` 报文边界：`parent:null,state:"live"` 成功、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id 一律 fail-closed）、`TestResolveHcTerminalIdentity`（hc 身份形状：顶层 parent null 判 main、带父地址判 subagent、pid 不在祖先链仍 S3 失败、畸形 terminal id 先于 socket 查询判死）、`TestResolveMCPAgentIdentity`（MCP 拓扑：agy/pi 宿主层、`bash -c` inline 非宿主、嵌套宿主、forbidden runtime、未知中间层、空 cmdline）、`TestEnvArgv0Masking`（env 掩码：`-a`/`--argv0`/`--argv`/`--arg`/`-ia`/`-iam`/`-S` 七种形态×扩展/MCP 两种模式）、`TestEnvCommandTokens`（GNU env 9.7 选项表 42 例：缩写、簇、尾随缺参、未知/歧义、`-0`、可选参数、`-S` 重扫、permutation-free）、`TestPromptArgStrippingFlagBoundary`（PiG 消费规则：@file/marker 可见、`---` 提示词吞掉）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestQueryPaneShellPid`（7 子例 + 无 socket）、`TestQueryPaneShellPidTimeout`、`TestReadProcSelf`、`TestPackedCellArgvFileSharedAcrossExtensions`（两顺序×双侧独立 ArgvCache） |
+| 身份判定 | `TestResolveAgentIdentityNegativeMarkers`（5 例）、`TestResolveAgentIdentityProofChain`（S1 缺失/非地址形状/伪造 id 仍须过 S2、S2 查询失败、S3 不在祖先链/无运行时祖先/空 cmdline、S4 中间运行时/第二个 pi/祖先 env/CLI 标记、主代理子进程/打包单元/融合/融合未知）、`TestQueryHcTerminalInfo`（hc `terminal.get` 报文边界：`parent:null,state:"live"` 成功、缺 `parent` 键/`parent:""`/非字符串 parent/非 `"live"` state/`result:null`/错 id/address 不匹配/zero/negative/fractional/string/bool/缺失 pid/坏 JSON 一律 fail-closed，外加空回复（半关闭 EOF）、出站 `terminal.get` 报文字段抓包（jsonrpc/id/method/params.caller/params.terminal）、无 socket 与静默超时边界——后者用 `t.Cleanup` 关通道立即回收服务端协程）、`TestResolveHcTerminalIdentity`（hc 身份形状：顶层 parent null 判 main、带父地址判 subagent、pid 不在祖先链仍 S3 失败、畸形 terminal id 先于 socket 查询判死、导出 `HC_TERMINAL_SOCKET=/tmp/attacker.sock` 时拨号路径仍恒为硬编码 `HcSocketFile`）、`TestResolveMCPAgentIdentity`（MCP 拓扑：agy/pi 宿主层、`bash -c` inline 非宿主、嵌套宿主、forbidden runtime（含 `/usr/local/bin/dispatch-agent-go` 祖先 S4 拦截）、未知中间层、空 cmdline）、`TestEnvArgv0Masking`（env 掩码：`-a`/`--argv0`/`--argv`/`--arg`/`-ia`/`-iam`/`-S` 七种形态×扩展/MCP 两种模式）、`TestEnvCommandTokens`（GNU env 9.7 选项表 42 例：缩写、簇、尾随缺参、未知/歧义、`-0`、可选参数、`-S` 重扫、permutation-free）、`TestPromptArgStrippingFlagBoundary`（PiG 消费规则：@file/marker 可见、`---` 提示词吞掉）、`TestResolveAgentIdentityUnreadableAncestry`、`TestDetectSubprocessForm`、`TestLoadEffectiveArgs`（6 子例，含「缓存优先于重新 export 的变量」）、`TestLoadEffectiveArgsConcurrent`（8 goroutine × 200 轮并发，`-race`）、`TestReadProcSelf`、`TestPackedCellArgvFileSharedAcrossExtensions`（两顺序×双侧独立 ArgvCache） |
 | 分类器回调 | `TestClassifyTypesafeSystemOne`、`…Failures`、`TestClassifyWithoutUsage`、`TestClassifyRejectsMalformedAnswers`（畸形答案 + `bool` 题型 + `score` 数组 `criteria` 正反例）、`TestClassifyBoolQuestionWireMapping`、`TestClassifyRejectsUntrustedBaseUrl` |
 | 并发 | `TestExecuteCheckConcurrent`（8 goroutine × 8 次，`-race`） |
 
@@ -320,14 +322,14 @@ ok  github.com/dorokuma/pi-extensions/go/jev-gate  3.3s
    OK
    ```
 
-2. **真实入口（工具可见性）**：`--mode json -p 'Call the jev_check tool …'` → `EXIT=0`，无 panic、
+2. **真实入口（工具可见性）**（2026-10-24 经典 herdr 时代记录，保留备查）：
+   `--mode json -p 'Call the jev_check tool …'` → `EXIT=0`，无 panic、
    无扩展加载错误；但模型回「No jev_check tool」，请求里工具只有 `read/bash/edit/write`。
-   **原因（非缺陷）**：本次运行发生在派发 pane `HERDR_PANE_ID=w37:p8` 内，进程链为
-   `扩展 → pig → sh → pi(当前 agent) → pane shell`，S4 发现「宿主与 pane shell 之间存在另一个 agent
+   **原因（非缺陷）**：本次运行发生在嵌套派发会话内，S4 发现「宿主与终端 shell 之间存在另一个 agent
    runtime」→ 按设计 **fail-closed 判子代理** → 子代理分支不注册 `jev_check`/`magpie-jev`，只清空
-   `typesafe`。该 pane 名 `w37:p8` 本身也不满足现行 S1 的 `:p1` 必要条件，同一结论。
+   `typesafe`。
    主代理分支的注册内容由 `TestToolDefinition` / `TestProviderConfig` / `TestNewExtensionBranches`
-   静态覆盖；**在真正的 p1 主代理里看到 `jev_check` 仍需 verifier 在非嵌套会话复跑一次**（未做，
+   静态覆盖；**在真正的顶层主代理终端里看到 `jev_check` 仍需 verifier 在非嵌套会话复跑一次**（未做，
    如实记录）。
 
 ## 未做 / 遗留
