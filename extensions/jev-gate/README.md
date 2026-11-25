@@ -123,8 +123,11 @@ extensions/jev-gate/README.md                # 本文件
   JSON-RPC 2.0 `terminal.get`——S1 要求 `HC_TERMINAL_ID` 匹配 `^t[0-9a-z]+$`，S2 回执必须
   id/address 回环、`state` 存在时为 `"live"`、`parent` 键存在且为 JSON 字面 `null`（顶层主终端；
   `hc run --bg` 子代理终端必带父地址）、pid 为正整数；缺失/格式不符/有 parent/超时/错误一律
-  fail-closed 判子代理。S3/S4 祖先链与负向标记不变。迁移后仓内值：md5
-  `5c5d607d596cb75efa3d3fb5295ad7d7` / 52941 字节 / 1090 行；块在两扩展间仍逐字节一致
+  fail-closed 判子代理。同日 R2 收口将 `pid` 校验由宽松 `Number()` 强转收紧为严格 JSON number
+  判定（`typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0` 即
+  fail-closed，杜绝 `"pid": true` 被强转为 PID 1 的绕过面），`"state" in record` / `!("parent" in record)`
+  改为 `Object.prototype.hasOwnProperty.call(...)`。S3/S4 祖先链与负向标记不变。迁移+加固后仓内值：md5
+  `90ffa34f0b7a985e39c61913a20a3a1e` / 53292 字节 / 1092 行；块在两扩展间仍逐字节一致
   （本节下方校验命令实测 exit 0）。**按任务纪律本次未运行 `install.sh`、未同步宿主部署副本**
   （部署侧真实加载入口现为 PiG 原生 Go 扩展 `go/jev-gate`，TS 部署副本属历史快照；
   若仍需 TS 部署副本同步，由主代理另行拍板）。
@@ -141,7 +144,8 @@ extensions/jev-gate/README.md                # 本文件
   `diff <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/jev-gate/src/jev-gate.ts) \
        <(sed -n '/SUBAGENT-IDENTITY-BEGIN/,/SUBAGENT-IDENTITY-END/p' extensions/exclude-tools-guard/src/exclude-tools-guard.ts)`
   （2026-10-09 与 2026-10-16 实测均 exit 0，块内 220 行 / md5 `0c4590313a515752986fbad0a903699e`；
-  2026-11-25 hc-only 迁移后块内 265 行 / md5 `8a1df69a4d41b46ff5fe2d2ad34d0838`，双侧一致性实测 exit 0）。
+  2026-11-25 hc-only 迁移 + 严格整数加固后块内 267 行 / 12634 字节 / md5 `55266bb9e0984fe80f13a76cd2afd196`，
+  双侧一致性实测 exit 0）。
 
 ## 验证记录（2026-10-06 初版 / 2026-10-16 Magpie Clef 迁移）
 - `npx tsc --noEmit`：**exit 0**（本仓 tsconfig `include` 已含本扩展）。

@@ -123,7 +123,7 @@ func buildInstructionsMarkdown() string {
 		"",
 		"- `payload` is sent to the local Magpie gateway (`http://127.0.0.1:3425/v1/systemone`) and forwarded to upstream Cloudflare Workers AI Clef.",
 		"- `payload` MUST ONLY contain the subagent return body or report text itself; NEVER send credentials, secrets, tokens, or unsanitized environment data.",
-		"- Main agent (`:p1`) only: subagents are strictly prohibited from calling `jev_check`.",
+		"- Main agent (top-level hc terminal) only: subagents are strictly prohibited from calling `jev_check`.",
 		"",
 	)
 	return strings.Join(lines, "\n")
@@ -342,9 +342,10 @@ func cancelAllInFlight() {
 //
 // jevgate.ResolveMCPAgentIdentity is the fail-closed verdict the .mjs applied
 // inline: negative launch markers on this process AND every ancestor (env +
-// argv, prompt tokens stripped), the S1 ":p1" pane requirement, the S2 herdr
-// socket query, and the S3/S4 ancestry proof with at most one host layer
-// (agy/antigravity or pi/pig) between jev-mcp and the pane shell. The Go
+// argv, prompt tokens stripped), the S1 HC_TERMINAL_ID shape/parent-null
+// requirement, the S2 herdr-core hc terminal.get query, and the S3/S4
+// ancestry proof with at most one host layer
+// (agy/antigravity or pi/pig) between jev-mcp and the terminal shell. The Go
 // version ports the full socket/ancestry proof the .mjs comment deferred.
 // ---------------------------------------------------------------------------
 
@@ -459,7 +460,7 @@ func handleRPC(w *responseWriter, msg map[string]any, framingMode string) {
 
 func handleToolsCall(w *responseWriter, id any, params map[string]any, framingMode string) {
 	if isSubagent, reason := resolveAgentIdentity(); isSubagent {
-		deny := "jev_check denied: 仅限主代理（:p1）调用，子代理严禁自审自批。（" + reason + "）"
+		deny := "jev_check denied: 仅限主代理（顶层终端）调用，子代理严禁自审自批。（" + reason + "）"
 		w.sendResult(id, toolErrorResult(deny), framingMode)
 		return
 	}

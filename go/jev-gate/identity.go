@@ -130,7 +130,9 @@ func queryHcTerminalInfo(socketPath, termID string, timeout time.Duration) (HcTe
 		return HcTerminalInfo{}, false
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(deadline)
+	if err := conn.SetDeadline(deadline); err != nil {
+		return HcTerminalInfo{}, false
+	}
 
 	request, err := json.Marshal(map[string]any{
 		"id":      "pi-identity",

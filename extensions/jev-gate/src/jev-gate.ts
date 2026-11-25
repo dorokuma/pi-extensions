@@ -840,13 +840,13 @@ function queryHcTerminalInfo(termId: string, timeoutMs: number = IDENTITY_QUERY_
         return
       }
       // state 在线上可选；存在时必须为 "live"，否则不能证明一个存活终端。
-      if ("state" in record && record.state !== "live") {
+      if (Object.prototype.hasOwnProperty.call(record, "state") && record.state !== "live") {
         finish(null)
         return
       }
       // parent 键必须存在：JSON null = 顶层终端；非空字符串 = 父地址（子代理终端）；
       // 缺失、空串或其它类型都无法证明顶层形态，整条记录 fail-closed。
-      if (!("parent" in record)) {
+      if (!Object.prototype.hasOwnProperty.call(record, "parent")) {
         finish(null)
         return
       }
@@ -860,11 +860,13 @@ function queryHcTerminalInfo(termId: string, timeoutMs: number = IDENTITY_QUERY_
         finish(null)
         return
       }
-      const pid = Number(record.pid)
-      if (!Number.isInteger(pid) || pid <= 0) {
+      // pid 必须是严格 JSON number 且为安全正整数：宽松 Number() 强转会放行 true/字符串/数组，
+      // 其中 true 强转为 1（Linux init PID 1），脱离/reparented 子代理可借此伪造顶层身份。
+      if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) {
         finish(null)
         return
       }
+      const pid = record.pid
       finish({ pid, parent })
     }
     socket = net.connect(HC_SOCKET_FILE)

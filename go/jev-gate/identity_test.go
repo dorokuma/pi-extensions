@@ -1,6 +1,7 @@
 package jevgate
 
 import (
+	"bufio"
 	"net"
 	"os"
 	"path/filepath"
@@ -423,6 +424,25 @@ func TestResolveMCPAgentIdentity(t *testing.T) {
 			if !strings.Contains(reason, "agent/tool runtime ancestor pid=150") {
 				t.Fatalf("claude ancestor %q rejected for wrong reason: %q", cmd, reason)
 			}
+		}
+	})
+	t.Run("forbidden_dispatch_agent_go_ancestor_rejected", func(t *testing.T) {
+		// dispatch-agent-go is the subagent orchestration binary: as a
+		// jev-mcp intermediate ancestor it must be S4-intercepted with the
+		// same fail-closed shape as the claude family.
+		chain := []AncestorProcess{
+			{PID: 100, PPID: 150, Cmdline: "jev-mcp"},
+			{PID: 150, PPID: 200, Cmdline: "/usr/local/bin/dispatch-agent-go"},
+			{PID: 200, PPID: 300, Cmdline: "/usr/local/bin/agy"},
+			{PID: 300, PPID: 1, Cmdline: "/bin/bash"},
+		}
+		environment := identityFixture(map[string]string{"HC_TERMINAL_ID": "t12t"}, chain, 300)
+		isSubagent, reason := ResolveMCPAgentIdentityWithEnv(environment)
+		if !isSubagent {
+			t.Fatalf("dispatch-agent-go ancestor must be rejected, reason=%q", reason)
+		}
+		if !strings.Contains(reason, "agent/tool runtime ancestor pid=150") {
+			t.Fatalf("dispatch-agent-go ancestor rejected for wrong reason: %q", reason)
 		}
 	})
 	t.Run("unknown_intermediate_shell_rejected", func(t *testing.T) {
@@ -997,6 +1017,37 @@ func paneSocket(t *testing.T, reply string) string {
 	return path
 }
 
+// paneSocketCapture works like paneSocket but hands the first \n-terminated
+// request line back through capturedCh, so a test can assert the outgoing
+// terminal.get wire fields. The channel establishes happens-before between
+// the accept goroutine and the test goroutine (no shared-pointer race).
+func paneSocketCapture(t *testing.T, reply string, capturedCh chan<- string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hc.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			line, _ := bufio.NewReader(conn).ReadString('\n')
+			if capturedCh != nil {
+				capturedCh <- line
+			}
+			if reply != "" {
+				_, _ = conn.Write([]byte(reply))
+			}
+			_ = conn.Close()
+		}
+	}()
+	return path
+}
+
 // TestQueryHcTerminalInfo covers the terminal.get JSON-RPC 2.0 wire shape
 // against a real unix socket: only a live record whose parent key carries the
 // JSON literal null (or a non-empty parent address) can prove a terminal;
@@ -1020,6 +1071,14 @@ func TestQueryHcTerminalInfo(t *testing.T) {
 		{"non_string_parent", `{"id":"pi-identity","result":{"address":"t12t","parent":5,"state":"live","pid":4321}}`, false, ""},
 		{"result_null", `{"id":"pi-identity","result":null}`, false, ""},
 		{"wrong_request_id", `{"id":"other","result":{"address":"t12t","parent":null,"state":"live","pid":4321}}`, false, ""},
+		{"address_mismatch", `{"id":"pi-identity","result":{"address":"t99t","parent":null,"state":"live","pid":4321}}`, false, ""},
+		{"zero_pid", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":0}}`, false, ""},
+		{"negative_pid", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":-7}}`, false, ""},
+		{"fractional_pid", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":4321.5}}`, false, ""},
+		{"pid_string", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":"4321"}}`, false, ""},
+		{"pid_bool", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live","pid":true}}`, false, ""},
+		{"missing_pid", `{"id":"pi-identity","result":{"address":"t12t","parent":null,"state":"live"}}`, false, ""},
+		{"bad_json", `not-json`, false, ""},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1037,19 +1096,74 @@ func TestQueryHcTerminalInfo(t *testing.T) {
 		}
 	})
 
+	t.Run("empty_reply", func(t *testing.T) {
+		// The server accepts and closes without answering (half-closed EOF):
+		// ReadBytes sees 0 bytes + EOF, which must fail closed, never panic.
+		path := filepath.Join(t.TempDir(), "hc.sock")
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("listen unix: %v", err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			buffer := make([]byte, 4096)
+			_, _ = conn.Read(buffer)
+			_ = conn.Close()
+		}()
+		if _, ok := queryHcTerminalInfo(path, "t12t", 500*time.Millisecond); ok {
+			t.Fatal("an empty (EOF) reply must fail closed")
+		}
+	})
+
+	t.Run("request_fields", func(t *testing.T) {
+		// Capture the outgoing terminal.get line and pin every wire field:
+		// jsonrpc/id/method plus params.caller/params.terminal.
+		capturedCh := make(chan string, 1)
+		path := paneSocketCapture(t, ok, capturedCh)
+		info, gotOK := queryHcTerminalInfo(path, "t12t", time.Second)
+		if !gotOK || info.Address != "t12t" || info.PID != 4321 {
+			t.Fatalf("queryHcTerminalInfo = %+v,%v", info, gotOK)
+		}
+		var captured string
+		select {
+		case captured = <-capturedCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for the captured terminal.get request")
+		}
+		for _, want := range []string{
+			`"jsonrpc":"2.0"`,
+			`"id":"pi-identity"`,
+			`"method":"terminal.get"`,
+			`"caller":"t12t"`,
+			`"terminal":"t12t"`,
+		} {
+			if !strings.Contains(captured, want) {
+				t.Fatalf("terminal.get request missing %s, got: %s", want, captured)
+			}
+		}
+	})
+
 	t.Run("timeout_bounded", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "hc.sock")
 		listener, err := net.Listen("unix", path)
 		if err != nil {
 			t.Fatalf("listen unix: %v", err)
 		}
-		defer listener.Close()
+		t.Cleanup(func() { _ = listener.Close() })
+		done := make(chan struct{})
+		t.Cleanup(func() { close(done) })
 		go func() {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			time.Sleep(2 * time.Second)
+			// Hold without replying until the subtest ends; t.Cleanup closes
+			// done so this goroutine exits promptly instead of sleeping on.
+			<-done
 			_ = conn.Close()
 		}()
 		start := time.Now()
@@ -1127,6 +1241,23 @@ func TestResolveHcTerminalIdentity(t *testing.T) {
 		}
 		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
 		if !isSubagent || !strings.Contains(reason, "S1: HC_TERMINAL_ID=t12t;touch-pwn is not a terminal address") {
+			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
+		}
+	})
+	t.Run("hc_terminal_socket_env_never_read", func(t *testing.T) {
+		// HC_TERMINAL_SOCKET is an attacker-injectable variable: even when
+		// exported (pointing at a would-be attacker socket), the dial target
+		// must stay the hard-coded HcSocketFile. This pins the never-read contract.
+		environment := hcFixture(HcTerminalInfo{Address: "t12t", PID: 300}, true)
+		t.Setenv("HC_TERMINAL_SOCKET", "/tmp/attacker.sock")
+		environment.QueryHcSocket = func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool) {
+			if socketPath != HcSocketFile {
+				t.Fatalf("dial target %q must be the hard-coded HcSocketFile even with HC_TERMINAL_SOCKET exported", socketPath)
+			}
+			return HcTerminalInfo{Address: "t12t", PID: 300}, true
+		}
+		isSubagent, reason := resolveAgentIdentityWithEnv(environment)
+		if isSubagent || !strings.Contains(reason, "S1-S4 hold") {
 			t.Fatalf("isSubagent=%v reason=%q", isSubagent, reason)
 		}
 	})

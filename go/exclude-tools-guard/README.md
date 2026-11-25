@@ -2,10 +2,10 @@
 
 本组件是原 TS 版 `exclude-tools-guard.ts` 向 PiG Go 扩展体系的行为等价移植实现。
 
-> **基准与文件声明**：
-> - 部署版（`/root/.pi/agent/extensions/exclude-tools-guard.ts`）与仓库未提交版（`extensions/exclude-tools-guard/src/exclude-tools-guard.ts`）经 `md5sum` 校验逐字节一致（MD5：`30722dbb05328b63a2cb87729072b7a0`）。
-> - 本 Go 移植以该内容为权威基准。
-> - 本组件自身 diff 不含这两个 TS 文件（`extensions/exclude-tools-guard/README.md` 与 `extensions/exclude-tools-guard/src/exclude-tools-guard.ts`）；分支上它们的未提交改动来自 exclude-tools-guard 的 TS 侧加固，不是本组件所为。部署版与仓内版 MD5 断言保持一致。本组件严格遵守铁律，只修改 `go/exclude-tools-guard/` 目录与自身依赖，不修改 `/root/.pi/agent/` 下的任何文件。
+> **基准与文件声明（2026-11-25 hc-only 迁移后更新）**：
+> - TS 权威源 `extensions/exclude-tools-guard/src/exclude-tools-guard.ts` 已于 2026-11-25 随 hc-only 迁移 + R2 严格整数加固更新为 326 行 / 15136 字节 / md5 `ad533f48efd988dd150612c969f869fd`（见 `extensions/exclude-tools-guard/README.md`）；按任务纪律**未运行 `install.sh`、未同步宿主部署副本**，部署版仍为 2026-10-22 最后同步点 md5 `30722dbb05328b63a2cb87729072b7a0`（279 行 / 12450 字节），两者**当前并不一致**（仓内源领先于部署副本）。
+> - 本 Go 移植的判据（herdr-core hc-only S1–S4）与新仓内 TS 源口径一致；上文历史断言（部署版与仓内版逐字节一致）仅适用于 2026-11-24 之前的基线。
+> - 本组件严格遵守铁律，只修改 `go/exclude-tools-guard/` 目录与自身依赖，不修改 `/root/.pi/agent/` 下的任何文件。
 
 ---
 
@@ -20,7 +20,7 @@
     ```
     一次查询硬上限 1500ms（从函数入口起算的总预算硬上限，**不延长预算、不叠加阻塞式重试层**）。回执必须满足 `reply.id === "pi-identity"`、`result.address === termId`、`state` 字段存在时必须为 `"live"`（`"finished"` 等一律 fail-closed）、`parent` 键必须存在且为 JSON 字面 `null`（顶层主终端；`hc run --bg` 派生的子代理终端必带父地址，因此 `parent` 缺失/`""`/非字符串同样 fail-closed）、且 `pid > 0` 后作为 `shell_pid` 进入 S3/S4。查询失败/超时一律 fail-closed 判子代理，并只向 stderr 记**一条** warning（`sync.Once` 去重）。**S1/S3/S4 的 fail-closed 分支同样走这条去重 warning**（reason 里带分支名，例如 `S1: HC_TERMINAL_ID unset or empty`、`S3: no agent-runtime ancestor …`、`S4: agent runtime ancestor …`），`PI_IDENTITY_DEBUG=1` 只增加细节、不改变判定。
     > **已知局限（stderr 在部署形态可能不可见）**：pig 会把扩展子进程的 stderr 重定向到临时文件且通常不保留（`ref/PiG/coding/extension/host/subprocess/host.go:3238-3248`，D56），所以这条 warning 在真实部署里**可能看不到**。它只是尽力而为的信号，不是可依赖的交付通道；排障时以 `PI_IDENTITY_DEBUG=1` 的前台运行或 reason 字符串为准。
-  - **判据分叉如实记录**：经典 herdr 协议分支（`HERDR_*` pane 环境变量 + `herdr.sock` + `pane.process_info`）已从本组件删除，判据分叉注释仍保留——这是本组件的**家族实现**口径：TS 源与 `go/jev-gate` 的共享核心都要求主 pane 以 `:p1` 结尾（TS 源码仍如此要求），本组件刻意不随其同步（packed-cell 跨扩展测试只校验共享 argv 桥，不校验判据一致）。
+  - **判据对齐如实记录（2026-11-25 更新）**：经典 herdr 协议分支（`HERDR_*` pane 环境变量 + `herdr.sock` + `pane.process_info`）已从本组件删除；**自 2026-11-25 hc-only 迁移起，本组件、TS 源与 `go/jev-gate` 的共享核心已重新对齐为同一 herdr-core hc-only 判据**（`:p1` pane 时代的历史分叉记录见 git 历史）。（packed-cell 跨扩展测试只校验共享 argv 桥，不校验判据一致。）
   - **S3 内核进程表祖先链与宿主锚定**：通过回溯本进程的 `/proc/<pid>/stat`（最多 32 跳），提取祖先进程链。该祖先链必须包含 S2 查询得到的 `shell_pid`，且 `shell_pid` 必须位于宿主进程的严格祖先方向（`shellIndex > hostIndex`）。宿主位置由**进程拓扑**锚定，与终端命名无关：
     - **subprocess 形态（主判别式 `DetectSubprocessForm`）**：从 self 向上遍历，**第一个** `IsAgentRuntimeCmdline(cmdline)` 为真的祖先即宿主；若到终端 shell 之前都没找到 → fail-closed 判子代理（reason 写清 `no agent-runtime ancestor` 与命中的环境键）。subprocess 形态的判据覆盖全部三种 out-of-process 传输形态：
       - isolated 进程：`PIG_EXT_SOCKET` 非空；
@@ -59,7 +59,7 @@
 | 行为模块 | TS 原版 (`exclude-tools-guard.ts`) | Go 移植版 (`exclude-tools-guard/extension.go`) | 说明 |
 |---|---|---|---|
 | **常量定义** | L49-L53, L240-L242 | `HcSocketFile`, `IdentityQueryTimeout`, `IdentityAncestorMaxHops`, `excludedTools`, `subagentExcludedTools`, `ExcludedTools()`, `SubagentExcludedTools()` | 常量与内部过滤集合及只读访问函数（Go 侧只剩 herdr-core `HcSocketFile`；`HerdrSocketFile` 已随经典 herdr 分支删除） |
-| **查询终端运行态** | L69-L128 (`queryPaneShellPid`) | `QueryHcTerminalInfo` | Go 侧移植为 herdr-core `terminal.get`（JSON-RPC 2.0，校验 `address`/`state`/`parent:null`/`pid`），不再保留经典 `pane.process_info` 查询；从函数入口起算硬上限 1500ms 总预算，标准库 `net.DialTimeout`，1MB 缓冲截断与 JSON 验证，fail-closed |
+| **查询终端运行态** | L82-L173 (`queryHcTerminalInfo`，2026-11-25 hc-only 迁移后行号) | `QueryHcTerminalInfo` | 双端均为 herdr-core `terminal.get`（JSON-RPC 2.0，校验 `address`/`state`/`parent:null`/严格整数 `pid`），经典 `pane.process_info` 查询已随 herdr 退役移除；从函数入口起算硬上限 1500ms 总预算，标准库 `net.DialTimeout`，1MB 缓冲截断与 JSON 验证，fail-closed |
 | **读取 /proc ppid** | L131-L142 (`readProcPpid`) | `ReadProcPpid` | 按最后一个 `)` 之后切分并读取第 2 个字段，防御性处理空格与括号 |
 | **读取 /proc cmdline** | L145-L151 (`readProcCmdline`) | `ReadProcCmdline` | 以 `\0` 分隔并过滤空串，空格拼接 |
 | **进程祖先链回溯** | L154-L168 (`readAncestorChain`) | `ReadAncestorChain` | 32 跳上限，环路与终止检测（`ppid == 0 \|\| ppid == current`） |
@@ -109,7 +109,7 @@
      - 若 `ctx.GetActiveTools()` 出错，当前策略为保留错误并放弃本次工具过滤，依赖上层或后续 turn 恢复。
      - **子代理在自己顶层终端且不带任何负向标记时会被判 main**。现网证据：`hc run`（不带 `--bg`）与手工 `bin/pi` 都不注入 `--name role-` / `PI_SUBAGENT` / `PI_ROLE`；此时 S1-S4 全部成立（宿主是 pi、`terminal.get` 顶层记录、无中间 agent runtime），故判 main，`jev_check` / `ask_user_question` 不会被摘、addendum 不会被清。
      - **TS 原块自认的另一条残余面**：「另一个 pi 塞进主代理终端 shell」——即某个 pi 进程被嵌在主代理终端的 shell 之下但不带负向标记，同样满足 S1-S4 而被判 main。
-     - **终端命名不作判据的代价**：判定面从「非 `:p1` 的 pane」（TS/jev-gate 共享核心判据）扩大到了「任意 herdr-core 顶层终端」。现在身份完全由负向标记 + herdr-core 运行态 + 进程拓扑决定，终端命名只写进 reason 作辅助证据。**受管派发（走 dispatch-agent）的判定依赖宿主 argv 桥（带前提）**：三条负向标记（`--name role-`、`/tmp/herdr-role-sessions`、`/tmp/dispatch-`）确实在宿主 argv 里，但**能否被 Go 扩展看到取决于宿主是否写 `PIG_HARNESS_ARGV_FILE`**（PiG 的 subprocess / packed cell 宿主会写，见 `ref/PiG/coding/extension/host/subprocess/harness_identity.go`）。在 PiG 宿主下三条标记可见，受管派发稳定判子代理；若运行在没有该桥的宿主上（例如 TS 版 pi 的进程内扩展），`/proc/<pid>/argv` 可能已被进程 title 改写成 `pi`，标记就不可见，此时落回残余面 1（子代理在自己终端且无可见负向标记时判 main）。
+     - **终端命名不作判据的代价**：判定面从「非 `:p1` 的 pane」（早期 TS/jev-gate 共享核心判据，2026-11-25 起四端已全部迁出该口径）扩大到了「任意 herdr-core 顶层终端」。现在身份完全由负向标记 + herdr-core 运行态 + 进程拓扑决定，终端命名只写进 reason 作辅助证据。**受管派发（走 dispatch-agent）的判定依赖宿主 argv 桥（带前提）**：三条负向标记（`--name role-`、`/tmp/herdr-role-sessions`、`/tmp/dispatch-`）确实在宿主 argv 里，但**能否被 Go 扩展看到取决于宿主是否写 `PIG_HARNESS_ARGV_FILE`**（PiG 的 subprocess / packed cell 宿主会写，见 `ref/PiG/coding/extension/host/subprocess/harness_identity.go`）。在 PiG 宿主下三条标记可见，受管派发稳定判子代理；若运行在没有该桥的宿主上（例如 TS 版 pi 的进程内扩展），`/proc/<pid>/argv` 可能已被进程 title 改写成 `pi`，标记就不可见，此时落回残余面 1（子代理在自己终端且无可见负向标记时判 main）。
 8. **TS 侧残留实现的核实记录（pi 1.4.0，仅核实与记录，不删实现）**：
    - `forceSystemPrompt` 在 pi 1.4.0 **并非不存在**：`dist/core/system-prompt.d.ts` 的 `BuildSystemPromptOptions` 里有 `/** Exact full prompt replacement set by a before_agent_start handler. */ forceSystemPrompt?: string;`，且只在某个 handler 返回 `systemPrompt` 覆盖时被填充（`agent-session.ts:1724`）。
    - 因此 TS 侧 `StripAddendumBlock(forceSystemPrompt, …)` **不是死代码**，但实际几乎不触发（常规子代理会话不会强制整块提示词）；**保留作防御**，不因「很少命中」而删除。Go 侧对本分支另有非字符串类型断言防护（见差异 5）。
