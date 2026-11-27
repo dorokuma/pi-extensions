@@ -49,6 +49,13 @@ assert_file_not_exists() { # $1=path $2=label
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
+# 非 /root/workspace/pi-extensions 检出路径下（如 GitHub Actions runner），
+# 将测试中隔离 registry 复制使用的旧绝对前缀映射为当前仓库根目录 $SCRIPT_DIR。
+if [ ! -e "$SCRIPT_DIR/extensions" ] || [ ! -d "/root/workspace/pi-extensions/extensions" ]; then
+  sed "s|/root/workspace/pi-extensions/|${SCRIPT_DIR}/|g" "$REGISTRY" > "$TMP_ROOT/registry.resolved.json"
+  REGISTRY="$TMP_ROOT/registry.resolved.json"
+fi
+
 # 从 registry 取一个 hosted 与 federated 扩展名/destFile
 hosted_name="$(jq -r '.extensions[] | select(.category=="hosted") | .name' "$REGISTRY" | head -n1)"
 hosted_dest="$(jq -r --arg n "$hosted_name" '.extensions[] | select(.name==$n) | .destFile' "$REGISTRY")"

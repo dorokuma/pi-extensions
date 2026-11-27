@@ -165,7 +165,7 @@ func (a *app) handleNativeAndZeroNode(ext Extension, dest string, isFederated bo
 }
 
 func (a *app) installHosted(ext Extension) error {
-	src := ext.Authority.sourcePath()
+	src := resolveSourcePath(ext.Authority.sourcePath(), a.repoRoot)
 	if src == "" {
 		return a.fail("hosted extension '%s' has no authority.sourcePath in registry", ext.Name)
 	}

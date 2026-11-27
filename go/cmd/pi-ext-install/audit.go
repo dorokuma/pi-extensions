@@ -20,7 +20,7 @@ func (a *app) runList() int {
 
 	for _, ext := range a.reg.Extensions {
 		cat := ext.effectiveCategory()
-		src := ext.Authority.sourcePath()
+		src := resolveSourcePath(ext.Authority.sourcePath(), a.repoRoot)
 		if src == "" {
 			src = "(out of band — external tool)"
 		}
@@ -30,7 +30,7 @@ func (a *app) runList() int {
 		} else {
 			dest = filepath.Join(a.destDir, ext.DestFile)
 		}
-		st := statusOf(ext, a.destDir)
+		st := statusOfWithRoot(ext, a.destDir, a.repoRoot)
 		fmt.Fprintf(a.stdout, "%-17s %-9s %-15s %-44s %s [%s]\n",
 			ext.Name, cat, ext.Authority.Kind, src, dest, st.status)
 	}
@@ -47,7 +47,7 @@ func (a *app) runAudit() int {
 
 	for _, ext := range a.reg.Extensions {
 		cat := ext.effectiveCategory()
-		st := statusOf(ext, a.destDir)
+		st := statusOfWithRoot(ext, a.destDir, a.repoRoot)
 		match := "MISMATCH"
 		if st.srcMD5 != "--" && st.srcMD5 == st.destMD5 {
 			match = "MATCH"
