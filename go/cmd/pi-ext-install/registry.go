@@ -56,6 +56,28 @@ func (a Authority) sourcePath() string {
 	return *a.SourcePath
 }
 
+const legacyRepoRoot = "/root/workspace/pi-extensions/"
+
+// resolveSourcePath maps legacy hardcoded /root/workspace/pi-extensions/ paths
+// to repoRoot when running from any other checkout location.
+func resolveSourcePath(raw, repoRoot string) string {
+	if raw == "" || repoRoot == "" {
+		return raw
+	}
+	if !strings.HasPrefix(raw, legacyRepoRoot) {
+		return raw
+	}
+	if _, err := os.Stat(raw); err == nil {
+		return raw
+	}
+	rel := filepath.FromSlash(strings.TrimPrefix(raw, legacyRepoRoot))
+	cand := filepath.Join(repoRoot, rel)
+	if _, err := os.Stat(cand); err == nil {
+		return cand
+	}
+	return raw
+}
+
 func (a Authority) installScript() string {
 	if a.InstallScript == nil {
 		return ""

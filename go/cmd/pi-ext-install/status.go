@@ -74,8 +74,12 @@ func (a *app) isZeroNodeProtectedDest() bool {
 }
 
 func statusOf(ext Extension, destDir string) extStatus {
+	return statusOfWithRoot(ext, destDir, "")
+}
+
+func statusOfWithRoot(ext Extension, destDir, repoRoot string) extStatus {
 	cat := ext.effectiveCategory()
-	src := ext.Authority.sourcePath()
+	src := resolveSourcePath(ext.Authority.sourcePath(), repoRoot)
 	var dest string
 	if cat == "native" {
 		dest = filepath.Join(destDir, ext.effectiveDestName())
